@@ -21,7 +21,7 @@ Legend: priority is rough — `[P1]` do first, `[P3]` nice to have.
   ceiling on the session rule.
 - Idempotent list draining (strike each done path out of the list file).
 - Git-push policy (none | after_new_commits | each_hour), final push on exit.
-- Rotating mirror log, `--dry-run`, `--max`, `--startIn`, `--maxStrike`, `--raw`.
+- Rotating mirror log, `--dry-run`, `--max-runs`, `--start-in`, `--max-strike`, `--raw`.
 - Sequential `run_loop` + parallel `run_parallel` (N concurrent workers).
 - Project-root decoupling (`--project-dir` / cwd), stop file.
 
@@ -37,7 +37,7 @@ becomes a configured token (e.g. `done`).
   avoid a false "done".
 - Plumb through as a Driver hook / `--completion-signal` + `--completion-threshold`.
 - The exact-string matching is brittle (Ralph plugin warns about this) — keep
-  `--max` as the primary safety net regardless.
+  `--max-runs` as the primary safety net regardless.
 
 ### [P1] Circuit breaker — stuck-loop detection
 Source: frankbria (its killer feature).
@@ -54,7 +54,7 @@ Source: continuous-claude (`--max-cost`, `--max-duration`).
 We already extract `total_cost_usd` per iteration from the result event.
 - `--max-cost USD` — stop once cumulative spend crosses the ceiling.
 - `--max-duration 2h` — wall-clock cap for the whole run (complements
-  `--maxStrike`, which is about the session window, not total runtime).
+  `--max-strike`, which is about the session window, not total runtime).
 
 ### [P2] Structured per-iteration metrics (JSONL)
 Source: frankbria (`metrics.jsonl`).

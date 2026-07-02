@@ -214,15 +214,23 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
         prog=prog,
         description=description or "Autonomous loop driving the Claude CLI.",
     )
-    p.add_argument("-m", "--max", type=int, default=None, metavar="N",
-                   help="stop after N iterations (default: run forever)")
+    # Option names are kept in sync with continuous_claude.py (kebab-case, and
+    # --max-runs for the iteration cap). The former spellings (--max, --startIn,
+    # --maxStrike) stay on as accepted aliases so existing invocations keep working.
+    p.add_argument("-m", "--max-runs", "--max", dest="max", type=int, default=None,
+                   metavar="N",
+                   help="stop after N iterations (default: run forever); "
+                        "--max is a deprecated alias")
     p.add_argument("-d", "--dry-run", action="store_true",
                    help="only print the commands, don't run claude")
-    p.add_argument("-r", "--raw", action="store_true",
+    # No -r short flag: -r is --review-prompt in continuous_claude.py, so it is
+    # left free here rather than reused for --raw.
+    p.add_argument("--raw", action="store_true",
                    help="print raw JSON events (for debugging)")
-    p.add_argument("-s", "--startIn", dest="start_in", metavar="DURATION",
+    p.add_argument("-s", "--start-in", "--startIn", dest="start_in", metavar="DURATION",
                    help="wait this long before starting the loop, e.g. 29m, 1h30m")
-    p.add_argument("-S", "--maxStrike", dest="max_strike", metavar="DURATION",
+    p.add_argument("-S", "--max-strike", "--maxStrike", dest="max_strike",
+                   metavar="DURATION",
                    help="per-session work budget before a pre-emptive pause, e.g. 3h")
     p.add_argument("-g", "--git-push", dest="git_push",
                    choices=[pol.value for pol in GitPushPolicy],
@@ -711,7 +719,7 @@ def _fmt_clock(ts: float) -> str:
 def wait_until(target_ts: float, reason: str = None) -> None:
     """Sleep until wall-clock time reaches target_ts, printing a periodic countdown.
 
-    Used after a probable token-limit error (or once the --maxStrike budget is
+    Used after a probable token-limit error (or once the --max-strike budget is
     spent): we idle until the 5-hour session window should have refreshed.
     `reason` overrides the default opening line. Ctrl+C interrupts the wait and
     stops the script.
@@ -736,7 +744,7 @@ def wait_until(target_ts: float, reason: str = None) -> None:
 
 
 def wait_before_start(spec: str) -> None:
-    """Idle for the duration given by --startIn before the loop begins.
+    """Idle for the duration given by --start-in before the loop begins.
 
     Lets you launch the script and walk away; work kicks off after the delay.
     Ctrl+C interrupts the wait and stops the script.
@@ -744,12 +752,12 @@ def wait_before_start(spec: str) -> None:
     try:
         seconds = parse_duration(spec)
     except ValueError as e:
-        print(f"Invalid --startIn value {spec!r}: {e}")
+        print(f"Invalid --start-in value {spec!r}: {e}")
         sys.exit(2)
     if seconds <= 0:
         return
     target_ts = time.time() + seconds
-    print(f"  ⏳ --startIn {spec}: waiting until {_fmt_clock(target_ts)} before starting…")
+    print(f"  ⏳ --start-in {spec}: waiting until {_fmt_clock(target_ts)} before starting…")
     try:
         while True:
             now = time.time()
@@ -798,7 +806,7 @@ class Driver:
         default.
 
     The loop owns all the scaffolding (stop file, git push, usage limits,
-    --max/--maxStrike, streaming render); the Driver only decides *what work to
+    --max-runs/--max-strike, streaming render); the Driver only decides *what work to
     do*. A project wrapper is then just::
 
         class MyDriver(StateFileDriver):
@@ -903,7 +911,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     from .usage import UsageSource
 
     max_iters = args.max          # None = no limit
-    # When a finite iteration cap is given (-m/--max) the run is short and
+    # When a finite iteration cap is given (-m/--max-runs) the run is short and
     # bounded on purpose, so the usage-limit machinery (the LimitPolicy
     # pause-on-limit logic) is skipped — we just run the requested iterations
     # without ever waiting out a window.
@@ -918,7 +926,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         try:
             max_strike_seconds = parse_duration(max_strike)
         except ValueError as e:
-            print(f"Invalid --maxStrike value {max_strike!r}: {e}")
+            print(f"Invalid --max-strike value {max_strike!r}: {e}")
             sys.exit(2)
 
     # Anchor every project-relative operation (git/claude cwd, the stop file, the
@@ -963,7 +971,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             last_git_push = maybe_git_push(git_push_policy, last_git_push)
 
         if max_iters is not None and iteration >= max_iters:
-            print(f"Iteration limit reached (--max {max_iters}). Stopping.")
+            print(f"Iteration limit reached (--max-runs {max_iters}). Stopping.")
             break
 
         # --maxStrike: once a finished iteration pushes us past the per-session
@@ -973,7 +981,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         if max_strike_seconds is not None and iteration > 0:
             elapsed = time.time() - session_start
             if elapsed > max_strike_seconds:
-                print(f"  ⌛ maxStrike budget ({max_strike}) reached after "
+                print(f"  ⌛ max-strike budget ({max_strike}) reached after "
                       f"{int(elapsed // 60)} min of work — pausing for the next "
                       f"session so this run stays whole.")
                 target_ts = session_start + SESSION_DURATION
@@ -1018,7 +1026,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # looping forever in dry-run is pointless — nothing is actually done,
             # so the driver would keep handing back the same first unit of work.
             if max_iters is None:
-                print("(dry-run without --max: running a single iteration and exiting)")
+                print("(dry-run without --max-runs: running a single iteration and exiting)")
                 break
             continue
 

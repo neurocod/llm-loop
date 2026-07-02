@@ -21,8 +21,8 @@ What this shares with the sequential runner, and what it deliberately drops:
     trade the live view for throughput — the right call for mechanical bulk work.
 
 CLI mirrors the family (see `--help`); the additions are `-j/--jobs N`
-(default 10) and `-C/--project-dir`. `--max N` caps the *total* number of files
-processed this run (across all workers), not iterations.
+(default 10) and `-C/--project-dir`. `--max-runs N` caps the *total* number of
+files processed this run (across all workers), not iterations.
 """
 
 import argparse
@@ -72,8 +72,8 @@ def parse_args(argv=None, *, prog: str = "parallel",
     """CLI for the parallel runner: the family's options plus -j/--jobs.
 
     A trimmed copy of cyclecore.parse_args (it can't be reused directly: it has
-    no --jobs, and its --max means *iterations*, which here is redefined as a
-    total-files cap). Every long option keeps its single-letter alias.
+    no --jobs, and its --max-runs means *iterations*, which here is redefined as
+    a total-files cap). Every long option keeps its single-letter alias.
     """
     p = argparse.ArgumentParser(
         prog=prog,
@@ -82,9 +82,10 @@ def parse_args(argv=None, *, prog: str = "parallel",
     )
     p.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS, metavar="N",
                    help=f"number of concurrent workers (default: {DEFAULT_JOBS})")
-    p.add_argument("-m", "--max", type=int, default=None, metavar="N",
+    p.add_argument("-m", "--max-runs", "--max", dest="max", type=int, default=None,
+                   metavar="N",
                    help="stop after processing N files total, across all workers "
-                        "(default: drain the whole list)")
+                        "(default: drain the whole list); --max is a deprecated alias")
     p.add_argument("-d", "--dry-run", action="store_true",
                    help="only print the commands that would run, don't run claude "
                         "and don't touch the list")
@@ -209,7 +210,7 @@ class Shared:
         self.in_progress = set()      # raw lines a worker is currently handling
         self.failed = set()           # raw lines parked after MAX_ATTEMPTS
         self.attempts = {}            # raw line -> failed-attempt count
-        self.claimed = 0              # files claimed this run (for --max)
+        self.claimed = 0              # files claimed this run (for --max-runs)
         self.done = 0                 # files processed successfully
         self.max_items = max_items
         self.stop = threading.Event()  # set on stop-file / no-work / fatal
@@ -266,7 +267,7 @@ def worker(job_id: int, shared: Shared, source: Optional[UsageSource],
            policy, session_start_box: list, usage_lock: threading.Lock) -> None:
     """One worker thread: claim -> (usage gate) -> run -> record, repeat.
 
-    Loops until the shared stop flag is set (queue drained, --max hit, or stop
+    Loops until the shared stop flag is set (queue drained, --max-runs hit, or stop
     file). A claim that returns None with the flag still clear means everything
     left is in flight elsewhere, so we briefly back off and retry. `source`/`policy`
     are None when --ignore-usage disables the session-limit gate.
@@ -352,7 +353,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         print(f"Nothing pending in {list_file_rel} — nothing to do.")
         return
 
-    # Dry-run: list the commands that would run (capped by --max), touch nothing.
+    # Dry-run: list the commands that would run (capped by --max-runs), touch nothing.
     if args.dry_run:
         limit = args.max if args.max is not None else len(pending_now)
         print(f"DRY-RUN: {min(limit, len(pending_now))} of {len(pending_now)} "

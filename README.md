@@ -119,9 +119,9 @@ Run it from the project root so the working directory is the project root (or
 pass `--project-dir <path>` from anywhere):
 
 ```
-python runFileList.py            # drain the list, one file per iteration
-python runFileList.py --max 5    # at most 5 iterations
-python runFileList.py --dry-run  # print the commands, run nothing
+python runFileList.py               # drain the list, one file per iteration
+python runFileList.py --max-runs 5  # at most 5 iterations
+python runFileList.py --dry-run     # print the commands, run nothing
 ```
 
 ### State-machine driver
@@ -185,20 +185,21 @@ class MyDriver(StateFileDriver):
 
 Leaving `limit_policy` unset uses `LimitPolicy([DayNightLimit()])`. The bookend
 usage snapshots and the per-check status lines report exactly the quotas the
-active policy watches. When `--max N` is given (a short bounded run) the limit
-gate is skipped entirely.
+active policy watches. When `--max-runs N` is given (a short bounded run) the
+limit gate is skipped entirely.
 
 ## Common options
 
 | Option | Meaning |
 |---|---|
-| `-m, --max N` | stop after N iterations (sequential) / N files total (parallel) |
+| `-m, --max-runs N` | stop after N iterations (sequential) / N files total (parallel); `--max` is a deprecated alias |
 | `-d, --dry-run` | print the commands, run nothing |
 | `-g, --git-push none\|after_new_commits\|each_hour` | when to `git push` |
 | `-C, --project-dir DIR` | project root (default: cwd) |
-| `-s, --startIn 29m` | wait before starting (sequential only) |
-| `-S, --maxStrike 3h` | per-session work budget before a pre-emptive pause |
+| `-s, --start-in 29m` | wait before starting (sequential only); alias `--startIn` |
+| `-S, --max-strike 3h` | per-session work budget before a pre-emptive pause; alias `--maxStrike` |
 | `-j, --jobs N` | concurrent workers (parallel only) |
+| `--raw` | print raw JSON events, for debugging (sequential only) |
 
 Create a file named `stop` in the project root to halt the loop at the next
 iteration boundary; it is removed on stop so the next launch starts clean.

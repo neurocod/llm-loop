@@ -36,7 +36,7 @@ class StateFileDriver(Driver):
 
     The loop never ends on its own (the state machine is meant to run forever);
     it stops only on an `error` state — which aborts the run with exit code 1 —
-    or via the usual stop file / Ctrl+C / --max.
+    or via the usual stop file / Ctrl+C / --max-runs.
 
     Configure via class attributes on a subclass:
       state_file     relative (to the project root) or absolute path to the state

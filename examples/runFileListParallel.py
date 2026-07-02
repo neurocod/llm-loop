@@ -8,7 +8,7 @@ the entry point; the list file is the single source of truth, guarded by one
 lock, so the run stays idempotent.
 
 CLI mirrors the family; the additions are `-j/--jobs N` (default 10), and
-`--max N` caps the *total* number of files processed this run, not iterations.
+`--max-runs N` caps the *total* number of files processed this run, not iterations.
 
 Copy this into your host project root next to runFileList.py and run
 `python runFileListParallel.py -j 8`.

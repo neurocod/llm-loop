@@ -3,7 +3,7 @@ Example wrapper: drive a state machine from a state file - currentState.md or an
 
 This is the StateFileDriver pattern. Each iteration reads the first line of a
 state file and runs a fixed prompt against it; on an `error` state the loop stops
-for human intervention, otherwise it runs forever (until the stop file, --max, or
+for human intervention, otherwise it runs forever (until the stop file, --max-runs, or
 Ctrl+C). The state lives in files in your project, so each `claude` call starts
 with fresh context and picks up where the last one left off — the canonical
 "Ralph" pattern.
