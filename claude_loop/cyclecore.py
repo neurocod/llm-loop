@@ -1015,9 +1015,14 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
         iteration += 1
         state_label = command.label or "(no label)"
+        # Show the model this iteration will use right in the header, so the
+        # per-iteration model is visible up front (an empty command.model means
+        # no --model flag — the CLI falls back to its own configured default).
+        model_label = command.model or "cli default"
         print_markup(
-            f"\n=== Iteration {iteration} === [{state_label}]",
-            f"\n[bold cyan]=== Iteration {iteration} ===[/] [dim]\\[{state_label}][/]",
+            f"\n=== Iteration {iteration} === [{state_label} · {model_label}]",
+            f"\n[bold cyan]=== Iteration {iteration} ===[/] "
+            f"[dim]\\[{state_label} · {model_label}][/]",
         )
 
         cmd = build_claude_argv(command)
