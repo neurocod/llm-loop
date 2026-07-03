@@ -182,6 +182,92 @@ def log_file_path(app_name: str = "runCycle") -> Path:
     return LOG_DIR / f"{app_name}-{os.path.basename(PROJECT_DIR)}.log"
 
 
+# Per-run cost accounting parsed straight back out of the mirror log: every run's
+# first iteration logs a "=== Iteration 1 ===" header (see run_loop) and every
+# successful iteration logs a "done (… c, $…)" line (see _render_event's "result"
+# branch). Summing the dollar figures between headers reconstructs per-run spend
+# with no extra bookkeeping. The patterns live here, next to the code that emits
+# both lines, so they can't drift apart. Note "=== Iteration 1 ===" matches only
+# iteration 1 (the "1 ===" boundary rules out "11", "12", …), so each match is a
+# genuine run boundary.
+_SESSION_RE = re.compile(r"=== Iteration 1 ===")
+_COST_RE = re.compile(r"done \(\s*[\d.]+ c,\s*\$([\d.]+)\)")
+
+
+def report_costs(app_name: str = "runCycle") -> None:
+    """Print per-session (per-run) cost totals parsed from the mirror log, then
+    exit — the standalone counterpart reached via the --cost flag.
+
+    A "session" is one run of the loop, delimited by its "=== Iteration 1 ==="
+    header; within it every "done (… c, $…)" line contributes its dollar cost. We
+    print a line per session, a grand total, and how full the log is against the
+    rotation limit (LOG_MAX_BYTES). Resolve the log via log_file_path(app_name),
+    so --cost reports on the very log this entry point writes.
+    """
+    path = log_file_path(app_name)
+    # Always name the log we are reading, so an empty report is unambiguous
+    # (right file, no data) rather than looking like a silent failure.
+    print(f"Reading mirror log: {path}")
+    sessions = []  # list of (header, total_cost, count)
+    header = None
+    total = 0.0
+    count = 0
+
+    def flush():
+        if header is not None:
+            sessions.append((header, total, count))
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if _SESSION_RE.search(line):
+                    flush()
+                    header = line.strip()
+                    total = 0.0
+                    count = 0
+                else:
+                    m = _COST_RE.search(line)
+                    if m and header is not None:
+                        total += float(m.group(1))
+                        count += 1
+    except FileNotFoundError:
+        print(f"No mirror log at {path} yet — nothing to report.")
+        return
+    flush()
+
+    grand = 0.0
+    grand_count = 0
+    for i, (h, t, c) in enumerate(sessions, 1):
+        print(f"Session {i}: {c} costs, ${t:.4f}  | {h}")
+        grand += t
+        grand_count += c
+
+    print("-" * 60)
+    print(f"TOTAL: {len(sessions)} sessions, {grand_count} costs, ${grand:.4f}")
+    if not sessions:
+        # The log exists but held no run boundaries / cost lines. Point at the
+        # likely cause rather than leaving a bare zero.
+        print("  (log has no '=== Iteration 1 ===' / '· done (… c, $…)' lines — "
+              "no completed billed iterations recorded here)")
+
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    pct = size / LOG_MAX_BYTES * 100 if LOG_MAX_BYTES else 0.0
+    print(f"LOG: {size / 1024 / 1024:.2f} / {LOG_MAX_BYTES / 1024 / 1024:.0f} MB "
+          f"({pct:.1f}% full, rotates at 100%)")
+    print(f"     {path}")
+
+
+# The app-specific logger that owns the mirror-log file handler, set by
+# _setup_file_logging. `_log_plain` (the Rich path) must target *this* logger:
+# the handler lives on "runCycle.<app_name>" (which does not propagate), so
+# logging to a bare "runCycle" would silently drop the message. Kept in a module
+# global because the Rich print helpers have no reference to the configured logger.
+_FILE_LOGGER: Optional[logging.Logger] = None
+
+
 def _setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
     """Configure a rotating file logger at log_file_path(app_name) (25 MB x 3)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -197,6 +283,8 @@ def _setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
             logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
         )
         logger.addHandler(handler)
+    global _FILE_LOGGER
+    _FILE_LOGGER = logger
     return logger
 
 
@@ -251,6 +339,9 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
                         "--max is a deprecated alias")
     p.add_argument("-d", "--dry-run", action="store_true",
                    help="only print the commands, don't run claude")
+    p.add_argument("-c", "--cost", action="store_true",
+                   help="print per-session cost totals from the mirror log and "
+                        "exit (no loop is run)")
     # No -r short flag: -r is --review-prompt in continuous_claude.py, so it is
     # left free here rather than reused for --raw.
     p.add_argument("--raw", action="store_true",
@@ -483,8 +574,15 @@ def _log_plain(text: str) -> None:
 
     Used on the Rich path, where the live frames bypass the tee — we still want
     the assistant's words in the log, just without the ANSI/redraw noise.
+
+    Targets the app-specific logger configured by _setup_file_logging (which owns
+    the file handler and does not propagate); falling back to a bare "runCycle"
+    logger only if logging was never set up (e.g. in tests). Using the wrong
+    logger name here silently drops every Rich-path line — including the
+    "=== Iteration N ===" headers and "· done (… c, $…)" cost lines that
+    report_costs parses — leaving --cost to report 0 sessions.
     """
-    logger = logging.getLogger("runCycle")
+    logger = _FILE_LOGGER or logging.getLogger("runCycle")
     for line in text.splitlines():
         logger.info(line)
 
@@ -960,6 +1058,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # Anchor every project-relative operation (git/claude cwd, the stop file, the
     # log name, the Driver's paths) to the chosen root before anything reads it.
     set_project_root(getattr(args, "project_dir", None))
+
+    # --cost: report per-run spend from the mirror log and exit, without touching
+    # the loop, the tee, git, or /usage. Done here (after the root is set, so the
+    # log path resolves) rather than in the loop body proper.
+    if getattr(args, "cost", False):
+        report_costs(app_name)
+        return
 
     # Mirror all screen output into a rotating log file under the home dir.
     logger = _setup_file_logging(app_name)

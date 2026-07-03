@@ -48,6 +48,7 @@ from .cyclecore import (
     parse_args,
     parse_duration,
     project_dir,
+    report_costs,
     run_loop,
     set_project_root,
 )
@@ -88,6 +89,7 @@ __all__ = [
     "parse_duration",
     "parse_usage",
     "project_dir",
+    "report_costs",
     "run_loop",
     "run_parallel",
     "set_project_root",
