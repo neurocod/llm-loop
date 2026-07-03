@@ -953,6 +953,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     limit_policy = driver.limit_policy or limits.default_policy()  # pauses on limit
     last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
     print(f"  · git push policy: {git_push_policy.value}")
+    if ignore_usage_limits:
+        print(f"  · usage limit policy: disabled (bounded run, --max {max_iters})")
+    else:
+        print(f"  · usage limit policy: {limit_policy.describe()}")
 
     # Bookend the run with a usage snapshot (the policy's watched quotas) so each
     # run records where it started; the matching end-of-run snapshot is below.

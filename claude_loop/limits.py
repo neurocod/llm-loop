@@ -99,6 +99,11 @@ class LimitRule:
         """The allowed usage % right now; usage at/above it triggers a pause."""
         raise NotImplementedError
 
+    def describe(self) -> str:
+        """One-line human summary of this rule's quota and ceiling policy, shown
+        in the loop preamble so a run records exactly what it is gated on."""
+        raise NotImplementedError
+
 
 class SessionLimit(LimitRule):
     """A flat ceiling on the ~5-hour "Current session" figure.
@@ -116,6 +121,9 @@ class SessionLimit(LimitRule):
 
     def ceiling(self, reading: UsageReading, now: float) -> float:
         return self.limit
+
+    def describe(self) -> str:
+        return f"{self.label}: flat ceiling {self.limit:.0f}%"
 
 
 class DayNightLimit(LimitRule):
@@ -160,6 +168,11 @@ class DayNightLimit(LimitRule):
         base = self._base(reading.reset_ts, now)
         return _dynamic_ceiling(base, reading.reset_ts, now, self.rate_per_min)
 
+    def describe(self) -> str:
+        return (f"{self.label}: day {self.day:.0f}% / night {self.night:.0f}% "
+                f"(night before {self.deadline_hour:02d}:00 when the window "
+                f"resets by then), climbing toward 100% near reset")
+
 
 class WeeklyLimit(LimitRule):
     """A flat ceiling on the weekly figure — "all models" by default, or the
@@ -181,6 +194,9 @@ class WeeklyLimit(LimitRule):
     def ceiling(self, reading: UsageReading, now: float) -> float:
         return self.limit
 
+    def describe(self) -> str:
+        return f"{self.label}: flat ceiling {self.limit:.0f}%"
+
 
 class LimitPolicy:
     """One or more LimitRules; the loop pauses when **any** of them is exceeded.
@@ -193,6 +209,16 @@ class LimitPolicy:
 
     def __init__(self, rules):
         self.rules = list(rules)
+
+    def describe(self) -> str:
+        """Human summary of every rule, joined for the loop preamble. The loop
+        pauses when *any* rule is exceeded, so the rules are joined with 'or'."""
+        parts = [r.describe() for r in self.rules]
+        if not parts:
+            return "no rules (never pauses on usage)"
+        if len(parts) == 1:
+            return parts[0]
+        return "pause when any of — " + " | ".join(parts)
 
     # --- inspection helpers ----------------------------------------------------
 
