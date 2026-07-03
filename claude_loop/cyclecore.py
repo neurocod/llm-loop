@@ -130,6 +130,34 @@ def project_dir() -> str:
     """The current project root (see set_project_root)."""
     return PROJECT_DIR
 
+
+# Markers that identify a project root when walking up the directory tree. `.git`
+# is matched as either a directory (normal clone) or a file (git worktree /
+# submodule), which os.path.exists covers for both.
+ROOT_MARKERS = (".git", ".hg", ".svn")
+
+
+def find_project_root(start: Optional[str] = None) -> Optional[str]:
+    """Walk up from `start` (the current working directory by default) until a
+    directory containing a VCS marker (`ROOT_MARKERS`) is found, and return it.
+
+    A wrapper that anchors the search to its own file location (rather than the
+    process cwd) gets a project root that is independent of where the loop was
+    launched from: run it from the repo root, from a subdirectory, or from
+    anywhere else and it lands on the same root — so git/claude run there, the
+    stop file lives there, and the model loads the root CLAUDE.md the same way
+    every time. Returns None if no marker is found up to the filesystem root,
+    leaving the engine's default (the current working directory) in place.
+    """
+    path = os.path.abspath(start if start else os.getcwd())
+    while True:
+        if any(os.path.exists(os.path.join(path, m)) for m in ROOT_MARKERS):
+            return path
+        parent = os.path.dirname(path)
+        if parent == path:  # reached the filesystem root without a match
+            return None
+        path = parent
+
 # A copy of everything printed to the screen is mirrored, line by line, to a
 # rotating log file under the user's home dir (NOT the project tree) so cycle
 # runs leave a durable record without cluttering the repo. The project folder
