@@ -80,8 +80,9 @@ def parse_args(argv=None, *, prog: str = "parallel",
         description=description or "Parallel autonomous loop running N "
                                   "concurrent `claude` workers over a list file.",
     )
-    p.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS, metavar="N",
-                   help=f"number of concurrent workers (default: {DEFAULT_JOBS})")
+    p.add_argument("-j", "--jobs", type=int, default=None, metavar="N",
+                   help="number of concurrent workers (default: the driver's "
+                        f"`jobs`, else {DEFAULT_JOBS})")
     p.add_argument("-m", "--max-runs", "--max", dest="max", type=int, default=None,
                    metavar="N",
                    help="stop after processing N files total, across all workers "
@@ -332,7 +333,14 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     and mirror-log machinery, but a thread pool over independent list items
     instead of one sequential Driver loop.
     """
-    jobs = max(1, args.jobs)
+    # Worker count precedence: explicit -j/--jobs on the CLI, then the driver's
+    # `jobs` attribute (a subclass may pin it), then the engine default.
+    jobs = args.jobs
+    if jobs is None:
+        jobs = getattr(driver, "jobs", None)
+    if jobs is None:
+        jobs = DEFAULT_JOBS
+    jobs = max(1, jobs)
     git_push_policy = GitPushPolicy(args.git_push)
 
     # Anchor every project-relative operation before anything reads the root.

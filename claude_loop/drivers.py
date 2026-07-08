@@ -135,6 +135,10 @@ class ListFileDriver(Driver):
       app_name / prog / description — the entry-point labels; app_name and prog
                      default to the wrapper's filename (see Driver), so usually
                      only description (if any) is worth setting.
+      jobs           default worker count for .main_parallel() (None -> the
+                     engine default unless -j/--jobs is passed). Set it as a class
+                     attribute or `self.jobs = N` in __init__ to bake in a default;
+                     an explicit -j/--jobs on the CLI always wins.
 
     Override `prompt(source_abs, target_abs)` (required — it builds the per-file
     instruction) and `model()` to pin/vary the model (default: "" — the CLI's own
@@ -148,9 +152,14 @@ class ListFileDriver(Driver):
     list_file: str = "products/list.md"
     target_suffix: str = ".ru.md"
     source_ext: str = ".md"
+    # Default concurrent-worker count for .main_parallel(); None means "defer to
+    # the CLI -j/--jobs, else the engine default". A subclass can pin it.
+    jobs: Optional[int] = None
 
-    def __init__(self):
+    def __init__(self, jobs: Optional[int] = None):
         self._current_line: Optional[str] = None  # raw list line being processed
+        if jobs is not None:
+            self.jobs = jobs
 
     def prompt(self, source: str, target: str) -> str:
         """The per-file instruction (receives absolute paths). Override this — it
@@ -233,16 +242,23 @@ class ListFileDriver(Driver):
         return f"{remaining} item(s) still pending in {self.list_file}."
 
     @classmethod
-    def main_parallel(cls, argv=None) -> None:
+    def main_parallel(cls, argv=None, jobs: Optional[int] = None) -> None:
         """Parse the parallel CLI (adds -j/--jobs) and drain the list with N
         concurrent `claude` workers over a fresh instance.
 
         The parallel counterpart of Driver.main(): a wrapper for the concurrent
         runner is just a subclass calling this. Imported lazily so drivers.py and
         parallel.py don't form an import cycle.
+
+        Worker-count precedence (first that is set wins): an explicit -j/--jobs on
+        the command line, the `jobs=` argument here, the driver's `jobs` attribute
+        (class attribute or `self.jobs` set in __init__), then the engine default.
         """
         from .parallel import run_parallel
         from .parallel import parse_args as parse_parallel_args
         args = parse_parallel_args(argv, prog=cls.resolved_prog(),
                                    description=cls.description)
-        run_parallel(cls(), args, app_name=cls.resolved_app_name())
+        driver = cls()
+        if jobs is not None:
+            driver.jobs = jobs
+        run_parallel(driver, args, app_name=cls.resolved_app_name())
