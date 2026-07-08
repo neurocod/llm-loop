@@ -242,6 +242,19 @@ class Shared:
             self.claimed += 1
             return line
 
+    def release(self, line: str) -> None:
+        """Return a claimed-but-unprocessed line to the queue.
+
+        Used when a worker claims a line but then bails out before running it
+        (the run was stopped while it sat in the session-limit gate): drop it from
+        `in_progress` so the drained check stays accurate, and undo its --max
+        reservation so the count reflects only files actually processed.
+        """
+        with self.lock:
+            self.in_progress.discard(line)
+            if self.claimed > 0:
+                self.claimed -= 1
+
     def finish(self, line: str, ok: bool) -> tuple:
         """Record an item's outcome: strike it on success, or count/park a fail.
 
@@ -284,9 +297,23 @@ def worker(job_id: int, shared: Shared, source: Optional[UsageSource],
                 shared.stop.set()
             break
 
-        # Session-limit gate: one worker checks at a time (cheap, /usage is
-        # TTL-cached), and a pause blocks every worker that reaches it — so the
-        # whole fleet idles together when the budget is spent.
+        # Claim work FIRST, before the session-limit gate. The gate can block for a
+        # long time when the budget is spent, and its wait loop does not watch the
+        # stop flag — so a worker that paused there before claiming would wedge and
+        # never notice the queue draining to empty around it, hanging the run's
+        # final join(). Claiming first means an empty/drained queue stops the worker
+        # here (claim() sets the stop flag) and it never enters the gate with
+        # nothing to do; only a worker actually holding a file ever pauses.
+        line = shared.claim()
+        if line is None:
+            if shared.stop.is_set():
+                break
+            time.sleep(2)  # busy: others hold the rest — back off and retry
+            continue
+
+        # Session-limit gate, now that we hold real work: one worker checks at a
+        # time (cheap, /usage is TTL-cached), and a pause blocks every worker that
+        # reaches it — so the whole fleet idles together when the budget is spent.
         if source is not None:
             with usage_lock:
                 if not shared.stop.is_set():
@@ -295,12 +322,12 @@ def worker(job_id: int, shared: Shared, source: Optional[UsageSource],
                     if paused:
                         session_start_box[0] = new_start
 
-        line = shared.claim()
-        if line is None:
-            if shared.stop.is_set():
-                break
-            time.sleep(2)  # busy: others hold the rest — back off and retry
-            continue
+        # The run may have been stopped (drained elsewhere, stop file, or --max
+        # reached) while we waited for the lock or paused on the budget: return the
+        # claimed file to the queue and exit without starting another claude run.
+        if shared.stop.is_set():
+            shared.release(line)
+            break
 
         command = shared.driver.command_for(line)
         emit_job(job_id, f"▶ {command.label}", "bold cyan")
