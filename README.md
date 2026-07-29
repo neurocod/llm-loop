@@ -202,7 +202,9 @@ limit gate is skipped entirely.
 | `--raw` | print raw JSON events, for debugging (sequential only) |
 
 Create a file named `stop` in the project root to halt the loop at the next
-iteration boundary; it is removed on stop so the next launch starts clean.
+iteration boundary; it is removed on stop so the next launch starts clean. A
+`--dry-run` never removes it — previewing commands while a real run has a stop
+pending must not cancel that stop — it only reports that the file is there.
 
 `pip install rich` enables live Markdown rendering of the assistant's output
 (the loop works without it, just plainer).

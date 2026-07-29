@@ -388,8 +388,14 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         print(f"Nothing pending in {list_file_rel} — nothing to do.")
         return
 
-    # Dry-run: list the commands that would run (capped by --max-runs), touch nothing.
+    # Dry-run: list the commands that would run (capped by --max-runs), touch
+    # nothing — including the stop sentinel, which only a real run consumes (the
+    # workers below are what remove it, and they never start here). Reported so
+    # the preview says why a real run would stop immediately.
     if args.dry_run:
+        if os.path.exists(cyclecore.STOP_FILE):
+            print("  · stop file present — a real run would stop at once. "
+                  "Left in place (a dry run never consumes it).")
         limit = args.max if args.max is not None else len(pending_now)
         print(f"DRY-RUN: {min(limit, len(pending_now))} of {len(pending_now)} "
               f"pending file(s) would be processed across {jobs} worker(s):")

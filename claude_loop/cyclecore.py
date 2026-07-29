@@ -1097,11 +1097,24 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         limit_policy.log_snapshot(usage_source, "at start (iteration 1)")
 
     iteration = 0
+    stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     while True:
         if os.path.exists(STOP_FILE):
-            os.remove(STOP_FILE)
-            print("Stop file detected — stopping (the file has been removed).")
-            break
+            # The sentinel is *consumed* when it stops a run: one file, one stop.
+            # A dry run must not consume it. `-d` is routinely used to preview
+            # commands while a real loop is running — and that is exactly when a
+            # stop request is pending — so removing it here would silently cancel
+            # someone else's stop, and the loop it was meant to halt would run on.
+            # Report it and leave it for whoever it was written for.
+            if dry_run:
+                if not stop_file_noted:
+                    print("Stop file present — a real run would stop here. "
+                          "Left in place (a dry run never consumes it).")
+                    stop_file_noted = True
+            else:
+                os.remove(STOP_FILE)
+                print("Stop file detected — stopping (the file has been removed).")
+                break
 
         # Git push policy: evaluated at the start of every iteration.
         if not dry_run:
