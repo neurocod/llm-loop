@@ -206,5 +206,11 @@ iteration boundary; it is removed on stop so the next launch starts clean. A
 `--dry-run` never removes it — previewing commands while a real run has a stop
 pending must not cancel that stop — it only reports that the file is there.
 
+A launch that finds the sentinel already in place does not start and does not
+consume it: it waits (sequential and parallel alike, before `--start-in`) until
+the file goes away — cleared by the run it was meant for, or removed by hand —
+and only then begins. So queueing the next run behind a stop you just requested
+works, and a leftover `stop` never costs a run its first iteration.
+
 `pip install rich` enables live Markdown rendering of the assistant's output
 (the loop works without it, just plainer).

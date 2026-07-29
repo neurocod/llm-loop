@@ -108,6 +108,10 @@ PROJECT_DIR = os.getcwd()
 # next launch starts clean. Recomputed by set_project_root().
 STOP_FILE = os.path.join(PROJECT_DIR, "stop")
 
+# How often wait_for_stop_file_clear() re-checks the sentinel while it holds a
+# launch back. Short enough that removing the file feels immediate.
+STOP_POLL_SECONDS = 2
+
 
 def set_project_root(path: Optional[str]) -> str:
     """Point the engine at the project root (cwd for git/claude, base for the
@@ -869,6 +873,39 @@ def wait_until(target_ts: float, reason: str = None) -> None:
     print("  ▶ The session window should have refreshed — continuing the loop.")
 
 
+def wait_for_stop_file_clear() -> None:
+    """Hold a launch back while a stop request is still pending, and return once
+    the sentinel is gone.
+
+    The stop file is a request aimed at a *running* loop, and the run that obeys
+    it consumes it. A launch that finds one already there therefore has no good
+    way to start: consuming it would silently cancel someone else's brake, and
+    obeying it would exit before doing any work at all. So it waits instead —
+    for the loop that owns the request to clear it on its way out, or for the
+    user to delete the file by hand — and then starts clean. Ctrl+C interrupts
+    the wait and stops the script.
+
+    Not called on a dry run: that mode never touches the sentinel and reports it
+    instead.
+    """
+    if not os.path.exists(STOP_FILE):
+        return
+    print(f"  ⏸ Stop file present at startup ({STOP_FILE}) — waiting for it to "
+          f"go away before starting (remove it to begin; Ctrl+C to abort)…")
+    waited = 0
+    try:
+        while os.path.exists(STOP_FILE):
+            time.sleep(STOP_POLL_SECONDS)
+            waited += STOP_POLL_SECONDS
+            if waited % 60 == 0:
+                print(f"    … still waiting ({waited // 60} min, now "
+                      f"{_fmt_clock(time.time())})", flush=True)
+    except KeyboardInterrupt:
+        print("\nWait interrupted by user (Ctrl+C).")
+        sys.exit(130)
+    print("  ▶ Stop file removed — starting.")
+
+
 def wait_before_start(spec: str) -> None:
     """Idle for the duration given by --start-in before the loop begins.
 
@@ -1077,6 +1114,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
               "Enable it with:")
         print(f"      {sys.executable} -m pip install rich")
 
+    # A stop request pending from another run: wait it out rather than consume
+    # it, so this launch starts on a clean sentinel instead of stopping on its
+    # first iteration boundary. Before --start-in: the point is to begin as soon
+    # as the brake is off, not to burn the delay while it is still on.
+    if not dry_run:
+        wait_for_stop_file_clear()
+
     if start_in and not dry_run:
         wait_before_start(start_in)
 
@@ -1108,7 +1152,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # Report it and leave it for whoever it was written for.
             if dry_run:
                 if not stop_file_noted:
-                    print("Stop file present — a real run would stop here. "
+                    print("Stop file present — a real run would have waited for "
+                          "it at startup, and stops here if it appears mid-run. "
                           "Left in place (a dry run never consumes it).")
                     stop_file_noted = True
             else:

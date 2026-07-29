@@ -391,17 +391,22 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # Dry-run: list the commands that would run (capped by --max-runs), touch
     # nothing — including the stop sentinel, which only a real run consumes (the
     # workers below are what remove it, and they never start here). Reported so
-    # the preview says why a real run would stop immediately.
+    # the preview says why a real run would not start yet.
     if args.dry_run:
         if os.path.exists(cyclecore.STOP_FILE):
-            print("  · stop file present — a real run would stop at once. "
-                  "Left in place (a dry run never consumes it).")
+            print("  · stop file present — a real run would wait here until it "
+                  "went away. Left in place (a dry run never consumes it).")
         limit = args.max if args.max is not None else len(pending_now)
         print(f"DRY-RUN: {min(limit, len(pending_now))} of {len(pending_now)} "
               f"pending file(s) would be processed across {jobs} worker(s):")
         for line in pending_now[:limit]:
             print("  " + " ".join(build_claude_argv(driver.command_for(line))))
         return
+
+    # Same as the sequential runner: a stop request pending from another run is
+    # waited out here, on the main thread, before any worker starts — otherwise
+    # the first worker would consume it and stop the run before it did anything.
+    cyclecore.wait_for_stop_file_clear()
 
     # Usage gate: a shared UsageSource (query/cache) plus the Driver's LimitPolicy
     # (which quotas to gate on). --ignore-usage turns both off.
