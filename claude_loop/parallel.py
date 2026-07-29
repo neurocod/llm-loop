@@ -11,7 +11,8 @@ picked up again.
 
 What this shares with the sequential runner, and what it deliberately drops:
 
-  * Reused — the ListFileDriver (list parsing, is_pending, command_for, strike),
+  * Reused — the ListFileDriver (list parsing, is_pending, pick, command_for,
+    strike),
     build_claude_argv, the /usage session-limit machinery, the git-push policy
     and the rotating mirror log.
   * Dropped — the live token-by-token Markdown rendering. cyclecore's stream
@@ -28,7 +29,6 @@ files processed this run (across all workers), not iterations.
 import argparse
 import json
 import os
-import random
 import subprocess
 import sys
 import threading
@@ -235,9 +235,10 @@ class Shared:
                 if not self.in_progress:
                     self.stop.set()
                 return None
-            # Random rather than list order so the run spreads evenly across a
-            # category-grouped list (the head would drain one category first).
-            line = random.choice(pending)
+            # The driver decides the order (random by default, list order when
+            # it sets pick_order = "list"); we are already under the lock, which
+            # is the thread-safety pick() is documented to expect.
+            line = self.driver.pick(pending)
             self.in_progress.add(line)
             self.claimed += 1
             return line

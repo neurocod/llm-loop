@@ -8,8 +8,9 @@ being hard-coded module constants:
   * StateFileDriver - a state machine: read the first line of a state file each
     iteration and run a fixed prompt against it, stopping on an `error` state.
   * ListFileDriver  - a work queue: hand out the files listed in a list file one
-    at a time (at random, to spread evenly across a grouped list), striking each
-    out once its command succeeds; stop when the list is empty.
+    at a time (at random by default, to spread evenly across a grouped list; set
+    `pick_order = "list"` to walk it top to bottom instead), striking each out
+    once its command succeeds; stop when the list is empty.
 
 Both resolve their relative paths against cyclecore.project_dir() (the project
 root, set from --project-dir / cwd), so the same code drives any host project.
@@ -120,11 +121,10 @@ class ListFileDriver(Driver):
 
     Progress lives in the list file itself (done paths are removed), so the run
     is idempotent: stop any time and relaunch — it picks up whatever paths are
-    still listed. `next_command` re-reads the list and returns a random
-    still-pending line (random, not the head, spreads the run evenly across a
-    category-grouped list), and returns None — ending the loop — once nothing is
-    pending. A failed iteration leaves its line in the list (on_success is what
-    strikes it), so it gets retried on some later iteration.
+    still listed. `next_command` re-reads the list, hands one still-pending line
+    to `pick()`, and returns None — ending the loop — once nothing is pending. A
+    failed iteration leaves its line in the list (on_success is what strikes it),
+    so it gets retried on some later iteration.
 
     Configure via class attributes on a subclass:
       list_file      relative (to the project root) or absolute path to the list.
@@ -132,6 +132,8 @@ class ListFileDriver(Driver):
                      in it are skipped as already-done / self-referential.
       source_ext     source extension replaced by target_suffix when deriving the
                      target path (default ".md": foo.md -> foo<suffix>).
+      pick_order     which pending line goes out next: "random" (default) or
+                     "list" (top to bottom). See pick().
       app_name / prog / description — the entry-point labels; app_name and prog
                      default to the wrapper's filename (see Driver), so usually
                      only description (if any) is worth setting.
@@ -152,6 +154,10 @@ class ListFileDriver(Driver):
     list_file: str = "products/list.md"
     target_suffix: str = ".ru.md"
     source_ext: str = ".md"
+    # Which pending line goes out next — see pick(). "random" is the default
+    # because it spreads a run evenly across a category-grouped list.
+    pick_order: str = "random"
+    PICK_ORDERS = ("random", "list")
     # Default concurrent-worker count for .main_parallel(); None means "defer to
     # the CLI -j/--jobs, else the engine default". A subclass can pin it.
     jobs: Optional[int] = None
@@ -160,6 +166,12 @@ class ListFileDriver(Driver):
         self._current_line: Optional[str] = None  # raw list line being processed
         if jobs is not None:
             self.jobs = jobs
+        # Validated once, at construction: a typo here would otherwise pass
+        # silently as "random" and quietly ignore what the wrapper asked for.
+        if self.pick_order not in self.PICK_ORDERS:
+            raise ValueError(
+                f"{type(self).__name__}.pick_order={self.pick_order!r} — "
+                f"expected one of {', '.join(map(repr, self.PICK_ORDERS))}")
 
     def prompt(self, source: str, target: str) -> str:
         """The per-file instruction (receives absolute paths). Override this — it
@@ -219,12 +231,32 @@ class ListFileDriver(Driver):
         _write_list_lines(list_path, lines)
         return True
 
+    def pick(self, pending: list) -> str:
+        """Choose the next line to hand out from the still-pending ones.
+
+        Both runners go through here — the sequential one below and the parallel
+        runner's claim() — so `pick_order` (and any override of this method)
+        governs the whole family. The two orders answer different questions:
+
+          "random" — spread the run evenly across a grouped list. The head would
+                     otherwise drain one category at a time, so an interrupted
+                     run leaves a lopsided sample of the catalogue.
+          "list"   — walk the list top to bottom, i.e. the order it was written
+                     in. Reach for it when the list is deliberately ordered
+                     (hand-picked priorities first) or when a run has to be
+                     reproducible.
+
+        Must be thread-safe: the parallel runner calls it under its own lock
+        with the driver shared across workers.
+        """
+        return pending[0] if self.pick_order == "list" else random.choice(pending)
+
     def next_command(self) -> Optional[ClaudeCommand]:
         pending = self.pending_lines()
         if not pending:
             self._current_line = None
             return None
-        self._current_line = random.choice(pending)
+        self._current_line = self.pick(pending)
         return self.command_for(self._current_line)
 
     def on_success(self, returncode: int) -> None:

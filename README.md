@@ -103,6 +103,7 @@ from claude_loop import ListFileDriver
 class FileListDriver(ListFileDriver):
     list_file     = "files.md"
     target_suffix = ".summary.md"
+    pick_order    = "random"   # or "list" to walk the list top to bottom
 
     def model(self):
         return "sonnet"   # or "" to use the CLI's own configured model
@@ -123,6 +124,11 @@ python runFileList.py               # drain the list, one file per iteration
 python runFileList.py --max-runs 5  # at most 5 iterations
 python runFileList.py --dry-run     # print the commands, run nothing
 ```
+
+Items go out in random order by default, which keeps an interrupted run from
+draining one section of a grouped list before touching the rest. Set
+`pick_order = "list"` (or override `pick(pending)`) to hand them out top to
+bottom instead — the setting governs the parallel runner too.
 
 ### State-machine driver
 
