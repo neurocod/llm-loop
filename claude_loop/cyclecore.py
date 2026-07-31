@@ -698,6 +698,60 @@ def print_styled(text: str, style: str) -> None:
     print_markup(text, f"[{style}]{_esc(text)}[/]")
 
 
+# Colour scale for the usage percentages (session/week quotas, and the ceilings
+# they are judged against): comfortable below GREEN_BELOW, alarming above
+# RED_ABOVE, watch-it in between. Both bounds are exclusive, so exactly 60% and
+# exactly 90% read as the middle band.
+PERCENT_GREEN_BELOW = 60.0
+PERCENT_RED_ABOVE = 90.0
+PERCENT_STYLES = ("green", "yellow", "bold red")  # low, middle, high
+
+# "44%", "7.5 %" — the figure plus its sign, as it appears in a printed line.
+_PERCENT_IN_TEXT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
+
+
+def percent_style(value: float) -> str:
+    """The palette entry for one percentage — see PERCENT_GREEN_BELOW/RED_ABOVE."""
+    if value < PERCENT_GREEN_BELOW:
+        return PERCENT_STYLES[0]
+    if value > PERCENT_RED_ABOVE:
+        return PERCENT_STYLES[2]
+    return PERCENT_STYLES[1]
+
+
+def markup_percents(text: str) -> str:
+    """Rich markup for `text` with every percentage coloured by percent_style.
+
+    Colouring the *rendered line* rather than each figure at its format site is
+    what keeps one scale across lines that are assembled in several places (a
+    rule's own `describe()`, the usage/ceiling line, the /usage summary lines
+    quoted verbatim from the CLI) — and what lets a line quoted from elsewhere be
+    coloured at all. The non-percentage parts are escaped, so a '[' in a label
+    stays literal.
+    """
+    out = []
+    last = 0
+    for m in _PERCENT_IN_TEXT_RE.finditer(text):
+        out.append(_esc(text[last:m.start()]))
+        value = float(m.group(0).rstrip("% \t"))
+        out.append(f"[{percent_style(value)}]{m.group(0)}[/]")
+        last = m.end()
+    out.append(_esc(text[last:]))
+    return "".join(out)
+
+
+def print_percents(text: str) -> None:
+    """Print a line whose percentages are colour-coded on screen (plain in the
+    log). A no-op difference from `print` when Rich is unavailable.
+
+    Flushed, because these lines include the once-a-minute countdown printed
+    while a run is paused on a limit — the one place output has to appear as it
+    is written rather than when a buffer happens to fill.
+    """
+    print_markup(text, markup_percents(text))
+    sys.stdout.flush()
+
+
 # Named single-style specialisations, each delegating to print_styled. Centralise
 # the loop's palette here so a colour is changed in one place, not at every call.
 def print_done(text: str) -> None:
@@ -1133,7 +1187,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     if ignore_usage_limits:
         print(f"  · usage limit policy: disabled (bounded run, --max {max_iters})")
     else:
-        print(f"  · usage limit policy: {limit_policy.describe()}")
+        print_percents(f"  · usage limit policy: {limit_policy.describe()}")
 
     # Bookend the run with a usage snapshot (the policy's watched quotas) so each
     # run records where it started; the matching end-of-run snapshot is below.
