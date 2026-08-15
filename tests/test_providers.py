@@ -30,8 +30,8 @@ def test_claude_argv_keeps_existing_contract():
 def test_codex_argv_is_non_interactive_jsonl():
     argv = build_agent_argv(AgentCommand("work", "gpt-test"), "codex", "/repo")
     assert argv[:3] == ["codex", "exec", "--json"]
-    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
     assert "--approve-for-me" in argv
+    assert "--sandbox" not in argv
     assert argv[argv.index("-C") + 1] == "/repo"
     assert argv[argv.index("--model") + 1] == "gpt-test"
     assert argv[-1] == "work"

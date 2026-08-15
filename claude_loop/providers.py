@@ -83,7 +83,8 @@ def build_agent_argv(command: AgentCommandLike, provider: str,
         spec.executable,
         "exec",
         "--json",
-        "--sandbox", "workspace-write",
+        # --approve-for-me already selects the workspace-write sandbox. Current
+        # Codex CLI versions reject combining it with an explicit --sandbox.
         "--approve-for-me",
         "--skip-git-repo-check",
         "-C", project_dir,
