@@ -35,7 +35,8 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from .cyclecore import CLAUDE_SESSION_DURATION, _fmt_clock, print_percents
+from .cyclecore import (CLAUDE_SESSION_DURATION, _fmt_clock, _fmt_left,
+                        print_percents)
 from .usage import Usage, UsageReading
 
 # Default ceilings for the ready-made rules (all overridable per instance).
@@ -253,8 +254,14 @@ class LimitPolicy:
             if rd.percent is None:
                 print(f"  · {r.label}: no figure in the usage report{note}")
             else:
+                # How long the window still has to run: the other half of what a
+                # percentage means (10% with four hours left is a different
+                # situation from 10% with ten minutes left), and the quantity a
+                # DayNightLimit ceiling is itself computed from.
+                left = (f", {_fmt_left(rd.reset_ts - now)} left"
+                        if rd.reset_ts is not None else " now")
                 print_percents(f"  · {r.label} usage: {rd.percent:.0f}% "
-                               f"(ceiling {c:.0f}% now){note}")
+                               f"(ceiling {c:.0f}%{left}){note}")
 
         if not self._violations(status):
             return False, session_start
@@ -308,12 +315,11 @@ class LimitPolicy:
                     usage = source.get_usage()
                     continue
 
-                mins = int((next_reset - now) // 60) + 1
                 over = ", ".join(
                     f"{r.label} {rd.percent:.0f}% ≥ {c:.0f}%"
                     for r, rd, c in violated)
-                print_percents(f"    … {over}; ~{mins} min to next reset "
-                               f"(now {_fmt_clock(now)})")
+                print_percents(f"    … {over}; {_fmt_left(next_reset - now)} "
+                               f"to next reset (now {_fmt_clock(now)})")
                 time.sleep(min(next_reset - now, 60))
         except KeyboardInterrupt:
             print("\nWait interrupted by user (Ctrl+C).")

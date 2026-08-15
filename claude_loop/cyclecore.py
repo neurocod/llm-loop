@@ -988,6 +988,25 @@ def _fmt_clock(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
 
+def _fmt_left(seconds: float) -> str:
+    """"4d3h" / "3h24m" / "24m" — a duration in the two largest units that matter.
+
+    The zero-valued smaller unit is dropped ("3h", not "3h0m"), and anything under
+    a minute reads "<1m" rather than "0m", so a countdown never looks like it is
+    already over. Two units is the point: a weekly window has days left, and
+    "4320 min" is not a quantity anyone reads.
+    """
+    total = max(0, int(seconds))
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days}d{hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h{minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m" if minutes else "<1m"
+
+
 def _fmt_moment(ts: float) -> str:
     """Like _fmt_clock, but names the day too once the moment is far enough away
     that a bare clock reading would be ambiguous — a weekly quota resets days out,
@@ -1015,8 +1034,8 @@ def wait_until(target_ts: float, reason: str = None) -> None:
             remaining = target_ts - now
             if remaining <= 0:
                 break
-            mins = int(remaining // 60) + 1
-            print(f"    … ~{mins} min left (now {_fmt_clock(now)})", flush=True)
+            print(f"    … {_fmt_left(remaining)} left (now {_fmt_clock(now)})",
+                  flush=True)
             time.sleep(min(remaining, 60))
     except KeyboardInterrupt:
         print("\nWait interrupted by user (Ctrl+C).")
@@ -1078,8 +1097,8 @@ def wait_before_start(spec: str) -> None:
             remaining = target_ts - now
             if remaining <= 0:
                 break
-            mins = int(remaining // 60) + 1
-            print(f"    … ~{mins} min left (now {_fmt_clock(now)})", flush=True)
+            print(f"    … {_fmt_left(remaining)} left (now {_fmt_clock(now)})",
+                  flush=True)
             time.sleep(min(remaining, 60))
     except KeyboardInterrupt:
         print("\nWait interrupted by user (Ctrl+C).")

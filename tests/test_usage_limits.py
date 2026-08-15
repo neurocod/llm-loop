@@ -14,6 +14,7 @@ hand, so it is pinned with a fake run instead.
 
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,30 @@ SAMPLE = {
                   "resets_at": "2026-08-19T12:59:59.700808+00:00"},
     "seven_day_sonnet": None,
 }
+
+
+def _iso_in(seconds: float) -> str:
+    """An ISO reset time `seconds` from now — the readings a test asserts about
+    have to move with the clock, or the test expires on a fixed date."""
+    return datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat()
+
+
+class _StubSource:
+    """A UsageSource answering from a payload instead of the network."""
+
+    def __init__(self, payload=None):
+        self.invalidated = 0
+        self.payload = payload if payload is not None else {
+            "five_hour": {"utilization": 9.0, "resets_at": _iso_in(2 * 3600)},
+            "seven_day": {"utilization": 40.5, "resets_at": _iso_in(4 * 86400)},
+            "seven_day_sonnet": None,
+        }
+
+    def get_usage(self, cache_value=True):
+        return usage.parse_usage(self.payload)
+
+    def invalidate(self):
+        self.invalidated += 1
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +122,39 @@ def test_a_failed_query_is_not_cached(monkeypatch):
     assert source.get_usage().session.percent is None
     assert source.get_usage().session.percent == 9.0
     assert answers == []
+
+
+@pytest.mark.parametrize("seconds,expected", [
+    (4 * 86400 + 3 * 3600 + 59 * 60, "4d3h"),
+    (2 * 86400, "2d"),                 # a zero smaller unit is dropped
+    (3 * 3600 + 24 * 60, "3h24m"),
+    (3 * 3600 + 4 * 60, "3h4m"),
+    (3600, "1h"),
+    (24 * 60 + 59, "24m"),
+    (30, "<1m"),                       # never "0m": the wait is not over yet
+    (-5, "<1m"),
+])
+def test_time_left_reads_as_a_quantity(seconds, expected):
+    assert cyclecore._fmt_left(seconds) == expected
+
+
+def test_the_status_line_says_how_long_the_window_has_left(capsys):
+    """A percentage alone is half the picture — 9% with four hours left and 9%
+    with ten minutes left call for opposite decisions, and it is the quantity the
+    DayNightLimit ceiling is computed from."""
+    source = _StubSource()
+    LimitPolicy([DayNightLimit()]).check_and_wait(source, time.time())
+    line = capsys.readouterr().out
+    assert "Current session usage: 9% (ceiling " in line
+    assert " left)" in line
+
+
+def test_a_reading_without_a_reset_time_still_prints(capsys):
+    """No reset time in the report — the ceiling line must not lose the ceiling."""
+    source = _StubSource({"five_hour": {"utilization": 9.0}})
+    LimitPolicy([DayNightLimit()]).check_and_wait(source, time.time())
+    out = capsys.readouterr().out
+    assert "Current session usage: 9% (ceiling 95% now)" in out
 
 
 # -- the rate_limit_event backstop ---------------------------------------------
@@ -175,17 +233,6 @@ def _run_with_verdict(tmp_path, monkeypatch, verdict):
     driver = _OneShotDriver()
     cyclecore.run_loop(driver, _args(str(tmp_path)), app_name="pytest-usage")
     return driver, waits
-
-
-class _StubSource:
-    def __init__(self):
-        self.invalidated = 0
-
-    def get_usage(self, cache_value=True):
-        return usage.parse_usage(SAMPLE)
-
-    def invalidate(self):
-        self.invalidated += 1
 
 
 def test_a_refusal_parks_the_loop_until_that_quota_resets(tmp_path, monkeypatch):
