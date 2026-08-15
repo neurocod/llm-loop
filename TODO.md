@@ -16,9 +16,10 @@ Legend: priority is rough — `[P1]` do first, `[P3]` nice to have.
 ## Already done (for reference — don't re-add)
 
 - Fresh context per iteration, state in files (the canonical Ralph pattern).
-- Pause on real `/usage` %, via a per-Driver `limit_policy` (usage.py + limits.py):
-  SessionLimit / DayNightLimit / WeeklyLimit rules, composable, day/night dynamic
-  ceiling on the session rule.
+- Pause on the account's real quota %, via a per-Driver `limit_policy` (usage.py +
+  limits.py): SessionLimit / DayNightLimit / WeeklyLimit rules, composable,
+  day/night dynamic ceiling on the session rule. Read straight from the usage
+  endpoint (no tokens), with the run's own `rate_limit_event` as the backstop.
 - Idempotent list draining (strike each done path out of the list file).
 - Git-push policy (none | after_new_commits | each_hour), final push on exit.
 - Rotating mirror log, `--dry-run`, `--max-runs`, `--start-in`, `--max-strike`, `--raw`.

@@ -13,7 +13,7 @@ What this shares with the sequential runner, and what it deliberately drops:
 
   * Reused — the ListFileDriver (list parsing, is_pending, pick, command_for,
     strike),
-    build_claude_argv, the /usage session-limit machinery, the git-push policy
+    build_claude_argv, the usage session-limit machinery, the git-push policy
     and the rotating mirror log.
   * Dropped — the live token-by-token Markdown rendering. cyclecore's stream
     renderer keeps module-global state that cannot serve several concurrent
@@ -101,7 +101,7 @@ def parse_args(argv=None, *, prog: str = "parallel",
                         "file and the list's relative paths "
                         "(default: the current working directory)")
     p.add_argument("--ignore-usage", action="store_true",
-                   help="don't pause on the Current-session /usage limit "
+                   help="don't pause on the Current-session usage limit "
                         "(by default the workers pause together when the session "
                         "budget is exhausted)")
     return p.parse_args(argv)
@@ -187,6 +187,14 @@ def run_job(job_id: int, command: ClaudeCommand) -> tuple:
                             if isinstance(c, dict)
                         )
                     emit_job(job_id, f"  ✗ {_short(content, 160)}", "red")
+        elif et == "rate_limit_event":
+            # The run's own rate-limit verdict (see cyclecore.RateLimitEvent).
+            # Surfaced, not acted on: with N workers the pause belongs to the
+            # shared usage gate, which sees the same wall as a pegged percentage
+            # when the next worker checks in.
+            rl = cyclecore.rate_limit_event_from(ev)
+            if rl is not None and rl.status != "allowed":
+                emit_job(job_id, f"⚠ rate limit: {rl.describe()}", "bold red")
         elif et == "result":
             cost_usd = ev.get("total_cost_usd")
             dur = ev.get("duration_ms")
@@ -313,7 +321,7 @@ def worker(job_id: int, shared: Shared, source: Optional[UsageSource],
             continue
 
         # Session-limit gate, now that we hold real work: one worker checks at a
-        # time (cheap, /usage is TTL-cached), and a pause blocks every worker that
+        # time (cheap, the reading is TTL-cached), and a pause blocks every worker that
         # reaches it — so the whole fleet idles together when the budget is spent.
         if source is not None:
             with usage_lock:

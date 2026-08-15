@@ -1,9 +1,9 @@
 """
 limits.py - the "what do we do about usage" layer: the pausing policy.
 
-usage.py reads `claude -p "/usage"` into a `Usage` snapshot; this module decides
-what to do with it. A host project picks a *limit specialisation* by setting one
-class attribute on its Driver::
+usage.py reads the account's quota figures into a `Usage` snapshot; this module
+decides what to do with them. A host project picks a *limit specialisation* by
+setting one class attribute on its Driver::
 
     class MyDriver(StateFileDriver):
         limit_policy = LimitPolicy([SessionLimit(80)])          # flat session cap
@@ -237,9 +237,9 @@ class LimitPolicy:
 
     def check_and_wait(self, source, session_start: float, note: str = "",
                        cache_value: bool = True) -> tuple:
-        """Query /usage; if any rule is at/over its ceiling, pause until they all
-        clear (a window reset, or — for DayNightLimit — the ceiling rising above
-        the usage as the reset nears).
+        """Read the usage figures; if any rule is at/over its ceiling, pause until
+        they all clear (a window reset, or — for DayNightLimit — the ceiling rising
+        above the usage as the reset nears).
 
         Returns (paused, session_start). `session_start` is refreshed to now only
         when the *session* window actually reset, so callers can reset their
@@ -251,7 +251,7 @@ class LimitPolicy:
 
         for r, rd, c in status:
             if rd.percent is None:
-                print(f"  · {r.label}: no figure in /usage output{note}")
+                print(f"  · {r.label}: no figure in the usage report{note}")
             else:
                 print_percents(f"  · {r.label} usage: {rd.percent:.0f}% "
                                f"(ceiling {c:.0f}% now){note}")
@@ -321,12 +321,12 @@ class LimitPolicy:
 
     def log_snapshot(self, source, label: str = "",
                      cache_value: bool = True) -> None:
-        """Log the /usage figures this policy watches (its rules' quota lines).
+        """Log the usage figures this policy watches (its rules' quota lines).
 
         Called at the run's bookends so each run records where it started and
         finished against exactly the limits it is gated on — a weekly-only policy
-        logs only the weekly line, a composite logs both. Reuses the CLI's
-        verbatim summary lines so the reset text is shown as reported.
+        logs only the weekly line, a composite logs both. Picks its lines out of
+        `Usage.summary_lines` by matching each rule's `label` against their start.
         """
         usage = source.get_usage(cache_value)
         head = f"  · usage {label}".rstrip() + ":"
@@ -334,7 +334,7 @@ class LimitPolicy:
         lines = [ln for ln in usage.summary_lines
                  if any(ln.lower().startswith(w) for w in wanted)]
         if not lines:
-            print(f"{head} (no matching figures in /usage output)")
+            print(f"{head} (no matching figures in the usage report)")
             return
         print(head)
         for ln in lines:

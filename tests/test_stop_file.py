@@ -49,7 +49,7 @@ class _OneShotDriver(Driver):
 
 
 class _StubPolicy:
-    """A LimitPolicy that never queries /usage and never pauses."""
+    """A LimitPolicy that never reads the usage report and never pauses."""
 
     def describe(self):
         return "stub"

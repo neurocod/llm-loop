@@ -33,7 +33,7 @@ composite `LimitPolicy([DayNightLimit(), WeeklyLimit(90)])`; unset defaults to a
 day/night session rule.
 
 See cyclecore for the engine and the Driver protocol, drivers for the two ready
-made Drivers, parallel for the concurrent list runner, usage for the /usage
+made Drivers, parallel for the concurrent list runner, usage for the quota
 query/parse layer and limits for the pausing policy.
 """
 
@@ -42,17 +42,20 @@ from .cyclecore import (
     Driver,
     GitPushPolicy,
     LoopStop,
+    RateLimitEvent,
     build_claude_argv,
     find_project_root,
+    last_rate_limit_event,
     log_file_path,
     parse_args,
     parse_duration,
     project_dir,
+    rate_limit_event_from,
     report_costs,
     run_loop,
     set_project_root,
 )
-from .usage import Usage, UsageReading, UsageSource, parse_usage
+from .usage import Usage, UsageReading, UsageSource, oauth_token, parse_usage
 from .limits import (
     DayNightLimit,
     LimitPolicy,
@@ -74,6 +77,7 @@ __all__ = [
     "LimitRule",
     "ListFileDriver",
     "LoopStop",
+    "RateLimitEvent",
     "SessionLimit",
     "StateFileDriver",
     "Usage",
@@ -83,12 +87,15 @@ __all__ = [
     "build_claude_argv",
     "default_policy",
     "find_project_root",
+    "last_rate_limit_event",
     "log_file_path",
+    "oauth_token",
     "parse_args",
     "parse_parallel_args",
     "parse_duration",
     "parse_usage",
     "project_dir",
+    "rate_limit_event_from",
     "report_costs",
     "run_loop",
     "run_parallel",

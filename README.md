@@ -69,7 +69,7 @@ default, or `--project-dir`/`-C`.
 claude_loop/
   cyclecore.py   engine: parse_args, run_loop, the Driver protocol,
                  git-push policy, mirror log, stream-json rendering
-  usage.py       UsageSource: query / cache / parse `claude -p "/usage"`
+  usage.py       UsageSource: query / cache / parse the account's quota figures
   limits.py      LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
   drivers.py     StateFileDriver (state machine) and ListFileDriver (work queue)
   parallel.py    run_parallel: N concurrent claude workers over a list file
@@ -166,8 +166,8 @@ if __name__ == "__main__":
 
 ## Usage limits
 
-Before each iteration (and after any failed one) the loop consults
-`claude -p "/usage"` and pauses if a watched quota is at/over its ceiling. Which
+Before each iteration (and after any failed one) the loop reads the account's
+quota figures and pauses if a watched one is at/over its ceiling. Which
 quota, and at what ceiling, is a *specialisation* you pick by setting the
 `limit_policy` class attribute on your Driver — a `LimitPolicy` holding one or
 more rules; the loop pauses while **any** of them is exceeded:
@@ -193,6 +193,21 @@ Leaving `limit_policy` unset uses `LimitPolicy([DayNightLimit()])`. The bookend
 usage snapshots and the per-check status lines report exactly the quotas the
 active policy watches. When `--max-runs N` is given (a short bounded run) the
 limit gate is skipped entirely.
+
+**Where the figures come from.** `usage.py` reads them over HTTP from the same
+endpoint the CLI's own `/usage` panel and status line are built from,
+authenticated with the OAuth token the CLI keeps in `~/.claude/.credentials.json`
+(`CLAUDE_CONFIG_DIR` / `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_BASE_URL` are
+honoured). No tokens, no model turn — the earlier `claude -p "/usage"` round-trip
+that this replaced cost $0.33 and 17 s per check, i.e. it spent a slice of the
+very budget it was measuring.
+
+That endpoint is undocumented, so a failure is treated as "no figures" rather
+than a fatal error and the run falls back on the reactive half: every `claude`
+run streams its own `rate_limit_event` verdict, and a `rejected` makes the loop
+wait out exactly the quota that refused it (`cyclecore.RateLimitEvent`). That
+half costs nothing and cannot go stale — it is the wire's own answer — but it
+carries no percentage, which is why the proactive check exists on top of it.
 
 ## Common options
 

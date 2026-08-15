@@ -27,13 +27,19 @@ Everything below is lifted verbatim from the original single-file runCycle.py,
 with the few state-specific pieces (which file to read, which prompt to send,
 which model to pick) factored out into the Driver protocol.
 
-Token-limit handling is driven by the CLI's own usage report rather than guessed
-from error counts. Before each iteration, and again immediately after any
-non-zero `claude` exit, the loop asks the Driver's `limit_policy` to consult
-`claude -p "/usage"` and pause if any watched quota is at/over its ceiling. The
-querying/parsing lives in usage.py (UsageSource) and the pausing policy in
-limits.py (LimitPolicy and the ready-made SessionLimit / DayNightLimit /
-WeeklyLimit rules); this module only wires them into the loop.
+Token-limit handling is driven by the account's real usage figures rather than
+guessed from error counts, in two layers:
+
+  * proactive — before each iteration, and again immediately after any non-zero
+    `claude` exit, the loop asks the Driver's `limit_policy` for the current
+    quota percentages and pauses if any watched one is at/over its ceiling. The
+    reading lives in usage.py (UsageSource, an HTTP GET of the usage endpoint)
+    and the pausing policy in limits.py (LimitPolicy and the ready-made
+    SessionLimit / DayNightLimit / WeeklyLimit rules).
+  * reactive — every run streams its own rate-limit verdict, which this module
+    picks out of the stream it is already parsing (see RateLimitEvent): a
+    "rejected" means the wall was hit, and the loop waits that quota out even if
+    the proactive reading was unavailable.
 """
 
 import argparse
@@ -55,7 +61,7 @@ CLAUDE_SESSION_DURATION = 5 * 60 * 60 + 3  # 5 hours as seconds and + 3s as a sa
 SESSION_DURATION = 3600 # or: if session is started at the end of a window, it may continue more from the start next time
 LIMIT_RETRY_THRESHOLD = CLAUDE_SESSION_DURATION
 
-# The usage-limit policy (which /usage quota to gate on, what ceiling to allow,
+# The usage-limit policy (which quota to gate on, what ceiling to allow,
 # when to pause) lives in limits.py / usage.py, chosen per project via a Driver's
 # `limit_policy` attribute — see Driver and run_loop.
 
@@ -90,7 +96,7 @@ except (AttributeError, ValueError):
     pass
 
 # The project root: the working directory of the project being driven. All
-# subprocesses (git, claude, /usage) run with this as their cwd, the relative
+# subprocesses (git, claude) run with this as their cwd, the relative
 # state/list paths a Driver is given are resolved against it, and the stop/log
 # file names are derived from it.
 #
@@ -724,10 +730,9 @@ def markup_percents(text: str) -> str:
 
     Colouring the *rendered line* rather than each figure at its format site is
     what keeps one scale across lines that are assembled in several places (a
-    rule's own `describe()`, the usage/ceiling line, the /usage summary lines
-    quoted verbatim from the CLI) — and what lets a line quoted from elsewhere be
-    coloured at all. The non-percentage parts are escaped, so a '[' in a label
-    stays literal.
+    rule's own `describe()`, the usage/ceiling line, the usage-report summary
+    lines) — and what lets a line quoted from elsewhere be coloured at all. The
+    non-percentage parts are escaped, so a '[' in a label stays literal.
     """
     out = []
     last = 0
@@ -782,6 +787,74 @@ _active_text_index = None
 _md_stream = _MarkdownStream()
 
 
+# --- the free half of the limit machinery: the run's own rate-limit events -----
+#
+# Every `claude` run streams a line of its own, built from the ratelimit headers
+# the API already returned to it:
+#
+#   {"type":"rate_limit_event","rate_limit_info":{"status":"allowed",
+#     "resetsAt":1786807200,"rateLimitType":"five_hour", …}}
+#
+# Reading it costs nothing — that stream is parsed anyway — and unlike a queried
+# figure it cannot be stale or unavailable: it is the wire's own verdict on the
+# request that just went out. It carries no percentage, so it cannot drive a
+# ceiling; it is the backstop *under* the proactive check in limits.py. "rejected"
+# means this run hit the wall, and `resetsAt` says when that quota comes back.
+
+# Quota id -> the name the CLI itself uses for it in limit messages.
+RATE_LIMIT_LABELS = {
+    "five_hour": "session limit",
+    "seven_day": "weekly limit",
+    "seven_day_opus": "Opus limit",
+    "seven_day_sonnet": "Sonnet limit",
+    "seven_day_overage_included": "usage-credit limit",
+}
+
+
+class RateLimitEvent(NamedTuple):
+    """One rate_limit_event: which quota it is about, how it stands, when it resets.
+
+    `status` is the API's own verdict — "allowed", "allowed_warning" (close to
+    the wall) or "rejected" (refused). `resets_at` is epoch seconds, or None when
+    the event carried no reset time.
+    """
+    status: str
+    limit_type: str
+    resets_at: Optional[float]
+
+    @property
+    def label(self) -> str:
+        return RATE_LIMIT_LABELS.get(self.limit_type, self.limit_type or "limit")
+
+    def describe(self) -> str:
+        when = f", resets {_fmt_moment(self.resets_at)}" if self.resets_at else ""
+        return f"{self.label} {self.status}{when}"
+
+
+def rate_limit_event_from(ev: dict) -> Optional[RateLimitEvent]:
+    """The RateLimitEvent carried by a stream-json event, or None if it isn't one."""
+    if ev.get("type") != "rate_limit_event":
+        return None
+    info = ev.get("rate_limit_info") or {}
+    resets = info.get("resetsAt")
+    return RateLimitEvent(
+        status=str(info.get("status") or "unknown"),
+        limit_type=str(info.get("rateLimitType") or ""),
+        resets_at=float(resets) if isinstance(resets, (int, float)) else None,
+    )
+
+
+# The last verdict seen by run_claude_streaming, cleared when a run starts — so it
+# always describes the run that just finished, never the one before it.
+_last_rate_limit_event = None
+
+
+def last_rate_limit_event() -> Optional[RateLimitEvent]:
+    """The rate-limit verdict of the most recent run_claude_streaming call (None
+    if that run streamed no rate_limit_event)."""
+    return _last_rate_limit_event
+
+
 def _render_event(ev: dict, partial: bool) -> None:
     """Print a single stream-json event in the style of interactive mode.
 
@@ -794,6 +867,15 @@ def _render_event(ev: dict, partial: bool) -> None:
     if et == "system" and ev.get("subtype") == "init":
         model = ev.get("model", "?")
         print(f"  · session started (model {model})")
+        return
+
+    if et == "rate_limit_event":
+        global _last_rate_limit_event
+        _last_rate_limit_event = rate_limit_event_from(ev)
+        # "allowed" is the normal case and would be one more line per run; the
+        # two states that mean something get shown.
+        if _last_rate_limit_event.status != "allowed":
+            print_error(f"  ⚠ rate limit: {_last_rate_limit_event.describe()}")
         return
 
     # Streaming deltas (Anthropic streaming events, wrapped in stream_event).
@@ -863,7 +945,13 @@ def _render_event(ev: dict, partial: bool) -> None:
 
 
 def run_claude_streaming(cmd: list, raw: bool, partial: bool) -> int:
-    """Runs claude, parses stream-json on the fly and prints the work in progress."""
+    """Runs claude, parses stream-json on the fly and prints the work in progress.
+
+    The run's rate-limit verdict, if it streamed one, is left in
+    `last_rate_limit_event()` for the caller to act on.
+    """
+    global _last_rate_limit_event
+    _last_rate_limit_event = None
     try:
         proc = subprocess.Popen(
             cmd, cwd=PROJECT_DIR,
@@ -898,6 +986,15 @@ def run_claude_streaming(cmd: list, raw: bool, partial: bool) -> int:
 
 def _fmt_clock(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+def _fmt_moment(ts: float) -> str:
+    """Like _fmt_clock, but names the day too once the moment is far enough away
+    that a bare clock reading would be ambiguous — a weekly quota resets days out,
+    and "12:59:59" alone reads as "in a few hours"."""
+    if ts - time.time() < 18 * 3600:
+        return _fmt_clock(ts)
+    return datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
 
 
 def wait_until(target_ts: float, reason: str = None) -> None:
@@ -1045,7 +1142,7 @@ class Driver:
     description: Optional[str] = None   # --help description (None = generic)
 
     # --- usage-limit specialisation (declarative, like the labels above) ------
-    # A limits.LimitPolicy picking which /usage quota(s) to gate on and at what
+    # A limits.LimitPolicy picking which quota(s) to gate on and at what
     # ceiling; None => the engine's default (a day/night session rule, see
     # limits.default_policy). Set it as a class attribute to specialise, e.g.
     #   limit_policy = LimitPolicy([SessionLimit(80)])            # flat session
@@ -1151,8 +1248,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     set_project_root(getattr(args, "project_dir", None))
 
     # --cost: report per-run spend from the mirror log and exit, without touching
-    # the loop, the tee, git, or /usage. Done here (after the root is set, so the
-    # log path resolves) rather than in the loop body proper.
+    # the loop, the tee, git, or the usage gate. Done here (after the root is
+    # set, so the log path resolves) rather than in the loop body proper.
     if getattr(args, "cost", False):
         report_costs(app_name)
         return
@@ -1180,7 +1277,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
     session_start = time.time()   # start of the current 5-hour session window
     consecutive_errors = 0        # reset to 0 after any successful iteration
-    usage_source = UsageSource()  # queries/caches `claude -p "/usage"`
+    usage_source = UsageSource()  # queries/caches the account's usage figures
     limit_policy = driver.limit_policy or limits.default_policy()  # pauses on limit
     last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
     print(f"  · git push policy: {git_push_policy.value}")
@@ -1241,9 +1338,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 session_start = time.time()
                 consecutive_errors = 0  # fresh window — start counting errors anew
 
-        # Proactive limit check: ask the CLI for the real Current-session usage
-        # and pause cleanly between iterations if it is already at/over the
-        # threshold, instead of running an iteration that would hit the wall.
+        # Proactive limit check: read the real Current-session usage from the
+        # account and pause cleanly between iterations if it is already at/over
+        # the threshold, instead of running an iteration that would hit the wall.
         if not dry_run and not ignore_usage_limits:
             paused, session_start = limit_policy.check_and_wait(usage_source, session_start)
             if paused:
@@ -1289,12 +1386,36 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         if returncode == 0:
             consecutive_errors = 0
             driver.on_success(returncode)
+
+        # The backstop under the proactive check (see RateLimitEvent): this run's
+        # own verdict from the wire. A refusal needs no figure and no query to be
+        # trusted, so it is honoured whatever the usage report said — including
+        # when the report was unavailable, which is the case this exists for.
+        # Checked for both outcomes: a run refused on its last turn may still have
+        # exited 0 with its work recorded above.
+        refusal = last_rate_limit_event()
+        if (not ignore_usage_limits and refusal is not None
+                and refusal.status == "rejected"):
+            # +5s so we come back after the reset, not exactly on it.
+            target_ts = (refusal.resets_at
+                         or time.time() + CLAUDE_SESSION_DURATION) + 5
+            wait_until(target_ts,
+                       reason=f"Hit the {refusal.label} — this run was refused. "
+                              f"Waiting until {_fmt_moment(target_ts)} for that "
+                              f"window to refresh…")
+            usage_source.invalidate()  # the figures behind the refusal are stale
+            if refusal.limit_type == "five_hour":
+                session_start = time.time()
+            consecutive_errors = 0  # fresh window — start counting errors anew
+            continue
+
+        if returncode == 0:
             continue
 
         # Non-zero exit — the cause is ambiguous (a network blip / one-off CLI
         # hiccup, or the session's token limit). Rather than guessing from a
-        # second consecutive error, ask the CLI directly: query /usage right away
-        # and let the real Current-session percentage decide.
+        # second consecutive error, ask the account directly: read the usage
+        # figures right away and let the real Current-session percentage decide.
         consecutive_errors += 1
         elapsed = time.time() - session_start
         print_error(f"claude exited with code {returncode} "
