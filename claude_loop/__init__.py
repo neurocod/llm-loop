@@ -1,5 +1,5 @@
 """
-claude_loop - a reusable engine for autonomous Claude-CLI loops.
+claude_loop - a reusable engine for autonomous Claude/Codex CLI loops.
 
 Vendor this package as a git submodule under a host project, then write a thin
 wrapper in the project that subclasses a Driver — supplying the project-specific
@@ -14,7 +14,7 @@ attributes / overridden methods — and calls its `.main()`:
         target_suffix = ".ru.md"
 
         def model(self):
-            return "sonnet"     # or "" to use the CLI's own configured model
+            return "" if self.provider == "codex" else "sonnet"
 
         def prompt(self, source, target):
             return f"Translate {source} to Russian, write {target}, keep search: verbatim ..."
@@ -22,7 +22,7 @@ attributes / overridden methods — and calls its `.main()`:
     if __name__ == "__main__":
         TranslateDriver.main()          # or .main_parallel() for N concurrent workers
 
-The engine anchors every project-relative operation (git/claude cwd, the stop
+The engine anchors every project-relative operation (git/agent cwd, the stop
 file, the Driver's relative paths) to the project root — the current working
 directory by default, or --project-dir / set_project_root(). So the code can
 live in a submodule subdirectory while still driving the host project's repo.
@@ -38,11 +38,13 @@ query/parse layer and limits for the pausing policy.
 """
 
 from .cyclecore import (
+    AgentCommand,
     ClaudeCommand,
     Driver,
     GitPushPolicy,
     LoopStop,
     RateLimitEvent,
+    build_agent_argv,
     build_claude_argv,
     find_project_root,
     last_rate_limit_event,
@@ -53,7 +55,15 @@ from .cyclecore import (
     rate_limit_event_from,
     report_costs,
     run_loop,
+    run_agent_streaming,
     set_project_root,
+)
+from .providers import (
+    PROVIDER_NAMES,
+    PROVIDERS,
+    ProviderSpec,
+    provider_spec,
+    usage_source_for,
 )
 from .usage import Usage, UsageReading, UsageSource, oauth_token, parse_usage
 from .limits import (
@@ -69,6 +79,7 @@ from .parallel import run_parallel
 from .parallel import parse_args as parse_parallel_args
 
 __all__ = [
+    "AgentCommand",
     "ClaudeCommand",
     "DayNightLimit",
     "Driver",
@@ -77,6 +88,9 @@ __all__ = [
     "LimitRule",
     "ListFileDriver",
     "LoopStop",
+    "PROVIDERS",
+    "PROVIDER_NAMES",
+    "ProviderSpec",
     "RateLimitEvent",
     "SessionLimit",
     "StateFileDriver",
@@ -84,6 +98,7 @@ __all__ = [
     "UsageReading",
     "UsageSource",
     "WeeklyLimit",
+    "build_agent_argv",
     "build_claude_argv",
     "default_policy",
     "find_project_root",
@@ -95,9 +110,12 @@ __all__ = [
     "parse_duration",
     "parse_usage",
     "project_dir",
+    "provider_spec",
     "rate_limit_event_from",
     "report_costs",
+    "run_agent_streaming",
     "run_loop",
     "run_parallel",
     "set_project_root",
+    "usage_source_for",
 ]

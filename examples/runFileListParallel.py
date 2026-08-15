@@ -1,7 +1,8 @@
 """
 Example wrapper: the parallel counterpart of runFileList.py.
 
-Same per-file work, but with N worker threads running `claude` concurrently
+Same per-file work, but with N worker threads running the selected provider
+concurrently
 (`.main_parallel()`) instead of one file at a time. It subclasses runFileList.py's
 driver (the same list path, target naming, prompt and model) and only relabels
 the entry point; the list file is the single source of truth, guarded by one
@@ -27,7 +28,7 @@ class FileListParallelDriver(FileListDriver):
     app_name = "runFileListParallel"
     prog = "runFileListParallel.py"
     description = (f"Process the files listed in {LIST_FILE_REL} with N "
-                   "concurrent `claude` workers.")
+                   "concurrent LLM workers.")
 
 
 if __name__ == "__main__":

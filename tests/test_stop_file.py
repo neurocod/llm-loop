@@ -7,8 +7,9 @@ routinely used while a real loop is running — which is exactly when a stop is
 pending. A dry run that consumed the sentinel would silently cancel someone
 else's stop request, and the loop it was meant to halt would keep going.
 
-So: a real run consumes it, a dry run reports it and leaves it in place. Both
-runners are covered, since either entry point could regress independently.
+So: the already-running owner consumes it at an iteration boundary, a new real
+launch waits for it to disappear, and a dry run reports it without touching it.
+Both runners are covered, since either entry point could regress independently.
 """
 
 import os
@@ -125,16 +126,31 @@ def test_dry_run_leaves_the_stop_file(tmp_path, capsys):
     assert driver.served == 1
 
 
-def test_real_run_consumes_the_stop_file(tmp_path, capsys):
-    """The run that honours the sentinel is the one that removes it."""
+def test_real_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch, capsys):
+    """A new launch leaves another run's pending stop request alone."""
+    monkeypatch.setattr(cyclecore, "STOP_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda cmd, raw, partial: 0)
     stop = _stop_file(tmp_path)
     driver = _OneShotDriver()
-    cyclecore.run_loop(driver, _seq_args(str(tmp_path), dry_run=False),
-                       app_name="pytest-stop")
+    done = threading.Event()
+
+    def go():
+        try:
+            cyclecore.run_loop(driver, _seq_args(str(tmp_path), dry_run=False),
+                               app_name="pytest-stop")
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert not done.wait(0.05), "launch ignored an existing stop file"
+    stop.unlink()
+    assert done.wait(2), "launch did not continue after the stop file was removed"
     assert not stop.exists(), "a real run left the stop file behind"
-    assert "Stop file detected" in capsys.readouterr().out
-    # Stopped before doing any work: the driver was never asked for a command.
-    assert driver.served == 0
+    output = capsys.readouterr().out
+    assert "Stop file present at startup" in output
+    assert "Stop file removed" in output
+    assert driver.served == 1
 
 
 def test_dry_run_reports_the_stop_file_once(tmp_path, capsys):
@@ -160,16 +176,18 @@ def test_parallel_dry_run_leaves_the_stop_file(tmp_path, capsys):
     assert "DRY-RUN" in out
 
 
-def test_parallel_worker_consumes_the_stop_file(tmp_path, monkeypatch):
-    """A real parallel run still stops on the sentinel and removes it."""
+def test_parallel_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch):
+    """A parallel launch also waits rather than stealing a pending stop."""
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
+    monkeypatch.setattr(cyclecore, "STOP_POLL_SECONDS", 0.01)
     stop = _stop_file(tmp_path)
     done = threading.Event()
 
     def go():
         try:
-            parallel.run_parallel(_MemListDriver(["products/a.md"]),
-                                  _par_args(str(tmp_path), dry_run=False),
+            args = _par_args(str(tmp_path), dry_run=False)
+            args.max = 1
+            parallel.run_parallel(_MemListDriver(["products/a.md"]), args,
                                   app_name="pytest-stop-parallel")
         except SystemExit:
             pass
@@ -177,8 +195,10 @@ def test_parallel_worker_consumes_the_stop_file(tmp_path, monkeypatch):
             done.set()
 
     threading.Thread(target=go, daemon=True).start()
-    assert done.wait(10), "run_parallel did not stop on the stop file"
-    assert not stop.exists(), "a real parallel run left the stop file behind"
+    assert not done.wait(0.05), "parallel launch ignored an existing stop file"
+    stop.unlink()
+    assert done.wait(5), "run_parallel did not continue after the stop file was removed"
+    assert not stop.exists(), "parallel run left the stop file behind"
 
 
 def test_stop_file_path_follows_the_project_root(tmp_path):

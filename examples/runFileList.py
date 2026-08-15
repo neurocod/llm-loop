@@ -3,10 +3,11 @@ Example wrapper: process every file listed in a files.md, one per iteration.
 
 This is the ListFileDriver pattern. The list file (here `files.md`) holds one
 source path per line; each iteration picks a still-pending path at random, runs
-`claude` with your prompt, and on success strikes that path out of the list — so
+the selected provider with your prompt, and on success strikes that path out of
+the list — so
 the run is idempotent (stop any time and relaunch to pick up the rest).
 
-This particular example asks claude to write a short summary of each source file
+This particular example asks the agent to write a short summary of each source file
 into a sibling `<name>.summary.md`. Swap `prompt()` / `target_suffix` / `model()`
 for your own per-file task (generate docs, add license headers, refactor, lint…).
 
@@ -36,7 +37,7 @@ class FileListDriver(ListFileDriver):
     def model(self) -> str:
         """A cheaper/faster model is enough for this mechanical task. Return "" to
         let the CLI use its own configured model instead."""
-        return "sonnet"
+        return "" if self.provider == "codex" else "sonnet"
 
     def prompt(self, source: str, target: str) -> str:
         """Instructions for a single file (receives absolute paths)."""

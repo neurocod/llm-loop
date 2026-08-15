@@ -1,5 +1,5 @@
 """
-drivers.py - reusable Driver implementations for the autonomous Claude-CLI loop.
+drivers.py - reusable Driver implementations for the autonomous LLM-CLI loop.
 
 These are the two task shapes the loop was originally built around, generalised
 so a host project supplies its own paths, prompts and models instead of them
@@ -21,7 +21,7 @@ import random
 from typing import Optional
 
 from . import cyclecore
-from .cyclecore import ClaudeCommand, Driver, LoopStop
+from .cyclecore import AgentCommand, Driver, LoopStop
 
 
 def _abs_in_project(path: str) -> str:
@@ -75,7 +75,7 @@ class StateFileDriver(Driver):
         """The instruction sent every iteration. Override to change the playbook."""
         return f"Follow the instructions in {self.state_file}"
 
-    def next_command(self) -> Optional[ClaudeCommand]:
+    def next_command(self) -> Optional[AgentCommand]:
         state = self.first_line()
         # State-machine contract: on error we do not proceed.
         if self.error_token.lower() in state.lower():
@@ -85,7 +85,7 @@ class StateFileDriver(Driver):
                 exit_code=1,
             )
         label = state or f"{self.state_file} not found"
-        return ClaudeCommand(self.prompt(), self.model(), label)
+        return AgentCommand(self.prompt(), self.model(), label, self.provider)
 
     def final_summary(self) -> Optional[str]:
         return f"Final state: {self.first_line()}"
@@ -148,7 +148,7 @@ class ListFileDriver(Driver):
     one).
 
     Entry points: ``MyListDriver.main()`` (sequential), or
-    ``MyListDriver.main_parallel()`` (N concurrent `claude` workers).
+    ``MyListDriver.main_parallel()`` (N concurrent provider workers).
     """
 
     list_file: str = "products/list.md"
@@ -203,15 +203,15 @@ class ListFileDriver(Driver):
         return [ln for ln in _read_list_lines(self.list_path())
                 if self.is_pending(ln)]
 
-    def command_for(self, line: str) -> ClaudeCommand:
+    def command_for(self, line: str) -> AgentCommand:
         """Build the command for one raw list line, without touching driver
         state — safe to call from any thread (used by the parallel runner)."""
         source = line.strip()
         source_abs = _abs_in_project(source)
         target_abs = self.target_path(source_abs)
         label = os.path.basename(source_abs)
-        return ClaudeCommand(self.prompt(source_abs, target_abs),
-                             self.model(), label)
+        return AgentCommand(self.prompt(source_abs, target_abs),
+                            self.model(), label, self.provider)
 
     def strike(self, line: str) -> bool:
         """Remove the first list entry exactly matching `line`; rewrite the file.
@@ -251,7 +251,7 @@ class ListFileDriver(Driver):
         """
         return pending[0] if self.pick_order == "list" else random.choice(pending)
 
-    def next_command(self) -> Optional[ClaudeCommand]:
+    def next_command(self) -> Optional[AgentCommand]:
         pending = self.pending_lines()
         if not pending:
             self._current_line = None
@@ -276,7 +276,7 @@ class ListFileDriver(Driver):
     @classmethod
     def main_parallel(cls, argv=None, jobs: Optional[int] = None) -> None:
         """Parse the parallel CLI (adds -j/--jobs) and drain the list with N
-        concurrent `claude` workers over a fresh instance.
+        concurrent provider workers over a fresh instance.
 
         The parallel counterpart of Driver.main(): a wrapper for the concurrent
         runner is just a subclass calling this. Imported lazily so drivers.py and

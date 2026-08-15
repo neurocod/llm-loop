@@ -2,7 +2,7 @@
 parallel.py - parallel sibling of the sequential ListFileDriver loop.
 
 Processes the files listed in a ListFileDriver's list, but with N worker threads
-running `claude` concurrently instead of one file at a time. The work
+running the selected provider concurrently instead of one file at a time. The work
 parallelises cleanly because each item is independent: a worker reads its own
 source and writes its own target; the only shared mutable state is the list file
 itself (each finished path is struck out of it), guarded by one lock, so the run
@@ -13,7 +13,7 @@ What this shares with the sequential runner, and what it deliberately drops:
 
   * Reused — the ListFileDriver (list parsing, is_pending, pick, command_for,
     strike),
-    build_claude_argv, the usage session-limit machinery, the git-push policy
+    build_agent_argv, the usage session-limit machinery, the git-push policy
     and the rotating mirror log.
   * Dropped — the live token-by-token Markdown rendering. cyclecore's stream
     renderer keeps module-global state that cannot serve several concurrent
@@ -38,9 +38,9 @@ from typing import Optional
 from . import cyclecore
 from . import limits
 from .cyclecore import (
-    ClaudeCommand,
+    AgentCommand,
     GitPushPolicy,
-    build_claude_argv,
+    build_agent_argv,
     git_push,
     git_unpushed_count,
     maybe_git_push,
@@ -49,7 +49,7 @@ from .cyclecore import (
     _describe_tool,
     _short,
 )
-from .usage import UsageSource
+from .providers import provider_spec, usage_source_for
 from .drivers import ListFileDriver
 
 # Default worker count. The work is cheap and fully independent, so a handful of
@@ -78,7 +78,7 @@ def parse_args(argv=None, *, prog: str = "parallel",
     p = argparse.ArgumentParser(
         prog=prog,
         description=description or "Parallel autonomous loop running N "
-                                  "concurrent `claude` workers over a list file.",
+                                  "concurrent LLM workers over a list file.",
     )
     p.add_argument("-j", "--jobs", type=int, default=None, metavar="N",
                    help="number of concurrent workers (default: the driver's "
@@ -87,8 +87,11 @@ def parse_args(argv=None, *, prog: str = "parallel",
                    metavar="N",
                    help="stop after processing N files total, across all workers "
                         "(default: drain the whole list); --max is a deprecated alias")
+    p.add_argument("--codex", action="store_const", const="codex",
+                   dest="provider", default=None,
+                   help="run Codex CLI instead of the Driver's default provider")
     p.add_argument("-d", "--dry-run", action="store_true",
-                   help="only print the commands that would run, don't run claude "
+                   help="only print the commands that would run, don't run the LLM CLI "
                         "and don't touch the list")
     p.add_argument("-g", "--git-push", dest="git_push",
                    choices=[pol.value for pol in GitPushPolicy],
@@ -97,7 +100,7 @@ def parse_args(argv=None, *, prog: str = "parallel",
                         f"(default: {cyclecore.GIT_PUSH_POLICY.value})")
     p.add_argument("-C", "--project-dir", dest="project_dir", metavar="DIR",
                    default=None,
-                   help="project root: cwd for git/claude, base for the stop "
+                   help="project root: cwd for git/provider CLI, base for the stop "
                         "file and the list's relative paths "
                         "(default: the current working directory)")
     p.add_argument("--ignore-usage", action="store_true",
@@ -137,17 +140,19 @@ def emit_tool(job_id: int, name: str, detail: str) -> None:
         _emit_markup(head_plain, head_markup)
 
 
-# --- the actual claude round-trip for one file ---------------------------------
+# --- one provider round-trip for one file --------------------------------------
 
-def run_job(job_id: int, command: ClaudeCommand) -> tuple:
-    """Run one `claude` command, rendering a compact per-job trace.
+def run_job(job_id: int, command: AgentCommand) -> tuple:
+    """Run one provider command, rendering a compact per-job trace.
 
     Unlike cyclecore's streaming renderer this prints only the key events — each
     tool call, any failed tool result, and the final cost line — one atomic line
     at a time, so several of these can run at once without their output
     colliding. Returns (returncode, cost_usd, duration_s).
     """
-    argv = build_claude_argv(command)
+    provider = command.provider or "claude"
+    spec = provider_spec(provider)
+    argv = build_agent_argv(command, provider)
     try:
         proc = subprocess.Popen(
             argv, cwd=cyclecore.project_dir(),
@@ -155,11 +160,12 @@ def run_job(job_id: int, command: ClaudeCommand) -> tuple:
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
     except FileNotFoundError:
-        emit_job(job_id, "executable 'claude' not found on PATH.", "bold red")
+        emit_job(job_id, f"executable {spec.executable!r} not found on PATH.", "bold red")
         return 2, None, None
 
     cost_usd = None
     duration_s = None
+    provider_failed = False
     for line in proc.stdout:
         line = line.rstrip("\n")
         if not line:
@@ -169,7 +175,34 @@ def run_job(job_id: int, command: ClaudeCommand) -> tuple:
         except json.JSONDecodeError:
             continue  # non-JSON CLI diagnostics — skip in compact mode
         et = ev.get("type")
-        if et == "assistant":
+        if provider == "codex":
+            item = ev.get("item") or {}
+            item_type = item.get("type")
+            if et == "item.completed" and item_type == "agent_message":
+                for text in str(item.get("text") or "").splitlines():
+                    emit_job(job_id, f"💬 {text}")
+            elif et == "item.started" and item_type == "command_execution":
+                emit_job(job_id, f"💻 {_short(item.get('command', ''), 160)}")
+            elif et == "item.completed" and item_type == "command_execution":
+                emit_job(job_id, f"📤 exit {item.get('exit_code', '')}: "
+                         f"{_short(item.get('command', ''), 140)}")
+            elif et == "item.completed" and item_type == "file_change":
+                changes = item.get("changes") or []
+                paths = [str(change.get("path")) for change in changes
+                         if isinstance(change, dict) and change.get("path")]
+                emit_job(job_id, f"🛠️ {', '.join(paths) or 'file changes applied'}")
+            elif et == "turn.completed":
+                usage = ev.get("usage") or {}
+                if usage:
+                    emit_job(job_id, "tokens: "
+                             f"input {usage.get('input_tokens', 0)}, "
+                             f"cached {usage.get('cached_input_tokens', 0)}, "
+                             f"output {usage.get('output_tokens', 0)}")
+            elif et in ("error", "turn.failed"):
+                provider_failed = True
+                emit_job(job_id, f"⚠ {_short(ev.get('message') or ev.get('error') or ev)}",
+                         "bold red")
+        elif et == "assistant":
             for block in ev.get("message", {}).get("content", []):
                 if block.get("type") == "tool_use":
                     name = block.get("name", "?")
@@ -199,7 +232,10 @@ def run_job(job_id: int, command: ClaudeCommand) -> tuple:
             cost_usd = ev.get("total_cost_usd")
             dur = ev.get("duration_ms")
             duration_s = dur / 1000 if dur is not None else None
-    return proc.wait(), cost_usd, duration_s
+    returncode = proc.wait()
+    if returncode == 0 and provider_failed:
+        returncode = 1
+    return returncode, cost_usd, duration_s
 
 
 # --- shared queue state, guarded by one lock -----------------------------------
@@ -286,7 +322,7 @@ class Shared:
 
 # --- worker loop ---------------------------------------------------------------
 
-def worker(job_id: int, shared: Shared, source: Optional[UsageSource],
+def worker(job_id: int, shared: Shared, source: Optional[object],
            policy, session_start_box: list, usage_lock: threading.Lock) -> None:
     """One worker thread: claim -> (usage gate) -> run -> record, repeat.
 
@@ -333,7 +369,7 @@ def worker(job_id: int, shared: Shared, source: Optional[UsageSource],
 
         # The run may have been stopped (drained elsewhere, stop file, or --max
         # reached) while we waited for the lock or paused on the budget: return the
-        # claimed file to the queue and exit without starting another claude run.
+        # claimed file to the queue and exit without starting another provider run.
         if shared.stop.is_set():
             shared.release(line)
             break
@@ -363,7 +399,7 @@ def worker(job_id: int, shared: Shared, source: Optional[UsageSource],
 
 def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                  app_name: str = "parallel") -> None:
-    """Drain `driver`'s list with N concurrent `claude` workers.
+    """Drain `driver`'s list with N concurrent provider workers.
 
     The parallel counterpart of cyclecore.run_loop: same session-limit, git-push
     and mirror-log machinery, but a thread pool over independent list items
@@ -371,6 +407,9 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     """
     # Worker count precedence: explicit -j/--jobs on the CLI, then the driver's
     # `jobs` attribute (a subclass may pin it), then the engine default.
+    provider = getattr(args, "provider", None) or driver.provider
+    spec = provider_spec(provider)
+    driver.provider = provider
     jobs = args.jobs
     if jobs is None:
         jobs = getattr(driver, "jobs", None)
@@ -389,6 +428,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     sys.stderr = cyclecore._TeeToLog(sys.stderr, logger)
     print(f"  · project root: {cyclecore.project_dir()}")
     print(f"  · logging to {cyclecore.log_file_path(app_name)}")
+    print(f"  · provider: {spec.display_name}")
     print(f"  · jobs: {jobs}  ·  git push policy: {git_push_policy.value}")
 
     list_file_rel = driver.list_file
@@ -409,7 +449,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         print(f"DRY-RUN: {min(limit, len(pending_now))} of {len(pending_now)} "
               f"pending file(s) would be processed across {jobs} worker(s):")
         for line in pending_now[:limit]:
-            print("  " + " ".join(build_claude_argv(driver.command_for(line))))
+            print("  " + " ".join(
+                build_agent_argv(driver.command_for(line), provider)))
         return
 
     # Same as the sequential runner: a stop request pending from another run is
@@ -419,13 +460,17 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     # Usage gate: a shared UsageSource (query/cache) plus the Driver's LimitPolicy
     # (which quotas to gate on). --ignore-usage turns both off.
-    source = None if args.ignore_usage else UsageSource()
-    policy = None if args.ignore_usage else (
-        driver.limit_policy or limits.default_policy())
+    source = None if args.ignore_usage else usage_source_for(provider)
+    policy = None
+    if source is not None:
+        policy = driver.limit_policy or limits.default_policy()
     usage_lock = threading.Lock()
     session_start_box = [time.time()]  # shared, refreshed when a window resets
 
-    if source is not None:
+    if not spec.supports_usage_limits:
+        print(f"  · usage limit policy: unavailable for {spec.display_name} "
+              "(provider stub)")
+    elif source is not None:
         policy.log_snapshot(source, "at start (parallel)")
 
     shared = Shared(driver, args.max)

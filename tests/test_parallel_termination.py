@@ -95,7 +95,7 @@ def test_worker_claims_before_touching_the_usage_gate(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
     # A source object is truthy so the gate branch is taken *if reached*.
-    monkeypatch.setattr(parallel, "UsageSource", lambda *a, **k: object())
+    monkeypatch.setattr(parallel, "usage_source_for", lambda provider: object())
 
     gate_calls = []
 

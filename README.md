@@ -1,7 +1,8 @@
 # claude-loop
 
-A reusable engine for **autonomous Claude-CLI loops**: it repeatedly invokes the
-`claude` CLI to grind through a unit of work, handling all the scaffolding —
+A reusable engine for **autonomous LLM-CLI loops** using Claude Code or Codex:
+it repeatedly invokes the selected CLI to grind through a unit of work,
+handling all the scaffolding —
 command-line parsing, a rotating mirror log, a git-push policy, the
 token-usage / session-window limit machinery, live stream-json rendering, and a
 graceful stop file — so a host project only has to say *what work to do each
@@ -20,7 +21,7 @@ The state machine is the headline shape. In essence the loop is just:
 
 ```
 while (state != error)
-    claude -p "Follow instructions in currentState.md"
+    selected_provider "Follow instructions in currentState.md"
 	state = readStateFrom("currentState.md")
 ```
 
@@ -59,7 +60,7 @@ mode, then rewrites the line to point at the next one. The
 
 Designed to be vendored as a **git submodule** under a host project. The code
 location and the project root are kept separate: the engine anchors every
-project-relative operation (git/claude cwd, the stop file, the relative paths a
+project-relative operation (git/agent cwd, the stop file, the relative paths a
 Driver is handed) to the project root — the current working directory by
 default, or `--project-dir`/`-C`.
 
@@ -69,10 +70,11 @@ default, or `--project-dir`/`-C`.
 claude_loop/
   cyclecore.py   engine: parse_args, run_loop, the Driver protocol,
                  git-push policy, mirror log, stream-json rendering
+  providers.py   Claude/Codex executable flags and argv construction
   usage.py       UsageSource: query / cache / parse the account's quota figures
   limits.py      LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
   drivers.py     StateFileDriver (state machine) and ListFileDriver (work queue)
-  parallel.py    run_parallel: N concurrent claude workers over a list file
+  parallel.py    run_parallel: N concurrent LLM workers over a list file
 examples/
   runCycle.py            state-machine wrapper
   runFileList.py         per-file work-queue wrapper
@@ -121,6 +123,7 @@ pass `--project-dir <path>` from anywhere):
 
 ```
 python runFileList.py               # drain the list, one file per iteration
+python runFileList.py --codex
 python runFileList.py --max-runs 5  # at most 5 iterations
 python runFileList.py --dry-run     # print the commands, run nothing
 ```
@@ -129,6 +132,15 @@ Items go out in random order by default, which keeps an interrupted run from
 draining one section of a grouped list before touching the rest. Set
 `pick_order = "list"` (or override `pick(pending)`) to hand them out top to
 bottom instead — the setting governs the parallel runner too.
+
+Claude remains the default for compatibility. Select Codex per invocation with
+`--codex`, or set `provider = "codex"` on the Driver subclass. An empty
+`model()` result lets the selected CLI use its configured default; a non-empty
+result is forwarded through that CLI's `--model` option. Codex runs through
+`codex exec --json` and the same sequential and parallel renderers show agent
+messages, commands, file changes, failures, and final token counts.
+The adapter grants writes only to the workspace and routes any approval through
+Codex's automatic reviewer; it does not bypass the sandbox.
 
 ### State-machine driver
 
@@ -166,7 +178,7 @@ if __name__ == "__main__":
 
 ## Usage limits
 
-Before each iteration (and after any failed one) the loop reads the account's
+For Claude, before each iteration (and after any failed one) the loop reads the account's
 quota figures and pauses if a watched one is at/over its ceiling. Which
 quota, and at what ceiling, is a *specialisation* you pick by setting the
 `limit_policy` class attribute on your Driver — a `LimitPolicy` holding one or
@@ -194,6 +206,12 @@ usage snapshots and the per-check status lines report exactly the quotas the
 active policy watches. When `--max-runs N` is given (a short bounded run) the
 limit gate is skipped entirely.
 
+Codex execution and JSONL rendering are implemented, but Codex quota retrieval
+is currently an explicit provider stub. A Codex run prints that the usage-limit
+policy is unavailable and never constructs the Claude `UsageSource`; failures
+still use the bounded consecutive-error retry path. This keeps the provider
+boundary correct until a Codex-specific quota source and policy are added.
+
 **Where the figures come from.** `usage.py` reads them over HTTP from the same
 endpoint the CLI's own `/usage` panel and status line are built from,
 authenticated with the OAuth token the CLI keeps in `~/.claude/.credentials.json`
@@ -213,6 +231,7 @@ carries no percentage, which is why the proactive check exists on top of it.
 
 | Option | Meaning |
 |---|---|
+| `--codex` | run Codex CLI instead of the Driver's default provider |
 | `-m, --max-runs N` | stop after N iterations (sequential) / N files total (parallel); `--max` is a deprecated alias |
 | `-d, --dry-run` | print the commands, run nothing |
 | `-g, --git-push none\|after_new_commits\|each_hour` | when to `git push` |

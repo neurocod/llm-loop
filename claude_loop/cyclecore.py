@@ -1,5 +1,5 @@
 """
-cyclecore.py - reusable engine behind the autonomous Claude-CLI loops.
+cyclecore.py - reusable engine behind autonomous Claude/Codex CLI loops.
 
 This module holds everything that is *not* specific to one particular task:
 command-line parsing, the rotating mirror log, the git-push policy, the whole
@@ -13,12 +13,12 @@ so the same engine drives both:
 
 A Driver answers three questions for the loop, via three hooks:
 
-  * next_command()  -> ClaudeCommand | None
+  * next_command()  -> AgentCommand | None
         The command to run this iteration, or None when there is no more work
         and the loop should stop normally. It may raise LoopStop to abort the
         whole run (e.g. an error state that needs a human).
   * on_success(rc)  -> None
-        Called after an iteration whose `claude` exited 0 — the place to record
+        Called after an iteration whose provider CLI exited 0 — the place to record
         progress (mark a file done, advance a cursor, …). Default: no-op.
   * final_summary() -> str | None
         A closing line printed on the way out (e.g. "Final state: …"). Optional.
@@ -27,16 +27,16 @@ Everything below is lifted verbatim from the original single-file runCycle.py,
 with the few state-specific pieces (which file to read, which prompt to send,
 which model to pick) factored out into the Driver protocol.
 
-Token-limit handling is driven by the account's real usage figures rather than
+Claude token-limit handling is driven by the account's real usage figures rather than
 guessed from error counts, in two layers:
 
   * proactive — before each iteration, and again immediately after any non-zero
-    `claude` exit, the loop asks the Driver's `limit_policy` for the current
+    Claude exit, the loop asks the Driver's `limit_policy` for the current
     quota percentages and pauses if any watched one is at/over its ceiling. The
     reading lives in usage.py (UsageSource, an HTTP GET of the usage endpoint)
     and the pausing policy in limits.py (LimitPolicy and the ready-made
     SessionLimit / DayNightLimit / WeeklyLimit rules).
-  * reactive — every run streams its own rate-limit verdict, which this module
+  * reactive — every Claude run streams its own rate-limit verdict, which this module
     picks out of the stream it is already parsing (see RateLimitEvent): a
     "rejected" means the wall was hit, and the loop waits that quota out even if
     the proactive reading was unavailable.
@@ -55,6 +55,12 @@ from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import NamedTuple, Optional
+
+from .providers import (
+    build_agent_argv as provider_argv,
+    provider_spec,
+    usage_source_for,
+)
 
 # Claude sessions last ~5 hours; after a token-limit error we wait out that window.
 CLAUDE_SESSION_DURATION = 5 * 60 * 60 + 3  # 5 hours as seconds and + 3s as a safety margin
@@ -96,7 +102,7 @@ except (AttributeError, ValueError):
     pass
 
 # The project root: the working directory of the project being driven. All
-# subprocesses (git, claude) run with this as their cwd, the relative
+# subprocesses (git, provider CLI) run with this as their cwd, the relative
 # state/list paths a Driver is given are resolved against it, and the stop/log
 # file names are derived from it.
 #
@@ -120,7 +126,7 @@ STOP_POLL_SECONDS = 2
 
 
 def set_project_root(path: Optional[str]) -> str:
-    """Point the engine at the project root (cwd for git/claude, base for the
+    """Point the engine at the project root (cwd for git/provider CLI, base for the
     stop file and relative Driver paths). `path` None/empty means "keep the
     current value" (which defaults to the process cwd). Returns the resolved
     absolute path.
@@ -154,7 +160,7 @@ def find_project_root(start: Optional[str] = None) -> Optional[str]:
     A wrapper that anchors the search to its own file location (rather than the
     process cwd) gets a project root that is independent of where the loop was
     launched from: run it from the repo root, from a subdirectory, or from
-    anywhere else and it lands on the same root — so git/claude run there, the
+    anywhere else and it lands on the same root — so git/provider CLI run there, the
     stop file lives there, and the model loads the root CLAUDE.md the same way
     every time. Returns None if no marker is found up to the filesystem root,
     leaving the engine's default (the current working directory) in place.
@@ -338,17 +344,21 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
     """
     p = argparse.ArgumentParser(
         prog=prog,
-        description=description or "Autonomous loop driving the Claude CLI.",
+        description=description or "Autonomous loop driving an LLM CLI.",
     )
-    # Option names are kept in sync with continuous_claude.py (kebab-case, and
-    # --max-runs for the iteration cap). The former spellings (--max, --startIn,
-    # --maxStrike) stay on as accepted aliases so existing invocations keep working.
+    # Most option names are kept in sync with continuous_claude.py (kebab-case,
+    # and --max-runs for the iteration cap). The former spellings (--max,
+    # --startIn, --maxStrike) stay on as accepted aliases so existing
+    # invocations keep working.
     p.add_argument("-m", "--max-runs", "--max", dest="max", type=int, default=None,
                    metavar="N",
                    help="stop after N iterations (default: run forever); "
                         "--max is a deprecated alias")
+    p.add_argument("--codex", action="store_const", const="codex",
+                   dest="provider", default=None,
+                   help="run Codex CLI instead of the Driver's default provider")
     p.add_argument("-d", "--dry-run", action="store_true",
-                   help="only print the commands, don't run claude")
+                   help="only print the commands, don't run the LLM CLI")
     p.add_argument("-c", "--cost", action="store_true",
                    help="print per-session cost totals from the mirror log and "
                         "exit (no loop is run)")
@@ -369,7 +379,7 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
                         f"(default: {GIT_PUSH_POLICY.value})")
     p.add_argument("-C", "--project-dir", dest="project_dir", metavar="DIR",
                    default=None,
-                   help="project root: cwd for git/claude, base for the stop "
+                   help="project root: cwd for git/provider CLI, base for the stop "
                         "file and the Driver's relative paths "
                         "(default: the current working directory)")
     return p.parse_args(argv)
@@ -479,17 +489,27 @@ def maybe_git_push(policy: GitPushPolicy, last_push: float) -> float:
     return last_push
 
 
-class ClaudeCommand(NamedTuple):
+class AgentCommand(NamedTuple):
     """One unit of work for the loop: the prompt to send, the model to use, and a
     short label shown in the iteration header. Drivers build these in
-    next_command(); build_claude_argv() turns one into the full `claude` argv.
+    next_command(); build_agent_argv() turns one into the provider's full argv.
 
-    An empty `model` means "no --model flag": the `claude` CLI then uses whatever
-    model it is configured to (its own default), which is the common case.
+    An empty `model` means "no --model flag": the selected provider then uses
+    its configured default, which is the common case.
     """
     prompt: str
     model: str = ""
     label: str = ""
+    provider: str = ""
+
+
+ClaudeCommand = AgentCommand
+
+
+def build_agent_argv(command: AgentCommand, provider: Optional[str] = None) -> list:
+    """Full provider command line for one unit of work."""
+    provider = provider or command.provider or "claude"
+    return provider_argv(command, provider, project_dir())
 
 
 def build_claude_argv(command: ClaudeCommand) -> list:
@@ -501,20 +521,7 @@ def build_claude_argv(command: ClaudeCommand) -> list:
     empty `command.model` omits --model entirely, letting the CLI pick its own
     configured default.
     """
-    argv = ["claude", "-p", command.prompt]
-    if command.model:
-        argv += ["--model", command.model]
-    argv += [
-        "--permission-mode", "acceptEdits",
-        # tools allowed without interactive confirmation
-        "--allowedTools", "Bash Edit Write Read Glob Grep WebFetch WebSearch",
-        # a stream of events instead of a single final answer — to see the work in progress
-        "--output-format", "stream-json",
-        "--verbose",
-        # text deltas as they are generated (we print token by token)
-        "--include-partial-messages",
-    ]
-    return argv
+    return build_agent_argv(command, "claude")
 
 
 def _short(text: str, limit: int = 200) -> str:
@@ -855,7 +862,7 @@ def last_rate_limit_event() -> Optional[RateLimitEvent]:
     return _last_rate_limit_event
 
 
-def _render_event(ev: dict, partial: bool) -> None:
+def _render_claude_event(ev: dict, partial: bool) -> None:
     """Print a single stream-json event in the style of interactive mode.
 
     partial=True — --include-partial-messages is enabled: we print text from the
@@ -944,14 +951,73 @@ def _render_event(ev: dict, partial: bool) -> None:
         return
 
 
-def run_claude_streaming(cmd: list, raw: bool, partial: bool) -> int:
-    """Runs claude, parses stream-json on the fly and prints the work in progress.
+def _render_codex_event(ev: dict) -> None:
+    """Render one event from ``codex exec --json``."""
+    event_type = ev.get("type")
+    item = ev.get("item") or {}
+    item_type = item.get("type")
 
-    The run's rate-limit verdict, if it streamed one, is left in
-    `last_rate_limit_event()` for the caller to act on.
+    if event_type == "thread.started":
+        thread_id = ev.get("thread_id") or "?"
+        print(f"  · session started (thread {thread_id})")
+        return
+
+    if event_type == "item.completed" and item_type == "agent_message":
+        _render_markdown_block(str(item.get("text") or ""))
+        return
+
+    if event_type == "item.started" and item_type == "command_execution":
+        command = _short(item.get("command", ""))
+        print_tool("Bash", command)
+        return
+
+    if event_type == "item.completed" and item_type == "command_execution":
+        exit_code = item.get("exit_code")
+        command = _short(item.get("command", ""), 160)
+        output = _short(item.get("aggregated_output", ""), 160)
+        mark = "✓" if exit_code in (None, 0) else "✗"
+        detail = f"exit {exit_code}: {command}" if exit_code is not None else command
+        if output:
+            detail += f" — {output}"
+        style = "green" if exit_code in (None, 0) else "red"
+        print_markup(f"    {mark} {detail}", f"    [{style}]{mark}[/] {_esc(detail)}")
+        return
+
+    if event_type == "item.completed" and item_type == "file_change":
+        changes = item.get("changes") or []
+        paths = [str(change.get("path")) for change in changes
+                 if isinstance(change, dict) and change.get("path")]
+        print_tool("Edit", ", ".join(paths) or "file changes applied")
+        return
+
+    if event_type == "turn.completed":
+        usage = ev.get("usage") or {}
+        bits = []
+        if usage:
+            bits.append(f"input {usage.get('input_tokens', 0)}")
+            cached = usage.get("cached_input_tokens", 0)
+            if cached:
+                bits.append(f"cached {cached}")
+            bits.append(f"output {usage.get('output_tokens', 0)}")
+        suffix = f" (tokens: {', '.join(bits)})" if bits else ""
+        print_done(f"  · done{suffix}")
+        return
+
+    if event_type in ("error", "turn.failed"):
+        error = ev.get("message") or ev.get("error") or item.get("error") or ev
+        print_error(f"  ⚠ result: {_short(error)}")
+
+
+def run_agent_streaming(cmd: list, provider: str, raw: bool,
+                        partial: bool = True) -> int:
+    """Run one provider CLI, parse its JSONL and render progress live.
+
+    Claude's rate-limit verdict, if streamed, is left in
+    ``last_rate_limit_event()``. Codex quota retrieval is not implemented yet.
     """
     global _last_rate_limit_event
     _last_rate_limit_event = None
+    spec = provider_spec(provider)
     try:
         proc = subprocess.Popen(
             cmd, cwd=PROJECT_DIR,
@@ -959,9 +1025,11 @@ def run_claude_streaming(cmd: list, raw: bool, partial: bool) -> int:
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
     except FileNotFoundError:
-        print("Executable 'claude' not found. Is the Claude CLI installed and on PATH?")
+        print(f"Executable {spec.executable!r} not found. "
+              f"Is {spec.display_name} installed and on PATH?")
         sys.exit(2)
 
+    provider_failed = False
     try:
         for line in proc.stdout:
             line = line.rstrip("\n")
@@ -976,12 +1044,23 @@ def run_claude_streaming(cmd: list, raw: bool, partial: bool) -> int:
                 # non-JSON line (e.g. CLI diagnostics) — print it as is
                 print(line)
                 continue
-            _render_event(ev, partial)
-        return proc.wait()
+            if provider == "claude":
+                _render_claude_event(ev, partial)
+            else:
+                _render_codex_event(ev)
+                provider_failed = provider_failed or ev.get("type") in (
+                    "error", "turn.failed")
+        returncode = proc.wait()
+        return 1 if returncode == 0 and provider_failed else returncode
     except KeyboardInterrupt:
         proc.terminate()
         print("\nInterrupted by user (Ctrl+C).")
         sys.exit(130)
+
+
+def run_claude_streaming(cmd: list, raw: bool, partial: bool) -> int:
+    """Backward-compatible Claude-only wrapper."""
+    return run_agent_streaming(cmd, "claude", raw, partial)
 
 
 def _fmt_clock(ts: float) -> str:
@@ -1159,6 +1238,7 @@ class Driver:
     app_name: Optional[str] = None      # names the rotating mirror log file
     prog: Optional[str] = None          # --help program name
     description: Optional[str] = None   # --help description (None = generic)
+    provider: str = "claude"            # may be overridden by --codex
 
     # --- usage-limit specialisation (declarative, like the labels above) ------
     # A limits.LimitPolicy picking which quota(s) to gate on and at what
@@ -1188,16 +1268,16 @@ class Driver:
             return cls.prog
         return os.path.basename(sys.argv[0]) or "runCycle.py"
 
-    def next_command(self) -> Optional[ClaudeCommand]:
+    def next_command(self) -> Optional[AgentCommand]:
         """The command to run this iteration, or None when work is exhausted and
         the loop should stop normally. May raise LoopStop to abort the run."""
         raise NotImplementedError
 
     def model(self) -> str:
-        """The Claude model to drive this iteration's command.
+        """The selected provider's model for this iteration.
 
-        Called by next_command() implementations to fill in ClaudeCommand.model.
-        The default returns "" — no --model flag, so the `claude` CLI uses its
+        Called by next_command() implementations to fill in AgentCommand.model.
+        The default returns "" — no --model flag, so the provider CLI uses its
         own configured model. Override this (the single model knob) to pin a
         specific model, pick a cheaper/faster one for mechanical work (e.g. a
         list driver translating files needs less than the main state machine), or
@@ -1206,7 +1286,7 @@ class Driver:
         return ""
 
     def on_success(self, returncode: int) -> None:
-        """Called after an iteration whose `claude` exited 0 — record progress
+        """Called after an iteration whose provider CLI exited 0 — record progress
         here (mark a file done, advance a cursor). Default: nothing to do."""
 
     def final_summary(self) -> Optional[str]:
@@ -1231,7 +1311,7 @@ class Driver:
 
 def run_loop(driver: Driver, args: argparse.Namespace,
              app_name: str = "runCycle") -> None:
-    """Drive the Claude CLI per `driver`, with all the shared session/limit/push
+    """Drive the selected provider per `driver`, with all shared lifecycle
     machinery. This is the former runCycle.main(), generalised: the only thing
     that changed is that "read currentState.md and pick a prompt" became
     `driver.next_command()`, and the closing "Final state" line became
@@ -1241,14 +1321,16 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # live in their own modules; imported here to avoid an import cycle
     # (limits/usage import cyclecore for its helpers).
     from . import limits
-    from .usage import UsageSource
 
+    provider = getattr(args, "provider", None) or driver.provider
+    spec = provider_spec(provider)
+    driver.provider = provider
     max_iters = args.max          # None = no limit
     # When a finite iteration cap is given (-m/--max-runs) the run is short and
     # bounded on purpose, so the usage-limit machinery (the LimitPolicy
     # pause-on-limit logic) is skipped — we just run the requested iterations
     # without ever waiting out a window.
-    ignore_usage_limits = max_iters is not None
+    ignore_usage_limits = max_iters is not None or not spec.supports_usage_limits
     dry_run = args.dry_run
     raw = args.raw
     start_in = args.start_in      # e.g. "29m" — delay before the loop starts
@@ -1262,7 +1344,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             print(f"Invalid --max-strike value {max_strike!r}: {e}")
             sys.exit(2)
 
-    # Anchor every project-relative operation (git/claude cwd, the stop file, the
+    # Anchor every project-relative operation (git/provider cwd, the stop file, the
     # log name, the Driver's paths) to the chosen root before anything reads it.
     set_project_root(getattr(args, "project_dir", None))
 
@@ -1279,6 +1361,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     sys.stderr = _TeeToLog(sys.stderr, logger)
     print(f"  · project root: {PROJECT_DIR}")
     print(f"  · logging to {log_file_path(app_name)}")
+    print(f"  · provider: {spec.display_name}")
     if not _RICH_AVAILABLE:
         print("  · Markdown rendering is off (the 'rich' library is missing). "
               "Enable it with:")
@@ -1296,18 +1379,23 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
     session_start = time.time()   # start of the current 5-hour session window
     consecutive_errors = 0        # reset to 0 after any successful iteration
-    usage_source = UsageSource()  # queries/caches the account's usage figures
-    limit_policy = driver.limit_policy or limits.default_policy()  # pauses on limit
+    usage_source = usage_source_for(provider)
+    limit_policy = None
+    if usage_source is not None:
+        limit_policy = driver.limit_policy or limits.default_policy()
     last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
     print(f"  · git push policy: {git_push_policy.value}")
-    if ignore_usage_limits:
+    if not spec.supports_usage_limits:
+        print(f"  · usage limit policy: unavailable for {spec.display_name} "
+              "(provider stub)")
+    elif ignore_usage_limits:
         print(f"  · usage limit policy: disabled (bounded run, --max {max_iters})")
     else:
         print_percents(f"  · usage limit policy: {limit_policy.describe()}")
 
     # Bookend the run with a usage snapshot (the policy's watched quotas) so each
     # run records where it started; the matching end-of-run snapshot is below.
-    if not dry_run:
+    if not dry_run and usage_source is not None:
         limit_policy.log_snapshot(usage_source, "at start (iteration 1)")
 
     iteration = 0
@@ -1390,7 +1478,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             f"[dim]\\[{state_label} · {model_label}][/]",
         )
 
-        cmd = build_claude_argv(command)
+        cmd = build_agent_argv(command, provider)
         if dry_run:
             print("DRY-RUN:", " ".join(cmd))
             # looping forever in dry-run is pointless — nothing is actually done,
@@ -1400,7 +1488,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 break
             continue
 
-        returncode = run_claude_streaming(cmd, raw, partial=True)
+        if provider == "claude":
+            returncode = run_claude_streaming(cmd, raw, partial=True)
+        else:
+            returncode = run_agent_streaming(cmd, provider, raw, partial=False)
 
         if returncode == 0:
             consecutive_errors = 0
@@ -1412,7 +1503,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # when the report was unavailable, which is the case this exists for.
         # Checked for both outcomes: a run refused on its last turn may still have
         # exited 0 with its work recorded above.
-        refusal = last_rate_limit_event()
+        refusal = last_rate_limit_event() if provider == "claude" else None
         if (not ignore_usage_limits and refusal is not None
                 and refusal.status == "rejected"):
             # +5s so we come back after the reset, not exactly on it.
@@ -1437,7 +1528,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # figures right away and let the real Current-session percentage decide.
         consecutive_errors += 1
         elapsed = time.time() - session_start
-        print_error(f"claude exited with code {returncode} "
+        print_error(f"{spec.display_name} exited with code {returncode} "
                     f"(error #{consecutive_errors} in a row).")
 
         if not ignore_usage_limits:
@@ -1450,13 +1541,18 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # Session is under the limit — this was a transient failure, not token
         # exhaustion. Retry, but don't spin forever if something is truly broken.
         if consecutive_errors < 5:
-            print(f"  ↻ Session under the allowed limit — likely transient. "
-                  f"Retrying immediately.")
+            if usage_source is None:
+                print("  ↻ Provider quota status is unavailable — retrying immediately.")
+            else:
+                print("  ↻ Session under the allowed limit — likely transient. "
+                      "Retrying immediately.")
             continue
         else:
-            print(f"  ⚠ {consecutive_errors} errors in a row with the session under "
-                  f"the allowed limit after {int(elapsed // 60)} min — not a "
-                  f"limit. Stopping.")
+            quota_state = ("with provider quota status unavailable"
+                           if usage_source is None
+                           else "with the session under the allowed limit")
+            print(f"  ⚠ {consecutive_errors} errors in a row {quota_state} after "
+                  f"{int(elapsed // 60)} min. Stopping.")
             sys.exit(returncode)
 
     # Final push: regardless of the EACH_HOUR cadence, push any pending commits
@@ -1474,7 +1570,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # logged before iteration 1 — so each run records where it finished. Forced
     # fresh (cache_value=False) so it reflects the true post-run state rather
     # than a possibly-recent cached reading from the last limit check.
-    if not dry_run:
+    if not dry_run and usage_source is not None:
         limit_policy.log_snapshot(usage_source, "at end (after last cycle)",
                                   cache_value=False)
 
