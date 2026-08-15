@@ -5,6 +5,7 @@ not: executable names, non-interactive flags, and command-line construction.
 """
 
 from dataclasses import dataclass
+import shutil
 from typing import Protocol
 
 
@@ -23,9 +24,7 @@ class ProviderSpec:
 
 PROVIDERS = {
     "claude": ProviderSpec("claude", "Claude Code", "claude", True),
-    # Codex quota retrieval is intentionally a separate follow-up: do not let a
-    # Codex run accidentally consult Claude's credentials or quota endpoint.
-    "codex": ProviderSpec("codex", "Codex CLI", "codex", False),
+    "codex": ProviderSpec("codex", "Codex CLI", "codex", True),
 }
 PROVIDER_NAMES = tuple(PROVIDERS)
 
@@ -41,7 +40,7 @@ def provider_spec(name: str) -> ProviderSpec:
 
 
 def usage_source_for(provider: str):
-    """Return the provider's quota source, or None while it has no adapter."""
+    """Return the selected provider's quota source."""
     spec = provider_spec(provider)
     if not spec.supports_usage_limits:
         return None
@@ -50,7 +49,17 @@ def usage_source_for(provider: str):
         # the package is being initialized.
         from .usage import UsageSource
         return UsageSource()
+    if provider == "codex":
+        from .codex_usage import CodexUsageSource
+        return CodexUsageSource()
     raise NotImplementedError(f"No usage source adapter for {spec.display_name}")
+
+
+def runtime_argv(argv: list[str], provider: str) -> list[str]:
+    """Resolve a provider shim (notably npm's ``codex.cmd`` on Windows)."""
+    spec = provider_spec(provider)
+    executable = shutil.which(spec.executable) or spec.executable
+    return [executable, *argv[1:]]
 
 
 def build_agent_argv(command: AgentCommandLike, provider: str,

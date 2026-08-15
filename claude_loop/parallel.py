@@ -49,7 +49,7 @@ from .cyclecore import (
     _describe_tool,
     _short,
 )
-from .providers import provider_spec, usage_source_for
+from .providers import provider_spec, runtime_argv, usage_source_for
 from .drivers import ListFileDriver
 
 # Default worker count. The work is cheap and fully independent, so a handful of
@@ -155,7 +155,7 @@ def run_job(job_id: int, command: AgentCommand) -> tuple:
     argv = build_agent_argv(command, provider)
     try:
         proc = subprocess.Popen(
-            argv, cwd=cyclecore.project_dir(),
+            runtime_argv(argv, provider), cwd=cyclecore.project_dir(),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
@@ -463,14 +463,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     source = None if args.ignore_usage else usage_source_for(provider)
     policy = None
     if source is not None:
-        policy = driver.limit_policy or limits.default_policy()
+        policy = driver.limit_policy or limits.default_policy(provider)
     usage_lock = threading.Lock()
     session_start_box = [time.time()]  # shared, refreshed when a window resets
 
-    if not spec.supports_usage_limits:
-        print(f"  · usage limit policy: unavailable for {spec.display_name} "
-              "(provider stub)")
-    elif source is not None:
+    if source is not None:
         policy.log_snapshot(source, "at start (parallel)")
 
     shared = Shared(driver, args.max)

@@ -347,8 +347,13 @@ class LimitPolicy:
             print_percents(f"      {ln}")
 
 
-def default_policy() -> LimitPolicy:
-    """The engine's default limit specialisation: the smart day/night session
-    rule (reproduces the historical behaviour). Used by run_loop / run_parallel
-    when a Driver leaves `limit_policy` unset."""
+def default_policy(provider: str = "claude") -> LimitPolicy:
+    """The provider-aware default limit specialisation.
+
+    Claude retains its historical smart session rule.  Codex plans can expose
+    a short session window, a weekly window, or only the weekly window, so its
+    default watches both shared slots and simply ignores an absent reading.
+    """
+    if provider == "codex":
+        return LimitPolicy([DayNightLimit(), WeeklyLimit()])
     return LimitPolicy([DayNightLimit()])

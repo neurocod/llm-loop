@@ -178,7 +178,7 @@ if __name__ == "__main__":
 
 ## Usage limits
 
-For Claude, before each iteration (and after any failed one) the loop reads the account's
+Before each iteration (and after any failed one) the loop reads the account's
 quota figures and pauses if a watched one is at/over its ceiling. Which
 quota, and at what ceiling, is a *specialisation* you pick by setting the
 `limit_policy` class attribute on your Driver — a `LimitPolicy` holding one or
@@ -201,18 +201,14 @@ class MyDriver(StateFileDriver):
 | `DayNightLimit(day=, night=, deadline_hour=)` | the session | day/night base + a climb toward 100% as the window nears its reset |
 | `WeeklyLimit(limit, sonnet_only=)` | the weekly quota | flat `limit`%, wait out the week |
 
-Leaving `limit_policy` unset uses `LimitPolicy([DayNightLimit()])`. The bookend
-usage snapshots and the per-check status lines report exactly the quotas the
-active policy watches. When `--max-runs N` is given (a short bounded run) the
-limit gate is skipped entirely.
+Leaving `limit_policy` unset keeps Claude's historical
+`LimitPolicy([DayNightLimit()])`. Codex defaults to the composite session and
+weekly policy because plans may expose both windows or only a weekly window.
+The bookend usage snapshots and per-check status lines report exactly the quotas
+the active policy watches. When `--max-runs N` is given (a short bounded run)
+the limit gate is skipped entirely.
 
-Codex execution and JSONL rendering are implemented, but Codex quota retrieval
-is currently an explicit provider stub. A Codex run prints that the usage-limit
-policy is unavailable and never constructs the Claude `UsageSource`; failures
-still use the bounded consecutive-error retry path. This keeps the provider
-boundary correct until a Codex-specific quota source and policy are added.
-
-**Where the figures come from.** `usage.py` reads them over HTTP from the same
+**Where the figures come from.** For Claude, `usage.py` reads them over HTTP from the same
 endpoint the CLI's own `/usage` panel and status line are built from,
 authenticated with the OAuth token the CLI keeps in `~/.claude/.credentials.json`
 (`CLAUDE_CONFIG_DIR` / `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_BASE_URL` are
@@ -220,12 +216,19 @@ honoured). No tokens, no model turn — the earlier `claude -p "/usage"` round-t
 that this replaced cost $0.33 and 17 s per check, i.e. it spent a slice of the
 very budget it was measuring.
 
-That endpoint is undocumented, so a failure is treated as "no figures" rather
-than a fatal error and the run falls back on the reactive half: every `claude`
-run streams its own `rate_limit_event` verdict, and a `rejected` makes the loop
-wait out exactly the quota that refused it (`cyclecore.RateLimitEvent`). That
-half costs nothing and cannot go stale — it is the wire's own answer — but it
-carries no percentage, which is why the proactive check exists on top of it.
+For Codex, `codex_usage.py` starts `codex app-server` and calls the official
+`account/rateLimits/read` JSONL/JSON-RPC method using the CLI's existing login.
+It does not start a thread or model turn. The returned window durations decide
+whether a reading is the short session quota or the long weekly quota, including
+weekly-only plans where Codex reports the seven-day window as `primary`.
+
+The Claude endpoint is undocumented, and either provider query can fail because
+of a temporary network, CLI, or authentication problem. A failure is therefore
+treated as "no figures" rather than a fatal error. Claude also has a reactive
+backstop: every run streams its own `rate_limit_event` verdict, and a `rejected`
+makes the loop wait out exactly the quota that refused it
+(`cyclecore.RateLimitEvent`). A failed Codex turn forces a fresh app-server
+reading before the bounded retry path continues.
 
 ## Common options
 

@@ -30,11 +30,11 @@ live in a submodule subdirectory while still driving the host project's repo.
 Pick a usage-limit specialisation with a Driver's `limit_policy` attribute, e.g.
 `LimitPolicy([SessionLimit(80)])`, `LimitPolicy([WeeklyLimit(90)])`, or a
 composite `LimitPolicy([DayNightLimit(), WeeklyLimit(90)])`; unset defaults to a
-day/night session rule.
+day/night session rule for Claude and a session-plus-weekly policy for Codex.
 
 See cyclecore for the engine and the Driver protocol, drivers for the two ready
-made Drivers, parallel for the concurrent list runner, usage for the quota
-query/parse layer and limits for the pausing policy.
+made Drivers, parallel for the concurrent list runner, usage/codex_usage for the
+provider quota query layers, and limits for the pausing policy.
 """
 
 from .cyclecore import (
@@ -63,8 +63,10 @@ from .providers import (
     PROVIDERS,
     ProviderSpec,
     provider_spec,
+    runtime_argv,
     usage_source_for,
 )
+from .codex_usage import CodexUsageSource, parse_rate_limits
 from .usage import Usage, UsageReading, UsageSource, oauth_token, parse_usage
 from .limits import (
     DayNightLimit,
@@ -81,6 +83,7 @@ from .parallel import parse_args as parse_parallel_args
 __all__ = [
     "AgentCommand",
     "ClaudeCommand",
+    "CodexUsageSource",
     "DayNightLimit",
     "Driver",
     "GitPushPolicy",
@@ -108,6 +111,7 @@ __all__ = [
     "parse_args",
     "parse_parallel_args",
     "parse_duration",
+    "parse_rate_limits",
     "parse_usage",
     "project_dir",
     "provider_spec",
@@ -116,6 +120,7 @@ __all__ = [
     "run_agent_streaming",
     "run_loop",
     "run_parallel",
+    "runtime_argv",
     "set_project_root",
     "usage_source_for",
 ]

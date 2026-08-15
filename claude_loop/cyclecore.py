@@ -59,6 +59,7 @@ from typing import NamedTuple, Optional
 from .providers import (
     build_agent_argv as provider_argv,
     provider_spec,
+    runtime_argv,
     usage_source_for,
 )
 
@@ -1013,14 +1014,15 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     """Run one provider CLI, parse its JSONL and render progress live.
 
     Claude's rate-limit verdict, if streamed, is left in
-    ``last_rate_limit_event()``. Codex quota retrieval is not implemented yet.
+    ``last_rate_limit_event()``. Codex limits are queried separately through
+    its app-server before and after turns.
     """
     global _last_rate_limit_event
     _last_rate_limit_event = None
     spec = provider_spec(provider)
     try:
         proc = subprocess.Popen(
-            cmd, cwd=PROJECT_DIR,
+            runtime_argv(cmd, provider), cwd=PROJECT_DIR,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
@@ -1382,13 +1384,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     usage_source = usage_source_for(provider)
     limit_policy = None
     if usage_source is not None:
-        limit_policy = driver.limit_policy or limits.default_policy()
+        limit_policy = driver.limit_policy or limits.default_policy(provider)
     last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
     print(f"  · git push policy: {git_push_policy.value}")
-    if not spec.supports_usage_limits:
-        print(f"  · usage limit policy: unavailable for {spec.display_name} "
-              "(provider stub)")
-    elif ignore_usage_limits:
+    if ignore_usage_limits:
         print(f"  · usage limit policy: disabled (bounded run, --max {max_iters})")
     else:
         print_percents(f"  · usage limit policy: {limit_policy.describe()}")

@@ -1,3 +1,5 @@
+import io
+import json
 import sys
 from pathlib import Path
 
@@ -5,9 +7,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from claude_loop import cyclecore
+from claude_loop import codex_usage, cyclecore, limits
 from claude_loop.cyclecore import AgentCommand, Driver
-from claude_loop.providers import build_agent_argv, provider_spec
+from claude_loop.providers import (build_agent_argv, provider_spec,
+                                   runtime_argv, usage_source_for)
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +40,120 @@ def test_codex_argv_is_non_interactive_jsonl():
 def test_unknown_provider_is_rejected():
     with pytest.raises(ValueError, match="Unknown LLM provider"):
         provider_spec("gemini")
+
+
+def test_codex_weekly_only_window_is_not_misclassified_as_a_session():
+    snapshot = codex_usage.parse_rate_limits({"rateLimits": {
+        "primary": {
+            "usedPercent": 16,
+            "windowDurationMins": 7 * 24 * 60,
+            "resetsAt": 1787231258,
+        },
+        "secondary": None,
+    }})
+    assert snapshot.session.percent is None
+    assert snapshot.week_all.percent == 16
+    assert snapshot.week_all.reset_ts == 1787231258
+    assert snapshot.summary_lines[0].startswith(
+        "Current week (all models): 16% used")
+
+
+def test_codex_short_and_long_windows_map_to_both_policy_slots():
+    snapshot = codex_usage.parse_rate_limits({"rateLimits": {
+        "primary": {
+            "usedPercent": 40,
+            "windowDurationMins": 300,
+            "resetsAt": 1000,
+        },
+        "secondary": {
+            "usedPercent": 80,
+            "windowDurationMins": 10080,
+            "resetsAt": 2000,
+        },
+    }})
+    assert snapshot.session.percent == 40
+    assert snapshot.session.reset_ts == 1000
+    assert snapshot.week_all.percent == 80
+    assert snapshot.week_all.reset_ts == 2000
+
+
+def test_codex_reached_window_is_treated_as_full():
+    snapshot = codex_usage.parse_rate_limits({"rateLimits": {
+        "primary": {"usedPercent": 42, "windowDurationMins": 300},
+        "rateLimitReachedType": "primary",
+    }})
+    assert snapshot.session.percent == 100
+
+
+def test_codex_default_policy_watches_session_and_week():
+    policy = limits.default_policy("codex")
+    assert [rule.label for rule in policy.rules] == [
+        "Current session", "Current week (all models)"]
+
+
+class _FakeAppServer:
+    class _Input(io.StringIO):
+        def close(self):
+            pass
+
+    def __init__(self, lines):
+        self.stdin = self._Input()
+        self.stdout = io.StringIO("".join(json.dumps(line) + "\n" for line in lines))
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+
+def test_codex_usage_source_uses_app_server_and_caches(monkeypatch):
+    created = []
+
+    def fake_popen(argv, **kwargs):
+        proc = _FakeAppServer([
+            {"id": 0, "result": {"userAgent": "test"}},
+            {"id": 1, "result": {"rateLimits": {
+                "primary": {"usedPercent": 16,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1787231258},
+                "secondary": None,
+            }}},
+        ])
+        created.append((argv, proc))
+        return proc
+
+    monkeypatch.setattr(codex_usage.shutil, "which", lambda name: "codex.CMD")
+    monkeypatch.setattr(codex_usage.subprocess, "Popen", fake_popen)
+    source = codex_usage.CodexUsageSource()
+    assert source.get_usage().week_all.percent == 16
+    assert source.get_usage().week_all.percent == 16
+    assert len(created) == 1
+    argv, proc = created[0]
+    assert argv == ["codex.CMD", "app-server"]
+    methods = [json.loads(line)["method"]
+               for line in proc.stdin.getvalue().splitlines()]
+    assert methods == ["initialize", "initialized", "account/rateLimits/read"]
+
+
+def test_codex_provider_constructs_its_own_usage_source():
+    assert isinstance(usage_source_for("codex"), codex_usage.CodexUsageSource)
+
+
+def test_runtime_argv_resolves_windows_command_shim(monkeypatch):
+    monkeypatch.setattr("claude_loop.providers.shutil.which",
+                        lambda executable: "C:/npm/codex.CMD")
+    assert runtime_argv(["codex", "exec", "prompt"], "codex") == [
+        "C:/npm/codex.CMD", "exec", "prompt"]
 
 
 def test_codex_events_render_message_commands_and_usage(capsys):
@@ -74,7 +191,7 @@ class _OneShotCodexDriver(Driver):
         return AgentCommand("do the thing", "", "thing", self.provider)
 
 
-def test_codex_dry_run_does_not_construct_claude_usage_source(
+def test_codex_dry_run_uses_codex_policy_not_claude_usage_source(
         tmp_path, monkeypatch, capsys):
     from claude_loop import usage
 
@@ -89,5 +206,6 @@ def test_codex_dry_run_does_not_construct_claude_usage_source(
     cyclecore.run_loop(_OneShotCodexDriver(), args, app_name="pytest-provider")
     output = capsys.readouterr().out
     assert "provider: Codex CLI" in output
-    assert "usage limit policy: unavailable for Codex CLI (provider stub)" in output
+    assert "Current session" in output
+    assert "Current week (all models)" in output
     assert "DRY-RUN: codex exec --json" in output
