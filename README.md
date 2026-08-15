@@ -138,7 +138,10 @@ Claude remains the default for compatibility. Select Codex per invocation with
 `model()` result lets the selected CLI use its configured default; a non-empty
 result is forwarded through that CLI's `--model` option. Codex runs through
 `codex exec --json` and the same sequential and parallel renderers show agent
-messages, commands, file changes, failures, and final token counts.
+messages, commands, file changes, failures, and final token counts. Its prompt
+is sent through a closed stdin stream (`codex exec ... -`) instead of argv,
+avoiding Windows command-line length limits without entering the interactive
+UI. Claude keeps its existing argv-based prompt transport.
 The adapter grants writes only to the workspace and routes any approval through
 Codex's automatic reviewer; it does not bypass the sandbox.
 

@@ -59,7 +59,7 @@ from typing import NamedTuple, Optional
 from .providers import (
     build_agent_argv as provider_argv,
     provider_spec,
-    runtime_argv,
+    start_agent_process,
     usage_source_for,
 )
 
@@ -1010,7 +1010,7 @@ def _render_codex_event(ev: dict) -> None:
 
 
 def run_agent_streaming(cmd: list, provider: str, raw: bool,
-                        partial: bool = True) -> int:
+                        partial: bool = True, prompt: str = "") -> int:
     """Run one provider CLI, parse its JSONL and render progress live.
 
     Claude's rate-limit verdict, if streamed, is left in
@@ -1021,11 +1021,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     _last_rate_limit_event = None
     spec = provider_spec(provider)
     try:
-        proc = subprocess.Popen(
-            runtime_argv(cmd, provider), cwd=PROJECT_DIR,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-        )
+        proc = start_agent_process(cmd, provider, prompt, PROJECT_DIR)
     except FileNotFoundError:
         print(f"Executable {spec.executable!r} not found. "
               f"Is {spec.display_name} installed and on PATH?")
@@ -1480,6 +1476,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         cmd = build_agent_argv(command, provider)
         if dry_run:
             print("DRY-RUN:", " ".join(cmd))
+            if provider == "codex":
+                print("STDIN:", command.prompt)
             # looping forever in dry-run is pointless — nothing is actually done,
             # so the driver would keep handing back the same first unit of work.
             if max_iters is None:
@@ -1490,7 +1488,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         if provider == "claude":
             returncode = run_claude_streaming(cmd, raw, partial=True)
         else:
-            returncode = run_agent_streaming(cmd, provider, raw, partial=False)
+            returncode = run_agent_streaming(
+                cmd, provider, raw, partial=False, prompt=command.prompt)
 
         if returncode == 0:
             consecutive_errors = 0

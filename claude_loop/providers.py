@@ -6,6 +6,7 @@ not: executable names, non-interactive flags, and command-line construction.
 
 from dataclasses import dataclass
 import shutil
+import subprocess
 from typing import Protocol
 
 
@@ -62,6 +63,42 @@ def runtime_argv(argv: list[str], provider: str) -> list[str]:
     return [executable, *argv[1:]]
 
 
+def start_agent_process(argv: list[str], provider: str, prompt: str,
+                        project_dir: str):
+    """Start a provider CLI with its provider-specific prompt transport.
+
+    Claude keeps the prompt in argv. Codex reads it from a closed stdin stream:
+    this preserves non-interactive JSONL mode while avoiding Windows command-line
+    length limits, especially when the executable is an npm ``codex.CMD`` shim.
+    """
+    kwargs = {
+        "cwd": project_dir,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
+    if provider == "codex":
+        kwargs["stdin"] = subprocess.PIPE
+
+    proc = subprocess.Popen(runtime_argv(argv, provider), **kwargs)
+    if provider == "codex":
+        try:
+            proc.stdin.write(prompt)
+        except (BrokenPipeError, OSError):
+            # The CLI may reject its flags before reading stdin. Its stdout/stderr
+            # still carries the useful diagnostic, so let the renderer show it.
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+    return proc
+
+
 def build_agent_argv(command: AgentCommandLike, provider: str,
                      project_dir: str) -> list[str]:
     """Build one unattended JSONL-producing provider invocation."""
@@ -91,5 +128,5 @@ def build_agent_argv(command: AgentCommandLike, provider: str,
     ]
     if command.model:
         argv += ["--model", command.model]
-    argv.append(command.prompt)
+    argv.append("-")
     return argv

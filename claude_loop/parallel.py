@@ -29,7 +29,6 @@ files processed this run (across all workers), not iterations.
 import argparse
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -49,7 +48,7 @@ from .cyclecore import (
     _describe_tool,
     _short,
 )
-from .providers import provider_spec, runtime_argv, usage_source_for
+from .providers import provider_spec, start_agent_process, usage_source_for
 from .drivers import ListFileDriver
 
 # Default worker count. The work is cheap and fully independent, so a handful of
@@ -154,11 +153,8 @@ def run_job(job_id: int, command: AgentCommand) -> tuple:
     spec = provider_spec(provider)
     argv = build_agent_argv(command, provider)
     try:
-        proc = subprocess.Popen(
-            runtime_argv(argv, provider), cwd=cyclecore.project_dir(),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-        )
+        proc = start_agent_process(
+            argv, provider, command.prompt, cyclecore.project_dir())
     except FileNotFoundError:
         emit_job(job_id, f"executable {spec.executable!r} not found on PATH.", "bold red")
         return 2, None, None
@@ -449,8 +445,10 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         print(f"DRY-RUN: {min(limit, len(pending_now))} of {len(pending_now)} "
               f"pending file(s) would be processed across {jobs} worker(s):")
         for line in pending_now[:limit]:
-            print("  " + " ".join(
-                build_agent_argv(driver.command_for(line), provider)))
+            command = driver.command_for(line)
+            print("  " + " ".join(build_agent_argv(command, provider)))
+            if provider == "codex":
+                print("    STDIN: " + command.prompt)
         return
 
     # Same as the sequential runner: a stop request pending from another run is

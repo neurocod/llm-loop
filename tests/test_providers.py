@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -7,10 +8,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from claude_loop import codex_usage, cyclecore, limits
+from claude_loop import codex_usage, cyclecore, limits, parallel, providers
 from claude_loop.cyclecore import AgentCommand, Driver
 from claude_loop.providers import (build_agent_argv, provider_spec,
-                                   runtime_argv, usage_source_for)
+                                   runtime_argv, start_agent_process,
+                                   usage_source_for)
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +36,8 @@ def test_codex_argv_is_non_interactive_jsonl():
     assert "--sandbox" not in argv
     assert argv[argv.index("-C") + 1] == "/repo"
     assert argv[argv.index("--model") + 1] == "gpt-test"
-    assert argv[-1] == "work"
+    assert "work" not in argv
+    assert argv[-1] == "-"
 
 
 def test_unknown_provider_is_rejected():
@@ -154,6 +157,99 @@ def test_runtime_argv_resolves_windows_command_shim(monkeypatch):
                         lambda executable: "C:/npm/codex.CMD")
     assert runtime_argv(["codex", "exec", "prompt"], "codex") == [
         "C:/npm/codex.CMD", "exec", "prompt"]
+
+
+class _PromptSink:
+    def __init__(self):
+        self.text = ""
+        self.closed = False
+
+    def write(self, value):
+        self.text += value
+        return len(value)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeAgentProcess:
+    def __init__(self, has_stdin=True):
+        self.stdin = _PromptSink() if has_stdin else None
+        self.stdout = io.StringIO("")
+
+    def wait(self):
+        return 0
+
+
+def test_codex_process_receives_prompt_via_closed_stdin(monkeypatch):
+    created = []
+
+    def fake_popen(argv, **kwargs):
+        proc = _FakeAgentProcess(has_stdin=kwargs.get("stdin") is subprocess.PIPE)
+        created.append((argv, kwargs, proc))
+        return proc
+
+    monkeypatch.setattr(providers.subprocess, "Popen", fake_popen)
+    prompt = "x" * 50_000
+
+    proc = start_agent_process(
+        ["codex", "exec", "--json", "-"], "codex", prompt, "/repo")
+
+    argv, kwargs, _ = created[0]
+    assert argv[-1] == "-"
+    assert kwargs["stdin"] is subprocess.PIPE
+    assert proc.stdin.text == prompt
+    assert proc.stdin.closed
+
+
+def test_claude_process_keeps_prompt_out_of_stdin(monkeypatch):
+    created = []
+
+    def fake_popen(argv, **kwargs):
+        proc = _FakeAgentProcess(has_stdin=False)
+        created.append((argv, kwargs, proc))
+        return proc
+
+    monkeypatch.setattr(providers.subprocess, "Popen", fake_popen)
+    argv = ["claude", "-p", "work", "--output-format", "stream-json"]
+
+    proc = start_agent_process(argv, "claude", "work", "/repo")
+
+    launched, kwargs, _ = created[0]
+    assert launched[1:] == argv[1:]
+    assert "stdin" not in kwargs
+    assert proc.stdin is None
+
+
+def test_sequential_codex_runner_forwards_prompt_to_stdin_transport(monkeypatch):
+    calls = []
+
+    def fake_start(argv, provider, prompt, project_dir):
+        calls.append((argv, provider, prompt, project_dir))
+        return _FakeAgentProcess(has_stdin=False)
+
+    monkeypatch.setattr(cyclecore, "start_agent_process", fake_start)
+
+    assert cyclecore.run_agent_streaming(
+        ["codex", "exec", "--json", "-"], "codex", False,
+        prompt="sequential prompt",
+    ) == 0
+    assert calls[0][1:3] == ("codex", "sequential prompt")
+
+
+def test_parallel_codex_runner_forwards_prompt_to_stdin_transport(monkeypatch):
+    calls = []
+
+    def fake_start(argv, provider, prompt, project_dir):
+        calls.append((argv, provider, prompt, project_dir))
+        return _FakeAgentProcess(has_stdin=False)
+
+    monkeypatch.setattr(parallel, "start_agent_process", fake_start)
+    command = AgentCommand("parallel prompt", "gpt-test", "job", "codex")
+
+    assert parallel.run_job(1, command)[0] == 0
+    assert calls[0][0][-1] == "-"
+    assert calls[0][1:3] == ("codex", "parallel prompt")
 
 
 def test_codex_events_render_message_commands_and_usage(capsys):
