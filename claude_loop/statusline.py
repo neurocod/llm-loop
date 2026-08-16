@@ -1493,6 +1493,9 @@ class StatusApp:
         self._started = False
         self._services: List[object] = []
         self._requested_stop = False      # did WE write the sentinel? (see below)
+        # Guards the ownership flag against the sentinel itself: the key press,
+        # the cancel and the repaint's re-sync all move the pair together.
+        self._stop_lock = threading.Lock()
         self._atexit_registered = False
         self._signal_handlers: List[Tuple[int, object]] = []
         if default_actions:
@@ -1694,26 +1697,35 @@ class StatusApp:
         """Create the sentinel. The loop claims and removes it (see
         `cyclecore.stop_file_lifecycle`); we deliberately do not latch it here,
         so a cancel before the loop notices leaves no trace."""
-        try:
-            with open(self.stop_file, "w", encoding="utf-8") as fh:
-                fh.write("")
-        except OSError as exc:
-            self.note(f"could not create {self.stop_file}: {exc}")
-            return
-        self._requested_stop = True
-        self.status.update(stop_pending=True)
+        with self._stop_lock:
+            # Claim ownership BEFORE the sentinel exists, never after: a runner
+            # polling in between would find a sentinel nobody owns, read this
+            # key press as somebody else's `touch stop`, and skip the cancel
+            # grace — losing precisely the mis-press the grace exists for. The
+            # claim is unobservable until the file is there, so it is free.
+            self._requested_stop = True
+            self.status.update(stop_pending=True)
+            try:
+                with open(self.stop_file, "w", encoding="utf-8") as fh:
+                    fh.write("")
+            except OSError as exc:
+                self._requested_stop = False
+                self.status.update(stop_pending=False)
+                self.note(f"could not create {self.stop_file}: {exc}")
+                return
         self.note("stop requested — the loop halts at the next iteration boundary")
 
     def cancel_stop(self) -> None:
-        try:
-            os.remove(self.stop_file)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            self.note(f"could not remove {self.stop_file}: {exc}")
-            return
-        self._requested_stop = False
-        self.status.update(stop_pending=False)
+        with self._stop_lock:
+            try:
+                os.remove(self.stop_file)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self.note(f"could not remove {self.stop_file}: {exc}")
+                return
+            self._requested_stop = False
+            self.status.update(stop_pending=False)
         self.note("stop request cancelled")
 
     # --- actions, modes, events --------------------------------------------
@@ -1820,13 +1832,16 @@ class StatusApp:
                     self.status.update(note="")
                 if ticks % 4 == 0:
                     # Also catches a sentinel created by hand (`touch stop`).
-                    pending = os.path.exists(self.stop_file)
-                    if pending != self.status.stop_pending:
-                        if not pending:
-                            # Removed behind our back: whatever `s` asked for is
-                            # void, so the cancel grace must not claim it.
-                            self._requested_stop = False
-                        self.status.update(stop_pending=pending)
+                    # Under the same lock as the key press, so a re-sync landing
+                    # mid-request cannot disown a sentinel we are still writing.
+                    with self._stop_lock:
+                        pending = os.path.exists(self.stop_file)
+                        if pending != self.status.stop_pending:
+                            if not pending:
+                                # Removed behind our back: whatever `s` asked
+                                # for is void, so the grace must not claim it.
+                                self._requested_stop = False
+                            self.status.update(stop_pending=pending)
                 # Re-assert the region on the periodic repaint: see Terminal.paint.
                 self._paint(reassert=True)
             except Exception:

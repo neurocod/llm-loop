@@ -36,6 +36,7 @@ from typing import Optional
 
 from . import cyclecore
 from . import limits
+from . import statusline
 from .cyclecore import (
     AgentCommand,
     GitPushPolicy,
@@ -62,6 +63,12 @@ DEFAULT_JOBS = 10
 # the `failed` set so it stops blocking the queue (and is reported at the end)
 # instead of being retried forever.
 MAX_ATTEMPTS = 3
+
+# How often a worker holding an interactive stop request re-reads the sentinel.
+# It is the responsiveness of "press s again to cancel" — the sequential loop's
+# countdown polls at the same rate (cyclecore.confirm_stop_request) — and the
+# only cost is one os.path.exists per idle worker.
+STOP_RECHECK_SECONDS = 0.25
 
 # Serialises every line printed by any worker so the compact per-job lines never
 # interleave mid-line (each print is atomic, the renderers are not thread-safe).
@@ -266,6 +273,12 @@ class Shared:
         self.max_items = max_items
         self.stop = threading.Event()  # cancel/wake the run on stop-file / no-work
         self.claims_closed = threading.Event()  # max reached: finish in-flight work
+        # A stop request closes claims too, but REVERSIBLY (see reopen_claims).
+        # Deliberately a second flag: cancelling a mis-pressed `s` must never be
+        # able to reopen a run whose claims closed because it hit --max-runs or
+        # drained the list, and one shared flag could not tell those apart.
+        self.stop_requested = threading.Event()
+        self.stop_owner = None        # job_id deciding the request's fate
         self.stop_reason = None
 
     def claim(self) -> Optional[str]:
@@ -273,10 +286,11 @@ class Shared:
 
         Returns the claimed raw line, or None. `claims_closed` distinguishes a
         clean max-items boundary (finish in-flight work, issue nothing new) from
-        a temporarily busy queue; `stop` cancels claims held at a usage gate.
+        a temporarily busy queue; `stop_requested` closes claims for a pending
+        stop sentinel; `stop` cancels claims held at a usage gate.
         """
         with self.lock:
-            if self.claims_closed.is_set():
+            if self.claims_closed.is_set() or self.stop_requested.is_set():
                 return None
             if self.max_items is not None and self.claimed >= self.max_items:
                 self.stop_reason = RunStopReason.LIMIT_REACHED
@@ -332,34 +346,137 @@ class Shared:
             remaining = len(self.driver.pending_lines())
             return self.done, remaining
 
+    # --- the stop request: closing claims is not the same as ending the run ----
+
+    def request_stop(self, job_id: int) -> tuple:
+        """Close new claims for a pending sentinel; returns (owner, first).
+
+        Work in flight is untouched — and this close is undoable, which is what
+        makes `s` a toggle for as long as a job row is still moving.
+
+        `owner` marks the ONE worker that decides the request's fate: N workers
+        each running the cancel countdown would fight over the note row and each
+        latch on its own deadline. `first` is True only on the pass that opened
+        the request, so the log line is written once however many workers see it.
+        """
+        with self.lock:
+            first = not self.stop_requested.is_set()
+            if first:
+                self.stop_owner = job_id
+            self.stop_requested.set()
+            return self.stop_owner == job_id, first
+
+    def reopen_claims(self) -> bool:
+        """The sentinel went away again: resume claiming. True if it had closed.
+
+        Only the stop close is undone. `claims_closed` (--max-runs, drained list)
+        is final by design: a max-items stop must not become cancellable just
+        because somebody removed a stop file.
+        """
+        with self.lock:
+            if not self.stop_requested.is_set():
+                return False
+            self.stop_requested.clear()
+            self.stop_owner = None
+            return True
+
+    def latch_stop(self) -> bool:
+        """End the run on the sentinel, for good. True for the worker that did it.
+
+        Returning True exactly once is what keeps the announcement (and the
+        lifecycle latch) single when every worker sees the file at the same time.
+        """
+        with self.lock:
+            if self.stop.is_set():
+                return False
+            cyclecore.mark_stop_file_detected()
+            self.stop_reason = RunStopReason.STOP_FILE
+            self.claims_closed.set()
+            self.stop.set()
+            return True
+
+    def busy(self) -> bool:
+        """Is any file in flight? (claimed and not yet finished or released)."""
+        with self.lock:
+            return bool(self.in_progress)
+
 
 # --- worker loop ---------------------------------------------------------------
 
+def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
+    """React to the stop sentinel from one worker. True => leave the run now.
+
+    Three outcomes, and telling them apart is the whole point:
+
+      * no sentinel — carry on claiming (and reopen claims if a request that
+        closed them has since been withdrawn, so a mis-pressed `s` costs
+        nothing but the files not claimed in between);
+      * this run's own interactive request — close new claims and HOLD while any
+        job is still in flight, leaving the toggle usable for as long as the
+        user can see a job row moving;
+      * anything else — latch it and end the run.
+
+    The grace is interactive-only, exactly as in `cyclecore.confirm_stop_request`:
+    a sentinel this run did not write (a script's `touch stop`, another run) has
+    nobody sitting here to press `s` again, so it must stop the run as promptly
+    as it always did.
+    """
+    if not os.path.exists(cyclecore.STOP_FILE):
+        if shared.reopen_claims():
+            emit_job(job_id, "stop request withdrawn — claiming files again.",
+                     "cyan")
+            app.update(phase="running")
+        return False
+
+    owner, first = shared.request_stop(job_id)
+    if app.enabled and app.stop_requested_here:
+        if first:
+            app.update(phase="stopping")
+            emit_job(job_id, "stop requested — no new files will be claimed; "
+                     "press s again to cancel while a job is still running.",
+                     "yellow")
+        # Held, not ended, while the owner decides: the sentinel may yet
+        # disappear. `stop.wait` rather than sleep so the latch releases this
+        # worker at once instead of after the poll interval.
+        if not owner or shared.busy():
+            shared.stop.wait(STOP_RECHECK_SECONDS)
+            return False
+        # Nothing left in flight: the same countdown the sequential loop holds
+        # at its iteration boundary, so both runners define "the user really
+        # meant it" identically. False => the sentinel went away, and the next
+        # pass reopens the claims.
+        if not cyclecore.confirm_stop_request(app):
+            return False
+    if shared.latch_stop():
+        # The outermost application lifecycle removes the sentinel only after all
+        # workers and wrapper-level cleanup have finished.
+        emit_job(job_id, "stop file detected — stopping; kept until "
+                 "application exit.", "bold red")
+        app.update(phase="stopping")
+    return True
+
+
 def worker(job_id: int, shared: Shared, source: Optional[object],
-           policy, session_start_box: list, usage_lock: threading.Lock) -> None:
+           policy, session_start_box: list, usage_lock: threading.Lock,
+           app=None) -> None:
     """One worker thread: claim -> (usage gate) -> run -> record, repeat.
 
-    Loops until the queue drains, the claim cap closes, or the shared stop flag is
-    set by the stop file. A claim that returns None while both signals remain clear
-    means everything left is in flight elsewhere, so we briefly back off and retry.
-    `source`/`policy` are None when --ignore-usage disables the session-limit gate.
+    Loops until the queue drains, the claim cap closes, or the stop sentinel is
+    latched (see apply_stop_request). A claim that returns None while every signal
+    remains clear means everything left is in flight elsewhere, so we briefly back
+    off and retry. `source`/`policy` are None when --ignore-usage disables the
+    session-limit gate. `app` is this run's status line; each worker owns the Job
+    of its own number, and Job's mutators are lock-guarded for exactly that.
     """
+    # A disabled StatusApp is a Null object: no terminal, no threads, every call
+    # below a no-op — so the worker has no `if app is not None` in it.
+    app = app if app is not None else statusline.StatusApp(enabled=False)
+    job = app.job(job_id)
     while not shared.stop.is_set():
-        if os.path.exists(cyclecore.STOP_FILE):
-            # First worker to see it latches the request and stops the whole run.
-            # The outermost application lifecycle removes the sentinel only after
-            # all workers and wrapper-level cleanup have finished.
-            with shared.lock:
-                if (not shared.stop.is_set()
-                        and os.path.exists(cyclecore.STOP_FILE)):
-                    cyclecore.mark_stop_file_detected()
-                    emit_job(job_id, "stop file detected — stopping; kept until "
-                             "application exit.",
-                             "bold red")
-                shared.stop_reason = RunStopReason.STOP_FILE
-                shared.claims_closed.set()
-                shared.stop.set()
+        if apply_stop_request(job_id, shared, app):
             break
+        if shared.stop_requested.is_set():
+            continue  # holding the grace: do not fall into the claim back-off
 
         # Claim work FIRST, before the session-limit gate. The gate can block for a
         # long time when the budget is spent, and its wait loop does not watch the
@@ -385,6 +502,10 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                         source, session_start_box[0])
                     if paused:
                         session_start_box[0] = new_start
+                    # The check just paid for a usage reading; publishing it here
+                    # is what keeps the provider's live figures on the pinned row
+                    # without a second round-trip (the cache serves it).
+                    statusline.push_quotas(app, source, policy)
 
         # A stop file may have arrived while we waited for the lock or paused on
         # the budget: return the claimed file to the queue and exit without
@@ -395,8 +516,16 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             break
 
         command = shared.driver.command_for(line)
+        # The same three calls the sequential loop makes on its single Job: the
+        # Job clock times THIS file, the run clock (latched once) times the run.
+        started_at = time.time()
+        app.mark_run_started(started_at)
+        job.start(item=command.label, model=command.model,
+                  prompt=command.prompt, now=started_at)
+        app.update(iteration=shared.claimed, phase="running")
         emit_job(job_id, f"▶ {command.label}", "bold cyan")
         rc, cost_usd, dur = run_job(job_id, command)
+        job.finish()
         ok = rc == 0
         done_total, remaining = shared.finish(line, ok)
 
@@ -471,11 +600,21 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         limit = args.max if args.max is not None else len(pending_now)
         print(f"DRY-RUN: {min(limit, len(pending_now))} of {len(pending_now)} "
               f"pending file(s) would be processed across {jobs} worker(s):")
+        first_command = None
         for line in pending_now[:limit]:
             command = driver.command_for(line)
+            first_command = first_command or command
             print("  " + " ".join(build_agent_argv(command, provider)))
             if provider == "codex":
                 print("    STDIN: " + command.prompt)
+        if first_command is not None:
+            # The argv lines above are what would be executed, but for claude the
+            # whole prompt sits inside one joined `-p …` token and is unreadable —
+            # and reading the prompt is what a dry run is for. Once, for job 1,
+            # through the one formatter every prompt view shares.
+            print(statusline.format_prompt_block(
+                job_id=1, label=first_command.label, prompt=first_command.prompt,
+                width=statusline.screen_width()))
         return RunResult(RunStopReason.DRY_RUN, remaining=len(pending_now))
 
     # Same as the sequential runner: a stop request pending from another run is
@@ -498,6 +637,38 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     shared = Shared(driver, args.max)
 
+    # The pinned status area. A Job is the unit of display in BOTH runners, so
+    # this is the sequential loop's wiring with N Jobs instead of one — no branch
+    # anywhere in the status line separates them. Disabled it is a Null object,
+    # so every call below stays a no-op and the run behaves exactly as before.
+    settings = statusline.SettingsRegistry()
+    settings.add(statusline.NumberSetting(
+        "max-runs", "--max-runs",
+        # Bound to Shared, not to a copy: here --max-runs caps FILES and the
+        # claim loop is what enforces it, so an edited cap (wave 2) lands in the
+        # one place that reads it. The run's other flags (-j, --git-push) are
+        # consumed when the threads are created and cannot be re-read mid-run,
+        # so they are printed in the header rather than offered as knobs.
+        lambda: shared.max_items,
+        lambda value: setattr(shared, "max_items",
+                              None if value is None else int(value)),
+        minimum=1))
+    app = statusline.StatusApp(
+        status=statusline.LoopStatus(
+            jobs=[statusline.Job(j) for j in range(1, jobs + 1)]),
+        settings=settings,
+        enabled=not getattr(args, "no_statusline", False))
+    app.update(
+        provider=provider,
+        # One claimed file is one iteration of work here, so the counter pair on
+        # the summary row reads honestly against a cap that counts files.
+        max_iterations=shared.max_items,
+        # Only a list driver has a pick order; read defensively so any other
+        # driver simply reports no `rand` marker.
+        random_order=str(getattr(driver, "pick_order", "")) == "random",
+        script_limits=settings.status_entries(),
+    )
+
     # Push pending commits up front on EACH_HOUR/AFTER_NEW_COMMITS, then let a
     # background pusher apply the policy on its cadence while workers run. git is
     # not thread-safe to call concurrently, so all pushes go through one thread.
@@ -512,7 +683,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     threads = [
         threading.Thread(target=worker, name=f"job{j}",
                          args=(j, shared, source, policy, session_start_box,
-                               usage_lock),
+                               usage_lock, app),
                          daemon=True)
         for j in range(1, jobs + 1)
     ]
@@ -520,24 +691,39 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     if git_push_policy != GitPushPolicy.NONE:
         pusher = threading.Thread(target=push_pump, name="pusher", daemon=True)
 
-    for t in threads:
-        t.start()
-    if pusher is not None:
-        pusher.start()
-
-    try:
+    # The region lives exactly as long as the workers do (run_loop releases it
+    # the same way, before its final push): a periodic run alternates batches of
+    # this runner with sequential grow-kit sweeps, and two status areas pinned at
+    # once would fight over the same rows.
+    with app:
+        if source is not None:
+            # Inside `with`, not before it: push_quotas is silent until start()
+            # has marked the app enabled. The reading is already paid for by the
+            # start-of-run snapshot above, so this costs no round-trip. The
+            # refresher only runs for a run that talks to the usage endpoint at
+            # all — with --ignore-usage `source` is None and nothing polls.
+            statusline.push_quotas(app, source, policy)
+            app.add_service(statusline.QuotaRefresher(
+                app, source, policy, provider=provider))
         for t in threads:
-            t.join()
-    except KeyboardInterrupt:
-        print("\nInterrupted by user (Ctrl+C) — signalling workers to stop…")
-        shared.stop.set()
-        for t in threads:
-            t.join(timeout=5)
-        sys.exit(130)
+            t.start()
+        if pusher is not None:
+            pusher.start()
 
-    shared.stop.set()  # release the pusher's wait()
-    if pusher is not None:
-        pusher.join(timeout=5)
+        try:
+            for t in threads:
+                t.join()
+        except KeyboardInterrupt:
+            print("\nInterrupted by user (Ctrl+C) — signalling workers to stop…")
+            shared.stop.set()
+            for t in threads:
+                t.join(timeout=5)
+            sys.exit(130)
+
+        shared.stop.set()  # release the pusher's wait()
+        if pusher is not None:
+            pusher.join(timeout=5)
+        app.update(phase="idle")
 
     # Final push on the way out (unless policy is NONE), mirroring run_loop.
     if git_push_policy != GitPushPolicy.NONE:
