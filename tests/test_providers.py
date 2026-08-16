@@ -173,9 +173,9 @@ class _PromptSink:
 
 
 class _FakeAgentProcess:
-    def __init__(self, has_stdin=True):
+    def __init__(self, has_stdin=True, stdout=""):
         self.stdin = _PromptSink() if has_stdin else None
-        self.stdout = io.StringIO("")
+        self.stdout = io.StringIO(stdout)
 
     def wait(self):
         return 0
@@ -250,6 +250,28 @@ def test_parallel_codex_runner_forwards_prompt_to_stdin_transport(monkeypatch):
     assert parallel.run_job(1, command)[0] == 0
     assert calls[0][0][-1] == "-"
     assert calls[0][1:3] == ("codex", "parallel prompt")
+
+
+def test_sequential_runner_treats_json_number_as_diagnostic(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cyclecore, "start_agent_process",
+        lambda *args: _FakeAgentProcess(has_stdin=False, stdout="0\n"),
+    )
+
+    assert cyclecore.run_agent_streaming(
+        ["codex", "exec", "--json", "-"], "codex", False,
+    ) == 0
+    assert capsys.readouterr().out.strip() == "0"
+
+
+def test_parallel_runner_ignores_json_number(monkeypatch):
+    monkeypatch.setattr(
+        parallel, "start_agent_process",
+        lambda *args: _FakeAgentProcess(has_stdin=False, stdout="0\n"),
+    )
+
+    command = AgentCommand("parallel prompt", "gpt-test", "job", "codex")
+    assert parallel.run_job(1, command) == (0, None, None)
 
 
 def test_codex_events_render_message_commands_and_usage(capsys):

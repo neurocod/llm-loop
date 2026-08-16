@@ -172,6 +172,8 @@ def run_job(job_id: int, command: AgentCommand) -> tuple:
             ev = json.loads(line)
         except json.JSONDecodeError:
             continue  # non-JSON CLI diagnostics — skip in compact mode
+        if not isinstance(ev, dict):
+            continue  # valid JSON can still be a diagnostic, not an event
         et = ev.get("type")
         if provider == "codex":
             item = ev.get("item") or {}

@@ -1061,6 +1061,10 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                 # non-JSON line (e.g. CLI diagnostics) — print it as is
                 print(line)
                 continue
+            if not isinstance(ev, dict):
+                # A JSON scalar/array is diagnostic output, not a JSONL event.
+                print(line)
+                continue
             if provider == "claude":
                 _render_claude_event(ev, partial)
             else:
