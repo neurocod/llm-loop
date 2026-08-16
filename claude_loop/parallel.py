@@ -120,7 +120,7 @@ def _emit_markup(plain: str, markup: str) -> None:
 
 def _job_tag(job_id: int) -> tuple:
     """(plain, markup) prefix identifying a worker, e.g. '[job 2]'."""
-    return f"[job {job_id}]", f"[cyan][job {job_id}][/]"
+    return f"[job {job_id}]", f"[cyan]\\[job {job_id}][/]"
 
 
 def emit_job(job_id: int, plain: str, style: Optional[str] = None) -> None:

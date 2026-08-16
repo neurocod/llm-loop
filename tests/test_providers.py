@@ -252,6 +252,13 @@ def test_parallel_codex_runner_forwards_prompt_to_stdin_transport(monkeypatch):
     assert calls[0][1:3] == ("codex", "parallel prompt")
 
 
+def test_parallel_job_tag_remains_visible_in_rich_markup():
+    rich_markup = pytest.importorskip("rich.markup")
+    plain, markup = parallel._job_tag(3)
+
+    assert rich_markup.render(markup).plain == plain
+
+
 @pytest.mark.parametrize("line", ["0", "null", "true", '"text"', "[]", "[1]"])
 def test_sequential_runner_treats_non_object_json_as_diagnostic(
         monkeypatch, capsys, line):
