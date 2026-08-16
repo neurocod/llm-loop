@@ -1,15 +1,17 @@
-"""The `stop` sentinel and who may consume it.
+"""The `stop` sentinel and who may claim it.
 
-A stop file is a one-shot signal: the run that honours it also removes it, so
-the next launch starts clean. That makes *who* removes it a correctness
+A stop file is a one-shot signal: the run that honours it keeps it through its
+complete application cleanup, then removes it immediately before exit so the
+next launch starts clean. That makes *who* claims and removes it a correctness
 question. A `--dry-run` previews the commands a run would build, and it is
 routinely used while a real loop is running — which is exactly when a stop is
 pending. A dry run that consumed the sentinel would silently cancel someone
 else's stop request, and the loop it was meant to halt would keep going.
 
-So: the already-running owner consumes it at an iteration boundary, a new real
+So: the already-running owner claims it at an iteration boundary, a new real
 launch waits for it to disappear, and a dry run reports it without touching it.
-Both runners are covered, since either entry point could regress independently.
+The owner removes it only at its outermost lifecycle exit. Both runners are
+covered, since either entry point could regress independently.
 """
 
 import os
@@ -49,6 +51,17 @@ class _OneShotDriver(Driver):
         return ClaudeCommand("do the thing", "", "the-thing")
 
 
+class _StopAfterOneDriver(_OneShotDriver):
+    """Creates the sentinel after its first completed provider call."""
+
+    def __init__(self, stop: Path):
+        super().__init__()
+        self.stop = stop
+
+    def on_success(self, returncode):
+        self.stop.write_text("", encoding="utf-8")
+
+
 class _StubPolicy:
     """A LimitPolicy that never reads the usage report and never pauses."""
 
@@ -77,6 +90,12 @@ class _MemListDriver(ListFileDriver):
 
     def pending_lines(self):
         return list(self._items)
+
+    def strike(self, line):
+        if line in self._items:
+            self._items.remove(line)
+            return True
+        return False
 
 
 def _seq_args(project_dir, *, dry_run):
@@ -162,6 +181,26 @@ def test_dry_run_reports_the_stop_file_once(tmp_path, capsys):
     assert capsys.readouterr().out.count("Stop file present") == 1
 
 
+def test_sequential_stop_file_lives_until_outer_application_exit(
+    tmp_path, monkeypatch, capsys
+):
+    stop = tmp_path / "stop"
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda cmd, raw, partial: 0)
+
+    with cyclecore.stop_file_lifecycle():
+        result = cyclecore.run_loop(
+            _StopAfterOneDriver(stop),
+            _seq_args(str(tmp_path), dry_run=False),
+            app_name="pytest-stop")
+        assert result.reason == cyclecore.RunStopReason.STOP_FILE
+        assert stop.exists(), "runner removed the mutex before application cleanup"
+
+    assert not stop.exists(), "application exit left the stop mutex behind"
+    out = capsys.readouterr().out
+    assert out.index("remains in place") < out.index("removed on application exit")
+
+
 # -- parallel runner -----------------------------------------------------------
 
 def test_parallel_dry_run_leaves_the_stop_file(tmp_path, capsys):
@@ -199,6 +238,33 @@ def test_parallel_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch):
     stop.unlink()
     assert done.wait(5), "run_parallel did not continue after the stop file was removed"
     assert not stop.exists(), "parallel run left the stop file behind"
+
+
+def test_parallel_stop_file_lives_until_outer_application_exit(
+    tmp_path, monkeypatch
+):
+    stop = tmp_path / "stop"
+    calls = 0
+
+    def stop_after_first_job(job_id, command):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            stop.write_text("", encoding="utf-8")
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", stop_after_first_job)
+    args = _par_args(str(tmp_path), dry_run=False)
+    args.jobs = 1
+
+    with cyclecore.stop_file_lifecycle():
+        result = parallel.run_parallel(
+            _MemListDriver(["products/a.md", "products/b.md"]), args,
+            app_name="pytest-stop-parallel")
+        assert result.reason == cyclecore.RunStopReason.STOP_FILE
+        assert stop.exists(), "workers removed the mutex before application cleanup"
+
+    assert not stop.exists(), "application exit left the stop mutex behind"
 
 
 def test_stop_file_path_follows_the_project_root(tmp_path):

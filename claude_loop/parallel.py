@@ -340,11 +340,14 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
     """
     while not shared.stop.is_set():
         if os.path.exists(cyclecore.STOP_FILE):
-            # First worker to see it removes it and stops the whole run.
+            # First worker to see it latches the request and stops the whole run.
+            # The outermost application lifecycle removes the sentinel only after
+            # all workers and wrapper-level cleanup have finished.
             with shared.lock:
                 if os.path.exists(cyclecore.STOP_FILE):
-                    os.remove(cyclecore.STOP_FILE)
-                    emit_job(job_id, "stop file detected — stopping (removed it).",
+                    cyclecore.mark_stop_file_detected()
+                    emit_job(job_id, "stop file detected — stopping; kept until "
+                             "application exit.",
                              "bold red")
                 shared.stop_reason = RunStopReason.STOP_FILE
                 shared.claims_closed.set()
@@ -407,6 +410,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                      "bold red")
 
 
+@cyclecore.stop_file_lifecycle()
 def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                  app_name: str = "parallel", *, setup_logging: bool = True,
                  wait_on_start: bool = True) -> RunResult:
@@ -450,8 +454,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         return RunResult(RunStopReason.NO_WORK, remaining=0)
 
     # Dry-run: list the commands that would run (capped by --max-runs), touch
-    # nothing — including the stop sentinel, which only a real run consumes (the
-    # workers below are what remove it, and they never start here). Reported so
+    # nothing — including the stop sentinel, which only a real run claims (the
+    # workers below are what detect it, and they never start here). Reported so
     # the preview says why a real run would not start yet.
     if args.dry_run:
         if os.path.exists(cyclecore.STOP_FILE):
@@ -469,7 +473,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     # Same as the sequential runner: a stop request pending from another run is
     # waited out here, on the main thread, before any worker starts — otherwise
-    # the first worker would consume it and stop the run before it did anything.
+    # the first worker would claim it and stop the run before it did anything.
     if wait_on_start:
         cyclecore.wait_for_stop_file_clear()
 

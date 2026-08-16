@@ -49,7 +49,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from enum import Enum
 from logging.handlers import RotatingFileHandler
@@ -136,13 +138,61 @@ except (AttributeError, ValueError):
 PROJECT_DIR = os.getcwd()
 # A manual brake: `touch stop` (create a file named "stop" in the project root)
 # and the loop halts at the next iteration boundary - the running iteration
-# finishes its one state transition first. The file is consumed on stop so the
-# next launch starts clean. Recomputed by set_project_root().
+# finishes its one state transition first. The file stays present while the
+# application winds down, then the outermost stop-file lifecycle removes it just
+# before exit so other launchers can use it as a mutex. Recomputed by
+# set_project_root().
 STOP_FILE = os.path.join(PROJECT_DIR, "stop")
 
 # How often wait_for_stop_file_clear() re-checks the sentinel while it holds a
 # launch back. Short enough that removing the file feels immediate.
 STOP_POLL_SECONDS = 2
+
+_stop_file_lifecycle_lock = threading.Lock()
+_stop_file_lifecycle_depth = 0
+_detected_stop_file: Optional[str] = None
+
+
+@contextmanager
+def stop_file_lifecycle():
+    """Keep a detected stop sentinel until the outermost application exits.
+
+    Runners enter this lifecycle themselves so direct users retain one-shot stop
+    semantics. A project wrapper can enter it once around its complete main()
+    lifecycle; nested sequential, parallel, and periodic runner calls then leave
+    the sentinel in place through all wrapper-level cleanup.
+    """
+    global _stop_file_lifecycle_depth, _detected_stop_file
+    with _stop_file_lifecycle_lock:
+        if _stop_file_lifecycle_depth == 0:
+            _detected_stop_file = None
+        _stop_file_lifecycle_depth += 1
+    try:
+        yield
+    finally:
+        with _stop_file_lifecycle_lock:
+            _stop_file_lifecycle_depth -= 1
+            outermost = _stop_file_lifecycle_depth == 0
+            detected = _detected_stop_file if outermost else None
+            if outermost:
+                _detected_stop_file = None
+        if detected is not None:
+            try:
+                os.remove(detected)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(f"warning: could not remove stop file on application exit "
+                      f"({detected}): {exc}", file=sys.stderr)
+            else:
+                print("Stop file removed on application exit.")
+
+
+def mark_stop_file_detected() -> None:
+    """Latch the current stop path for outermost-lifecycle exit cleanup."""
+    global _detected_stop_file
+    with _stop_file_lifecycle_lock:
+        _detected_stop_file = STOP_FILE
 
 
 def set_project_root(path: Optional[str]) -> str:
@@ -1148,8 +1198,9 @@ def wait_for_stop_file_clear() -> None:
     the sentinel is gone.
 
     The stop file is a request aimed at a *running* loop, and the run that obeys
-    it consumes it. A launch that finds one already there therefore has no good
-    way to start: consuming it would silently cancel someone else's brake, and
+    it claims it and clears it after cleanup. A launch that finds one already
+    there therefore has no good way to start: removing it would silently cancel
+    someone else's brake, and
     obeying it would exit before doing any work at all. So it waits instead —
     for the loop that owns the request to clear it on its way out, or for the
     user to delete the file by hand — and then starts clean. Ctrl+C interrupts
@@ -1330,6 +1381,7 @@ class Driver:
         return run_loop(cls(), args, app_name=cls.resolved_app_name())
 
 
+@stop_file_lifecycle()
 def run_loop(driver: Driver, args: argparse.Namespace,
              app_name: str = "runCycle", *, setup_logging: bool = True,
              wait_on_start: bool = True) -> RunResult:
@@ -1424,9 +1476,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     while True:
         if os.path.exists(STOP_FILE):
-            # The sentinel is *consumed* when it stops a run: one file, one stop.
-            # A dry run must not consume it. `-d` is routinely used to preview
-            # commands while a real loop is running — and that is exactly when a
+            # The sentinel is removed only after the outer application has
+            # finished cleanup. A dry run must not claim it. `-d` is routinely
+            # used to preview commands while a real loop is running — and that is
+            # exactly when a
             # stop request is pending — so removing it here would silently cancel
             # someone else's stop, and the loop it was meant to halt would run on.
             # Report it and leave it for whoever it was written for.
@@ -1437,8 +1490,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                           "Left in place (a dry run never consumes it).")
                     stop_file_noted = True
             else:
-                os.remove(STOP_FILE)
-                print("Stop file detected — stopping (the file has been removed).")
+                mark_stop_file_detected()
+                print("Stop file detected — stopping; it remains in place until "
+                      "the application exits.")
                 stop_reason = RunStopReason.STOP_FILE
                 break
 
