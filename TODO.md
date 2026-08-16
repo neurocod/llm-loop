@@ -25,6 +25,8 @@ Legend: priority is rough — `[P1]` do first, `[P3]` nice to have.
 - Rotating mirror log, `--dry-run`, `--max-runs`, `--start-in`, `--max-strike`, `--raw`.
 - Sequential `run_loop` + parallel `run_parallel` (N concurrent workers).
 - Project-root decoupling (`--project-dir` / cwd), stop file.
+- Opt-in per-user completion sound, configured through the platform config
+  directory (or `CLAUDE_LOOP_SETTINGS`).
 
 ## Worth borrowing
 
@@ -69,12 +71,6 @@ Source: continuous-claude / frankbria.
 `build_claude_argv` hardcodes the tool list. Make it a Driver field /
 `--allowed-tools` option (support granular patterns like `Bash(git *)`). Small
 change, removes a magic string, tightens safety for unattended runs.
-
-### [P3] Notification on stop / limit / completion
-Source: frankbria (`--notify`).
-For overnight runs, emit a terminal bell / desktop notification when the loop
-stops, hits a limit, or completes — instead of only writing to the log.
-Windows-native (winsound / PowerShell toast) since that's the primary platform.
 
 ### [P3] Calls-per-hour throttle
 Source: frankbria (`MAX_CALLS_PER_HOUR`), continuous-claude (`--max-calls-per-hour`).

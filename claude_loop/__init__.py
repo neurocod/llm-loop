@@ -81,6 +81,12 @@ from .limits import (
 from .drivers import ListFileDriver, StateFileDriver
 from .parallel import run_parallel
 from .parallel import parse_args as parse_parallel_args
+from .notifications import (
+    SettingsError,
+    completion_sound_enabled,
+    play_completion_sound,
+    settings_path,
+)
 
 __all__ = [
     "AgentCommand",
@@ -100,6 +106,7 @@ __all__ = [
     "RunResult",
     "RunStopReason",
     "SessionLimit",
+    "SettingsError",
     "StateFileDriver",
     "Usage",
     "UsageReading",
@@ -107,6 +114,7 @@ __all__ = [
     "WeeklyLimit",
     "build_agent_argv",
     "build_claude_argv",
+    "completion_sound_enabled",
     "default_policy",
     "find_project_root",
     "last_rate_limit_event",
@@ -117,6 +125,7 @@ __all__ = [
     "parse_duration",
     "parse_rate_limits",
     "parse_usage",
+    "play_completion_sound",
     "project_dir",
     "provider_spec",
     "rate_limit_event_from",
@@ -126,5 +135,6 @@ __all__ = [
     "run_parallel",
     "runtime_argv",
     "set_project_root",
+    "settings_path",
     "usage_source_for",
 ]

@@ -247,6 +247,22 @@ reading before the bounded retry path continues.
 | `-j, --jobs N` | concurrent workers (parallel only) |
 | `--raw` | print raw JSON events, for debugging (sequential only) |
 
+## Per-user settings
+
+Wrappers can opt into a completion sound through the per-user JSON settings
+file. It is disabled when the file or key is absent:
+
+```json
+{
+  "completion_sound": true
+}
+```
+
+On Windows the file is `%APPDATA%\claude-loop\settings.json`. On Linux and
+macOS it is `${XDG_CONFIG_HOME:-~/.config}/claude-loop/settings.json`. Set
+`CLAUDE_LOOP_SETTINGS` to use a different absolute path. Windows wrappers use
+the native system notification sound; other platforms emit a terminal bell.
+
 Create a file named `stop` in the project root to halt the loop at the next
 iteration boundary; it is removed on stop so the next launch starts clean. A
 `--dry-run` never removes it — previewing commands while a real run has a stop
