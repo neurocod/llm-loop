@@ -16,6 +16,10 @@ class SettingsError(ValueError):
     """A present claude-loop settings file is malformed."""
 
 
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-standard JSON value {value}")
+
+
 def settings_path(*, environ: Optional[Mapping[str, str]] = None,
                   platform: Optional[str] = None,
                   home: Optional[Path] = None) -> Path:
@@ -46,8 +50,8 @@ def load_settings(path: Optional[Path] = None) -> dict:
         raise SettingsError(f"cannot read {resolved}: {exc}") from exc
 
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        data = json.loads(raw, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise SettingsError(f"invalid JSON in {resolved}: {exc}") from exc
     if not isinstance(data, dict):
         raise SettingsError(f"{resolved} must contain a JSON object")
@@ -75,4 +79,7 @@ def play_completion_sound() -> None:
             sys.stdout.write("\a")
             sys.stdout.flush()
     except Exception as exc:
-        print(f"warning: completion sound failed: {exc}", file=sys.stderr)
+        try:
+            print(f"warning: completion sound failed: {exc}", file=sys.stderr)
+        except Exception:
+            pass

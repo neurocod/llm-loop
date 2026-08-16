@@ -48,7 +48,12 @@ def test_completion_sound_requires_explicit_true(tmp_path):
     assert completion_sound_enabled(path) is True
 
 
-@pytest.mark.parametrize("contents", ["[]", "not json", '{"completion_sound": 1}'])
+@pytest.mark.parametrize("contents", [
+    "[]",
+    "not json",
+    '{"completion_sound": 1}',
+    '{"completion_sound": true, "other": NaN}',
+])
 def test_invalid_settings_are_reported(tmp_path, contents):
     path = tmp_path / "settings.json"
     path.write_text(contents, encoding="utf-8")
@@ -69,3 +74,18 @@ def test_windows_completion_sound_uses_native_message_beep(monkeypatch):
     notifications.play_completion_sound()
 
     assert calls == [64]
+
+
+def test_completion_sound_cannot_fail_when_output_streams_are_broken(monkeypatch):
+    class BrokenStream:
+        def write(self, _text):
+            raise BrokenPipeError("closed")
+
+        def flush(self):
+            raise BrokenPipeError("closed")
+
+    monkeypatch.setattr(notifications.sys, "platform", "linux")
+    monkeypatch.setattr(notifications.sys, "stdout", BrokenStream())
+    monkeypatch.setattr(notifications.sys, "stderr", BrokenStream())
+
+    notifications.play_completion_sound()
