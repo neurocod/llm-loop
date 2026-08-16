@@ -129,3 +129,40 @@ def test_release_returns_claim_to_queue():
     assert shared.claimed == 0 and line not in shared.in_progress
     # The line is still pending (never struck), so a re-run picks it up.
     assert set(driver.pending_lines()) == {"a", "b"}
+
+
+def test_max_runs_closes_claims_without_cancelling_in_flight_work(
+    tmp_path, monkeypatch
+):
+    """The batch cap must let every already-claimed item finish."""
+    started = 0
+    started_lock = threading.Lock()
+    all_started = threading.Event()
+    release = threading.Event()
+
+    def blocked_job(job_id, command):
+        nonlocal started
+        with started_lock:
+            started += 1
+            if started == 3:
+                all_started.set()
+        assert release.wait(5), "test did not release the in-flight jobs"
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", blocked_job)
+    driver = _MemDriver([f"products/f{i}.md" for i in range(6)])
+    done = threading.Event()
+
+    def go():
+        try:
+            parallel.run_parallel(
+                driver, _args(str(tmp_path), jobs=6, max_runs=3),
+                app_name="pytest-parallel")
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert all_started.wait(5), "fewer than three capped jobs reached execution"
+    release.set()
+    assert done.wait(5), "capped parallel run did not terminate"
+    assert len(driver.pending_lines()) == 3

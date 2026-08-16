@@ -89,6 +89,25 @@ class GitPushPolicy(Enum):
     EACH_HOUR = "each_hour"
 
 
+class RunStopReason(Enum):
+    """Why a runner returned normally."""
+
+    STOP_FILE = "stop_file"
+    LIMIT_REACHED = "limit_reached"
+    NO_WORK = "no_work"
+    DRIVER_STOP = "driver_stop"
+    DRY_RUN = "dry_run"
+
+
+class RunResult(NamedTuple):
+    """Structured normal-exit result used by higher-level coordinators."""
+
+    reason: RunStopReason
+    attempted: int = 0
+    completed: int = 0
+    remaining: Optional[int] = None
+
+
 # Default push policy. Override on the command line with --git-push.
 GIT_PUSH_POLICY = GitPushPolicy.EACH_HOUR
 
@@ -1293,7 +1312,7 @@ class Driver:
         return None
 
     @classmethod
-    def main(cls, argv=None) -> None:
+    def main(cls, argv=None) -> RunResult:
         """Parse the shared CLI and run the sequential loop over a fresh instance.
 
         This is the whole body of a project wrapper: subclass, override the
@@ -1304,11 +1323,12 @@ class Driver:
         """
         args = parse_args(argv, prog=cls.resolved_prog(),
                           description=cls.description)
-        run_loop(cls(), args, app_name=cls.resolved_app_name())
+        return run_loop(cls(), args, app_name=cls.resolved_app_name())
 
 
 def run_loop(driver: Driver, args: argparse.Namespace,
-             app_name: str = "runCycle") -> None:
+             app_name: str = "runCycle", *, setup_logging: bool = True,
+             wait_on_start: bool = True) -> RunResult:
     """Drive the selected provider per `driver`, with all shared lifecycle
     machinery. This is the former runCycle.main(), generalised: the only thing
     that changed is that "read currentState.md and pick a prompt" became
@@ -1351,12 +1371,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # set, so the log path resolves) rather than in the loop body proper.
     if getattr(args, "cost", False):
         report_costs(app_name)
-        return
+        return RunResult(RunStopReason.NO_WORK)
 
     # Mirror all screen output into a rotating log file under the home dir.
-    logger = _setup_file_logging(app_name)
-    sys.stdout = _TeeToLog(sys.stdout, logger)
-    sys.stderr = _TeeToLog(sys.stderr, logger)
+    if setup_logging:
+        logger = _setup_file_logging(app_name)
+        sys.stdout = _TeeToLog(sys.stdout, logger)
+        sys.stderr = _TeeToLog(sys.stderr, logger)
     print(f"  · project root: {PROJECT_DIR}")
     print(f"  · logging to {log_file_path(app_name)}")
     print(f"  · provider: {spec.display_name}")
@@ -1369,7 +1390,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # it, so this launch starts on a clean sentinel instead of stopping on its
     # first iteration boundary. Before --start-in: the point is to begin as soon
     # as the brake is off, not to burn the delay while it is still on.
-    if not dry_run:
+    if not dry_run and wait_on_start:
         wait_for_stop_file_clear()
 
     if start_in and not dry_run:
@@ -1394,6 +1415,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         limit_policy.log_snapshot(usage_source, "at start (iteration 1)")
 
     iteration = 0
+    completed = 0
+    stop_reason = RunStopReason.NO_WORK
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     while True:
         if os.path.exists(STOP_FILE):
@@ -1412,6 +1435,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             else:
                 os.remove(STOP_FILE)
                 print("Stop file detected — stopping (the file has been removed).")
+                stop_reason = RunStopReason.STOP_FILE
                 break
 
         # Git push policy: evaluated at the start of every iteration.
@@ -1420,6 +1444,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
         if max_iters is not None and iteration >= max_iters:
             print(f"Iteration limit reached (--max-runs {max_iters}). Stopping.")
+            stop_reason = RunStopReason.LIMIT_REACHED
             break
 
         # --maxStrike: once a finished iteration pushes us past the per-session
@@ -1456,9 +1481,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             print(stop.message)
             if stop.exit_code:
                 sys.exit(stop.exit_code)
+            stop_reason = RunStopReason.DRIVER_STOP
             break
         if command is None:
             print("No more work — stopping.")
+            stop_reason = RunStopReason.NO_WORK
             break
 
         iteration += 1
@@ -1482,6 +1509,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # so the driver would keep handing back the same first unit of work.
             if max_iters is None:
                 print("(dry-run without --max-runs: running a single iteration and exiting)")
+                stop_reason = RunStopReason.DRY_RUN
                 break
             continue
 
@@ -1493,6 +1521,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
         if returncode == 0:
             consecutive_errors = 0
+            completed += 1
             driver.on_success(returncode)
 
         # The backstop under the proactive check (see RateLimitEvent): this run's
@@ -1576,3 +1605,4 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     summary = driver.final_summary()
     if summary:
         print(f"\n{summary}")
+    return RunResult(stop_reason, iteration, completed)

@@ -274,7 +274,7 @@ class ListFileDriver(Driver):
         return f"{remaining} item(s) still pending in {self.list_file}."
 
     @classmethod
-    def main_parallel(cls, argv=None, jobs: Optional[int] = None) -> None:
+    def main_parallel(cls, argv=None, jobs: Optional[int] = None):
         """Parse the parallel CLI (adds -j/--jobs) and drain the list with N
         concurrent provider workers over a fresh instance.
 
@@ -293,4 +293,4 @@ class ListFileDriver(Driver):
         driver = cls()
         if jobs is not None:
             driver.jobs = jobs
-        run_parallel(driver, args, app_name=cls.resolved_app_name())
+        return run_parallel(driver, args, app_name=cls.resolved_app_name())

@@ -39,6 +39,8 @@ from . import limits
 from .cyclecore import (
     AgentCommand,
     GitPushPolicy,
+    RunResult,
+    RunStopReason,
     build_agent_argv,
     git_push,
     git_unpushed_count,
@@ -254,18 +256,23 @@ class Shared:
         self.claimed = 0              # files claimed this run (for --max-runs)
         self.done = 0                 # files processed successfully
         self.max_items = max_items
-        self.stop = threading.Event()  # set on stop-file / no-work / fatal
+        self.stop = threading.Event()  # cancel/wake the run on stop-file / no-work
+        self.claims_closed = threading.Event()  # max reached: finish in-flight work
+        self.stop_reason = None
 
     def claim(self) -> Optional[str]:
         """Reserve the next pending list line, or signal why there is none.
 
-        Returns the claimed raw line, or None. When None, `stop` is set iff the
-        queue is truly drained (nothing pending and nothing in flight); a None
-        with `stop` clear means "busy, try again shortly".
+        Returns the claimed raw line, or None. `claims_closed` distinguishes a
+        clean max-items boundary (finish in-flight work, issue nothing new) from
+        a temporarily busy queue; `stop` cancels claims held at a usage gate.
         """
         with self.lock:
+            if self.claims_closed.is_set():
+                return None
             if self.max_items is not None and self.claimed >= self.max_items:
-                self.stop.set()
+                self.stop_reason = RunStopReason.LIMIT_REACHED
+                self.claims_closed.set()
                 return None
             pending = [ln for ln in self.driver.pending_lines()
                        if ln not in self.in_progress
@@ -273,6 +280,8 @@ class Shared:
             if not pending:
                 # Drained only if no one else is still working; otherwise back off.
                 if not self.in_progress:
+                    self.stop_reason = RunStopReason.NO_WORK
+                    self.claims_closed.set()
                     self.stop.set()
                 return None
             # The driver decides the order (random by default, list order when
@@ -322,10 +331,10 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
            policy, session_start_box: list, usage_lock: threading.Lock) -> None:
     """One worker thread: claim -> (usage gate) -> run -> record, repeat.
 
-    Loops until the shared stop flag is set (queue drained, --max-runs hit, or stop
-    file). A claim that returns None with the flag still clear means everything
-    left is in flight elsewhere, so we briefly back off and retry. `source`/`policy`
-    are None when --ignore-usage disables the session-limit gate.
+    Loops until the queue drains, the claim cap closes, or the shared stop flag is
+    set by the stop file. A claim that returns None while both signals remain clear
+    means everything left is in flight elsewhere, so we briefly back off and retry.
+    `source`/`policy` are None when --ignore-usage disables the session-limit gate.
     """
     while not shared.stop.is_set():
         if os.path.exists(cyclecore.STOP_FILE):
@@ -335,6 +344,8 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                     os.remove(cyclecore.STOP_FILE)
                     emit_job(job_id, "stop file detected — stopping (removed it).",
                              "bold red")
+                shared.stop_reason = RunStopReason.STOP_FILE
+                shared.claims_closed.set()
                 shared.stop.set()
             break
 
@@ -347,7 +358,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # nothing to do; only a worker actually holding a file ever pauses.
         line = shared.claim()
         if line is None:
-            if shared.stop.is_set():
+            if shared.stop.is_set() or shared.claims_closed.is_set():
                 break
             time.sleep(2)  # busy: others hold the rest — back off and retry
             continue
@@ -363,9 +374,10 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                     if paused:
                         session_start_box[0] = new_start
 
-        # The run may have been stopped (drained elsewhere, stop file, or --max
-        # reached) while we waited for the lock or paused on the budget: return the
-        # claimed file to the queue and exit without starting another provider run.
+        # A stop file may have arrived while we waited for the lock or paused on
+        # the budget: return the claimed file to the queue and exit without
+        # starting another provider run. A max-items boundary only closes new
+        # claims, so already-claimed work deliberately continues past this check.
         if shared.stop.is_set():
             shared.release(line)
             break
@@ -394,7 +406,8 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
 
 
 def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
-                 app_name: str = "parallel") -> None:
+                 app_name: str = "parallel", *, setup_logging: bool = True,
+                 wait_on_start: bool = True) -> RunResult:
     """Drain `driver`'s list with N concurrent provider workers.
 
     The parallel counterpart of cyclecore.run_loop: same session-limit, git-push
@@ -419,9 +432,10 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     # Mirror all output to the rotating log, same as run_loop — under its own app
     # name so this runner's log doesn't fight the sequential one's.
-    logger = cyclecore._setup_file_logging(app_name)
-    sys.stdout = cyclecore._TeeToLog(sys.stdout, logger)
-    sys.stderr = cyclecore._TeeToLog(sys.stderr, logger)
+    if setup_logging:
+        logger = cyclecore._setup_file_logging(app_name)
+        sys.stdout = cyclecore._TeeToLog(sys.stdout, logger)
+        sys.stderr = cyclecore._TeeToLog(sys.stderr, logger)
     print(f"  · project root: {cyclecore.project_dir()}")
     print(f"  · logging to {cyclecore.log_file_path(app_name)}")
     print(f"  · provider: {spec.display_name}")
@@ -431,7 +445,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     pending_now = driver.pending_lines()
     if not pending_now:
         print(f"Nothing pending in {list_file_rel} — nothing to do.")
-        return
+        return RunResult(RunStopReason.NO_WORK, remaining=0)
 
     # Dry-run: list the commands that would run (capped by --max-runs), touch
     # nothing — including the stop sentinel, which only a real run consumes (the
@@ -449,12 +463,13 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             print("  " + " ".join(build_agent_argv(command, provider)))
             if provider == "codex":
                 print("    STDIN: " + command.prompt)
-        return
+        return RunResult(RunStopReason.DRY_RUN, remaining=len(pending_now))
 
     # Same as the sequential runner: a stop request pending from another run is
     # waited out here, on the main thread, before any worker starts — otherwise
     # the first worker would consume it and stop the run before it did anything.
-    cyclecore.wait_for_stop_file_clear()
+    if wait_on_start:
+        cyclecore.wait_for_stop_file_clear()
 
     # Usage gate: a shared UsageSource (query/cache) plus the Driver's LimitPolicy
     # (which quotas to gate on). --ignore-usage turns both off.
@@ -532,3 +547,5 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
               f"{MAX_ATTEMPTS} failed attempts:")
         for line in sorted(shared.failed):
             print(f"      {os.path.basename(line.strip())}")
+    reason = shared.stop_reason or RunStopReason.NO_WORK
+    return RunResult(reason, shared.claimed, shared.done, remaining)
