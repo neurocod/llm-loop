@@ -344,7 +344,8 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # The outermost application lifecycle removes the sentinel only after
             # all workers and wrapper-level cleanup have finished.
             with shared.lock:
-                if os.path.exists(cyclecore.STOP_FILE):
+                if (not shared.stop.is_set()
+                        and os.path.exists(cyclecore.STOP_FILE)):
                     cyclecore.mark_stop_file_detected()
                     emit_job(job_id, "stop file detected — stopping; kept until "
                              "application exit.",

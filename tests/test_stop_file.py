@@ -267,6 +267,49 @@ def test_parallel_stop_file_lives_until_outer_application_exit(
     assert not stop.exists(), "application exit left the stop mutex behind"
 
 
+def test_parallel_stop_file_is_reported_once_by_competing_workers(
+    tmp_path, monkeypatch, capsys
+):
+    stop = tmp_path / "stop"
+    stop_created = threading.Event()
+    jobs_ready = threading.Barrier(4)
+    checks_ready = threading.Barrier(4)
+    checked_threads = set()
+    checked_lock = threading.Lock()
+    real_exists = os.path.exists
+
+    def finish_jobs_together(job_id, command):
+        jobs_ready.wait(timeout=5)
+        if job_id == 1:
+            stop.write_text("", encoding="utf-8")
+            stop_created.set()
+        assert stop_created.wait(5)
+        return 0, 0.0, 0.01
+
+    def coordinate_first_worker_checks(path):
+        thread_name = threading.current_thread().name
+        if (path == str(stop) and stop_created.is_set()
+                and thread_name.startswith("job")):
+            with checked_lock:
+                first = thread_name not in checked_threads
+                checked_threads.add(thread_name)
+            if first:
+                checks_ready.wait(timeout=5)
+        return real_exists(path)
+
+    monkeypatch.setattr(parallel, "run_job", finish_jobs_together)
+    monkeypatch.setattr(parallel.os.path, "exists", coordinate_first_worker_checks)
+    args = _par_args(str(tmp_path), dry_run=False)
+    args.jobs = 4
+
+    result = parallel.run_parallel(
+        _MemListDriver([f"products/{i}.md" for i in range(8)]), args,
+        app_name="pytest-stop-parallel")
+
+    assert result.reason == cyclecore.RunStopReason.STOP_FILE
+    assert capsys.readouterr().out.lower().count("stop file detected") == 1
+
+
 def test_stop_file_path_follows_the_project_root(tmp_path):
     """The sentinel is resolved against the chosen root, not the cwd — otherwise
     a -C run would watch the wrong file (and the tests would pass by accident)."""
