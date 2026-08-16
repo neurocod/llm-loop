@@ -29,16 +29,18 @@ ADDING a subclass and registering it - never by editing a dispatch chain, adding
 a boolean to `LoopStatus`, or hard-coding a key into the legend.
 """
 
+import atexit
 import os
 import re
 import shutil
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from . import cyclecore
+from . import cmdline, cyclecore
 
 __all__ = [
     "Action",
@@ -68,6 +70,7 @@ __all__ = [
     "QuotaSegment",
     "Resize",
     "Row",
+    "RuleRow",
     "ScriptLimitSegment",
     "Segment",
     "SegmentRow",
@@ -119,6 +122,15 @@ PHASE_GLYPHS = {
 
 # Shown when a command carries no --model: the provider CLI picks its own.
 CLI_DEFAULT_MODEL = "cli default"
+
+# Chrome: the furniture that frames the toolbar. One style for both the opening
+# rule and the value separators, so nothing but the data is at full intensity —
+# and both are ordinary characters, so a terminal with no colour still shows the
+# separation (the rule IS the separation; degrading it to an empty line would
+# merge the toolbar into the scrolling output above).
+SEPARATOR = " | "
+RULE_CHAR = "_"
+CHROME_STYLE = "dim"
 
 
 # --- text helpers --------------------------------------------------------------
@@ -224,22 +236,31 @@ _SGR = {
     "dim": "\x1b[2m",
 }
 _SGR_RESET = "\x1b[0m"
+# One pass over the line: a percentage takes the usage scale's colour, a pipe or
+# a run of underscores takes the muted chrome style.
 _PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
+_STYLED_RE = re.compile(r"\d+(?:\.\d+)?\s*%|_{2,}|\|")
 
 
 def colorize(line: str) -> str:
-    """Colour every percentage in a rendered row on the shared usage scale.
+    """Colour a rendered row: percentages on the usage scale, chrome muted.
 
     Reuses `cyclecore.percent_style` so the pinned rows and the scrolling log
-    lines agree about what "alarming" looks like.
+    lines agree about what "alarming" looks like. Adding the codes here rather
+    than in the Rows keeps the truncation arithmetic counting characters instead
+    of escape bytes — and keeps the rows readable as plain strings in tests.
     """
     out = []
     last = 0
-    for match in _PERCENT_RE.finditer(line):
-        style = _SGR.get(cyclecore.percent_style(
-            float(match.group(0).rstrip("% \t"))), "")
+    for match in _STYLED_RE.finditer(line):
+        token = match.group(0)
+        if _PERCENT_RE.fullmatch(token):
+            style = _SGR.get(cyclecore.percent_style(
+                float(token.rstrip("% \t"))), "")
+        else:
+            style = _SGR.get(CHROME_STYLE, "")
         out.append(line[last:match.start()])
-        out.append(f"{style}{match.group(0)}{_SGR_RESET}" if style else match.group(0))
+        out.append(f"{style}{token}{_SGR_RESET}" if style else token)
         last = match.end()
     out.append(line[last:])
     return "".join(out)
@@ -515,10 +536,24 @@ class Row:
         raise NotImplementedError
 
 
-class SegmentRow(Row):
-    """Segments joined with ' · ', omitting the ones that return None."""
+class RuleRow(Row):
+    """The full-width rule of underscores that opens the status area.
 
-    separator = " · "
+    A Row like every other one on purpose: the reserved region is sized by the
+    row COUNT, so a rule special-cased in the Terminal would put the region one
+    line out of step with what is painted. Rendered as plain characters, dimmed
+    later by `colorize` — it must survive a terminal that shows no colour, since
+    it is the only thing separating the toolbar from the scrolling output.
+    """
+
+    def render(self, status, width, now=None):
+        return RULE_CHAR * max(0, width)
+
+
+class SegmentRow(Row):
+    """Segments joined with the chrome separator, omitting the None ones."""
+
+    separator = SEPARATOR
 
     def __init__(self, segments: Sequence[Segment], prefix: str = " "):
         self.segments = list(segments)
@@ -557,12 +592,14 @@ class JobRow(Row):
         item = job.item if (job.running and job.item) else "idle"
         model = job.model or CLI_DEFAULT_MODEL
         elapsed = format_elapsed(job.elapsed(now))
-        line = (f" job {job.job_id} {glyph} {pad(item, self.item_width)} "
-                f"{pad(model, self.model_width)} "
-                f"iter {job.iteration:<4}")
+        # Same separator as every other row (the columns stay padded, so the job
+        # rows still line up under each other with -j N).
+        cells = [f" job {job.job_id} {glyph} {pad(item, self.item_width)}",
+                 pad(model, self.model_width),
+                 f"iter {job.iteration:<4}"]
         if elapsed:
-            line += f" {elapsed}"
-        return fit(line, width)
+            cells.append(elapsed)
+        return fit(SEPARATOR.join(cells), width)
 
 
 class KeyLegendRow(Row):
@@ -580,7 +617,7 @@ class KeyLegendRow(Row):
         parts = [f"{key} {label}" for key, label in self.entries() if key]
         if not parts:
             return ""
-        return fit(" keys: " + " · ".join(parts), width)
+        return fit(" keys: " + SEPARATOR.join(parts), width)
 
 
 class NoteRow(Row):
@@ -595,7 +632,7 @@ class NoteRow(Row):
 
 
 class Layout:
-    """The row set: summary, one JobRow per Job, the legend, the note.
+    """The row set: the rule, summary, one JobRow per Job, the legend, the note.
 
     One Layout serves both the sequential and the parallel runner — a sequential
     run is a run with one Job. Subclass only if a future mode needs a different
@@ -616,7 +653,7 @@ class Layout:
         return SegmentRow(segments)
 
     def rows(self, status: LoopStatus) -> List[Row]:
-        rows: List[Row] = [self.summary_row(status)]
+        rows: List[Row] = [RuleRow(), self.summary_row(status)]
         rows += [JobRow(job.job_id) for job in status.jobs]
         rows.append(KeyLegendRow(self._legend_entries))
         rows.append(NoteRow())
@@ -714,13 +751,21 @@ class Terminal:
                 + f"\x1b[1;{lines - rows}r"        # DECSTBM: shrink the scroll area
                 + f"\x1b[{lines - rows};1H")       # park at the bottom of it
 
-    def paint(self, lines: Sequence[str]) -> bool:
+    def paint(self, lines: Sequence[str], *, reassert: bool = False) -> bool:
         if not self.active:
             return False
         with self._lock:
             columns, total = self._size
             first = total - self._rows + 1
             out = ["\x1b7"]  # save cursor (DECSC) — output above must not move
+            if reassert:
+                # The region is not sticky: an `ESC[r`, an alt-screen switch or a
+                # full reset from anything downstream (a provider CLI, a pager)
+                # un-pins it for good, and every absolute row write below would
+                # then scroll away with the output. Re-stating it costs one short
+                # escape on the periodic repaint; DECSTBM homes the cursor, which
+                # the DECRC at the end undoes.
+                out.append(f"\x1b[1;{total - self._rows}r")
             for i in range(self._rows):
                 text = lines[i] if i < len(lines) else ""
                 out.append(f"\x1b[{first + i};1H\x1b[2K{text}")
@@ -762,7 +807,7 @@ class NullTerminal(Terminal):
     def reserve(self, rows):
         return False
 
-    def paint(self, lines):
+    def paint(self, lines, *, reassert=False):
         return False
 
     def release(self):
@@ -854,6 +899,14 @@ class InputSource:
     def stop(self) -> None:
         raise NotImplementedError
 
+    def restore_tty(self) -> None:
+        """Undo any terminal mode this source set. Nothing to undo by default.
+
+        Separate from `stop()` because it must be callable from a signal handler
+        or from atexit, where the reader thread's own `finally` will never run.
+        """
+        return None
+
 
 class NullInputSource(InputSource):
     """No TTY (or disabled): yields nothing, so no key is ever read."""
@@ -926,6 +979,8 @@ class TerminalInput(InputSource):
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._decoder = _EscapeDecoder()
+        # (fd, saved termios attrs) while the tty is in cbreak, else None.
+        self._tty_state: Optional[Tuple[int, object]] = None
 
     def usable(self) -> bool:
         try:
@@ -947,6 +1002,20 @@ class TerminalInput(InputSource):
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=1.0)
+        self.restore_tty()   # the thread normally did it; make sure of it here
+
+    def restore_tty(self):
+        """Take the tty back out of cbreak, from any thread, at most once."""
+        state, self._tty_state = self._tty_state, None
+        if state is None:
+            return
+        fd, saved = state
+        try:
+            import termios
+
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        except Exception:
+            pass
 
     def _guard(self, target, handler):
         try:
@@ -983,6 +1052,9 @@ class TerminalInput(InputSource):
         saved = termios.tcgetattr(fd)
         try:
             tty.setcbreak(fd)  # cbreak, not raw: ISIG (Ctrl+C) stays enabled
+            # Published so a signal handler / atexit can undo it: this thread is
+            # a daemon, and a signal kills it without running the finally below.
+            self._tty_state = (fd, saved)
             while not self._stop.is_set():
                 ready, _, _ = select.select([fd], [], [], self.poll_seconds)
                 if not ready:
@@ -994,7 +1066,7 @@ class TerminalInput(InputSource):
                     self._emit(handler, char)
         finally:
             # Guaranteed restore: a terminal left in cbreak is unusable.
-            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            self.restore_tty()
 
 
 # --- actions and modes ---------------------------------------------------------
@@ -1051,7 +1123,7 @@ class HelpAction(Action):
     def run(self, app):
         parts = [f"{'/'.join(a.all_keys())} {a.help_text(app)}"
                  for a in app.actions if a.available(app)]
-        app.note("keys — " + " · ".join(parts))
+        app.note("keys — " + SEPARATOR.join(parts))
 
 
 class Mode:
@@ -1174,9 +1246,19 @@ class SettingsRegistry:
     """Ordered Settings, and the bridge to the command-line renderer."""
 
     def __init__(self, settings: Sequence[Setting] = ()):
-        self._settings: List[Setting] = list(settings)
+        self._settings: List[Setting] = []
+        for setting in settings:
+            self.add(setting)
 
     def add(self, setting: Setting) -> Setting:
+        # Validated here so a mistyped flag fails at registration — i.e. at
+        # startup, on every run — instead of raising KeyError out of
+        # `cmdline.render` the first time somebody presses the key that shows
+        # the reproducing command line.
+        if setting.flag not in cmdline.FLAG_ALIASES:
+            raise KeyError(
+                f"setting {setting.name!r}: unknown canonical flag "
+                f"{setting.flag!r}; known: {sorted(cmdline.FLAG_ALIASES)}")
         self._settings.append(setting)
         return setting
 
@@ -1257,6 +1339,62 @@ def push_quotas(app: "StatusApp", usage_source, limit_policy=None, *,
                                  cache_value=cache_value))
 
 
+# Threads whose stdout writes are being diverted: ident -> list of chunks.
+_capture_lock = threading.Lock()
+_captured: dict = {}
+
+
+class _ThreadScopedCapture:
+    """A `sys.stdout` stand-in that diverts ONE thread's writes into a buffer.
+
+    Needed because the background quota poll reaches `usage.query_usage_json`,
+    which prints its diagnostics ("no usage figures: … 401 …"). Printed from a
+    daemon thread they land at an arbitrary point of the scrolling output —
+    possibly mid-token inside a rich `Live` block — and in the mirror log that
+    `--cost` parses. Replacing `sys.stdout` outright for the duration would
+    steal the LOOP's own output too, so the diversion is keyed on the thread
+    that asked for it; every other thread passes straight through.
+    """
+
+    def __init__(self, target):
+        self._target = target
+
+    def write(self, text):
+        buffer = _captured.get(threading.get_ident())
+        if buffer is None:
+            return self._target.write(text)
+        buffer.append(text)
+        return len(text)
+
+    def flush(self):
+        if _captured.get(threading.get_ident()) is None:
+            self._target.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
+
+
+@contextmanager
+def capture_stdout_here():
+    """Collect THIS thread's stdout writes; yields the list of chunks."""
+    ident = threading.get_ident()
+    buffer: List[str] = []
+    with _capture_lock:
+        if not isinstance(sys.stdout, _ThreadScopedCapture):
+            sys.stdout = _ThreadScopedCapture(sys.stdout)
+        _captured[ident] = buffer
+    try:
+        yield buffer
+    finally:
+        with _capture_lock:
+            _captured.pop(ident, None)
+            proxy = sys.stdout
+            # Uninstall only once nobody is capturing any more, and only if the
+            # proxy is still ours — the loop installs its own tee over stdout.
+            if not _captured and isinstance(proxy, _ThreadScopedCapture):
+                sys.stdout = proxy._target
+
+
 class QuotaRefresher:
     """Low-frequency background poll so the pinned figures do not go stale while
     a long iteration runs. Uses the shared cached source, hence the low rate."""
@@ -1270,6 +1408,7 @@ class QuotaRefresher:
             CODEX_QUOTA_REFRESH if provider == "codex" else CLAUDE_QUOTA_REFRESH)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._last_report = ""
 
     def start(self) -> None:
         if (self._thread is not None or self.usage_source is None
@@ -1289,8 +1428,32 @@ class QuotaRefresher:
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             # cache_value=False: this poll exists precisely to age out the cache.
-            push_quotas(self.app, self.usage_source, self.limit_policy,
-                        cache_value=False)
+            # Its diagnostics are captured, never printed — see
+            # `_ThreadScopedCapture` — and surfaced on the note row instead,
+            # which is the one place a background message can appear without
+            # corrupting the stream or the mirror log.
+            with capture_stdout_here() as chunks:
+                push_quotas(self.app, self.usage_source, self.limit_policy,
+                            cache_value=False)
+            self._report("".join(chunks))
+
+    def _report(self, text: str) -> None:
+        """Put a captured diagnostic on the note row — once per distinct message.
+
+        Silently swallowing it forever would hide a stale OAuth token behind
+        figures that simply stop moving; repeating the same line every interval
+        would sit permanently on the note row instead of the run's own feedback.
+        """
+        text = " ".join(text.split())
+        if text == self._last_report:
+            return
+        self._last_report = text
+        if not text:
+            return                  # recovered: next failure is reportable again
+        try:
+            self.app.note(f"quota refresh: {text}")
+        except Exception:
+            pass
 
 
 # --- the controller ------------------------------------------------------------
@@ -1329,6 +1492,9 @@ class StatusApp:
         self._reserved = 0
         self._started = False
         self._services: List[object] = []
+        self._requested_stop = False      # did WE write the sentinel? (see below)
+        self._atexit_registered = False
+        self._signal_handlers: List[Tuple[int, object]] = []
         if default_actions:
             self.register_action(StopAction())
             self.register_action(HelpAction())
@@ -1373,16 +1539,89 @@ class StatusApp:
             self._paint_thread = threading.Thread(
                 target=self._repaint_loop, name="statusline-paint", daemon=True)
             self._paint_thread.start()
+            self._install_emergency_restore()
         except Exception:
             self.disable()
         for service in self._services:
             self._start_service(service)
         return self
 
+    # Signals worth a last-resort restore. SIGKILL / `taskkill /F` are
+    # unblockable by definition — nothing can save the terminal there.
+    _RESTORE_SIGNALS = ("SIGTERM", "SIGHUP", "SIGBREAK")
+
+    def _install_emergency_restore(self) -> None:
+        """Put the terminal back even when no `finally` of ours runs.
+
+        stop() covers a normal return, an exception, SystemExit and
+        KeyboardInterrupt — but a signal unwinds nothing, and the key reader's
+        termios restore sits in a daemon thread that simply dies with the
+        process. Without this a `kill`/`taskkill` on a long run leaves the
+        DECSTBM region pinned and, on POSIX, the tty in cbreak.
+        """
+        atexit.register(self._emergency_restore)
+        self._atexit_registered = True
+        if threading.current_thread() is not threading.main_thread():
+            return          # only the main thread may install signal handlers
+        import signal
+
+        for name in self._RESTORE_SIGNALS:
+            number = getattr(signal, name, None)
+            if number is None:
+                continue
+            try:
+                previous = signal.getsignal(number)
+                signal.signal(number, self._signal_restore)
+            except (ValueError, OSError, RuntimeError):
+                continue
+            self._signal_handlers.append((number, previous))
+
+    def _signal_restore(self, signum, frame) -> None:
+        """Restore, then let the signal do what it was going to do."""
+        self._emergency_restore()
+        import signal
+
+        previous = dict(self._signal_handlers).get(signum, signal.SIG_DFL)
+        if callable(previous):
+            previous(signum, frame)
+            return
+        # Re-raise under the original disposition: swallowing a termination
+        # signal would make the process survive a kill it was never meant to.
+        signal.signal(signum, previous if previous is not None else signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    def _remove_emergency_restore(self) -> None:
+        if self._atexit_registered:
+            atexit.unregister(self._emergency_restore)
+            self._atexit_registered = False
+        handlers, self._signal_handlers = self._signal_handlers, []
+        if not handlers:
+            return
+        import signal
+
+        for number, previous in handlers:
+            try:
+                signal.signal(number, previous)
+            except (ValueError, OSError, RuntimeError):
+                pass
+
+    def _emergency_restore(self) -> None:
+        """Release the region and the tty. Safe to call twice, never raises."""
+        try:
+            self.terminal.release()
+        except Exception:
+            pass
+        try:
+            if self._input is not None:
+                self._input.restore_tty()
+        except Exception:
+            pass
+
     def stop(self) -> None:
         if not self._started:
             return
         self._started = False
+        self._remove_emergency_restore()
         for service in self._services:
             try:
                 service.stop()
@@ -1440,6 +1679,17 @@ class StatusApp:
         # Read late: --project-dir moves cyclecore.STOP_FILE after import.
         return self._stop_file or cyclecore.STOP_FILE
 
+    @property
+    def stop_requested_here(self) -> bool:
+        """True while the PENDING sentinel is the one this app's `s` key wrote.
+
+        `cyclecore.confirm_stop_request`'s cancel grace hangs off this rather
+        than off `enabled`: a sentinel written by somebody else (a script's
+        `touch stop`, another run) must halt this run as promptly as it always
+        did — nobody is sitting at this terminal waiting to press `s` again.
+        """
+        return self._requested_stop and self.status.stop_pending
+
     def request_stop(self) -> None:
         """Create the sentinel. The loop claims and removes it (see
         `cyclecore.stop_file_lifecycle`); we deliberately do not latch it here,
@@ -1450,6 +1700,7 @@ class StatusApp:
         except OSError as exc:
             self.note(f"could not create {self.stop_file}: {exc}")
             return
+        self._requested_stop = True
         self.status.update(stop_pending=True)
         self.note("stop requested — the loop halts at the next iteration boundary")
 
@@ -1461,6 +1712,7 @@ class StatusApp:
         except OSError as exc:
             self.note(f"could not remove {self.stop_file}: {exc}")
             return
+        self._requested_stop = False
         self.status.update(stop_pending=False)
         self.note("stop request cancelled")
 
@@ -1497,7 +1749,13 @@ class StatusApp:
     def handle_event(self, event: InputEvent) -> None:
         try:
             if isinstance(event, Resize):
-                self._reserve(len(self.rows()))
+                # A refused reserve() leaves the OLD geometry in place, so
+                # carrying on would paint absolute rows outside the new screen
+                # with the region set for the old one. Disable instead —
+                # start() answers the same refusal the same way.
+                if not self._reserve(len(self.rows())):
+                    self.disable()
+                    return
                 self._paint()
                 return
             for mode in reversed(self.modes):
@@ -1531,7 +1789,7 @@ class StatusApp:
             return True
         return False
 
-    def _paint(self) -> None:
+    def _paint(self, *, reassert: bool = False) -> None:
         if not self.terminal.active:
             return
         try:
@@ -1542,7 +1800,8 @@ class StatusApp:
                 # painting into lines the terminal is still scrolling.
                 if not self._reserve(len(rows)):
                     return
-            self.terminal.paint([colorize(line) for line in rows])
+            self.terminal.paint([colorize(line) for line in rows],
+                                reassert=reassert)
         except Exception:
             self.disable()
 
@@ -1563,8 +1822,13 @@ class StatusApp:
                     # Also catches a sentinel created by hand (`touch stop`).
                     pending = os.path.exists(self.stop_file)
                     if pending != self.status.stop_pending:
+                        if not pending:
+                            # Removed behind our back: whatever `s` asked for is
+                            # void, so the cancel grace must not claim it.
+                            self._requested_stop = False
                         self.status.update(stop_pending=pending)
-                self._paint()
+                # Re-assert the region on the periodic repaint: see Terminal.paint.
+                self._paint(reassert=True)
             except Exception:
                 self.disable()
                 return

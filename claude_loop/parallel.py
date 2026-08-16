@@ -108,6 +108,12 @@ def parse_args(argv=None, *, prog: str = "parallel",
                    help="don't pause on the Current-session usage limit "
                         "(by default the workers pause together when the session "
                         "budget is exhausted)")
+    # Accepted here too: the flag is documented as a general one, and a periodic
+    # run hands these args to the sequential loop (which honours it), so a parser
+    # that rejected it would exit 2 on a documented spelling.
+    p.add_argument("--no-statusline", dest="no_statusline", action="store_true",
+                   help="do not pin the interactive status rows at the bottom of "
+                        "the terminal (same as CLAUDE_LOOP_STATUSLINE=0)")
     return p.parse_args(argv)
 
 

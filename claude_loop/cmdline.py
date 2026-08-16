@@ -13,8 +13,10 @@ answer honest: flags this engine never parses - the host wrapper's -p/--parallel
 module knowing what they mean.
 
 The module is deliberately PURE: no terminal, no I/O, and no import of cyclecore,
-limits or parallel (statusline imports this, and those import statusline - a
-single import here would close the cycle).
+limits or parallel. `statusline` imports this one (SettingsRegistry validates
+every Setting.flag against FLAG_ALIASES) while cyclecore/limits/parallel import
+statusline - so a single import from here in the other direction would close the
+cycle.
 """
 
 import os

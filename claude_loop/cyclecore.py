@@ -208,13 +208,15 @@ def confirm_stop_request(app=None, grace: float = STOP_GRACE_SECONDS,
                          poll: float = 0.25) -> bool:
     """True if the pending stop sentinel should be acted on now.
 
-    The grace exists ONLY for the interactive status line (`app.enabled`): a
-    piped run, a CI run, or a script that wrote the file itself gets today's
-    behaviour, unslowed — automation must not wait for a keypress that cannot
-    come. Both runners call this, so the sequential loop and the parallel
-    claim-loop share one definition of "the user really meant it".
+    The grace exists ONLY for a sentinel this run's own `s` key created
+    (`app.stop_requested_here`): a piped run, a CI run, or a script that wrote
+    the file itself gets today's behaviour, unslowed — automation must not wait
+    out a countdown for a keypress that is never coming. Intended as the one
+    definition of "the user really meant it" for both runners; the parallel
+    claim-loop adopts it when it grows a status line of its own.
     """
-    if app is None or not getattr(app, "enabled", False) or grace <= 0:
+    if (app is None or not getattr(app, "enabled", False)
+            or not getattr(app, "stop_requested_here", False) or grace <= 0):
         return True
     app.update(phase="stopping")
     deadline = time.time() + grace
@@ -1298,20 +1300,64 @@ def wait_before_start(spec: str) -> None:
     print("  ▶ Starting the loop.")
 
 
-def _script_limit_entries(max_iters, max_strike, git_push_policy) -> list:
-    """The script's own ceilings as (label, text) pairs for the status line.
+class RunSettings:
+    """The script's own knobs, held in one MUTABLE object the loop re-reads.
 
-    Kept next to the loop that owns these values rather than inside the status
-    line: wave 2 replaces this with `SettingsRegistry.status_entries()` once the
-    same knobs become editable, and the renderer never has to know either way.
+    Plain locals froze these at startup, which made "edit the limits while the
+    run goes" (the status line's `l` key) impossible without touching the loop
+    body. The loop now reads this object at every iteration boundary, so moving
+    `--max-runs` from 40 to 60 mid-run takes effect at the next boundary and
+    nothing else has to change.
+
+    `max_strike_seconds` is derived on every read for the same reason: an edited
+    duration text and the seconds the loop compares against cannot drift apart.
     """
-    entries = []
-    if max_iters is not None:
-        entries.append(("max-runs", str(max_iters)))
-    if max_strike:
-        entries.append(("max-strike", str(max_strike)))
-    entries.append(("git-push", git_push_policy.value))
-    return entries
+
+    def __init__(self, *, max_runs: Optional[int] = None,
+                 max_strike: Optional[str] = None,
+                 git_push: "GitPushPolicy" = None):
+        self.max_runs = max_runs
+        self.max_strike = max_strike        # duration text, as spelled on the CLI
+        self.git_push = git_push or GitPushPolicy(GIT_PUSH_POLICY)
+
+    @property
+    def max_strike_seconds(self) -> Optional[float]:
+        if not self.max_strike:
+            return None
+        try:
+            return parse_duration(str(self.max_strike))
+        except ValueError:
+            # The startup value is validated (and exits 2); a later edit that
+            # spells nonsense turns the budget off rather than killing the run.
+            return None
+
+
+def _script_settings(run_settings: RunSettings, statusline) -> "SettingsRegistry":
+    """The script's knobs as a SettingsRegistry — the display AND edit surface.
+
+    One registry is the single source of truth for both the pinned row
+    (`status_entries()`) and the reproducing command line (`overrides()`), so a
+    figure on screen can never disagree with the flag that would reproduce it;
+    the flags are checked against `cmdline.FLAG_ALIASES` at registration.
+    `statusline` is passed in because cyclecore must not import it at module
+    level (statusline imports cyclecore).
+    """
+    registry = statusline.SettingsRegistry()
+    registry.add(statusline.NumberSetting(
+        "max-runs", "--max-runs",
+        lambda: run_settings.max_runs,
+        lambda value: setattr(run_settings, "max_runs",
+                              None if value is None else int(value)),
+        minimum=1))
+    registry.add(statusline.NumberSetting(
+        "max-strike", "--max-strike",
+        lambda: run_settings.max_strike,
+        lambda value: setattr(run_settings, "max_strike", value)))
+    registry.add(statusline.Setting(
+        "git-push", "--git-push",
+        lambda: run_settings.git_push.value,
+        lambda value: setattr(run_settings, "git_push", GitPushPolicy(value))))
+    return registry
 
 
 class LoopStop(Exception):
@@ -1456,23 +1502,28 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     provider = getattr(args, "provider", None) or driver.provider
     spec = provider_spec(provider)
     driver.provider = provider
-    max_iters = args.max          # None = no limit
+    # The live knobs (see RunSettings): read at each iteration boundary, never
+    # snapshotted into locals, so the status line's editor can move them mid-run.
+    run_settings = RunSettings(
+        max_runs=args.max,                          # None = no limit
+        max_strike=args.max_strike,                 # e.g. "3h" — per-session work budget
+        git_push=GitPushPolicy(args.git_push))      # when to `git push` each iteration
     # When a finite iteration cap is given (-m/--max-runs) the run is short and
     # bounded on purpose, so the usage-limit machinery (the LimitPolicy
     # pause-on-limit logic) is skipped — we just run the requested iterations
-    # without ever waiting out a window.
-    ignore_usage_limits = max_iters is not None or not spec.supports_usage_limits
+    # without ever waiting out a window. Decided once, from the value the run was
+    # LAUNCHED with: it also governs whether this run talks to the usage endpoint
+    # at all, which is a property of the invocation, not of the current cap.
+    ignore_usage_limits = (args.max is not None
+                           or not spec.supports_usage_limits)
     dry_run = args.dry_run
     raw = args.raw
     start_in = args.start_in      # e.g. "29m" — delay before the loop starts
-    git_push_policy = GitPushPolicy(args.git_push)  # when to `git push` each iteration
-    max_strike = args.max_strike  # e.g. "3h" — per-session work budget before a pre-emptive pause
-    max_strike_seconds = None
-    if max_strike:
+    if args.max_strike:
         try:
-            max_strike_seconds = parse_duration(max_strike)
+            parse_duration(args.max_strike)   # reject a bad spelling at startup
         except ValueError as e:
-            print(f"Invalid --max-strike value {max_strike!r}: {e}")
+            print(f"Invalid --max-strike value {args.max_strike!r}: {e}")
             sys.exit(2)
 
     # Anchor every project-relative operation (git/provider cwd, the stop file, the
@@ -1516,9 +1567,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     if usage_source is not None:
         limit_policy = driver.limit_policy or limits.default_policy(provider)
     last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
-    print(f"  · git push policy: {git_push_policy.value}")
+    print(f"  · git push policy: {run_settings.git_push.value}")
     if ignore_usage_limits:
-        print(f"  · usage limit policy: disabled (bounded run, --max {max_iters})")
+        print(f"  · usage limit policy: disabled (bounded run, "
+              f"--max {run_settings.max_runs})")
     else:
         print_percents(f"  · usage limit policy: {limit_policy.describe()}")
 
@@ -1531,24 +1583,18 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # the sequential loop is a run with exactly one Job — no branch anywhere in
     # the status line separates it from `-j N`. Disabled it is a Null object, so
     # every call below stays a no-op and the loop behaves exactly as before.
+    settings = _script_settings(run_settings, statusline)
     app = statusline.StatusApp(
+        settings=settings,
         enabled=not dry_run and not getattr(args, "no_statusline", False))
     app.update(
         provider=provider,
-        max_iterations=max_iters,
+        max_iterations=run_settings.max_runs,
         # Only a list driver has a pick order; read it defensively so any other
         # Driver simply reports no `rand` marker.
         random_order=str(getattr(driver, "pick_order", "")) == "random",
-        script_limits=_script_limit_entries(max_iters, max_strike,
-                                            git_push_policy),
+        script_limits=settings.status_entries(),
     )
-    if usage_source is not None:
-        # Keeps the pinned quota figures fresh through a long iteration; goes
-        # through the SAME cached UsageSource, so it costs one request per
-        # interval and nothing at all next to a limit check.
-        app.add_service(statusline.QuotaRefresher(app, usage_source, limit_policy,
-                                                  provider=provider))
-        statusline.push_quotas(app, usage_source, limit_policy)
 
     iteration = 0
     completed = 0
@@ -1556,7 +1602,28 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     dry_run_prompt_shown = False  # dry-run: show job 1's prompt once, not per pass
     with app:
+        if usage_source is not None:
+            # Inside `with`, not before it: push_quotas is silent until start()
+            # has marked the app enabled, so priming it earlier left requirement
+            # #1 — the provider's live figures — blank until the first limit
+            # check (i.e. for the whole run when the checks are skipped). The
+            # reading itself is already paid for by the start-of-run snapshot
+            # above, so this costs no round-trip.
+            statusline.push_quotas(app, usage_source, limit_policy)
+            if not ignore_usage_limits:
+                # Only for a run that is allowed to talk to the usage endpoint at
+                # all: the poll forces a FRESH reading (cache_value=False), so on
+                # a bounded `-m N` run — whose whole point is not to touch the
+                # usage machinery — it would be an unsolicited HTTP GET every
+                # interval (a codex app-server call every 300 s).
+                app.add_service(statusline.QuotaRefresher(
+                    app, usage_source, limit_policy, provider=provider))
         while True:
+            # The caps are read LIVE (see RunSettings) and republished here, so an
+            # edit made while the run is going takes effect at this boundary and
+            # is what the pinned row shows.
+            app.update(max_iterations=run_settings.max_runs,
+                       script_limits=settings.status_entries())
             if os.path.exists(STOP_FILE):
                 # The sentinel is removed only after the outer application has
                 # finished cleanup. A dry run must not claim it. `-d` is routinely
@@ -1582,10 +1649,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
             # Git push policy: evaluated at the start of every iteration.
             if not dry_run:
-                last_git_push = maybe_git_push(git_push_policy, last_git_push)
+                last_git_push = maybe_git_push(run_settings.git_push, last_git_push)
 
-            if max_iters is not None and iteration >= max_iters:
-                print(f"Iteration limit reached (--max-runs {max_iters}). Stopping.")
+            max_runs = run_settings.max_runs
+            if max_runs is not None and iteration >= max_runs:
+                print(f"Iteration limit reached (--max-runs {max_runs}). Stopping.")
                 stop_reason = RunStopReason.LIMIT_REACHED
                 break
 
@@ -1593,10 +1661,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # work budget, pause pre-emptively (same as a token-limit hit) so the
             # current unit of work stays whole and we don't run into the limit
             # mid-iteration. Checked between iterations, never in the middle of one.
+            max_strike_seconds = run_settings.max_strike_seconds
             if max_strike_seconds is not None and iteration > 0:
                 elapsed = time.time() - session_start
                 if elapsed > max_strike_seconds:
-                    print(f"  ⌛ max-strike budget ({max_strike}) reached after "
+                    print(f"  ⌛ max-strike budget ({run_settings.max_strike}) "
+                          f"reached after "
                           f"{int(elapsed // 60)} min of work — pausing for the next "
                           f"session so this run stays whole.")
                     target_ts = session_start + SESSION_DURATION
@@ -1675,7 +1745,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                         width=statusline.screen_width()))
                 # looping forever in dry-run is pointless — nothing is actually done,
                 # so the driver would keep handing back the same first unit of work.
-                if max_iters is None:
+                if run_settings.max_runs is None:
                     print("(dry-run without --max-runs: running a single iteration and exiting)")
                     stop_reason = RunStopReason.DRY_RUN
                     break
@@ -1761,7 +1831,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # Final push: regardless of the EACH_HOUR cadence, push any pending commits
     # on the way out so work isn't left only on the local branch — unless the
     # policy is NONE (never auto-push).
-    if not dry_run and git_push_policy != GitPushPolicy.NONE:
+    if not dry_run and run_settings.git_push != GitPushPolicy.NONE:
         count = git_unpushed_count()
         if count is None or count > 0:
             print("  · final git push on exit…")

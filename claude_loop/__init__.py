@@ -37,6 +37,7 @@ made Drivers, parallel for the concurrent list runner, usage/codex_usage for the
 provider quota query layers, and limits for the pausing policy.
 """
 
+from . import cmdline
 from .cyclecore import (
     AgentCommand,
     ClaudeCommand,
@@ -140,6 +141,7 @@ __all__ = [
     "WeeklyLimit",
     "build_agent_argv",
     "build_claude_argv",
+    "cmdline",
     "completion_sound_enabled",
     "confirm_stop_request",
     "default_policy",

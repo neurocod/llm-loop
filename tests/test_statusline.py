@@ -7,8 +7,10 @@ what a human actually reads.
 """
 
 import io
+import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -49,11 +51,11 @@ def parallel_status(count=3):
 # --- the pure renderer ---------------------------------------------------------
 
 
-def test_one_job_renders_summary_job_legend_and_note_rows():
+def test_one_job_renders_rule_summary_job_legend_and_note_rows():
     rows = sl.render_rows(sequential_status(), 200, now=NOW)
 
-    assert len(rows) == 4          # summary + 1 job + legend + note
-    summary, job_row = rows[0], rows[1]
+    assert len(rows) == 5          # rule + summary + 1 job + legend + note
+    summary, job_row = rows[1], rows[2]
     assert "iter 12/40" in summary
     assert "claude/opus" in summary
     assert "session 43% (ceil 95%, 2h11m)" in summary
@@ -65,29 +67,31 @@ def test_one_job_renders_summary_job_legend_and_note_rows():
 def test_each_job_gets_its_own_row_and_an_idle_one_has_no_clock():
     rows = sl.render_rows(parallel_status(3), 200, now=NOW)
 
-    assert len(rows) == 6          # summary + 3 jobs + legend + note
-    assert "3 jobs" in rows[0]
-    assert [f"job {i}" in rows[i] for i in (1, 2, 3)] == [True] * 3
-    assert "item-3.md" not in rows[3] and "idle" in rows[3]
-    assert "0m00s" not in rows[3]
+    assert len(rows) == 7          # rule + summary + 3 jobs + legend + note
+    assert "3 jobs" in rows[1]
+    assert [f"job {i}" in rows[i + 1] for i in (1, 2, 3)] == [True] * 3
+    assert "item-3.md" not in rows[4] and "idle" in rows[4]
+    assert "0m00s" not in rows[4]
 
 
 def test_rows_never_exceed_the_terminal_width():
     for width in (40, 60, 100):
-        for line in sl.render_rows(sequential_status(), width, now=NOW):
+        rows = sl.render_rows(sequential_status(), width, now=NOW)
+        for line in rows:
             assert sl.cell_width(line) <= width
-        assert "…" in sl.render_rows(sequential_status(), 40, now=NOW)[0]
+            assert "\n" not in line        # exactly one terminal line per row
+    assert "…" in sl.render_rows(sequential_status(), 40, now=NOW)[1]
 
 
 def test_rand_marker_follows_the_random_order_flag():
     assert "rand" in sl.render_rows(
-        sequential_status(random_order=True), 200, now=NOW)[0]
-    assert "rand" not in sl.render_rows(sequential_status(), 200, now=NOW)[0]
+        sequential_status(random_order=True), 200, now=NOW)[1]
+    assert "rand" not in sl.render_rows(sequential_status(), 200, now=NOW)[1]
 
 
 def test_max_marker_is_dropped_for_an_unbounded_run():
     summary = sl.render_rows(
-        sequential_status(max_iterations=None), 200, now=NOW)[0]
+        sequential_status(max_iterations=None), 200, now=NOW)[1]
 
     assert "iter 12" in summary and "/40" not in summary
 
@@ -98,29 +102,29 @@ def test_an_empty_model_reads_as_cli_default():
 
     rows = sl.render_rows(status, 200, now=NOW)
 
-    assert "claude/cli default" in rows[0]
-    assert "cli default" in rows[1]
+    assert "claude/cli default" in rows[1]
+    assert "cli default" in rows[2]
 
 
 def test_stop_pending_marker_appears_only_while_pending():
     assert "STOP pending" not in sl.render_rows(
-        sequential_status(), 200, now=NOW)[0]
+        sequential_status(), 200, now=NOW)[1]
     assert "STOP pending — press s to cancel" in sl.render_rows(
-        sequential_status(stop_pending=True), 200, now=NOW)[0]
+        sequential_status(stop_pending=True), 200, now=NOW)[1]
 
 
 def test_the_two_clocks_are_different_clocks():
     """The job row times the CURRENT iteration; the summary times the whole run."""
     rows = sl.render_rows(sequential_status(), 200, now=NOW)
 
-    assert "1h00m" in rows[0] and "1h00m" not in rows[1]
-    assert "4m12s" in rows[1] and "4m12s" not in rows[0]
+    assert "1h00m" in rows[1] and "1h00m" not in rows[2]
+    assert "4m12s" in rows[2] and "4m12s" not in rows[1]
 
 
 def test_quota_without_a_figure_reads_as_not_available():
     status = sequential_status(quotas=[("session", None, 95.0, None)])
 
-    assert "session n/a" in sl.render_rows(status, 200, now=NOW)[0]
+    assert "session n/a" in sl.render_rows(status, 200, now=NOW)[1]
 
 
 def test_note_row_carries_the_transient_message():
@@ -129,12 +133,39 @@ def test_note_row_carries_the_transient_message():
     assert rows[-1].strip() == "stop requested"
 
 
-def test_colorize_only_wraps_percentages():
+def test_colorize_styles_percentages_and_chrome_and_nothing_else():
     line = sl.colorize(" session 43% (ceil 95%)")
 
     assert "\x1b[" in line
     assert "session" in line and line.count("\x1b[0m") == 2
     assert sl.colorize(" no figures here") == " no figures here"
+
+
+# --- chrome: the rule and the value separators ---------------------------------
+
+
+def test_the_rule_row_opens_the_area_and_spans_the_width():
+    for width in (40, 100, 200):
+        rule = sl.render_rows(sequential_status(), width, now=NOW)[0]
+
+        assert rule == sl.RULE_CHAR * width       # plain chars: no colour needed
+        assert sl.cell_width(rule) == width
+
+
+def test_values_inside_a_row_are_separated_by_the_chrome_pipe():
+    rows = sl.render_rows(sequential_status(), 200, now=NOW)
+
+    assert " | " in rows[1] and "iter 12/40 | claude/opus" in rows[1]
+    assert " | " in rows[2]                        # job row columns
+    assert " | " in sl.StatusApp(enabled=False).render(width=200, now=NOW)[-2]
+
+
+def test_the_rule_and_the_separators_share_one_muted_style():
+    dim = sl._SGR[sl.CHROME_STYLE]
+    painted = sl.colorize(f"a{sl.SEPARATOR}b")
+
+    assert painted == f"a {dim}|{sl._SGR_RESET} b"
+    assert sl.colorize(sl.RULE_CHAR * 8) == f"{dim}{'_' * 8}{sl._SGR_RESET}"
 
 
 # --- key legend derived from the registered Actions ----------------------------
@@ -236,6 +267,7 @@ class _FakeApp:
     "the user pressed s again" happen at a defined moment."""
 
     enabled = True
+    stop_requested_here = True     # as if the sentinel came from the `s` key
 
     def __init__(self, on_note=None):
         self.notes = []
@@ -290,6 +322,40 @@ def test_a_non_interactive_run_stops_without_any_grace(monkeypatch, tmp_path):
     assert cyclecore.confirm_stop_request(
         sl.StatusApp(enabled=False), grace=60) is True
     assert time.monotonic() - started < 1.0
+
+
+def test_a_sentinel_this_run_did_not_write_stops_it_at_once(monkeypatch, tmp_path):
+    """`touch stop` from a script: the grace waits for a key nobody will press."""
+    from claude_loop import cyclecore
+
+    sentinel = tmp_path / "stop"
+    sentinel.write_text("", encoding="utf-8")
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    external = _FakeApp()
+    external.stop_requested_here = False    # written by somebody else
+    started = time.monotonic()
+
+    assert cyclecore.confirm_stop_request(external, grace=1.0, poll=0.01) is True
+    assert time.monotonic() - started < 0.5
+    assert external.notes == []             # no countdown was ever announced
+
+
+def test_the_stop_key_is_what_marks_the_sentinel_as_ours(tmp_path):
+    """The grace is keyed on `s`, so the flag must follow the key, not the file."""
+    sentinel = tmp_path / "stop"
+    app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
+
+    assert app.stop_requested_here is False
+    sentinel.write_text("", encoding="utf-8")       # an external `touch stop`
+    app.status.update(stop_pending=True)
+    assert app.stop_requested_here is False
+
+    app.handle_event(sl.Key("s"))                   # toggle: removes it
+    app.handle_event(sl.Key("s"))                   # and writes it as ours
+    assert sentinel.exists() and app.stop_requested_here is True
+
+    app.handle_event(sl.Key("s"))
+    assert app.stop_requested_here is False
 
 
 # --- disabled / no-TTY paths ---------------------------------------------------
@@ -554,6 +620,365 @@ def test_a_dry_run_prints_the_prompt_block_for_job_one(tmp_path, capsys):
     assert "prompt · job 1 · the-thing · 23 chars" in out
     assert "do the thing, carefully" in out
     assert out.count("prompt · job 1") == 1       # once, not per pass
+
+
+# --- the mirror log must never see an escape ----------------------------------
+
+
+class _CollectingHandler(logging.Handler):
+    def __init__(self, sink):
+        super().__init__()
+        self.sink = sink
+
+    def emit(self, record):
+        self.sink.append(record.getMessage())
+
+
+def test_a_default_terminal_targets_the_real_stream_not_the_tee(monkeypatch):
+    from claude_loop import cyclecore
+
+    console = _FakeStream(True)
+    monkeypatch.setattr(cyclecore, "_real_stream", lambda: console)
+
+    assert sl.Terminal()._stream is console
+
+
+def test_the_pinned_rows_never_reach_the_mirror_log(monkeypatch):
+    """The feature's #1 non-negotiable: cursor bytes in the log corrupt the run
+    record `--cost` parses, and every other test injects its own stream."""
+    from claude_loop import cyclecore
+
+    console = _FakeStream(True)
+    logged = []
+    logger = logging.getLogger("pytest-statusline-tee")
+    logger.handlers = [_CollectingHandler(logged)]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    monkeypatch.setattr(sys, "stdout", cyclecore._TeeToLog(console, logger))
+    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+                        lambda fallback=(0, 0): os.terminal_size((100, 30)))
+
+    app = sl.StatusApp(input_source=sl.NullInputSource(), refresh=60)
+    assert app.terminal._stream is console      # the tee was unwrapped
+    with app:
+        app.update(iteration=7, phase="running")
+        print("ordinary output")                # still goes through the tee
+
+    assert "\x1b" in console.getvalue() and "iter 7" in console.getvalue()
+    assert logged == ["ordinary output"]
+    assert all("\x1b" not in line for line in logged)
+
+
+# --- teardown -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("blow_up", [RuntimeError("boom"), SystemExit(3),
+                                     KeyboardInterrupt()])
+def test_every_way_out_releases_the_region(monkeypatch, blow_up):
+    """Disabling is not enough — the region has to be reset on the way out, or
+    the shell keeps scrolling inside it after the process is gone."""
+    stream = _FakeStream(True)
+    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+                        lambda fallback=(0, 0): os.terminal_size((100, 30)))
+    app = sl.StatusApp(terminal=sl.terminal_for(stream),
+                       input_source=sl.NullInputSource(), refresh=60)
+
+    with pytest.raises(type(blow_up)):
+        with app:
+            app.update(iteration=1, phase="running")
+            raise blow_up
+
+    assert "\x1b[r" in stream.getvalue()        # DECSTBM reset, not just disabled
+    assert app.terminal._rows == 0
+    assert app.enabled is False
+
+
+def test_a_signal_restores_the_terminal_and_still_lets_the_kill_through():
+    """A signal unwinds no `finally` of ours, and the key reader is a daemon —
+    without a handler the region stays pinned after the process is gone."""
+    import signal
+
+    stream = _FakeStream(True)
+    app = sl.StatusApp(terminal=sl.Terminal(stream),
+                       input_source=sl.NullInputSource(), refresh=60)
+    chained = []
+    previous = signal.signal(signal.SIGTERM, lambda *args: chained.append(args))
+    try:
+        with app:
+            # == not `is`: a bound method is a fresh object on every attribute read
+            assert signal.getsignal(signal.SIGTERM) == app._signal_restore
+            app._signal_restore(signal.SIGTERM, None)
+            assert app.terminal._rows == 0          # the region was given back
+            assert chained                          # and the kill still happens
+        assert signal.getsignal(signal.SIGTERM) != app._signal_restore
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def test_a_resize_the_region_cannot_satisfy_stops_painting(monkeypatch):
+    """reserve() refuses without touching its geometry, so ignoring its answer
+    left the rows being painted at the OLD coordinates."""
+    stream = _FakeStream(True)
+    size = [(100, 30)]
+    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+                        lambda fallback=(0, 0): os.terminal_size(size[0]))
+    app = sl.StatusApp(terminal=sl.terminal_for(stream),
+                       input_source=sl.NullInputSource(), refresh=60)
+
+    with app:
+        assert app.enabled is True
+        assert "\x1b[27;1H" in stream.getvalue()     # 5 rows at the 30-line size
+        size[0] = (100, 6)                           # no room for the region now
+        mark = len(stream.getvalue())
+        app.handle_event(sl.Resize(100, 6))
+        app.update(iteration=99)
+
+        assert app.enabled is False
+        tail = stream.getvalue()[mark:]
+        assert "iter" not in tail        # no row painted into the smaller screen
+        assert "\x1b[r" in tail          # the region was given back instead
+
+
+# --- concurrent writers (the net under wave 3's N workers) ---------------------
+
+
+def test_concurrent_job_updates_never_tear_a_snapshot():
+    status = sl.LoopStatus(jobs=[sl.Job(i) for i in range(1, 5)])
+    stop = threading.Event()
+    errors = []
+
+    def churn(job):
+        try:
+            while not stop.is_set():
+                job.start(item=f"item-{job.job_id}.md", model="opus")
+                job.finish()
+        except Exception as exc:              # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=churn, args=(job,), daemon=True)
+               for job in status.jobs]
+    for thread in threads:
+        thread.start()
+    try:
+        for _ in range(300):
+            frozen = status.snapshot()
+            assert [j.job_id for j in frozen.jobs] == [1, 2, 3, 4]
+            for job in frozen.jobs:
+                # A painted row is ONE iteration, never half of two.
+                assert (job.started_at > 0) is job.running
+                assert job.item in ("", f"item-{job.job_id}.md")
+            sl.render_rows(status, 120)
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=2)
+
+    assert not errors
+
+
+# --- the loop's wiring: live caps, primed quotas, no forced polls ---------------
+
+
+class _LiveTerminal(sl.Terminal):
+    """Active from reserve() on, with no screen behind it.
+
+    What these tests are about happens on either side of start() (push_quotas is
+    silent until the app is enabled), which a NullTerminal — off always, and
+    short-circuited by start() — cannot express and a real Terminal needs a tty
+    for.
+    """
+
+    def __init__(self):
+        super().__init__(stream=io.StringIO())
+        self._on = False
+
+    @property
+    def active(self):
+        return self._on
+
+    def size(self):
+        return (120, 30)
+
+    def reserve(self, rows):
+        self._on = True
+        return True
+
+    def paint(self, lines, *, reassert=False):
+        return True
+
+    def release(self):
+        self._on = False
+
+
+class _CountingSource:
+    """A UsageSource that never leaves the process."""
+
+    def __init__(self, percent=5.0):
+        from claude_loop.usage import Usage, UsageReading
+
+        reading = UsageReading(percent, NOW + 3600)
+        self.usage = Usage(reading, reading, UsageReading(None, None),
+                           [f"Current session: {percent:.0f}% used"])
+        self.reads = []
+
+    def get_usage(self, cache_value=True):
+        self.reads.append(cache_value)
+        return self.usage
+
+    def invalidate(self):
+        pass
+
+
+def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None, **arg_fields):
+    """run_loop with a live (screenless) status line; returns (app, source)."""
+    from claude_loop import cyclecore
+
+    source = _CountingSource()
+    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: source)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda cmd, raw, partial: 0)
+    made = {}
+    real_app_class = sl.StatusApp        # captured before the patch below
+
+    def _app(**kwargs):
+        kwargs.pop("enabled", None)
+        app = real_app_class(terminal=_LiveTerminal(),
+                             input_source=sl.NullInputSource(), refresh=60,
+                             **kwargs)
+        made["app"] = app
+        if on_app is not None:
+            on_app(app)
+        return app
+
+    monkeypatch.setattr(sl, "StatusApp", _app)
+
+    args = type("NS", (), {})()
+    args.max = 1
+    args.dry_run = False
+    args.raw = False
+    args.start_in = None
+    args.max_strike = None
+    args.git_push = "none"
+    args.project_dir = str(tmp_path)
+    args.cost = False
+    args.no_statusline = False
+    for name, value in arg_fields.items():
+        setattr(args, name, value)
+
+    previous = cyclecore.project_dir()
+    try:
+        cyclecore.run_loop(driver, args, app_name="pytest-statusline",
+                           setup_logging=False, wait_on_start=False)
+    finally:
+        cyclecore.set_project_root(previous)
+    return made["app"], source
+
+
+def test_a_bounded_run_shows_the_quotas_and_never_polls_for_them(monkeypatch,
+                                                                 tmp_path):
+    """Priming before `with app:` published nothing (push_quotas needs an enabled
+    app), and a `-m N` run has no later limit check to publish them either."""
+    from claude_loop.cyclecore import AgentCommand, Driver
+
+    class _OneShot(Driver):
+        def next_command(self):
+            return AgentCommand("do the thing", "", "the-thing")
+
+    app, _source = _run_with_status(monkeypatch, tmp_path, _OneShot())
+
+    assert app.status.quotas, "the provider's figures never reached the row"
+    # -m N deliberately skips the usage machinery: no forced-fresh poll either.
+    assert app._services == []
+
+
+def test_an_unbounded_run_keeps_the_quota_figures_refreshed(monkeypatch, tmp_path):
+    from claude_loop.cyclecore import Driver
+
+    class _NoWork(Driver):
+        def next_command(self):
+            return None
+
+    app, _source = _run_with_status(monkeypatch, tmp_path, _NoWork(), max=None)
+
+    assert [type(s).__name__ for s in app._services] == ["QuotaRefresher"]
+    assert app.status.quotas
+
+
+def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
+                                                                   tmp_path):
+    """Wave 2 edits --max-runs while the run goes, so the loop must not be
+    comparing against a local it snapshotted at startup."""
+    from claude_loop.cyclecore import AgentCommand, Driver
+
+    class _RaisesItsOwnCap(Driver):
+        app = None
+        calls = 0
+
+        def next_command(self):
+            self.calls += 1
+            if self.calls == 1:
+                self.app.settings.get("max-runs").set(2)
+            return AgentCommand("do the thing", "", f"item-{self.calls}")
+
+    driver = _RaisesItsOwnCap()
+    app, _source = _run_with_status(monkeypatch, tmp_path, driver,
+                                    on_app=lambda a: setattr(driver, "app", a))
+
+    assert driver.calls == 2                          # the raised cap took effect
+    assert app.status.max_iterations == 2
+    assert ("max-runs", "2") in app.status.script_limits
+
+
+def test_a_setting_flag_is_checked_against_the_command_line_table():
+    """A typo must fail at registration, not when `c` renders the command line."""
+    with pytest.raises(KeyError):
+        sl.SettingsRegistry().add(sl.NumberSetting(
+            "max-runs", "--max-run", lambda: 1, lambda v: None))
+
+
+# --- the background refresher stays out of the stream --------------------------
+
+
+def test_a_background_quota_poll_notes_its_failure_instead_of_printing(capsys):
+    """A daemon thread printing lands mid-stream and in the mirror log — possibly
+    inside a rich Live block."""
+    class _NoisySource:
+        def get_usage(self, cache_value=True):
+            print("  · no usage figures: the stored OAuth token was rejected (401)")
+            raise RuntimeError("no figures")     # quota_rows swallows this
+
+    app = sl.StatusApp(terminal=_LiveTerminal(),
+                       input_source=sl.NullInputSource(), refresh=60)
+    with app:
+        refresher = sl.QuotaRefresher(app, _NoisySource(), interval=0.01)
+        refresher.start()
+        deadline = time.time() + 5
+        while not app.status.note and time.time() < deadline:
+            time.sleep(0.01)
+        refresher.stop()
+
+    assert "quota refresh" in app.status.note and "401" in app.status.note
+    assert capsys.readouterr().out == ""          # nothing reached the stream
+
+
+def test_capture_only_diverts_the_thread_that_asked_for_it(capsys):
+    other = threading.Event()
+
+    def elsewhere():
+        print("from another thread")
+        other.set()
+
+    with sl.capture_stdout_here() as chunks:
+        print("mine")
+        threading.Thread(target=elsewhere, daemon=True).start()
+        other.wait(5)
+
+    assert "".join(chunks) == "mine\n"
+    assert capsys.readouterr().out == "from another thread\n"
+    assert not isinstance(sys.stdout, sl._ThreadScopedCapture)   # uninstalled
 
 
 def test_escape_decoder_names_the_special_keys_on_both_platforms():
