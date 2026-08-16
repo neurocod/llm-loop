@@ -252,22 +252,25 @@ def test_parallel_codex_runner_forwards_prompt_to_stdin_transport(monkeypatch):
     assert calls[0][1:3] == ("codex", "parallel prompt")
 
 
-def test_sequential_runner_treats_json_number_as_diagnostic(monkeypatch, capsys):
+@pytest.mark.parametrize("line", ["0", "null", "true", '"text"', "[]", "[1]"])
+def test_sequential_runner_treats_non_object_json_as_diagnostic(
+        monkeypatch, capsys, line):
     monkeypatch.setattr(
         cyclecore, "start_agent_process",
-        lambda *args: _FakeAgentProcess(has_stdin=False, stdout="0\n"),
+        lambda *args: _FakeAgentProcess(has_stdin=False, stdout=f"{line}\n"),
     )
 
     assert cyclecore.run_agent_streaming(
         ["codex", "exec", "--json", "-"], "codex", False,
     ) == 0
-    assert capsys.readouterr().out.strip() == "0"
+    assert capsys.readouterr().out.strip() == line
 
 
-def test_parallel_runner_ignores_json_number(monkeypatch):
+@pytest.mark.parametrize("line", ["0", "null", "true", '"text"', "[]", "[1]"])
+def test_parallel_runner_ignores_non_object_json(monkeypatch, line):
     monkeypatch.setattr(
         parallel, "start_agent_process",
-        lambda *args: _FakeAgentProcess(has_stdin=False, stdout="0\n"),
+        lambda *args: _FakeAgentProcess(has_stdin=False, stdout=f"{line}\n"),
     )
 
     command = AgentCommand("parallel prompt", "gpt-test", "job", "codex")
