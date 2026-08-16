@@ -195,6 +195,41 @@ def mark_stop_file_detected() -> None:
         _detected_stop_file = STOP_FILE
 
 
+# How long an interactive run counts down before it acts on a stop request. The
+# status line's `s` key both sets and clears the sentinel, so a mis-press must be
+# undoable — but a runner that latched the file and exited a millisecond later
+# would make "press s again" a race the user always loses. Five seconds is long
+# enough to notice the countdown row and press the key again, short enough that
+# a deliberate stop still feels immediate.
+STOP_GRACE_SECONDS = 5.0
+
+
+def confirm_stop_request(app=None, grace: float = STOP_GRACE_SECONDS,
+                         poll: float = 0.25) -> bool:
+    """True if the pending stop sentinel should be acted on now.
+
+    The grace exists ONLY for the interactive status line (`app.enabled`): a
+    piped run, a CI run, or a script that wrote the file itself gets today's
+    behaviour, unslowed — automation must not wait for a keypress that cannot
+    come. Both runners call this, so the sequential loop and the parallel
+    claim-loop share one definition of "the user really meant it".
+    """
+    if app is None or not getattr(app, "enabled", False) or grace <= 0:
+        return True
+    app.update(phase="stopping")
+    deadline = time.time() + grace
+    while True:
+        if not os.path.exists(STOP_FILE):   # pressed `s` again — undo everything
+            app.update(phase="idle", stop_pending=False)
+            app.note("stop cancelled — continuing")
+            return False
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return True
+        app.note(f"stopping in {int(remaining) + 1}s — press s to cancel")
+        time.sleep(min(poll, remaining))
+
+
 def set_project_root(path: Optional[str]) -> str:
     """Point the engine at the project root (cwd for git/provider CLI, base for the
     stop file and relative Driver paths). `path` None/empty means "keep the
@@ -452,6 +487,12 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
                    help="project root: cwd for git/provider CLI, base for the stop "
                         "file and the Driver's relative paths "
                         "(default: the current working directory)")
+    # No short alias: this is a rescue hatch for an odd terminal, not a knob to
+    # reach for. CLAUDE_LOOP_STATUSLINE=0 does the same without editing a
+    # command line, and no TTY disables it by itself.
+    p.add_argument("--no-statusline", dest="no_statusline", action="store_true",
+                   help="do not pin the interactive status rows at the bottom of "
+                        "the terminal (same as CLAUDE_LOOP_STATUSLINE=0)")
     return p.parse_args(argv)
 
 
@@ -1257,6 +1298,22 @@ def wait_before_start(spec: str) -> None:
     print("  ▶ Starting the loop.")
 
 
+def _script_limit_entries(max_iters, max_strike, git_push_policy) -> list:
+    """The script's own ceilings as (label, text) pairs for the status line.
+
+    Kept next to the loop that owns these values rather than inside the status
+    line: wave 2 replaces this with `SettingsRegistry.status_entries()` once the
+    same knobs become editable, and the renderer never has to know either way.
+    """
+    entries = []
+    if max_iters is not None:
+        entries.append(("max-runs", str(max_iters)))
+    if max_strike:
+        entries.append(("max-strike", str(max_strike)))
+    entries.append(("git-push", git_push_policy.value))
+    return entries
+
+
 class LoopStop(Exception):
     """Raised by a Driver to abort the whole run (not a normal completion).
 
@@ -1393,8 +1450,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     """
     # The usage-limit query/parse (UsageSource) and pausing policy (LimitPolicy)
     # live in their own modules; imported here to avoid an import cycle
-    # (limits/usage import cyclecore for its helpers).
-    from . import limits
+    # (limits/usage/statusline import cyclecore for its helpers).
+    from . import limits, statusline
 
     provider = getattr(args, "provider", None) or driver.provider
     spec = provider_spec(provider)
@@ -1470,175 +1527,236 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     if not dry_run and usage_source is not None:
         limit_policy.log_snapshot(usage_source, "at start (iteration 1)")
 
+    # The pinned status area. A Job is the unit of display in both runners, so
+    # the sequential loop is a run with exactly one Job — no branch anywhere in
+    # the status line separates it from `-j N`. Disabled it is a Null object, so
+    # every call below stays a no-op and the loop behaves exactly as before.
+    app = statusline.StatusApp(
+        enabled=not dry_run and not getattr(args, "no_statusline", False))
+    app.update(
+        provider=provider,
+        max_iterations=max_iters,
+        # Only a list driver has a pick order; read it defensively so any other
+        # Driver simply reports no `rand` marker.
+        random_order=str(getattr(driver, "pick_order", "")) == "random",
+        script_limits=_script_limit_entries(max_iters, max_strike,
+                                            git_push_policy),
+    )
+    if usage_source is not None:
+        # Keeps the pinned quota figures fresh through a long iteration; goes
+        # through the SAME cached UsageSource, so it costs one request per
+        # interval and nothing at all next to a limit check.
+        app.add_service(statusline.QuotaRefresher(app, usage_source, limit_policy,
+                                                  provider=provider))
+        statusline.push_quotas(app, usage_source, limit_policy)
+
     iteration = 0
     completed = 0
     stop_reason = RunStopReason.NO_WORK
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
-    while True:
-        if os.path.exists(STOP_FILE):
-            # The sentinel is removed only after the outer application has
-            # finished cleanup. A dry run must not claim it. `-d` is routinely
-            # used to preview commands while a real loop is running — and that is
-            # exactly when a
-            # stop request is pending — so removing it here would silently cancel
-            # someone else's stop, and the loop it was meant to halt would run on.
-            # Report it and leave it for whoever it was written for.
+    dry_run_prompt_shown = False  # dry-run: show job 1's prompt once, not per pass
+    with app:
+        while True:
+            if os.path.exists(STOP_FILE):
+                # The sentinel is removed only after the outer application has
+                # finished cleanup. A dry run must not claim it. `-d` is routinely
+                # used to preview commands while a real loop is running — and that is
+                # exactly when a
+                # stop request is pending — so removing it here would silently cancel
+                # someone else's stop, and the loop it was meant to halt would run on.
+                # Report it and leave it for whoever it was written for.
+                if dry_run:
+                    if not stop_file_noted:
+                        print("Stop file present — a real run would have waited for "
+                              "it at startup, and stops here if it appears mid-run. "
+                              "Left in place (a dry run never consumes it).")
+                        stop_file_noted = True
+                elif confirm_stop_request(app):
+                    mark_stop_file_detected()
+                    print("Stop file detected — stopping; it remains in place until "
+                          "the application exits.")
+                    app.update(phase="stopping")
+                    stop_reason = RunStopReason.STOP_FILE
+                    break
+                # Cancelled inside the interactive grace — carry on with no trace.
+
+            # Git push policy: evaluated at the start of every iteration.
+            if not dry_run:
+                last_git_push = maybe_git_push(git_push_policy, last_git_push)
+
+            if max_iters is not None and iteration >= max_iters:
+                print(f"Iteration limit reached (--max-runs {max_iters}). Stopping.")
+                stop_reason = RunStopReason.LIMIT_REACHED
+                break
+
+            # --maxStrike: once a finished iteration pushes us past the per-session
+            # work budget, pause pre-emptively (same as a token-limit hit) so the
+            # current unit of work stays whole and we don't run into the limit
+            # mid-iteration. Checked between iterations, never in the middle of one.
+            if max_strike_seconds is not None and iteration > 0:
+                elapsed = time.time() - session_start
+                if elapsed > max_strike_seconds:
+                    print(f"  ⌛ max-strike budget ({max_strike}) reached after "
+                          f"{int(elapsed // 60)} min of work — pausing for the next "
+                          f"session so this run stays whole.")
+                    target_ts = session_start + SESSION_DURATION
+                    app.update(phase="paused")
+                    wait_until(target_ts,
+                               reason=f"maxStrike: pausing pre-emptively until "
+                                      f"{_fmt_clock(target_ts)} (until the 5-hour session "
+                                      f"window refreshes)…")
+                    app.update(phase="idle")
+                    session_start = time.time()
+                    consecutive_errors = 0  # fresh window — start counting errors anew
+
+            # Proactive limit check: read the real Current-session usage from the
+            # account and pause cleanly between iterations if it is already at/over
+            # the threshold, instead of running an iteration that would hit the wall.
+            if not dry_run and not ignore_usage_limits:
+                app.update(phase="waiting")
+                paused, session_start = limit_policy.check_and_wait(usage_source, session_start)
+                # The check just paid for a usage reading; publishing it here is
+                # what puts the provider's live limits on the status row without
+                # a second HTTP round-trip (the UsageSource cache serves it).
+                statusline.push_quotas(app, usage_source, limit_policy)
+                app.update(phase="idle")
+                if paused:
+                    consecutive_errors = 0  # fresh window — start counting errors anew
+
+            # Ask the driver what to do next. None => no more work (stop cleanly);
+            # LoopStop => abort the run (e.g. an error state needing a human).
+            try:
+                command = driver.next_command()
+            except LoopStop as stop:
+                print(stop.message)
+                if stop.exit_code:
+                    sys.exit(stop.exit_code)
+                stop_reason = RunStopReason.DRIVER_STOP
+                break
+            if command is None:
+                print("No more work — stopping.")
+                stop_reason = RunStopReason.NO_WORK
+                break
+
+            iteration += 1
+            state_label = command.label or "(no label)"
+            # Show the model this iteration will use right in the header, so the
+            # per-iteration model is visible up front (an empty command.model means
+            # no --model flag — the CLI falls back to its own configured default).
+            model_label = command.model or "cli default"
+            # Same three calls the parallel workers make, on this run's one Job:
+            # the Job clock times THIS iteration, the run clock (latched once)
+            # times the whole run.
+            started_at = time.time()
+            app.mark_run_started(started_at)
+            app.job(1).start(item=state_label, model=command.model,
+                             prompt=command.prompt, iteration=iteration,
+                             now=started_at)
+            app.update(iteration=iteration, phase="running")
+            print_markup(
+                f"\n=== Iteration {iteration} === [{state_label} · {model_label}]",
+                f"\n[bold cyan]=== Iteration {iteration} ===[/] "
+                f"[dim]\\[{state_label} · {model_label}][/]",
+            )
+
+            cmd = build_agent_argv(command, provider)
             if dry_run:
-                if not stop_file_noted:
-                    print("Stop file present — a real run would have waited for "
-                          "it at startup, and stops here if it appears mid-run. "
-                          "Left in place (a dry run never consumes it).")
-                    stop_file_noted = True
+                print("DRY-RUN:", " ".join(cmd))
+                if provider == "codex":
+                    print("STDIN:", command.prompt)
+                if not dry_run_prompt_shown:
+                    # The argv line above is what will be executed, but for
+                    # claude the whole prompt sits inside one joined `-p …`
+                    # token and is unreadable — and reading the prompt is what a
+                    # dry run is for. Printed once, for job 1.
+                    dry_run_prompt_shown = True
+                    print(statusline.format_prompt_block(
+                        job_id=1, label=state_label, prompt=command.prompt,
+                        width=statusline.screen_width()))
+                # looping forever in dry-run is pointless — nothing is actually done,
+                # so the driver would keep handing back the same first unit of work.
+                if max_iters is None:
+                    print("(dry-run without --max-runs: running a single iteration and exiting)")
+                    stop_reason = RunStopReason.DRY_RUN
+                    break
+                continue
+
+            if provider == "claude":
+                returncode = run_claude_streaming(cmd, raw, partial=True)
             else:
-                mark_stop_file_detected()
-                print("Stop file detected — stopping; it remains in place until "
-                      "the application exits.")
-                stop_reason = RunStopReason.STOP_FILE
-                break
+                returncode = run_agent_streaming(
+                    cmd, provider, raw, partial=False, prompt=command.prompt)
+            app.job(1).finish()
+            app.update(phase="idle")
 
-        # Git push policy: evaluated at the start of every iteration.
-        if not dry_run:
-            last_git_push = maybe_git_push(git_push_policy, last_git_push)
+            if returncode == 0:
+                consecutive_errors = 0
+                completed += 1
+                driver.on_success(returncode)
 
-        if max_iters is not None and iteration >= max_iters:
-            print(f"Iteration limit reached (--max-runs {max_iters}). Stopping.")
-            stop_reason = RunStopReason.LIMIT_REACHED
-            break
-
-        # --maxStrike: once a finished iteration pushes us past the per-session
-        # work budget, pause pre-emptively (same as a token-limit hit) so the
-        # current unit of work stays whole and we don't run into the limit
-        # mid-iteration. Checked between iterations, never in the middle of one.
-        if max_strike_seconds is not None and iteration > 0:
-            elapsed = time.time() - session_start
-            if elapsed > max_strike_seconds:
-                print(f"  ⌛ max-strike budget ({max_strike}) reached after "
-                      f"{int(elapsed // 60)} min of work — pausing for the next "
-                      f"session so this run stays whole.")
-                target_ts = session_start + SESSION_DURATION
+            # The backstop under the proactive check (see RateLimitEvent): this run's
+            # own verdict from the wire. A refusal needs no figure and no query to be
+            # trusted, so it is honoured whatever the usage report said — including
+            # when the report was unavailable, which is the case this exists for.
+            # Checked for both outcomes: a run refused on its last turn may still have
+            # exited 0 with its work recorded above.
+            refusal = last_rate_limit_event() if provider == "claude" else None
+            if (not ignore_usage_limits and refusal is not None
+                    and refusal.status == "rejected"):
+                # +5s so we come back after the reset, not exactly on it.
+                target_ts = (refusal.resets_at
+                             or time.time() + CLAUDE_SESSION_DURATION) + 5
+                app.update(phase="paused")
                 wait_until(target_ts,
-                           reason=f"maxStrike: pausing pre-emptively until "
-                                  f"{_fmt_clock(target_ts)} (until the 5-hour session "
-                                  f"window refreshes)…")
-                session_start = time.time()
-                consecutive_errors = 0  # fresh window — start counting errors anew
-
-        # Proactive limit check: read the real Current-session usage from the
-        # account and pause cleanly between iterations if it is already at/over
-        # the threshold, instead of running an iteration that would hit the wall.
-        if not dry_run and not ignore_usage_limits:
-            paused, session_start = limit_policy.check_and_wait(usage_source, session_start)
-            if paused:
-                consecutive_errors = 0  # fresh window — start counting errors anew
-
-        # Ask the driver what to do next. None => no more work (stop cleanly);
-        # LoopStop => abort the run (e.g. an error state needing a human).
-        try:
-            command = driver.next_command()
-        except LoopStop as stop:
-            print(stop.message)
-            if stop.exit_code:
-                sys.exit(stop.exit_code)
-            stop_reason = RunStopReason.DRIVER_STOP
-            break
-        if command is None:
-            print("No more work — stopping.")
-            stop_reason = RunStopReason.NO_WORK
-            break
-
-        iteration += 1
-        state_label = command.label or "(no label)"
-        # Show the model this iteration will use right in the header, so the
-        # per-iteration model is visible up front (an empty command.model means
-        # no --model flag — the CLI falls back to its own configured default).
-        model_label = command.model or "cli default"
-        print_markup(
-            f"\n=== Iteration {iteration} === [{state_label} · {model_label}]",
-            f"\n[bold cyan]=== Iteration {iteration} ===[/] "
-            f"[dim]\\[{state_label} · {model_label}][/]",
-        )
-
-        cmd = build_agent_argv(command, provider)
-        if dry_run:
-            print("DRY-RUN:", " ".join(cmd))
-            if provider == "codex":
-                print("STDIN:", command.prompt)
-            # looping forever in dry-run is pointless — nothing is actually done,
-            # so the driver would keep handing back the same first unit of work.
-            if max_iters is None:
-                print("(dry-run without --max-runs: running a single iteration and exiting)")
-                stop_reason = RunStopReason.DRY_RUN
-                break
-            continue
-
-        if provider == "claude":
-            returncode = run_claude_streaming(cmd, raw, partial=True)
-        else:
-            returncode = run_agent_streaming(
-                cmd, provider, raw, partial=False, prompt=command.prompt)
-
-        if returncode == 0:
-            consecutive_errors = 0
-            completed += 1
-            driver.on_success(returncode)
-
-        # The backstop under the proactive check (see RateLimitEvent): this run's
-        # own verdict from the wire. A refusal needs no figure and no query to be
-        # trusted, so it is honoured whatever the usage report said — including
-        # when the report was unavailable, which is the case this exists for.
-        # Checked for both outcomes: a run refused on its last turn may still have
-        # exited 0 with its work recorded above.
-        refusal = last_rate_limit_event() if provider == "claude" else None
-        if (not ignore_usage_limits and refusal is not None
-                and refusal.status == "rejected"):
-            # +5s so we come back after the reset, not exactly on it.
-            target_ts = (refusal.resets_at
-                         or time.time() + CLAUDE_SESSION_DURATION) + 5
-            wait_until(target_ts,
-                       reason=f"Hit the {refusal.label} — this run was refused. "
-                              f"Waiting until {_fmt_moment(target_ts)} for that "
-                              f"window to refresh…")
-            usage_source.invalidate()  # the figures behind the refusal are stale
-            if refusal.limit_type == "five_hour":
-                session_start = time.time()
-            consecutive_errors = 0  # fresh window — start counting errors anew
-            continue
-
-        if returncode == 0:
-            continue
-
-        # Non-zero exit — the cause is ambiguous (a network blip / one-off CLI
-        # hiccup, or the session's token limit). Rather than guessing from a
-        # second consecutive error, ask the account directly: read the usage
-        # figures right away and let the real Current-session percentage decide.
-        consecutive_errors += 1
-        elapsed = time.time() - session_start
-        print_error(f"{spec.display_name} exited with code {returncode} "
-                    f"(error #{consecutive_errors} in a row).")
-
-        if not ignore_usage_limits:
-            paused, session_start = limit_policy.check_and_wait(
-                usage_source, session_start, note=" (checked after error)")
-            if paused:
+                           reason=f"Hit the {refusal.label} — this run was refused. "
+                                  f"Waiting until {_fmt_moment(target_ts)} for that "
+                                  f"window to refresh…")
+                usage_source.invalidate()  # the figures behind the refusal are stale
+                statusline.push_quotas(app, usage_source, limit_policy)
+                app.update(phase="idle")
+                if refusal.limit_type == "five_hour":
+                    session_start = time.time()
                 consecutive_errors = 0  # fresh window — start counting errors anew
                 continue
 
-        # Session is under the limit — this was a transient failure, not token
-        # exhaustion. Retry, but don't spin forever if something is truly broken.
-        if consecutive_errors < 5:
-            if usage_source is None:
-                print("  ↻ Provider quota status is unavailable — retrying immediately.")
+            if returncode == 0:
+                continue
+
+            # Non-zero exit — the cause is ambiguous (a network blip / one-off CLI
+            # hiccup, or the session's token limit). Rather than guessing from a
+            # second consecutive error, ask the account directly: read the usage
+            # figures right away and let the real Current-session percentage decide.
+            consecutive_errors += 1
+            elapsed = time.time() - session_start
+            print_error(f"{spec.display_name} exited with code {returncode} "
+                        f"(error #{consecutive_errors} in a row).")
+
+            if not ignore_usage_limits:
+                app.update(phase="waiting")
+                paused, session_start = limit_policy.check_and_wait(
+                    usage_source, session_start, note=" (checked after error)")
+                statusline.push_quotas(app, usage_source, limit_policy)
+                app.update(phase="idle")
+                if paused:
+                    consecutive_errors = 0  # fresh window — start counting errors anew
+                    continue
+
+            # Session is under the limit — this was a transient failure, not token
+            # exhaustion. Retry, but don't spin forever if something is truly broken.
+            if consecutive_errors < 5:
+                if usage_source is None:
+                    print("  ↻ Provider quota status is unavailable — retrying immediately.")
+                else:
+                    print("  ↻ Session under the allowed limit — likely transient. "
+                          "Retrying immediately.")
+                continue
             else:
-                print("  ↻ Session under the allowed limit — likely transient. "
-                      "Retrying immediately.")
-            continue
-        else:
-            quota_state = ("with provider quota status unavailable"
-                           if usage_source is None
-                           else "with the session under the allowed limit")
-            print(f"  ⚠ {consecutive_errors} errors in a row {quota_state} after "
-                  f"{int(elapsed // 60)} min. Stopping.")
-            sys.exit(returncode)
+                quota_state = ("with provider quota status unavailable"
+                               if usage_source is None
+                               else "with the session under the allowed limit")
+                print(f"  ⚠ {consecutive_errors} errors in a row {quota_state} after "
+                      f"{int(elapsed // 60)} min. Stopping.")
+                sys.exit(returncode)
 
     # Final push: regardless of the EACH_HOUR cadence, push any pending commits
     # on the way out so work isn't left only on the local branch — unless the

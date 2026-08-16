@@ -246,6 +246,18 @@ reading before the bounded retry path continues.
 | `-S, --max-strike 3h` | per-session work budget before a pre-emptive pause; alias `--maxStrike` |
 | `-j, --jobs N` | concurrent workers (parallel only) |
 | `--raw` | print raw JSON events, for debugging (sequential only) |
+| `--no-statusline` | do not pin the status rows (same as `CLAUDE_LOOP_STATUSLINE=0`) |
+
+## Interactive status line
+
+On a terminal, a run pins a few rows at the bottom — iteration, provider/model,
+elapsed time, the provider's live quota figures and the script's own limits, one
+row per job, and a legend of the keys it answers to. Piped output, CI and
+`--no-statusline` get the plain scrolling output of before.
+
+Keys: `s` requests a graceful stop (it creates the same `stop` sentinel, and
+pressing `s` again during the countdown cancels it), `h` or `?` shows the full
+key list.
 
 ## Per-user settings
 
