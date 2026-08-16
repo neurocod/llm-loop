@@ -391,6 +391,45 @@ def report_costs(app_name: str = "runCycle") -> None:
 _FILE_LOGGER: Optional[logging.Logger] = None
 
 
+# How long a handler waits before retrying a rotation that failed. Long enough
+# that a wedged rename is attempted once a minute rather than once per line.
+ROLLOVER_RETRY_SECONDS = 60.0
+
+
+class _MirrorLogHandler(RotatingFileHandler):
+    """A rotating handler that survives another process holding the same log.
+
+    Running two loops side by side is normal here (a sequential run, a parallel
+    run, the grow-kit pass), and same-named runs share one mirror log. On Windows
+    a rename fails while another process has the file open, and the stock handler
+    reports that through `logging.raiseExceptions`, i.e. by printing to
+    `sys.stderr` — which is the `_TeeToLog` mirror, which logs the line, which
+    fails again: an unbounded recursion that ends the run with a RecursionError
+    over a *log file*. Measured, not theorised: two runs colliding on a 25 MB
+    rollover killed the second one outright.
+
+    So a failed rotation is not an error here. We keep appending to the current
+    file (briefly past the size cap, which the next successful rotation trims)
+    and try again later.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._retry_rollover_at = 0.0
+
+    def doRollover(self) -> None:
+        if time.time() < self._retry_rollover_at:
+            return  # a recent attempt failed; the other holder still has it
+        try:
+            super().doRollover()
+        except OSError:
+            self._retry_rollover_at = time.time() + ROLLOVER_RETRY_SECONDS
+
+    def handleError(self, record) -> None:
+        """Swallow. The default writes the traceback to `sys.stderr`, which is
+        the tee — see the class docstring for why that cannot be allowed."""
+
+
 def _setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
     """Configure a rotating file logger at log_file_path(app_name) (25 MB x 3)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -398,7 +437,7 @@ def _setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if not logger.handlers:  # avoid duplicate handlers if called twice
-        handler = RotatingFileHandler(
+        handler = _MirrorLogHandler(
             log_file_path(app_name), maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
         )
@@ -420,6 +459,12 @@ class _TeeToLog:
     live token-by-token output.
     """
 
+    # Set while this thread is inside a logging call, so anything the logging
+    # machinery itself prints goes to the screen only. Without it a handler that
+    # reports a failure through stderr feeds its own report back into the logger
+    # that just failed, and the run dies of recursion (see _MirrorLogHandler).
+    _in_logging = threading.local()
+
     def __init__(self, stream, logger: logging.Logger):
         self._stream = stream
         self._logger = logger
@@ -427,10 +472,16 @@ class _TeeToLog:
 
     def write(self, text: str) -> int:
         self._stream.write(text)
+        if getattr(self._in_logging, "active", False):
+            return len(text)
         self._buf += text
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            self._logger.info(line)
+            self._in_logging.active = True
+            try:
+                self._logger.info(line)
+            finally:
+                self._in_logging.active = False
         return len(text)
 
     def flush(self) -> None:
