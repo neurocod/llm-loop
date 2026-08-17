@@ -572,7 +572,7 @@ class SegmentRow(Row):
 
 
 class JobRow(Row):
-    """One Job: " job 1 ▶ | opus | iter 3 | 3m01s | garlic.md".
+    """One Job: " job 1 ▶ opus | iter 3 | 3m01s | garlic.md".
 
     Keeps `job_id` rather than the Job object so a mouse click on this screen row
     maps back to the live Job (wave 4) even after the job list was rebuilt.
@@ -616,8 +616,8 @@ class JobRow(Row):
         elapsed = format_elapsed(job.elapsed(now))
         # Same separator as every other row (the leading columns stay padded, so
         # the job rows still line up under each other with -j N).
-        cells = [f" job {job.job_id} {glyph}",
-                 pad(model, self.model_width(status)),
+        # The glyph already separates the job from its model, so no pipe there.
+        cells = [f" job {job.job_id} {glyph} {pad(model, self.model_width(status))}",
                  f"iter {job.iteration:<4}",
                  pad(elapsed, self.elapsed_width),
                  item]
