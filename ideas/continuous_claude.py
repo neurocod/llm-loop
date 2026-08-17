@@ -3,7 +3,12 @@
 with automatic commit / pull-request / merge management.
 
 Python port of continuous_claude.sh v0.24.7
-(https://github.com/AnandChowdhary/continuous-claude).
+(https://github.com/AnandChowdhary/continuous-claude), Copyright (c) Anand
+Chowdhary, MIT License. This file is a derivative work of that script and
+carries its notice; the rest of this repository is Copyright (c) 2026 neurocod,
+also MIT.
+
+Not part of the llm_loop library - see ideas/README.md.
 
 Differences from the Bash original:
 - No external `jq` dependency (native JSON parsing).
