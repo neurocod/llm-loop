@@ -112,12 +112,18 @@ NOTE_TTL = 8.0
 CLAUDE_QUOTA_REFRESH = 120.0
 CODEX_QUOTA_REFRESH = 300.0
 
+# Shown wherever a pending stop is announced — the phase glyph and the pending
+# marker both. A stop request is the one state the user may want to undo, so it
+# gets a glyph that carries across a screenful of scrolling output. Double-width:
+# measure it with `cell_width`, never len().
+STOP_GLYPH = "🚫"
+
 PHASE_GLYPHS = {
     "idle": "·",
     "running": "⟳",
     "paused": "⏸",
     "waiting": "⏳",
-    "stopping": "⏹",
+    "stopping": STOP_GLYPH,
 }
 
 # Shown when a command carries no --model: the provider CLI picks its own.
@@ -528,7 +534,11 @@ class StopSegment(Segment):
     def text(self, status, now=None):
         if not status.stop_pending:
             return None
-        return "STOP pending — press s to cancel"
+        # Once the phase itself is "stopping" the row already opens with the
+        # glyph, and printing it twice on one line reads as noise, not urgency.
+        glyph = "" if PHASE_GLYPHS.get(status.phase) == STOP_GLYPH \
+            else f"{STOP_GLYPH} "
+        return f"{glyph}STOP pending — press s to cancel"
 
 
 # --- rows ----------------------------------------------------------------------

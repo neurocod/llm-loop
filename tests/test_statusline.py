@@ -131,8 +131,17 @@ def test_an_empty_model_reads_as_cli_default():
 def test_stop_pending_marker_appears_only_while_pending():
     assert "STOP pending" not in sl.render_rows(
         sequential_status(), 200, now=NOW)[1]
-    assert "STOP pending — press s to cancel" in sl.render_rows(
-        sequential_status(stop_pending=True), 200, now=NOW)[1]
+    pending = sl.render_rows(sequential_status(stop_pending=True), 200,
+                             now=NOW)[1]
+    assert f"{sl.STOP_GLYPH} STOP pending — press s to cancel" in pending
+
+    # …but not twice on one line: once the phase is "stopping" the row already
+    # opens with the same glyph.
+    status = sequential_status(stop_pending=True)
+    status.update(phase="stopping")
+    stopping = sl.render_rows(status, 200, now=NOW)[1]
+    assert stopping.count(sl.STOP_GLYPH) == 1
+    assert "STOP pending — press s to cancel" in stopping
 
 
 def test_the_two_clocks_are_different_clocks():
