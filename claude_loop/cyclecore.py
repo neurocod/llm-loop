@@ -1568,17 +1568,27 @@ class Driver:
 @stop_file_lifecycle()
 def run_loop(driver: Driver, args: argparse.Namespace,
              app_name: str = "runCycle", *, setup_logging: bool = True,
-             wait_on_start: bool = True) -> RunResult:
+             wait_on_start: bool = True, progress=None) -> RunResult:
     """Drive the selected provider per `driver`, with all shared lifecycle
     machinery. This is the former runCycle.main(), generalised: the only thing
     that changed is that "read currentState.md and pick a prompt" became
     `driver.next_command()`, and the closing "Final state" line became
     `driver.final_summary()`.
+
+    `progress` is the whole invocation's InvocationProgress, for a wrapper that
+    makes several runner calls in one process (see run_parallel); left None, this
+    call is the invocation and owns its own figures.
     """
     # The usage-limit query/parse (UsageSource) and pausing policy (LimitPolicy)
     # live in their own modules; imported here to avoid an import cycle
-    # (limits/usage/statusline import cyclecore for its helpers).
+    # (limits/usage/statusline import cyclecore for its helpers). drivers imports
+    # this module, so ListFileDriver comes in here rather than at module level.
     from . import limits, statusline
+    from .drivers import ListFileDriver
+
+    owns_progress = progress is None
+    if owns_progress:
+        progress = statusline.InvocationProgress(max_items=args.max)
 
     provider = getattr(args, "provider", None) or driver.provider
     spec = provider_spec(provider)
@@ -1673,12 +1683,22 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # the status line separates it from `-j N`. Disabled it is a Null object, so
     # every call below stays a no-op and the loop behaves exactly as before.
     settings = _script_settings(run_settings, statusline)
+    # A list driver's list is the source of truth for how much work this
+    # invocation has: the summary row counts items STRUCK out of it, not
+    # iterations, so a retried item is not progress and a preflight that strikes
+    # finished ones is. Any other Driver has no such total and counts iterations.
+    list_driven = isinstance(driver, ListFileDriver)
+    if list_driven:
+        progress.track_list(len(driver.pending_lines()))
     app = statusline.StatusApp(
+        # From the invocation's pool: a wrapper's next runner call resumes this
+        # row instead of starting a fresh Job at iteration 1.
+        status=statusline.LoopStatus(jobs=progress.jobs(1)),
         settings=settings,
         enabled=not dry_run and not getattr(args, "no_statusline", False))
     app.update(
         provider=provider,
-        max_iterations=run_settings.max_runs,
+        **progress.summary_fields(),
         # Only a list driver has a pick order; read it defensively so any other
         # Driver simply reports no `rand` marker.
         random_order=str(getattr(driver, "pick_order", "")) == "random",
@@ -1710,8 +1730,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         while True:
             # The caps are read LIVE (see RunSettings) and republished here, so an
             # edit made while the run is going takes effect at this boundary and
-            # is what the pinned row shows.
-            app.update(max_iterations=run_settings.max_runs,
+            # is what the pinned row shows. Under a wrapper the invocation's cap
+            # is the wrapper's to set — this call's cap only sizes one batch.
+            if owns_progress:
+                progress.max_items = run_settings.max_runs
+            app.update(**progress.summary_fields(),
                        script_limits=settings.status_entries())
             if os.path.exists(STOP_FILE):
                 # The sentinel is removed only after the outer application has
@@ -1808,10 +1831,14 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # times the whole run.
             started_at = time.time()
             app.mark_run_started(started_at)
+            # The Job bumps its own counter (no `iteration=`): the local counter
+            # restarts with every runner call, and pinning the row to it is what
+            # kept a periodic run's job rows at 1.
             app.job(1).start(item=state_label, model=command.model,
-                             prompt=command.prompt, iteration=iteration,
-                             now=started_at)
-            app.update(iteration=iteration, phase="running")
+                             prompt=command.prompt, now=started_at)
+            if not list_driven:
+                progress.note_iteration()
+            app.update(**progress.summary_fields(), phase="running")
             print_markup(
                 f"\n=== Iteration {iteration} === [{state_label} · {model_label}]",
                 f"\n[bold cyan]=== Iteration {iteration} ===[/] "
@@ -1852,6 +1879,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 consecutive_errors = 0
                 completed += 1
                 driver.on_success(returncode)
+                if list_driven:
+                    # on_success struck the item, so the list itself now says how
+                    # far the invocation has got.
+                    progress.note_remaining(len(driver.pending_lines()))
+                    app.update(**progress.summary_fields())
 
             # The backstop under the proactive check (see RateLimitEvent): this run's
             # own verdict from the wire. A refusal needs no figure and no query to be

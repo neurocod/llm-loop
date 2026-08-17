@@ -435,6 +435,161 @@ def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
     assert len({opened for (_r, opened) in log[::2]}) == 4
 
 
+# --- the counters belong to the invocation, not to one runner call ---------------
+#
+# A periodic run (--grow-kit-periodically N) calls run_parallel once per batch.
+# Everything below pins the figures a user reads against the whole invocation:
+# per-call counters made the summary row freeze at `iter <claimed>/<batch cap>`
+# and restarted every job row at 1.
+
+
+class _CodexDriver(_MemDriver):
+    """The same work, provider-shaped like the run that reported the bug.
+
+    Nothing on the counter path is supposed to be gated on the provider; a codex
+    run is what proves it rather than assuming it.
+    """
+
+    def model(self):
+        return "gpt-5.6-terra"
+
+
+def _codex_args(project_dir, jobs, *, max_runs=None):
+    args = _args(project_dir, jobs, max_runs=max_runs)
+    args.provider = "codex"
+    return args
+
+
+def _batch(driver, args, progress):
+    """One runner call of a multi-batch invocation."""
+    return parallel.run_parallel(
+        driver, args, app_name="pytest-parallel-statusline",
+        setup_logging=False, wait_on_start=False, progress=progress)
+
+
+def test_batches_of_one_invocation_share_one_rising_counter(tmp_path, monkeypatch):
+    """Seven products in batches of three: `done` rises, the total never moves."""
+    made = _live_statusline(monkeypatch, {})
+    samples = []
+
+    def sample_then_finish(job_id, command):
+        # Sampled from inside the work, so a batch is also pinned where it OPENS
+        # — before any of its own files have finished.
+        samples.append((made["app"].status.iteration,
+                        made["app"].status.max_iterations))
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", sample_then_finish)
+    driver = _CodexDriver([f"products/f{i}.md" for i in range(7)])
+    progress = sl.InvocationProgress()          # no --max: the queue is the total
+    args = _codex_args(str(tmp_path), jobs=2, max_runs=3)   # 3 = the BATCH slice
+    seen = []
+    opening = []
+
+    previous = cyclecore.project_dir()
+    try:
+        while driver.pending_lines():
+            first = len(samples)
+            _batch(driver, args, progress)
+            opening.append(samples[first])
+            status = made["app"].status
+            seen.append((status.iteration, status.max_iterations))
+    finally:
+        cyclecore.set_project_root(previous)
+
+    assert seen == [(3, 7), (6, 7), (7, 7)]
+    assert opening == [(0, 7), (3, 7), (6, 7)]
+    assert "iter 7/7" in made["app"].render(width=200)[1]
+
+
+def test_the_denominator_is_the_smaller_of_the_queue_and_the_cap(tmp_path,
+                                                                 monkeypatch):
+    """min(pending at the start, --max), checked both ways round."""
+    made = _live_statusline(monkeypatch, {})
+    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
+    previous = cyclecore.project_dir()
+    try:
+        # Cap smaller than the queue: the run promises only what it will do.
+        capped = _MemDriver([f"products/f{i}.md" for i in range(5)])
+        progress = sl.InvocationProgress(max_items=2)
+        args = _args(str(tmp_path), jobs=2, max_runs=1)     # one file per batch
+        _batch(capped, args, progress)
+        first = (made["app"].status.iteration, made["app"].status.max_iterations)
+        _batch(capped, args, progress)
+        second = (made["app"].status.iteration, made["app"].status.max_iterations)
+
+        # Queue smaller than the cap: the queue is all there is to do.
+        short = _MemDriver([f"products/g{i}.md" for i in range(3)])
+        roomy = sl.InvocationProgress(max_items=10)
+        args = _args(str(tmp_path), jobs=2, max_runs=2)
+        _batch(short, args, roomy)
+        third = (made["app"].status.iteration, made["app"].status.max_iterations)
+        _batch(short, args, roomy)
+        fourth = (made["app"].status.iteration, made["app"].status.max_iterations)
+    finally:
+        cyclecore.set_project_root(previous)
+
+    assert (first, second) == ((1, 2), (2, 2))
+    assert (third, fourth) == ((2, 3), (3, 3))
+
+
+def test_job_rows_resume_in_the_next_call_of_the_invocation(tmp_path, monkeypatch):
+    """Each row keeps counting its OWN work across the batch boundary."""
+    made = _live_statusline(monkeypatch, {})
+    both = threading.Barrier(2, timeout=5)
+
+    def one_file_each(job_id, command):
+        both.wait()       # neither worker can take the other's file in a batch
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", one_file_each)
+    driver = _CodexDriver([f"products/f{i}.md" for i in range(4)])
+    progress = sl.InvocationProgress()
+    args = _codex_args(str(tmp_path), jobs=2, max_runs=2)   # two files per batch
+    rows = []
+
+    previous = cyclecore.project_dir()
+    try:
+        for _batch_number in (1, 2):
+            _batch(driver, args, progress)
+            both.reset()
+            status = made["app"].status
+            rows.append({job.job_id: job.iteration for job in status.jobs})
+            assert status.provider == "codex"
+            assert all(job.model == "gpt-5.6-terra" for job in status.jobs)
+    finally:
+        cyclecore.set_project_root(previous)
+
+    # One file each per batch: two rows, each counting only what it ran itself.
+    assert rows == [{1: 1, 2: 1}, {1: 2, 2: 2}]
+    assert "iter 2   " in made["app"].render(width=200)[2]
+
+
+def test_a_capped_run_never_reports_more_than_it_promised():
+    """`done` follows the list, and a preflight can strike items this run never
+    touched — but the row must not report past the cap it displayed."""
+    progress = sl.InvocationProgress(max_items=2)
+    progress.track_list(5)
+    progress.note_remaining(1)      # four gone: two run, two struck as finished
+
+    assert progress.summary_fields() == {"iteration": 2, "max_iterations": 2}
+
+
+def test_the_job_pool_grows_but_never_resurrects_an_idle_row():
+    """A narrower batch shows only the rows it runs; the rest keep their counts."""
+    progress = sl.InvocationProgress()
+    wide = progress.jobs(3)
+    for job in wide:
+        job.start(item="products/x.md")
+
+    narrow = progress.jobs(2)
+    assert [job.job_id for job in narrow] == [1, 2]
+    assert narrow[0] is wide[0] and narrow[1] is wide[1]
+
+    again = progress.jobs(3)
+    assert again[2] is wide[2] and again[2].iteration == 1
+
+
 # --- the dry run prints job 1's prompt ------------------------------------------
 
 

@@ -864,8 +864,13 @@ class _CountingSource:
         pass
 
 
-def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None, **arg_fields):
-    """run_loop with a live (screenless) status line; returns (app, source)."""
+def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
+                     progress=None, **arg_fields):
+    """run_loop with a live (screenless) status line; returns (app, source).
+
+    `progress` stands in for a wrapper making several runner calls in one
+    process; left None, the call is the whole invocation.
+    """
     from claude_loop import cyclecore
 
     source = _CountingSource()
@@ -903,7 +908,8 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None, **arg_fields
     previous = cyclecore.project_dir()
     try:
         cyclecore.run_loop(driver, args, app_name="pytest-statusline",
-                           setup_logging=False, wait_on_start=False)
+                           setup_logging=False, wait_on_start=False,
+                           progress=progress)
     finally:
         cyclecore.set_project_root(previous)
     return made["app"], source
@@ -962,6 +968,157 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
     assert driver.calls == 2                          # the raised cap took effect
     assert app.status.max_iterations == 2
     assert ("max-runs", "2") in app.status.script_limits
+
+
+def _counts_down(total):
+    """A non-list Driver with `total` units of work and no queue behind it."""
+    from claude_loop.cyclecore import AgentCommand, Driver
+
+    class _CountsDown(Driver):
+        provider = "codex"
+
+        def __init__(self):
+            self.calls = 0
+
+        def model(self):
+            return "gpt-5.6-terra"
+
+        def next_command(self):
+            if self.calls >= total:
+                return None
+            self.calls += 1
+            return AgentCommand("do the thing", self.model(),
+                                f"item-{self.calls}", self.provider)
+
+    return _CountsDown()
+
+
+def test_a_driver_with_no_list_gets_no_invented_denominator(monkeypatch, tmp_path):
+    """Only a list says how much work a run has. Without one an uncapped run
+    counts, and says nothing it cannot know."""
+    from claude_loop import cyclecore
+
+    monkeypatch.setattr(cyclecore, "run_agent_streaming",
+                        lambda cmd, provider, raw, partial, prompt: 0)
+    app, _source = _run_with_status(monkeypatch, tmp_path, _counts_down(3),
+                                    max=None, provider="codex")
+
+    assert app.status.iteration == 3
+    assert app.status.max_iterations is None
+    summary = app.render(width=200)[1]
+    assert "iter 3" in summary and "iter 3/" not in summary
+
+
+def test_a_capped_run_with_no_list_shows_the_cap_it_was_given(monkeypatch,
+                                                              tmp_path):
+    """--max is the whole denominator here — there is no queue to be smaller."""
+    from claude_loop import cyclecore
+
+    monkeypatch.setattr(cyclecore, "run_agent_streaming",
+                        lambda cmd, provider, raw, partial, prompt: 0)
+    app, _source = _run_with_status(monkeypatch, tmp_path, _counts_down(10),
+                                    max=2, provider="codex")
+
+    assert (app.status.iteration, app.status.max_iterations) == (2, 2)
+    assert "iter 2/2" in app.render(width=200)[1]
+
+
+def _list_driver(items):
+    """A ListFileDriver whose list lives in memory (no files, no provider)."""
+    from claude_loop.drivers import ListFileDriver
+
+    class _MemList(ListFileDriver):
+        provider = "codex"
+        target_suffix = ".out.md"
+        pick_order = "list"          # deterministic: the tests name the order
+
+        def __init__(self):
+            super().__init__()
+            self.items = list(items)
+
+        def prompt(self, source, target):
+            return "do it"
+
+        def model(self):
+            return "gpt-5.6-terra"
+
+        def pending_lines(self):
+            return list(self.items)
+
+        def strike(self, line):
+            if line in self.items:
+                self.items.remove(line)
+                return True
+            return False
+
+    return _MemList()
+
+
+def test_the_sequential_loop_counts_items_struck_not_iterations(monkeypatch,
+                                                                tmp_path):
+    """The list is the total in BOTH runners, so a retried item is not progress —
+    while the job row keeps counting the iterations it actually ran."""
+    from claude_loop import cyclecore
+
+    codes = [1, 0, 0, 0]        # the first item fails once and comes back
+    monkeypatch.setattr(cyclecore, "run_agent_streaming",
+                        lambda cmd, provider, raw, partial, prompt: codes.pop(0))
+    driver = _list_driver([f"products/f{i}.md" for i in range(3)])
+    app, _source = _run_with_status(monkeypatch, tmp_path, driver, max=None,
+                                    provider="codex")
+
+    assert (app.status.iteration, app.status.max_iterations) == (3, 3)
+    assert app.status.jobs[0].iteration == 4      # attempts, not items
+    assert "iter 3/3" in app.render(width=200)[1]
+
+
+def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
+    """Both runners share the rule: a Job belongs to the invocation, not to the
+    call that displayed it — and a per-call cap is not the invocation's."""
+    from claude_loop import cyclecore
+
+    monkeypatch.setattr(cyclecore, "usage_source_for",
+                        lambda provider: _CountingSource())
+    monkeypatch.setattr(cyclecore, "run_agent_streaming",
+                        lambda cmd, provider, raw, partial, prompt: 0)
+    made = []
+    real_app_class = sl.StatusApp        # captured before the patch below
+
+    def _app(**kwargs):
+        kwargs.pop("enabled", None)
+        app = real_app_class(terminal=_LiveTerminal(),
+                             input_source=sl.NullInputSource(), refresh=60,
+                             **kwargs)
+        made.append(app)
+        return app
+
+    monkeypatch.setattr(sl, "StatusApp", _app)
+
+    args = type("NS", (), {})()
+    for name, value in dict(max=2, dry_run=False, raw=False, start_in=None,
+                            max_strike=None, git_push="none", cost=False,
+                            no_statusline=False, provider="codex",
+                            project_dir=str(tmp_path)).items():
+        setattr(args, name, value)
+
+    progress = sl.InvocationProgress()
+    previous = cyclecore.project_dir()
+    try:
+        for _call in (1, 2):        # what a periodic wrapper does, twice
+            cyclecore.run_loop(_counts_down(2), args,
+                               app_name="pytest-statusline",
+                               setup_logging=False, wait_on_start=False,
+                               progress=progress)
+    finally:
+        cyclecore.set_project_root(previous)
+
+    first, second = made
+    assert first.status.jobs[0] is second.status.jobs[0]
+    assert (first.status.iteration, second.status.iteration) == (2, 4)
+    assert second.status.jobs[0].iteration == 4
+    # The 2 each call was allowed to run sized a batch, not the run: with no
+    # invocation-level --max there is nothing honest to put after the slash.
+    assert second.status.max_iterations is None
 
 
 def test_a_setting_flag_is_checked_against_the_command_line_table():

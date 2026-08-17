@@ -82,6 +82,7 @@ from .limits import (
 )
 from .statusline import (
     Action,
+    InvocationProgress,
     Job,
     LoopStatus,
     Mode,
@@ -113,6 +114,7 @@ __all__ = [
     "DayNightLimit",
     "Driver",
     "GitPushPolicy",
+    "InvocationProgress",
     "Job",
     "LimitPolicy",
     "LimitRule",

@@ -418,6 +418,97 @@ class LoopStatus:
         return copy
 
 
+class InvocationProgress:
+    """The figures of one INVOCATION, kept alive across several runner calls.
+
+    A StatusApp and its Jobs are built inside run_parallel/run_loop, so every
+    counter that lives in them restarts when the call does. One process is one
+    invocation, but a wrapper may slice it into several calls — the periodic
+    runner (--grow-kit-periodically N) calls run_parallel once per batch — and
+    then per-call counters are the wrong quantity: the summary row froze at the
+    batch cap and every job row restarted at 1. So the invocation-wide figures
+    live here, and the wrapper hands the same instance to every call it makes.
+    A runner given none makes its own, which is the single-call case unchanged.
+
+    Two things are kept:
+
+      * the Job pool, reused by job_id — the Job objects already ARE the
+        per-worker state, so a worker resuming with the same Job keeps its count
+        correct by construction, with no second bookkeeping to disagree with it;
+      * list progress, where `done` is DERIVED as (pending when the invocation
+        began − pending now) rather than counted. That is self-correcting: items
+        a preflight strikes, or work a previous run finished, move the figure
+        with the list instead of leaving a counter to drift away from it.
+
+    The cap is one global number for the whole invocation (`max_items`), never
+    the wrapper's per-batch cap — a batch cap is an internal detail of how the
+    work is sliced and says nothing about how much the run has to do.
+    """
+
+    def __init__(self, max_items: Optional[int] = None):
+        self._lock = threading.Lock()
+        self.max_items = max_items   # the invocation's --max (None = uncapped)
+        self._pool = {}              # job_id -> Job, reused by every runner call
+        self._baseline = None        # list items pending when the invocation began
+        self._remaining = None       # list items pending now
+        self._iterations = 0         # non-list runs count iterations instead
+
+    def jobs(self, count: int) -> List[Job]:
+        """The `count` job rows of one runner call, reused across calls.
+
+        The pool grows to the widest call ever made; a narrower call gets only
+        the rows its workers will actually feed, so no row is resurrected for a
+        worker that is not running — while its count is kept for a later, wider
+        batch that does run it.
+        """
+        with self._lock:
+            for job_id in range(1, count + 1):
+                if job_id not in self._pool:
+                    self._pool[job_id] = Job(job_id)
+            return [self._pool[job_id] for job_id in range(1, count + 1)]
+
+    def track_list(self, pending: int) -> None:
+        """Latch the list's size at the start of the invocation (first call wins).
+
+        Later calls must NOT re-baseline: their list is already short by whatever
+        the earlier batches finished, and re-reading it there is what made the
+        denominator describe a batch instead of the run.
+        """
+        with self._lock:
+            if self._baseline is None:
+                self._baseline = pending
+                self._remaining = pending
+
+    def note_remaining(self, remaining: int) -> None:
+        """Record how many list items are still pending (the source of `done`)."""
+        with self._lock:
+            if self._baseline is not None:
+                self._remaining = remaining
+
+    def note_iteration(self) -> None:
+        """Count one iteration of a non-list run (a list run derives it instead)."""
+        with self._lock:
+            self._iterations += 1
+
+    def summary_fields(self) -> dict:
+        """`iteration`/`max_iterations` for the summary row, as update() kwargs.
+
+        A list-backed run reads as items COMPLETED out of the smaller of what the
+        list held at the start and the cap — `done` clamped into the total, so a
+        capped run cannot report more than it promised even when a preflight
+        strikes extra items. Any other driver counts its own iterations and gets a
+        denominator only when one was actually given.
+        """
+        with self._lock:
+            if self._baseline is None:
+                return {"iteration": self._iterations,
+                        "max_iterations": self.max_items}
+            total = (self._baseline if self.max_items is None
+                     else min(self._baseline, self.max_items))
+            done = min(max(self._baseline - self._remaining, 0), total)
+            return {"iteration": done, "max_iterations": total}
+
+
 # --- segments ------------------------------------------------------------------
 
 

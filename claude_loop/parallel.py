@@ -487,7 +487,7 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
 
 def worker(job_id: int, shared: Shared, source: Optional[object],
            policy, session_start_box: list, usage_lock: threading.Lock,
-           app=None) -> None:
+           app=None, progress=None) -> None:
     """One worker thread: claim -> (usage gate) -> run -> record, repeat.
 
     Loops until the queue drains, the claim cap closes, or the stop sentinel is
@@ -496,10 +496,13 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
     off and retry. `source`/`policy` are None when --ignore-usage disables the
     session-limit gate. `app` is this run's status line; each worker owns the Job
     of its own number, and Job's mutators are lock-guarded for exactly that.
+    `progress` carries the summary-row figures of the whole invocation.
     """
     # A disabled StatusApp is a Null object: no terminal, no threads, every call
     # below a no-op — so the worker has no `if app is not None` in it.
     app = app if app is not None else statusline.StatusApp(enabled=False)
+    progress = (progress if progress is not None
+                else statusline.InvocationProgress())
     job = app.job(job_id)
     while not shared.stop.is_set():
         if apply_stop_request(job_id, shared, app):
@@ -551,12 +554,17 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         app.mark_run_started(started_at)
         job.start(item=command.label, model=command.model,
                   prompt=command.prompt, now=started_at)
-        app.update(iteration=shared.claimed, phase="running")
+        app.update(phase="running")
         emit_job(job_id, f"▶ {command.label}", "bold cyan")
         rc, cost_usd, dur = run_job(job_id, command)
         job.finish()
         ok = rc == 0
         done_total, remaining = shared.finish(line, ok)
+        # The summary counter moves on COMPLETION, not on the claim: a claimed
+        # file is in flight, and counting it as progress would report N jobs'
+        # worth of work that nothing has finished yet.
+        progress.note_remaining(remaining)
+        app.update(**progress.summary_fields())
 
         bits = []
         if dur is not None:
@@ -578,12 +586,17 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
 @cyclecore.stop_file_lifecycle()
 def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                  app_name: str = "parallel", *, setup_logging: bool = True,
-                 wait_on_start: bool = True) -> RunResult:
+                 wait_on_start: bool = True, progress=None) -> RunResult:
     """Drain `driver`'s list with N concurrent provider workers.
 
     The parallel counterpart of cyclecore.run_loop: same session-limit, git-push
     and mirror-log machinery, but a thread pool over independent list items
     instead of one sequential Driver loop.
+
+    `progress` is the whole invocation's InvocationProgress. It matters to a
+    wrapper that calls this once per batch: `args` are then BATCH arguments, so
+    args.max is a slice size and this call cannot know the run's real work — the
+    wrapper passes what it knows. Left None, this call is the invocation.
     """
     # Worker count precedence: explicit -j/--jobs on the CLI, then the driver's
     # `jobs` attribute (a subclass may pin it), then the engine default.
@@ -597,6 +610,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         jobs = DEFAULT_JOBS
     jobs = max(1, jobs)
     git_push_policy = GitPushPolicy(args.git_push)
+    # No wrapper above us: this call is the whole invocation, so its own --max is
+    # the invocation cap and it owns the figures (see the setting below).
+    owns_progress = progress is None
+    if owns_progress:
+        progress = statusline.InvocationProgress(max_items=args.max)
 
     # Anchor every project-relative operation before anything reads the root.
     set_project_root(getattr(args, "project_dir", None))
@@ -684,6 +702,20 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     shared = Shared(driver, args.max)
 
+    # What the list holds right now: the baseline on the first call of the
+    # invocation, and how far it has got on every later one.
+    progress.track_list(len(pending_now))
+    progress.note_remaining(len(pending_now))
+
+    def set_max_items(value):
+        value = None if value is None else int(value)
+        shared.max_items = value
+        # A cap edited mid-run moves the summary row's denominator too — but only
+        # when this call IS the invocation. Under a wrapper the displayed cap is
+        # the wrapper's to set; this one only sizes the current batch.
+        if owns_progress:
+            progress.max_items = value
+
     # The pinned status area. A Job is the unit of display in BOTH runners, so
     # this is the sequential loop's wiring with N Jobs instead of one — no branch
     # anywhere in the status line separates them. Disabled it is a Null object,
@@ -697,19 +729,19 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # consumed when the threads are created and cannot be re-read mid-run,
         # so they are printed in the header rather than offered as knobs.
         lambda: shared.max_items,
-        lambda value: setattr(shared, "max_items",
-                              None if value is None else int(value)),
+        set_max_items,
         minimum=1))
     app = statusline.StatusApp(
-        status=statusline.LoopStatus(
-            jobs=[statusline.Job(j) for j in range(1, jobs + 1)]),
+        # Jobs come from the invocation's pool, so a second batch resumes the
+        # rows of the first instead of starting a fresh set at iteration 1.
+        status=statusline.LoopStatus(jobs=progress.jobs(jobs)),
         settings=settings,
         enabled=not getattr(args, "no_statusline", False))
     app.update(
         provider=provider,
-        # One claimed file is one iteration of work here, so the counter pair on
-        # the summary row reads honestly against a cap that counts files.
-        max_iterations=shared.max_items,
+        # Files COMPLETED out of the run's real work (see InvocationProgress) —
+        # not files claimed, and not the size of this batch.
+        **progress.summary_fields(),
         # Only a list driver has a pick order; read defensively so any other
         # driver simply reports no `rand` marker.
         random_order=str(getattr(driver, "pick_order", "")) == "random",
@@ -730,7 +762,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     threads = [
         threading.Thread(target=worker, name=f"job{j}",
                          args=(j, shared, source, policy, session_start_box,
-                               usage_lock, app),
+                               usage_lock, app, progress),
                          daemon=True)
         for j in range(1, jobs + 1)
     ]
