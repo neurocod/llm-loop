@@ -21,7 +21,7 @@ import sys
 # Make the vendored submodule importable. Adjust the path if you put the
 # submodule somewhere other than tools/llm-loop.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tools", "llm-loop"))
+                                "tools", "llm-loop", "src"))
 
 from llm_loop import ListFileDriver
 

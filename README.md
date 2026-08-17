@@ -98,7 +98,7 @@ attributes / an overridden `prompt()`, and call `.main()`:
 # runFileList.py  (in your project root)
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tools", "llm-loop"))
+                                "tools", "llm-loop", "src"))
 
 from llm_loop import ListFileDriver
 
