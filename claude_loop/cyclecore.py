@@ -292,7 +292,10 @@ LOG_DIR = Path.home() / ".runCycle" / "logs"
 # tools (e.g. sum_session_costs.py) can report how full the log is against the
 # same limit instead of hard-coding it.
 LOG_MAX_BYTES = 25 * 1024 * 1024
-LOG_BACKUP_COUNT = 3
+# Deep enough that a burst of output cannot rotate an interesting segment off
+# the end of the chain before anyone reads it: at 3 backups a single preview run
+# displaced the failure a live run was recording, and it was gone for good.
+LOG_BACKUP_COUNT = 5
 
 
 def log_file_path(app_name: str = "runCycle") -> Path:
@@ -431,7 +434,7 @@ class _MirrorLogHandler(RotatingFileHandler):
 
 
 def _setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
-    """Configure a rotating file logger at log_file_path(app_name) (25 MB x 3)."""
+    """Configure the rotating file logger at log_file_path(app_name)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(f"runCycle.{app_name}")
     logger.setLevel(logging.INFO)
@@ -694,10 +697,37 @@ def _short(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+_BACKSLASH_RUN_RE = re.compile(r"\\+")
+
+
+def undouble_backslashes(text: str) -> str:
+    r"""Halve uniformly doubled backslashes in a command line, for display only.
+
+    Codex reports the command it ran with every backslash doubled — its own
+    escaping, not JSON's (json.loads already removed one level, and the quotes
+    in the same value arrive unescaped) — so a Windows path reaches the screen
+    and the log as C:\\WINDOWS\\... and cannot be copied without hand-editing.
+
+    Halving is the exact inverse only while EVERY run of consecutive backslashes
+    has even length: a UNC \\server\share arrives as four and halves back to its
+    correct two. A single odd run means the string was never uniformly doubled,
+    so it is returned untouched — showing a raw string beats corrupting one.
+    That is why this is not `text.replace("\\\\", "\\")`, which would eat the
+    UNC pair and mangle half-escaped strings.
+
+    Apply it to values that are definitionally command lines, before _short, so
+    truncation counts the characters the reader actually sees.
+    """
+    runs = _BACKSLASH_RUN_RE.findall(text)
+    if not runs or any(len(run) % 2 for run in runs):
+        return text
+    return _BACKSLASH_RUN_RE.sub(lambda m: "\\" * (len(m.group(0)) // 2), text)
+
+
 def _describe_tool(name: str, ti: dict) -> str:
     """Short human-readable description of a tool call and its arguments."""
     if name == "Bash":
-        return f"$ {_short(ti.get('command', ''))}"
+        return f"$ {_short(undouble_backslashes(str(ti.get('command', ''))))}"
     if name in ("Read", "Edit", "Write", "NotebookEdit"):
         return ti.get("file_path", ti.get("notebook_path", ""))
     if name in ("Glob", "Grep"):
@@ -1131,13 +1161,13 @@ def _render_codex_event(ev: dict) -> None:
         return
 
     if event_type == "item.started" and item_type == "command_execution":
-        command = _short(item.get("command", ""))
+        command = _short(undouble_backslashes(str(item.get("command", ""))))
         print_tool("Bash", command)
         return
 
     if event_type == "item.completed" and item_type == "command_execution":
         exit_code = item.get("exit_code")
-        command = _short(item.get("command", ""), 160)
+        command = _short(undouble_backslashes(str(item.get("command", ""))), 160)
         output = _short(item.get("aggregated_output", ""), 160)
         mark = "✓" if exit_code in (None, 0) else "✗"
         detail = f"exit {exit_code}: {command}" if exit_code is not None else command
@@ -1588,13 +1618,21 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         report_costs(app_name)
         return RunResult(RunStopReason.NO_WORK)
 
-    # Mirror all screen output into a rotating log file under the home dir.
-    if setup_logging:
+    # Mirror all screen output into a rotating log file under the home dir —
+    # except for a dry run, which is a preview and not a run: its output would
+    # otherwise displace real runs' records out of the shared rotating log (a
+    # preview once pushed ~26 MB through it, and the failure it was launched to
+    # explain rotated off the end). Said on screen so the missing log is visible
+    # rather than mysterious.
+    if setup_logging and not dry_run:
         logger = _setup_file_logging(app_name)
         sys.stdout = _TeeToLog(sys.stdout, logger)
         sys.stderr = _TeeToLog(sys.stderr, logger)
     print(f"  · project root: {PROJECT_DIR}")
-    print(f"  · logging to {log_file_path(app_name)}")
+    if dry_run:
+        print(f"  · dry run: nothing is mirrored to {log_file_path(app_name)}")
+    else:
+        print(f"  · logging to {log_file_path(app_name)}")
     print(f"  · provider: {spec.display_name}")
     if not _RICH_AVAILABLE:
         print("  · Markdown rendering is off (the 'rich' library is missing). "

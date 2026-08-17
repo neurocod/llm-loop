@@ -64,6 +64,28 @@ def test_one_job_renders_rule_summary_job_legend_and_note_rows():
     assert "job 1" in job_row and "bmx-bike.md" in job_row
 
 
+def test_the_item_comes_last_and_keeps_the_rest_of_the_line():
+    """The one unbounded field goes where the space is, and is not truncated
+    while the line has room — a cut config path is the least useful thing to
+    show, and the fields before it are all short and fixed."""
+    long_item = "products/configs/kitchenware-and-accessories-non-electric/loaf-pan.md"
+    status = sequential_status()
+    status.job(1).start(item=long_item, model="gpt-5.6-terra",
+                        iteration=12, now=NOW - 252)
+
+    job_row = sl.render_rows(status, 200, now=NOW)[2]
+
+    assert job_row.endswith(long_item)          # last cell, nothing after it
+    assert "…" not in job_row
+
+    # Within one run the item column starts at the same offset on every row,
+    # idle ones included — that is what the padded empty clock is for. (Across
+    # runs it may differ: the model column is sized from that run's own names.)
+    rows = sl.render_rows(parallel_status(3), 200, now=NOW)
+    running, idle = rows[2], rows[4]
+    assert running.index("item-1.md") == idle.index("idle")
+
+
 def test_each_job_gets_its_own_row_and_an_idle_one_has_no_clock():
     rows = sl.render_rows(parallel_status(3), 200, now=NOW)
 
@@ -165,7 +187,8 @@ def test_the_rule_and_the_separators_share_one_muted_style():
     painted = sl.colorize(f"a{sl.SEPARATOR}b")
 
     assert painted == f"a {dim}|{sl._SGR_RESET} b"
-    assert sl.colorize(sl.RULE_CHAR * 8) == f"{dim}{'_' * 8}{sl._SGR_RESET}"
+    assert (sl.colorize(sl.RULE_CHAR * 8)
+            == f"{dim}{sl.RULE_CHAR * 8}{sl._SGR_RESET}")
 
 
 # --- key legend derived from the registered Actions ----------------------------

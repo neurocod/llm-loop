@@ -129,7 +129,11 @@ CLI_DEFAULT_MODEL = "cli default"
 # separation (the rule IS the separation; degrading it to an empty line would
 # merge the toolbar into the scrolling output above).
 SEPARATOR = " | "
-RULE_CHAR = "_"
+# U+2500, not an underscore: the box-drawing glyph is designed to touch both
+# cell edges, so a row of them reads as one continuous line, while underscores
+# leave a gap at every cell boundary (and sit on the baseline, below where a
+# separator belongs).
+RULE_CHAR = "─"
 CHROME_STYLE = "dim"
 
 
@@ -237,9 +241,11 @@ _SGR = {
 }
 _SGR_RESET = "\x1b[0m"
 # One pass over the line: a percentage takes the usage scale's colour, a pipe or
-# a run of underscores takes the muted chrome style.
+# a run of rule glyphs takes the muted chrome style. Built from RULE_CHAR so the
+# two cannot drift apart when the glyph changes.
 _PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
-_STYLED_RE = re.compile(r"\d+(?:\.\d+)?\s*%|_{2,}|\|")
+_STYLED_RE = re.compile(
+    rf"\d+(?:\.\d+)?\s*%|{re.escape(RULE_CHAR)}{{2,}}|\|")
 
 
 def colorize(line: str) -> str:
@@ -566,17 +572,33 @@ class SegmentRow(Row):
 
 
 class JobRow(Row):
-    """One Job: " job 1 ▶ garlic.md   opus   iter 3   3m01s".
+    """One Job: " job 1 ▶ | opus | iter 3 | 3m01s | garlic.md".
 
     Keeps `job_id` rather than the Job object so a mouse click on this screen row
     maps back to the live Job (wave 4) even after the job list was rebuilt.
+
+    The item comes LAST and is the only unpadded cell, so it spends whatever is
+    left of the line: it is the one field with no bound (a config path can be any
+    length), while every field before it is short and fixed. The fixed cells are
+    padded — including an empty elapsed for an idle job — so the item column
+    starts at the same offset on every row and the names stay scannable.
     """
 
-    item_width = 26
-    model_width = 12
+    elapsed_width = 6
+    # The model column is sized from the data instead of pinned, because a model
+    # name is an identifier the reader may want to recognise or copy, and
+    # "gpt-5.6-ter…" says less than the two extra columns cost. Still bounded, so
+    # one absurd name cannot squeeze the item column off the row; and it is the
+    # widest name across ALL jobs, so the rows stay aligned under each other.
+    model_width_max = 24
 
     def __init__(self, job_id: int):
         self.job_id = job_id
+
+    def model_width(self, status: LoopStatus) -> int:
+        widths = [cell_width(job.model or CLI_DEFAULT_MODEL)
+                  for job in status.jobs]
+        return min(self.model_width_max, max(widths, default=0))
 
     def _job(self, status: LoopStatus) -> Optional[Job]:
         for job in status.jobs:
@@ -592,13 +614,13 @@ class JobRow(Row):
         item = job.item if (job.running and job.item) else "idle"
         model = job.model or CLI_DEFAULT_MODEL
         elapsed = format_elapsed(job.elapsed(now))
-        # Same separator as every other row (the columns stay padded, so the job
-        # rows still line up under each other with -j N).
-        cells = [f" job {job.job_id} {glyph} {pad(item, self.item_width)}",
-                 pad(model, self.model_width),
-                 f"iter {job.iteration:<4}"]
-        if elapsed:
-            cells.append(elapsed)
+        # Same separator as every other row (the leading columns stay padded, so
+        # the job rows still line up under each other with -j N).
+        cells = [f" job {job.job_id} {glyph}",
+                 pad(model, self.model_width(status)),
+                 f"iter {job.iteration:<4}",
+                 pad(elapsed, self.elapsed_width),
+                 item]
         return fit(SEPARATOR.join(cells), width)
 
 

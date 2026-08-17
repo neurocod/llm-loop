@@ -27,6 +27,7 @@ files processed this run (across all workers), not iterations.
 """
 
 import argparse
+import collections
 import json
 import os
 import sys
@@ -48,6 +49,7 @@ from .cyclecore import (
     maybe_git_push,
     print_markup,
     set_project_root,
+    undouble_backslashes,
     _describe_tool,
     _short,
 )
@@ -59,10 +61,21 @@ from .drivers import ListFileDriver
 # becomes the bottleneck.
 DEFAULT_JOBS = 10
 
+# How many of a failed job's discarded non-JSON lines are kept as its failure
+# explanation. The reason a dying CLI gives is in its last lines, and the bound
+# is what keeps a chatty one from growing a long-running worker.
+FAILURE_TAIL_LINES = 5
+
 # Per-file retry budget: a path that fails this many times in a row is parked in
 # the `failed` set so it stops blocking the queue (and is reported at the end)
 # instead of being retried forever.
 MAX_ATTEMPTS = 3
+
+# How many pending items an uncapped `--dry-run` lists before summarising the
+# rest. One item is one argv line with a whole prompt in it, so this is roughly
+# a screenful of preview; the count a real run would process is printed either
+# way, so the cap costs no information about the size of the queue.
+DRY_RUN_LIST_LIMIT = 10
 
 # How often a worker holding an interactive stop request re-reads the sentinel.
 # It is the responsiveness of "press s again to cancel" — the sequential loop's
@@ -177,6 +190,12 @@ def run_job(job_id: int, command: AgentCommand) -> tuple:
     cost_usd = None
     duration_s = None
     provider_failed = False
+    # The child's stderr is merged into its stdout (start_agent_process), so a
+    # provider that dies with a plain-text message says so on these skipped
+    # lines. Compact mode drops them, which is how a job once failed with
+    # `exit 1` and no cause anywhere. Kept as a bounded tail — a chatty CLI must
+    # not be able to grow a worker's memory — and printed only if the job fails.
+    diagnostics = collections.deque(maxlen=FAILURE_TAIL_LINES)
     for line in proc.stdout:
         line = line.rstrip("\n")
         if not line:
@@ -184,6 +203,7 @@ def run_job(job_id: int, command: AgentCommand) -> tuple:
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
+            diagnostics.append(_short(line))
             continue  # non-JSON CLI diagnostics — skip in compact mode
         if not isinstance(ev, dict):
             continue  # valid JSON can still be a diagnostic, not an event
@@ -195,10 +215,11 @@ def run_job(job_id: int, command: AgentCommand) -> tuple:
                 for text in str(item.get("text") or "").splitlines():
                     emit_job(job_id, f"💬 {text}")
             elif et == "item.started" and item_type == "command_execution":
-                emit_job(job_id, f"💻 {_short(item.get('command', ''), 160)}")
+                emit_job(job_id, "💻 " + _short(
+                    undouble_backslashes(str(item.get("command", ""))), 160))
             elif et == "item.completed" and item_type == "command_execution":
-                emit_job(job_id, f"📤 exit {item.get('exit_code', '')}: "
-                         f"{_short(item.get('command', ''), 140)}")
+                emit_job(job_id, f"📤 exit {item.get('exit_code', '')}: " + _short(
+                    undouble_backslashes(str(item.get("command", ""))), 140))
             elif et == "item.completed" and item_type == "file_change":
                 changes = item.get("changes") or []
                 paths = [str(change.get("path")) for change in changes
@@ -248,6 +269,14 @@ def run_job(job_id: int, command: AgentCommand) -> tuple:
     returncode = proc.wait()
     if returncode == 0 and provider_failed:
         returncode = 1
+    # Last resort only: a codex error/turn.failed already printed its own ⚠ line
+    # live, so repeating the tail there would be noise. A failure with no other
+    # explanation is exactly what must never print bare again. Emitted here, so
+    # the lines sit immediately above the worker's ✗ verdict for this job.
+    if returncode != 0 and not provider_failed and diagnostics:
+        emit_job(job_id, f"provider output before exit {returncode}:", "red")
+        for text in diagnostics:
+            emit_job(job_id, f"  {text}", "red")
     return returncode, cost_usd, duration_s
 
 
@@ -573,13 +602,19 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     set_project_root(getattr(args, "project_dir", None))
 
     # Mirror all output to the rotating log, same as run_loop — under its own app
-    # name so this runner's log doesn't fight the sequential one's.
-    if setup_logging:
+    # name so this runner's log doesn't fight the sequential one's. A dry run is
+    # a preview, not a run, and stays out of the shared record entirely: see the
+    # same branch in cyclecore.run_loop for the incident behind it.
+    if setup_logging and not args.dry_run:
         logger = cyclecore._setup_file_logging(app_name)
         sys.stdout = cyclecore._TeeToLog(sys.stdout, logger)
         sys.stderr = cyclecore._TeeToLog(sys.stderr, logger)
     print(f"  · project root: {cyclecore.project_dir()}")
-    print(f"  · logging to {cyclecore.log_file_path(app_name)}")
+    if args.dry_run:
+        print("  · dry run: nothing is mirrored to "
+              f"{cyclecore.log_file_path(app_name)}")
+    else:
+        print(f"  · logging to {cyclecore.log_file_path(app_name)}")
     print(f"  · provider: {spec.display_name}")
     print(f"  · jobs: {jobs}  ·  git push policy: {git_push_policy.value}")
 
@@ -597,16 +632,28 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         if os.path.exists(cyclecore.STOP_FILE):
             print("  · stop file present — a real run would wait here until it "
                   "went away. Left in place (a dry run never consumes it).")
-        limit = args.max if args.max is not None else len(pending_now)
-        print(f"DRY-RUN: {min(limit, len(pending_now))} of {len(pending_now)} "
+        would_run = (len(pending_now) if args.max is None
+                     else min(args.max, len(pending_now)))
+        # Every pending item carries its whole prompt inside the joined argv, so
+        # listing a full list is unreadable (1961 products once made ~26 MB of
+        # preview). An explicit --max-runs is the user naming how many items they
+        # want to see, so it wins; an uncapped preview is trimmed to a screenful
+        # and says so — a silent truncation would be a lie about what is pending.
+        listed = would_run if args.max is not None else min(
+            would_run, DRY_RUN_LIST_LIMIT)
+        print(f"DRY-RUN: {would_run} of {len(pending_now)} "
               f"pending file(s) would be processed across {jobs} worker(s):")
         first_command = None
-        for line in pending_now[:limit]:
+        for line in pending_now[:listed]:
             command = driver.command_for(line)
             first_command = first_command or command
             print("  " + " ".join(build_agent_argv(command, provider)))
             if provider == "codex":
                 print("    STDIN: " + command.prompt)
+        if listed < would_run:
+            print(f"  … and {would_run - listed} more pending — listing capped "
+                  f"at {DRY_RUN_LIST_LIMIT}; pass -m/--max-runs N to preview "
+                  f"exactly N.")
         if first_command is not None:
             # The argv lines above are what would be executed, but for claude the
             # whole prompt sits inside one joined `-p …` token and is unreadable —

@@ -173,12 +173,13 @@ class _PromptSink:
 
 
 class _FakeAgentProcess:
-    def __init__(self, has_stdin=True, stdout=""):
+    def __init__(self, has_stdin=True, stdout="", returncode=0):
         self.stdin = _PromptSink() if has_stdin else None
         self.stdout = io.StringIO(stdout)
+        self.returncode = returncode
 
     def wait(self):
-        return 0
+        return self.returncode
 
 
 def test_codex_process_receives_prompt_via_closed_stdin(monkeypatch):
@@ -337,3 +338,113 @@ def test_codex_dry_run_uses_codex_policy_not_claude_usage_source(
     assert "Current session" in output
     assert "Current week (all models)" in output
     assert "DRY-RUN: codex exec --json" in output
+
+
+# --- a failed parallel job must say why ----------------------------------------
+#
+# The child's stderr is merged into its stdout, so a provider that dies with a
+# plain-text message says so on lines the compact renderer skips as non-JSON.
+# Dropping them is how a job printed `✗ … (exit 1)` with no cause anywhere.
+
+def _codex_job(monkeypatch, stdout, returncode):
+    monkeypatch.setattr(
+        parallel, "start_agent_process",
+        lambda *args: _FakeAgentProcess(
+            has_stdin=False, stdout=stdout, returncode=returncode))
+    return parallel.run_job(4, AgentCommand("p", "gpt-test", "job", "codex"))
+
+
+def test_a_failed_job_surfaces_the_providers_plain_text_diagnostics(
+        monkeypatch, capsys):
+    rc, _cost, _dur = _codex_job(
+        monkeypatch,
+        "error: unexpected argument '--approve-for-me' found\n"
+        "try 'codex exec --help'\n",
+        returncode=1)
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[job 4]" in out                      # attributed to the failing job
+    assert "unexpected argument" in out
+    assert "try 'codex exec --help'" in out
+
+
+def test_a_successful_job_stays_quiet_about_skipped_lines(monkeypatch, capsys):
+    rc, _cost, _dur = _codex_job(
+        monkeypatch,
+        "npm warn deprecated something@1.0.0\n"
+        '{"type": "turn.completed", "usage": {"input_tokens": 1}}\n',
+        returncode=0)
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "npm warn" not in out                 # compact mode stays compact
+
+
+def test_a_reported_provider_error_is_not_repeated_as_a_tail(monkeypatch, capsys):
+    """turn.failed already printed the cause live; repeating it is noise."""
+    rc, _cost, _dur = _codex_job(
+        monkeypatch,
+        "npm warn deprecated something@1.0.0\n"
+        '{"type": "turn.failed", "message": "model refused the turn"}\n',
+        returncode=0)
+
+    out = capsys.readouterr().out
+    assert rc == 1                               # mapped from the failure event
+    assert out.count("model refused the turn") == 1
+    assert "npm warn" not in out
+
+
+def test_the_kept_tail_is_bounded_and_truncated(monkeypatch, capsys):
+    """A chatty CLI must not be able to grow a worker's memory."""
+    noise = "".join(f"line {i} {'x' * 400}\n" for i in range(50))
+    _codex_job(monkeypatch, noise, returncode=1)
+
+    out = capsys.readouterr().out
+    kept = [ln for ln in out.splitlines() if "line " in ln]
+    assert len(kept) == parallel.FAILURE_TAIL_LINES
+    assert "line 49" in out and "line 44" not in out   # the LAST few lines
+    assert all(len(ln) < 300 for ln in kept)           # each one _short-ened
+
+
+# --- command lines are shown the way they can be copied ------------------------
+#
+# Codex doubles every backslash in the `command` it reports, so a Windows path
+# reached the screen as C:\\WINDOWS\\... and had to be hand-edited after copying.
+
+def test_a_doubled_windows_path_is_halved_for_display():
+    assert cyclecore.undouble_backslashes(
+        r"powershell.exe -Command 'D:\\g\\3d-research\\x'"
+    ) == r"powershell.exe -Command 'D:\g\3d-research\x'"
+
+
+def test_a_doubled_unc_path_keeps_its_leading_pair():
+    assert cyclecore.undouble_backslashes(
+        r"dir \\\\server\\share") == r"dir \\server\share"
+
+
+def test_a_string_with_an_odd_run_is_left_completely_alone():
+    raw = r"grep 'a\b' \\host\c"      # runs of 1, 2, 1: not uniformly doubled
+    assert cyclecore.undouble_backslashes(raw) == raw
+
+
+def test_a_string_without_backslashes_is_untouched():
+    assert cyclecore.undouble_backslashes("pytest -q") == "pytest -q"
+
+
+def test_both_renderers_use_the_helper_on_command_execution(monkeypatch, capsys):
+    item = {"type": "command_execution", "command": r"cd D:\\g\\loop && ls",
+            "exit_code": 0}
+    cyclecore._render_codex_event({"type": "item.completed", "item": item})
+    _codex_job(monkeypatch,
+               json.dumps({"type": "item.completed", "item": item}) + "\n",
+               returncode=0)
+
+    out = capsys.readouterr().out
+    assert out.count(r"cd D:\g\loop && ls") == 2
+    assert r"D:\\g" not in out
+
+
+def test_the_claude_bash_tool_line_uses_the_helper():
+    assert cyclecore._describe_tool("Bash", {"command": r"type C:\\a\\b.txt"}) \
+        == r"$ type C:\a\b.txt"
