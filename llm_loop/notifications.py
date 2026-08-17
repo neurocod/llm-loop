@@ -7,13 +7,13 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 
-SETTINGS_ENV = "CLAUDE_LOOP_SETTINGS"
+SETTINGS_ENV = "LLM_LOOP_SETTINGS"
 SETTINGS_FILENAME = "settings.json"
 COMPLETION_SOUND_KEY = "completion_sound"
 
 
 class SettingsError(ValueError):
-    """A present claude-loop settings file is malformed."""
+    """A present llm-loop settings file is malformed."""
 
 
 def _reject_json_constant(value: str):
@@ -36,7 +36,7 @@ def settings_path(*, environ: Optional[Mapping[str, str]] = None,
         config_home = Path(env["XDG_CONFIG_HOME"])
     else:
         config_home = (Path.home() if home is None else Path(home)) / ".config"
-    return config_home / "claude-loop" / SETTINGS_FILENAME
+    return config_home / "llm-loop" / SETTINGS_FILENAME
 
 
 def load_settings(path: Optional[Path] = None) -> dict:

@@ -19,7 +19,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tools", "claude-loop"))
+                                "tools", "llm-loop"))
 
 from runFileList import LIST_FILE_REL, FileListDriver
 

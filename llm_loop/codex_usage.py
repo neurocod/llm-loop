@@ -160,8 +160,8 @@ class CodexUsageSource:
                 "method": "initialize",
                 "id": 0,
                 "params": {"clientInfo": {
-                    "name": "claude_loop",
-                    "title": "claude-loop",
+                    "name": "llm_loop",
+                    "title": "llm-loop",
                     "version": "1.0.0",
                 }},
             })

@@ -544,11 +544,11 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
                         "file and the Driver's relative paths "
                         "(default: the current working directory)")
     # No short alias: this is a rescue hatch for an odd terminal, not a knob to
-    # reach for. CLAUDE_LOOP_STATUSLINE=0 does the same without editing a
+    # reach for. LLM_LOOP_STATUSLINE=0 does the same without editing a
     # command line, and no TTY disables it by itself.
     p.add_argument("--no-statusline", dest="no_statusline", action="store_true",
                    help="do not pin the interactive status rows at the bottom of "
-                        "the terminal (same as CLAUDE_LOOP_STATUSLINE=0)")
+                        "the terminal (same as LLM_LOOP_STATUSLINE=0)")
     return p.parse_args(argv)
 
 

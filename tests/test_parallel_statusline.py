@@ -21,9 +21,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from claude_loop import cyclecore, parallel
-from claude_loop import statusline as sl
-from claude_loop.drivers import ListFileDriver
+from llm_loop import cyclecore, parallel
+from llm_loop import statusline as sl
+from llm_loop.drivers import ListFileDriver
 
 
 class _MemDriver(ListFileDriver):
@@ -388,7 +388,7 @@ class _RecordingTerminal(_LiveTerminal):
 def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
     """--grow-kit-periodically alternates parallel batches with sequential
     sweeps; two regions pinned at once would fight over the same screen rows."""
-    from claude_loop.cyclecore import Driver
+    from llm_loop.cyclecore import Driver
 
     log = []
     real_app_class = sl.StatusApp

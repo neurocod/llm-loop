@@ -7,34 +7,34 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from claude_loop.notifications import (
+from llm_loop.notifications import (
     SettingsError,
     completion_sound_enabled,
     settings_path,
 )
-from claude_loop import notifications
+from llm_loop import notifications
 
 
 def test_settings_path_uses_appdata_on_windows(tmp_path):
     assert settings_path(
         environ={"APPDATA": str(tmp_path)}, platform="win32",
-    ) == tmp_path / "claude-loop" / "settings.json"
+    ) == tmp_path / "llm-loop" / "settings.json"
 
 
 def test_settings_path_honours_explicit_override(tmp_path):
     target = tmp_path / "custom.json"
     assert settings_path(
-        environ={"CLAUDE_LOOP_SETTINGS": str(target)}, platform="win32",
+        environ={"LLM_LOOP_SETTINGS": str(target)}, platform="win32",
     ) == target
 
 
 def test_settings_path_uses_xdg_then_home(tmp_path):
     assert settings_path(
         environ={"XDG_CONFIG_HOME": str(tmp_path)}, platform="linux",
-    ) == tmp_path / "claude-loop" / "settings.json"
+    ) == tmp_path / "llm-loop" / "settings.json"
     assert settings_path(
         environ={}, platform="linux", home=tmp_path,
-    ) == tmp_path / ".config" / "claude-loop" / "settings.json"
+    ) == tmp_path / ".config" / "llm-loop" / "settings.json"
 
 
 def test_completion_sound_is_disabled_without_settings(tmp_path):

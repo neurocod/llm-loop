@@ -1,4 +1,4 @@
-# claude-loop
+# llm-loop
 
 A reusable engine for **autonomous LLM-CLI loops** using Claude Code or Codex:
 it repeatedly invokes the selected CLI to grind through a unit of work,
@@ -67,7 +67,7 @@ default, or `--project-dir`/`-C`.
 ## Layout
 
 ```
-claude_loop/
+llm_loop/
   cyclecore.py   engine: parse_args, run_loop, the Driver protocol,
                  git-push policy, mirror log, stream-json rendering
   providers.py   Claude/Codex executable flags and argv construction
@@ -87,8 +87,8 @@ Add it as a submodule, then copy one of the [`examples/`](examples/) wrappers
 into your project root and adjust the paths, prompt and model:
 
 ```bash
-git submodule add <repo-url> tools/claude-loop
-cp tools/claude-loop/examples/runFileList.py .   # then edit the constants
+git submodule add <repo-url> tools/llm-loop
+cp tools/llm-loop/examples/runFileList.py .   # then edit the constants
 ```
 
 A wrapper is tiny — subclass a Driver, set the project-specific bits as class
@@ -98,9 +98,9 @@ attributes / an overridden `prompt()`, and call `.main()`:
 # runFileList.py  (in your project root)
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tools", "claude-loop"))
+                                "tools", "llm-loop"))
 
-from claude_loop import ListFileDriver
+from llm_loop import ListFileDriver
 
 class FileListDriver(ListFileDriver):
     list_file     = "files.md"
@@ -152,7 +152,7 @@ line names the current mode, and an overridden `model()` picks the model per mod
 (drop it to let the CLI use its own configured model):
 
 ```python
-from claude_loop import StateFileDriver
+from llm_loop import StateFileDriver
 
 class CycleDriver(StateFileDriver):
     state_file = "currentState.md"
@@ -188,7 +188,7 @@ quota, and at what ceiling, is a *specialisation* you pick by setting the
 more rules; the loop pauses while **any** of them is exceeded:
 
 ```python
-from claude_loop import (LimitPolicy, SessionLimit, DayNightLimit, WeeklyLimit)
+from llm_loop import (LimitPolicy, SessionLimit, DayNightLimit, WeeklyLimit)
 
 class MyDriver(StateFileDriver):
     # pick ONE of these:
@@ -246,7 +246,7 @@ reading before the bounded retry path continues.
 | `-S, --max-strike 3h` | per-session work budget before a pre-emptive pause; alias `--maxStrike` |
 | `-j, --jobs N` | concurrent workers (parallel only) |
 | `--raw` | print raw JSON events, for debugging (sequential only) |
-| `--no-statusline` | do not pin the status rows (same as `CLAUDE_LOOP_STATUSLINE=0`) |
+| `--no-statusline` | do not pin the status rows (same as `LLM_LOOP_STATUSLINE=0`) |
 
 ## Interactive status line
 
@@ -270,9 +270,9 @@ file. It is disabled when the file or key is absent:
 }
 ```
 
-On Windows the file is `%APPDATA%\claude-loop\settings.json`. On Linux and
-macOS it is `${XDG_CONFIG_HOME:-~/.config}/claude-loop/settings.json`. Set
-`CLAUDE_LOOP_SETTINGS` to use a different absolute path. Windows wrappers use
+On Windows the file is `%APPDATA%\llm-loop\settings.json`. On Linux and
+macOS it is `${XDG_CONFIG_HOME:-~/.config}/llm-loop/settings.json`. Set
+`LLM_LOOP_SETTINGS` to use a different absolute path. Windows wrappers use
 the native system notification sound; other platforms emit a terminal bell.
 
 Create a file named `stop` in the project root to halt the loop at the next

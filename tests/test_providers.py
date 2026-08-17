@@ -8,9 +8,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from claude_loop import codex_usage, cyclecore, limits, parallel, providers
-from claude_loop.cyclecore import AgentCommand, Driver
-from claude_loop.providers import (build_agent_argv, provider_spec,
+from llm_loop import codex_usage, cyclecore, limits, parallel, providers
+from llm_loop.cyclecore import AgentCommand, Driver
+from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
                                    usage_source_for)
 
@@ -153,7 +153,7 @@ def test_codex_provider_constructs_its_own_usage_source():
 
 
 def test_runtime_argv_resolves_windows_command_shim(monkeypatch):
-    monkeypatch.setattr("claude_loop.providers.shutil.which",
+    monkeypatch.setattr("llm_loop.providers.shutil.which",
                         lambda executable: "C:/npm/codex.CMD")
     assert runtime_argv(["codex", "exec", "prompt"], "codex") == [
         "C:/npm/codex.CMD", "exec", "prompt"]
@@ -322,7 +322,7 @@ class _OneShotCodexDriver(Driver):
 
 def test_codex_dry_run_uses_codex_policy_not_claude_usage_source(
         tmp_path, monkeypatch, capsys):
-    from claude_loop import usage
+    from llm_loop import usage
 
     def forbidden_usage_source():
         raise AssertionError("Codex must not read Claude usage")

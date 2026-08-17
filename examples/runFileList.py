@@ -11,7 +11,7 @@ This particular example asks the agent to write a short summary of each source f
 into a sibling `<name>.summary.md`. Swap `prompt()` / `target_suffix` / `model()`
 for your own per-file task (generate docs, add license headers, refactor, lint…).
 
-Copy this into your host project root (next to the `tools/claude-loop`
+Copy this into your host project root (next to the `tools/llm-loop`
 submodule), adjust the class attributes, and run `python runFileList.py`.
 """
 
@@ -19,11 +19,11 @@ import os
 import sys
 
 # Make the vendored submodule importable. Adjust the path if you put the
-# submodule somewhere other than tools/claude-loop.
+# submodule somewhere other than tools/llm-loop.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tools", "claude-loop"))
+                                "tools", "llm-loop"))
 
-from claude_loop import ListFileDriver
+from llm_loop import ListFileDriver
 
 LIST_FILE_REL = "files.md"        # one source path per line
 

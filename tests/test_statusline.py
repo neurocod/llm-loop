@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from claude_loop import statusline as sl
+from llm_loop import statusline as sl
 
 
 NOW = 1_700_000_000.0
@@ -284,7 +284,7 @@ def test_stop_key_creates_the_sentinel_and_pressing_it_again_cancels(tmp_path):
 
 
 def test_stop_file_defaults_to_the_engine_sentinel(monkeypatch):
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     monkeypatch.setattr(cyclecore, "STOP_FILE", "/somewhere/stop")
 
@@ -316,7 +316,7 @@ class _FakeApp:
 
 
 def test_a_stop_request_cancelled_inside_the_grace_leaves_no_trace(monkeypatch, tmp_path):
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     sentinel = tmp_path / "stop"
     sentinel.write_text("", encoding="utf-8")
@@ -330,7 +330,7 @@ def test_a_stop_request_cancelled_inside_the_grace_leaves_no_trace(monkeypatch, 
 
 
 def test_a_stop_request_still_pending_after_the_grace_stops_the_run(monkeypatch, tmp_path):
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     sentinel = tmp_path / "stop"
     sentinel.write_text("", encoding="utf-8")
@@ -343,7 +343,7 @@ def test_a_stop_request_still_pending_after_the_grace_stops_the_run(monkeypatch,
 
 def test_a_non_interactive_run_stops_without_any_grace(monkeypatch, tmp_path):
     """Automation (`touch stop` from a script, a piped run) must not be slowed."""
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     sentinel = tmp_path / "stop"
     sentinel.write_text("", encoding="utf-8")
@@ -358,7 +358,7 @@ def test_a_non_interactive_run_stops_without_any_grace(monkeypatch, tmp_path):
 
 def test_a_sentinel_this_run_did_not_write_stops_it_at_once(monkeypatch, tmp_path):
     """`touch stop` from a script: the grace waits for a key nobody will press."""
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     sentinel = tmp_path / "stop"
     sentinel.write_text("", encoding="utf-8")
@@ -549,8 +549,8 @@ class _FakeUsageSource:
 
 
 def test_quota_rows_follow_the_policy_rules():
-    from claude_loop.limits import LimitPolicy, SessionLimit
-    from claude_loop.usage import Usage, UsageReading
+    from llm_loop.limits import LimitPolicy, SessionLimit
+    from llm_loop.usage import Usage, UsageReading
 
     usage = Usage(UsageReading(43.0, NOW + 600), UsageReading(61.0, None),
                   UsageReading(None, None), [])
@@ -620,8 +620,8 @@ def test_format_prompt_block_survives_an_empty_prompt():
 
 def test_a_dry_run_prints_the_prompt_block_for_job_one(tmp_path, capsys):
     """The joined `-p …` argv line hides the prompt; the block is what shows it."""
-    from claude_loop import cyclecore
-    from claude_loop.cyclecore import AgentCommand, Driver
+    from llm_loop import cyclecore
+    from llm_loop.cyclecore import AgentCommand, Driver
 
     class _OneShot(Driver):
         def next_command(self):
@@ -667,7 +667,7 @@ class _CollectingHandler(logging.Handler):
 
 
 def test_a_default_terminal_targets_the_real_stream_not_the_tee(monkeypatch):
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     console = _FakeStream(True)
     monkeypatch.setattr(cyclecore, "_real_stream", lambda: console)
@@ -678,7 +678,7 @@ def test_a_default_terminal_targets_the_real_stream_not_the_tee(monkeypatch):
 def test_the_pinned_rows_never_reach_the_mirror_log(monkeypatch):
     """The feature's #1 non-negotiable: cursor bytes in the log corrupt the run
     record `--cost` parses, and every other test injects its own stream."""
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     console = _FakeStream(True)
     logged = []
@@ -849,7 +849,7 @@ class _CountingSource:
     """A UsageSource that never leaves the process."""
 
     def __init__(self, percent=5.0):
-        from claude_loop.usage import Usage, UsageReading
+        from llm_loop.usage import Usage, UsageReading
 
         reading = UsageReading(percent, NOW + 3600)
         self.usage = Usage(reading, reading, UsageReading(None, None),
@@ -871,7 +871,7 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
     `progress` stands in for a wrapper making several runner calls in one
     process; left None, the call is the whole invocation.
     """
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     source = _CountingSource()
     monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: source)
@@ -919,7 +919,7 @@ def test_a_bounded_run_shows_the_quotas_and_never_polls_for_them(monkeypatch,
                                                                  tmp_path):
     """Priming before `with app:` published nothing (push_quotas needs an enabled
     app), and a `-m N` run has no later limit check to publish them either."""
-    from claude_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.cyclecore import AgentCommand, Driver
 
     class _OneShot(Driver):
         def next_command(self):
@@ -933,7 +933,7 @@ def test_a_bounded_run_shows_the_quotas_and_never_polls_for_them(monkeypatch,
 
 
 def test_an_unbounded_run_keeps_the_quota_figures_refreshed(monkeypatch, tmp_path):
-    from claude_loop.cyclecore import Driver
+    from llm_loop.cyclecore import Driver
 
     class _NoWork(Driver):
         def next_command(self):
@@ -949,7 +949,7 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
                                                                    tmp_path):
     """Wave 2 edits --max-runs while the run goes, so the loop must not be
     comparing against a local it snapshotted at startup."""
-    from claude_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.cyclecore import AgentCommand, Driver
 
     class _RaisesItsOwnCap(Driver):
         app = None
@@ -972,7 +972,7 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
 
 def _counts_down(total):
     """A non-list Driver with `total` units of work and no queue behind it."""
-    from claude_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.cyclecore import AgentCommand, Driver
 
     class _CountsDown(Driver):
         provider = "codex"
@@ -996,7 +996,7 @@ def _counts_down(total):
 def test_a_driver_with_no_list_gets_no_invented_denominator(monkeypatch, tmp_path):
     """Only a list says how much work a run has. Without one an uncapped run
     counts, and says nothing it cannot know."""
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     monkeypatch.setattr(cyclecore, "run_agent_streaming",
                         lambda cmd, provider, raw, partial, prompt: 0)
@@ -1012,7 +1012,7 @@ def test_a_driver_with_no_list_gets_no_invented_denominator(monkeypatch, tmp_pat
 def test_a_capped_run_with_no_list_shows_the_cap_it_was_given(monkeypatch,
                                                               tmp_path):
     """--max is the whole denominator here — there is no queue to be smaller."""
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     monkeypatch.setattr(cyclecore, "run_agent_streaming",
                         lambda cmd, provider, raw, partial, prompt: 0)
@@ -1025,7 +1025,7 @@ def test_a_capped_run_with_no_list_shows_the_cap_it_was_given(monkeypatch,
 
 def _list_driver(items):
     """A ListFileDriver whose list lives in memory (no files, no provider)."""
-    from claude_loop.drivers import ListFileDriver
+    from llm_loop.drivers import ListFileDriver
 
     class _MemList(ListFileDriver):
         provider = "codex"
@@ -1058,7 +1058,7 @@ def test_the_sequential_loop_counts_items_struck_not_iterations(monkeypatch,
                                                                 tmp_path):
     """The list is the total in BOTH runners, so a retried item is not progress —
     while the job row keeps counting the iterations it actually ran."""
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     codes = [1, 0, 0, 0]        # the first item fails once and comes back
     monkeypatch.setattr(cyclecore, "run_agent_streaming",
@@ -1075,7 +1075,7 @@ def test_the_sequential_loop_counts_items_struck_not_iterations(monkeypatch,
 def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
     """Both runners share the rule: a Job belongs to the invocation, not to the
     call that displayed it — and a per-call cap is not the invocation's."""
-    from claude_loop import cyclecore
+    from llm_loop import cyclecore
 
     monkeypatch.setattr(cyclecore, "usage_source_for",
                         lambda provider: _CountingSource())

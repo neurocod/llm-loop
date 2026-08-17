@@ -1,4 +1,4 @@
-# TODO — claude-loop
+# TODO — llm-loop
 
 A backlog of features worth borrowing from the wider "autonomous Claude-CLI
 loop" ecosystem, scored against what this engine already does. Implement the
@@ -26,7 +26,7 @@ Legend: priority is rough — `[P1]` do first, `[P3]` nice to have.
 - Sequential `run_loop` + parallel `run_parallel` (N concurrent workers).
 - Project-root decoupling (`--project-dir` / cwd), stop file.
 - Opt-in per-user completion sound, configured through the platform config
-  directory (or `CLAUDE_LOOP_SETTINGS`).
+  directory (or `LLM_LOOP_SETTINGS`).
 
 ## Worth borrowing
 

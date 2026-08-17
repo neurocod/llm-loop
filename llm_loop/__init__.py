@@ -1,5 +1,5 @@
 """
-claude_loop - a reusable engine for autonomous Claude/Codex CLI loops.
+llm_loop - a reusable engine for autonomous Claude/Codex CLI loops.
 
 Vendor this package as a git submodule under a host project, then write a thin
 wrapper in the project that subclasses a Driver — supplying the project-specific
@@ -7,7 +7,7 @@ bits (which file to read, which prompt to send, which model to use) as class
 attributes / overridden methods — and calls its `.main()`:
 
     # runTranslate.py (thin wrapper in the host project root)
-    from claude_loop import ListFileDriver
+    from llm_loop import ListFileDriver
 
     class TranslateDriver(ListFileDriver):
         list_file     = "products/list.md"

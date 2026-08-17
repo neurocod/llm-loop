@@ -1,4 +1,4 @@
-"""Tests for claude_loop.cmdline - the reproducing command line.
+"""Tests for llm_loop.cmdline - the reproducing command line.
 
 The module's whole job is "remove every spelling of a flag, then append the new
 value", so most of these tests are one spelling each: a missed spelling leaves
@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from claude_loop.cmdline import FLAG_ALIASES, Flag, quote, rebuild_argv, render
+from llm_loop.cmdline import FLAG_ALIASES, Flag, quote, rebuild_argv, render
 
 
 # --- removal: every spelling of one flag ---------------------------------------

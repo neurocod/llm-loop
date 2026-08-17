@@ -19,9 +19,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from claude_loop import cyclecore, parallel
-from claude_loop.cyclecore import ClaudeCommand, Driver
-from claude_loop.drivers import ListFileDriver
+from llm_loop import cyclecore, parallel
+from llm_loop.cyclecore import ClaudeCommand, Driver
+from llm_loop.drivers import ListFileDriver
 
 
 @pytest.fixture(autouse=True)

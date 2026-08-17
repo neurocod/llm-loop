@@ -13,7 +13,7 @@ the agent to follow a playbook (e.g. read a TODO list, do one item, update the
 state). Override `model()` to pin or vary the model by state if you like; leave it
 alone to let the selected CLI use its own configured model.
 
-Copy this into your host project root (next to the `tools/claude-loop` submodule),
+Copy this into your host project root (next to the `tools/llm-loop` submodule),
 adjust the class attributes, and run `python runCycle.py`.
 """
 
@@ -21,9 +21,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tools", "claude-loop"))
+                                "tools", "llm-loop"))
 
-from claude_loop import StateFileDriver
+from llm_loop import StateFileDriver
 
 STATE_FILE_REL = "currentState.md"
 

@@ -238,7 +238,7 @@ class UsageSource:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-loop",
+            "User-Agent": "llm-loop",
         })
         last = ""
         for attempt in range(HTTP_ATTEMPTS):

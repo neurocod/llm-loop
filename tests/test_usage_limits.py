@@ -21,9 +21,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from claude_loop import cyclecore, usage
-from claude_loop.cyclecore import ClaudeCommand, Driver, RateLimitEvent
-from claude_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
+from llm_loop import cyclecore, usage
+from llm_loop.cyclecore import ClaudeCommand, Driver, RateLimitEvent
+from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
 
 
 # A response like the endpoint's, trimmed to the quotas the engine reads. The

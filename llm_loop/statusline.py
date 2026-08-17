@@ -93,7 +93,7 @@ __all__ = [
 
 # Environment kill switch, honoured next to --no-statusline so a hostile terminal
 # can be worked around without editing any command line.
-ENV_FLAG = "CLAUDE_LOOP_STATUSLINE"
+ENV_FLAG = "LLM_LOOP_STATUSLINE"
 
 # Below these the reserved region would eat the visible scrollback, so we simply
 # do not pin anything.
