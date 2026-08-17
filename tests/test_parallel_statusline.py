@@ -366,19 +366,29 @@ def test_only_one_worker_owns_the_pending_request():
 
 
 class _RecordingTerminal(_LiveTerminal):
-    """A live terminal that logs when its region opens and closes."""
+    """A live terminal that logs when its region opens and closes.
+
+    The terminal itself goes into the log, not its id(). That reference is
+    load-bearing, not incidental: id() is unique only among *live* objects, and
+    every region here is closed before the next one opens, so a released
+    terminal can be collected and the next one handed the very same address.
+    Logging ids made the distinctness check below report 3 objects where 4 were
+    created - a false alarm that surfaced once on one CI cell and would have
+    read as a real region leak. Holding the objects keeps their addresses
+    distinct by construction.
+    """
 
     def __init__(self, log):
         super().__init__()
         self.log = log
 
     def reserve(self, rows):
-        self.log.append(("reserve", id(self)))
+        self.log.append(("reserve", self))
         return super().reserve(rows)
 
     def release(self):
         if self._on:
-            self.log.append(("release", id(self)))
+            self.log.append(("release", self))
         super().release()
 
 
@@ -428,8 +438,10 @@ def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
     # Each region is closed by the run that opened it, and every run gets a new
     # one — no region survives its runner to be inherited by the next phase.
     pairs = list(zip(log[::2], log[1::2]))
-    assert all(opened == closed for (_r, opened), (_x, closed) in pairs)
-    assert len({opened for (_r, opened) in log[::2]}) == 4
+    assert all(opened is closed for (_r, opened), (_x, closed) in pairs)
+    # `log` holds every terminal alive, so identity here really does mean
+    # "four different objects" — see _RecordingTerminal on why ids would not.
+    assert len({id(opened) for (_r, opened) in log[::2]}) == 4
 
 
 # --- the counters belong to the invocation, not to one runner call ---------------
