@@ -37,6 +37,13 @@ made Drivers, parallel for the concurrent list runner, usage/codex_usage for the
 provider quota query layers, and limits for the pausing policy.
 """
 
+# The single source of truth for the version: pyproject.toml reads it back out
+# of here (`[tool.setuptools.dynamic] version = {attr = "llm_loop.__version__"}`),
+# so bumping this line is the whole release step. Keep it a plain literal -
+# the build backend parses it without importing the package, which only works
+# while the right-hand side stays a constant.
+__version__ = "0.1.0"
+
 from . import cmdline
 from .cyclecore import (
     AgentCommand,

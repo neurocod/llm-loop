@@ -13,11 +13,8 @@ explain — off the end of the backup chain.
 import logging
 import os
 import sys
-from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from llm_loop import cyclecore, parallel
 from llm_loop.cyclecore import ClaudeCommand, Driver

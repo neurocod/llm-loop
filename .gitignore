@@ -3,3 +3,9 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# Build backend output. `pip wheel .` and `python -m build` leave both behind,
+# and `pip install -e .` leaves the egg-info above inside src/.
+build/
+dist/
+.pytest_cache/

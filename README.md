@@ -64,22 +64,39 @@ project-relative operation (git/agent cwd, the stop file, the relative paths a
 Driver is handed) to the project root — the current working directory by
 default, or `--project-dir`/`-C`.
 
+## Requirements
+
+**Python 3.9+ and nothing else.** The engine has zero third-party
+dependencies — every import across its modules comes from the standard
+library — so vendoring it adds no transitive dependency to your project and
+cannot conflict with the versions you already pin.
+
 ## Layout
 
 ```
-llm_loop/
-  cyclecore.py   engine: parse_args, run_loop, the Driver protocol,
-                 git-push policy, mirror log, stream-json rendering
-  providers.py   Claude/Codex executable flags and argv construction
-  usage.py       UsageSource: query / cache / parse the account's quota figures
-  limits.py      LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
-  drivers.py     StateFileDriver (state machine) and ListFileDriver (work queue)
-  parallel.py    run_parallel: N concurrent LLM workers over a list file
+src/
+  llm_loop/
+    cyclecore.py   engine: parse_args, run_loop, the Driver protocol,
+                   git-push policy, mirror log, stream-json rendering
+    providers.py   Claude/Codex executable flags and argv construction
+    usage.py       UsageSource: query / cache / parse the account's quota figures
+    limits.py      LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
+    drivers.py     StateFileDriver (state machine) and ListFileDriver (work queue)
+    parallel.py    run_parallel: N concurrent LLM workers over a list file
 examples/
   runCycle.py            state-machine wrapper
   runFileList.py         per-file work-queue wrapper
   runFileListParallel.py parallel work-queue wrapper
+ideas/                   study material, never shipped — see ideas/README.md
 ```
+
+The package sits under `src/` for one reason, and it is the reason to keep it
+there: a host project puts that directory on `sys.path`, so whatever sits
+directly inside it becomes a top-level importable name for them — at position
+0, outranking their own modules. With `src/` holding nothing but the package,
+vendoring costs an adopter exactly one name. Flat at the repository root it
+would also hand them `tests`, which nearly every project already has.
+`tests/test_vendoring_footprint.py` keeps that honest.
 
 ## Use it from a host project
 
@@ -87,9 +104,21 @@ Add it as a submodule, then copy one of the [`examples/`](examples/) wrappers
 into your project root and adjust the paths, prompt and model:
 
 ```bash
-git submodule add <repo-url> tools/llm-loop
+git submodule add https://github.com/neurocod/llm-loop.git tools/llm-loop
 cp tools/llm-loop/examples/runFileList.py .   # then edit the constants
 ```
+
+Vendoring is the intended route: it pins the engine to a commit your project
+controls, and a wrapper needs no install step. If you would rather have it on
+the import path proper, it is a normal PEP 621 project:
+
+```bash
+pip install git+https://github.com/neurocod/llm-loop.git
+```
+
+then drop the `sys.path.insert` line from the wrapper. Note that `pip install
+llm-loop` does **not** get you this project — that name on PyPI belongs to an
+unrelated 2023 package.
 
 A wrapper is tiny — subclass a Driver, set the project-specific bits as class
 attributes / an overridden `prompt()`, and call `.main()`:

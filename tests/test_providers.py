@@ -2,11 +2,8 @@ import io
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from llm_loop import codex_usage, cyclecore, limits, parallel, providers
 from llm_loop.cyclecore import AgentCommand, Driver

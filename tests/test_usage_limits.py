@@ -15,11 +15,8 @@ hand, so it is pinned with a fake run instead.
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from llm_loop import cyclecore, usage
 from llm_loop.cyclecore import ClaudeCommand, Driver, RateLimitEvent
