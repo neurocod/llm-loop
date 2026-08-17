@@ -17,6 +17,7 @@ covered, since either entry point could regress independently.
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -126,6 +127,35 @@ def _stop_file(project_dir: Path) -> Path:
     return path
 
 
+def _await_output(capsys, needle: str, timeout: float = 10.0) -> str:
+    """Block until `needle` has been printed, and return everything seen so far.
+
+    The handshake the launch-waits-for-a-stop-file tests need. Both start a
+    runner on a background thread and then have to establish that it is being
+    held at the startup gate before removing the sentinel - and "sleep a bit,
+    then assume it got there" is not that. It cost a CI failure on the slowest
+    matrix cell (windows/3.9): thread startup alone outran the 50 ms window, so
+    the sentinel was deleted before the runner ever looked for it. The launch
+    then sailed through a gate that was already open, the run completed exactly
+    as the test demanded, and the only visible symptom was a missing message.
+    A wait that is too short does not report "too short" - it reports whatever
+    the race happened to produce.
+
+    Waiting on the printed line is what makes it airtight rather than merely
+    longer: the gate prints strictly after it has confirmed the sentinel and
+    strictly before it starts polling, so seeing that line means the runner is
+    inside the wait. Output is accumulated across polls because readouterr()
+    drains what it returns.
+    """
+    seen = ""
+    deadline = time.monotonic() + timeout
+    while True:
+        seen += capsys.readouterr().out
+        if needle in seen or time.monotonic() >= deadline:
+            return seen
+        time.sleep(0.01)
+
+
 # -- sequential runner ---------------------------------------------------------
 
 def test_dry_run_leaves_the_stop_file(tmp_path, capsys):
@@ -160,12 +190,13 @@ def test_real_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch, caps
             done.set()
 
     threading.Thread(target=go, daemon=True).start()
+    output = _await_output(capsys, "Stop file present at startup")
+    assert "Stop file present at startup" in output, "launch never reached the gate"
     assert not done.wait(0.05), "launch ignored an existing stop file"
     stop.unlink()
-    assert done.wait(2), "launch did not continue after the stop file was removed"
+    assert done.wait(10), "launch did not continue after the stop file was removed"
     assert not stop.exists(), "a real run left the stop file behind"
-    output = capsys.readouterr().out
-    assert "Stop file present at startup" in output
+    output += capsys.readouterr().out
     assert "Stop file removed" in output
     assert driver.served == 1
 
@@ -213,7 +244,7 @@ def test_parallel_dry_run_leaves_the_stop_file(tmp_path, capsys):
     assert "DRY-RUN" in out
 
 
-def test_parallel_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch):
+def test_parallel_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch, capsys):
     """A parallel launch also waits rather than stealing a pending stop."""
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
     monkeypatch.setattr(cyclecore, "STOP_POLL_SECONDS", 0.01)
@@ -232,9 +263,11 @@ def test_parallel_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch):
             done.set()
 
     threading.Thread(target=go, daemon=True).start()
+    output = _await_output(capsys, "Stop file present at startup")
+    assert "Stop file present at startup" in output, "launch never reached the gate"
     assert not done.wait(0.05), "parallel launch ignored an existing stop file"
     stop.unlink()
-    assert done.wait(5), "run_parallel did not continue after the stop file was removed"
+    assert done.wait(10), "run_parallel did not continue after the stop file was removed"
     assert not stop.exists(), "parallel run left the stop file behind"
 
 
