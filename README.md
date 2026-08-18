@@ -67,6 +67,13 @@ If the state is "cleanup": review the changes, commit, delete currentTask.md,
 set the state to "plan mode", exit.
 ```
 
+That sketch is boiled down to the mechanism. A playbook that survives real
+unattended nights is considerably more detailed — where the task comes from when
+the TODO list runs dry, when a test is written, what `cleanup` is allowed to
+revert, what counts as a dead end — see
+[`examples/currentState.md`](examples/currentState.md), the file this project's
+own loop runs on.
+
 Because every step is its own process, the implementation step is not reading a
 context window already half-full of the *analysis* that chose the task —
 planning can be as heavy as it likes and still costs the implementation nothing.
