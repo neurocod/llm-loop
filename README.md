@@ -1,5 +1,107 @@
 # llm-loop
 
+**Run a coding agent unattended for hours.** `llm-loop` calls a headless LLM CLI
+(Claude Code or Codex) over and over, each time with a *fresh* context window,
+while the actual progress lives where it survives a context reset: in your files
+and in git. The loop stops itself when the account's quota runs low, when the
+agent reports a dead end, or when you ask it to — and it is a Python package
+with zero third-party dependencies, so it behaves identically on Windows, Linux
+and macOS.
+
+## llm-loop vs. the Ralph loop
+
+The technique this builds on is Geoffrey Huntley's
+[Ralph](https://ghuntley.com/ralph/) — *"Ralph is a bash loop"*:
+
+```bash
+while :; do cat PROMPT.md | claude-code ; done
+```
+
+That one line is the whole idea, and it is a good one. Everything below is the
+scaffolding you end up writing yourself the moment you leave such a loop running
+overnight.
+
+| | Ralph (the canonical loop) | llm-loop |
+|---|---|---|
+| Implementation | a bash one-liner; forks exist in bash/PowerShell | a Python package (3.9+, **stdlib only**), one code path on Windows/Linux/macOS |
+| Iteration body | the same prompt file, every time | a pluggable `Driver`: state machine, work queue, or your own |
+| Multi-step work | one undifferentiated "do the next thing" step | explicit phases; **the state is read back by the script**, not only by the agent |
+| Prompt | fixed file | `prompt()` is computed per iteration from the current state / work item |
+| Model choice | one model for the whole run | `model()` per iteration — a cheap model for `cleanup`, a smart one for `implementation` |
+| Quota / rate limits | run until the CLI dies | the account's real figures are read over the provider's API **before** each iteration, and the loop waits under configurable ceilings (session / day-night / weekly), with a reactive `rate_limit_event` backstop |
+| Parallelism | sequential (fan-out only *inside* one agent) | `-j N` concurrent CLI workers draining a work-queue file, one item per job |
+| Stopping | Ctrl+C | `stop` sentinel file, `s` key, `--max-runs`, `--max-strike` time budget, and an `error` state that halts for a human |
+| Providers | whatever the pipe points at | Claude and Codex adapters (argv vs. stdin prompt transport, both stream-json rendered) |
+| Observability | terminal scrollback | pinned status line (iteration, model, elapsed, live quota, per-job rows), rotating mirror log, optional Markdown rendering |
+| git | your problem | `--git-push none\|after_new_commits\|each_hour` |
+| Setup cost | none | one submodule + a ~15-line wrapper |
+
+Nothing here replaces the idea; it makes the idea survivable unattended.
+
+## Why the extra machinery pays off
+
+**Each step gets a clean context.** The loop is, in pseudocode:
+
+```
+while not error and not limits_reached:
+    claude|codex -p "Follow the instructions in currentState.md"
+    state = first_line_of("currentState.md")
+```
+
+and `currentState.md` is a playbook whose first line names the current step:
+
+```
+Current state: plan mode
+
+If the state is "plan mode": read TODO.md, choose ONE task, write it to
+currentTask.md, set the state to "implementation", exit.
+
+If the state is "implementation": implement currentTask.md,
+set the state to "cleanup", exit.
+
+If the state is "cleanup": review the changes, commit, delete currentTask.md,
+set the state to "plan mode", exit.
+```
+
+Because every step is its own process, the implementation step is not reading a
+context window already half-full of the *analysis* that chose the task —
+planning can be as heavy as it likes and still costs the implementation nothing.
+Add as many steps as your project deserves: human review, refactor pass,
+benchmark, docs.
+
+**The script sees the step, so it can specialise it.** The state line comes back
+to the Python side, which is what makes per-step model selection, per-step
+prompts and per-step limits possible at all — `cleanup` on a cheap model,
+`implementation` on the expensive one.
+
+**The other shape is a work queue** — a list file that the loop drains:
+
+```
+while not error and not limits_reached:
+    line = read_line_from(list_file)
+    run("claude|codex", f"Translate {line} to Portuguese into Port-{line}, "
+                        f"then strike {line} out of {list_file}")
+```
+
+Idempotent by construction: kill it any time, relaunch, it picks up the
+remainder. And since the items are independent, they can run **N at a time**:
+
+```
+[job 3] 💻 pdfinfo 'D:\g\3d-research\musical-instruments\acoustic-upright-piano\kawai-k-series-…
+[job 3] 📤 exit 0
+[job 4] 💻 curl.exe -L --fail --output 'D:\g\3d-research\food-and-beverages\eggs-dozen\thirty-…
+
+──────────────────────────────
+ ⟳ iter 4/12 | codex | 4 jobs | 1m37s | session n/a | week 26% (ceil 95%, 6d8h) | max-runs 12
+ job 1 ▶ gpt-5.6-terra | iter 1    | 1m37s  | calculator-desktop.md
+ job 2 ▶ gpt-5.6-terra | iter 1    | 1m36s  | terminal-block-connector.md
+ job 3 ▶ gpt-5.6-terra | iter 1    | 1m36s  | acoustic-upright-piano.md
+ job 4 ▶ gpt-5.6-terra | iter 1    | 1m36s  | eggs-dozen.md
+ keys: s stop | h help
+```
+
+## What it actually is
+
 A reusable engine for **autonomous LLM-CLI loops** using Claude Code or Codex:
 it repeatedly invokes the selected CLI to grind through a unit of work,
 handling all the scaffolding —
@@ -17,16 +119,7 @@ It ships two ready-made task shapes (and you can write your own `Driver`) = **St
   one at a time (or N at a time, see `run_parallel`), striking each out of the
   list once its command succeeds. Idempotent: stop any time and relaunch.
 
-The state machine is the headline shape. In essence the loop is just:
-
-```
-while (state != error)
-    selected_provider "Follow instructions in currentState.md"
-	state = readStateFrom("currentState.md")
-```
-
-Its state file's first line names the current mode; each iteration runs that
-mode, then rewrites the line to point at the next one. The
+The state machine is the headline shape. The
 [`examples/currentState.md`](examples/currentState.md) playbook cycles like this:
 
 ```
