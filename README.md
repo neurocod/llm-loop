@@ -40,7 +40,11 @@ Nothing here replaces the idea; it makes the idea survivable unattended.
 
 ## Why the extra machinery pays off
 
-**Each step gets a clean context.** The loop is, in pseudocode:
+You write only *what work to do each iteration* — a `Driver` subclass, usually
+some fifteen lines. Two are ready-made, and the shape decides the rest.
+
+**A state machine (`StateFileDriver`) gives each step a clean context.** The
+loop is, in pseudocode:
 
 ```
 while not error and not limits_reached:
@@ -74,7 +78,8 @@ to the Python side, which is what makes per-step model selection, per-step
 prompts and per-step limits possible at all — `cleanup` on a cheap model,
 `implementation` on the expensive one.
 
-**The other shape is a work queue** — a list file that the loop drains:
+**The other shape is a work queue (`ListFileDriver`)** — a list file that the
+loop drains, striking each item out once its command succeeds:
 
 ```
 while not error and not limits_reached:
@@ -100,27 +105,11 @@ remainder. And since the items are independent, they can run **N at a time**:
  keys: s stop | h help
 ```
 
-## What it actually is
+## A playbook worth stealing
 
-A reusable engine for **autonomous LLM-CLI loops** using Claude Code or Codex:
-it repeatedly invokes the selected CLI to grind through a unit of work,
-handling all the scaffolding —
-command-line parsing, a rotating mirror log, a git-push policy, the
-token-usage / session-window limit machinery, live stream-json rendering, and a
-graceful stop file — so a host project only has to say *what work to do each
-iteration*.
-
-It ships two ready-made task shapes (and you can write your own `Driver`) = **State machine** and **Work queue**.
-
-- **State machine** (`StateFileDriver`) — read the first line of a state file
-  each iteration and run a fixed prompt against it; stop on an `error` state.
-  Good for "follow this playbook until done" loops where progress lives in files.
-- **Work queue** (`ListFileDriver`) — process the files listed in a list file
-  one at a time (or N at a time, see `run_parallel`), striking each out of the
-  list once its command succeeds. Idempotent: stop any time and relaunch.
-
-The state machine is the headline shape. The
-[`examples/currentState.md`](examples/currentState.md) playbook cycles like this:
+The state machine is the headline shape, and a playbook for it is where the
+project-specific thinking goes. The shipped
+[`examples/currentState.md`](examples/currentState.md) cycles like this:
 
 ```
          ┌──────────────────────────────────────────────┐
@@ -150,12 +139,6 @@ The state machine is the headline shape. The
                   │   (halt)    │  resets the state line
                   └─────────────┘
 ```
-
-Designed to be vendored as a **git submodule** under a host project. The code
-location and the project root are kept separate: the engine anchors every
-project-relative operation (git/agent cwd, the stop file, the relative paths a
-Driver is handed) to the project root — the current working directory by
-default, or `--project-dir`/`-C`.
 
 ## Requirements
 
@@ -202,7 +185,11 @@ cp tools/llm-loop/examples/runFileList.py .   # then edit the constants
 ```
 
 Vendoring is the intended route: it pins the engine to a commit your project
-controls, and a wrapper needs no install step. If you would rather have it on
+controls, and a wrapper needs no install step. Where the code sits and where
+your project sits are kept separate — the engine anchors every project-relative
+operation (git/agent cwd, the stop file, the relative paths a Driver is handed)
+to the project root: the current working directory by default, or
+`--project-dir`/`-C`. If you would rather have it on
 the import path proper, it is a normal PEP 621 project:
 
 ```bash
