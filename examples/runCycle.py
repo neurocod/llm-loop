@@ -33,13 +33,21 @@ class CycleDriver(StateFileDriver):
     description = f"Autonomous loop driving Claude or Codex per {STATE_FILE_REL}."
 
     def model(self) -> str:
-        """Choose the model from the current state. Override as needed, or delete
-        this method to let the CLI use its own configured model."""
+        """Choose the model from the current state — the point of running the
+        steps as separate processes. Override as needed, or delete this method to
+        let the CLI use its own configured model.
+
+        Model names are per-CLI: Claude's and Codex's namespaces do not overlap,
+        so keep the two branches apart rather than mapping one onto the other.
+        """
         if self.provider == "codex":
             return ""
         if "implementation" in self.first_line().lower():
             return "opus"
-        return "opus"
+        # Planning and cleanup are cheaper work than writing the code: reading a
+        # TODO list, tidying comments, committing. Raise this to the strong model
+        # if your planning step does real design.
+        return "sonnet"
 
 
 if __name__ == "__main__":
