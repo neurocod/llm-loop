@@ -66,9 +66,43 @@ class UsageReading(NamedTuple):
     reset_ts: Optional[float]
 
 
+class Quota(NamedTuple):
+    """One of the windows an account is metered on — the *description* of a
+    quota, not a reading of it.
+
+    Everything that needs to speak about a quota (the parser, the log lines, the
+    rules in limits.py, the status line) names it through this table rather than
+    with a string of its own, so the four namings cannot drift apart:
+
+      field  — the `Usage` attribute holding its reading, and the name a
+               LimitRule's `quota` selects it by.
+      key    — the response key it is parsed from.
+      label  — what its summary line starts with (a contract: LimitPolicy
+               picks its lines by matching a rule's `label` against them).
+      short  — the status line's abbreviation; a pinned row has no room for prose.
+      always — pinned on the status line even with no figure to show. True for
+               the windows every plan has, so the reader always sees both;
+               false for the ones a plan may simply not have.
+    """
+    field: str
+    key: str
+    label: str
+    short: str
+    always: bool
+
+
+QUOTAS = (
+    Quota("session", "five_hour", "Current session", "session", True),
+    Quota("week_all", "seven_day", "Current week (all models)", "week", True),
+    Quota("week_sonnet", "seven_day_sonnet", "Current week (Sonnet only)",
+          "week/sonnet", False),
+)
+QUOTA_BY_FIELD = {quota.field: quota for quota in QUOTAS}
+
+
 class Usage(NamedTuple):
     """A full parsed usage snapshot: the three quota readings plus summary lines
-    rendered for the log.
+    rendered for the log. The readings are the QUOTAS above, in that order:
 
       * session     — the ~5-hour window ("five_hour").
       * week_all    — the weekly all-models window ("seven_day").
@@ -83,17 +117,18 @@ class Usage(NamedTuple):
     week_sonnet: UsageReading
     summary_lines: list
 
+    def readings(self) -> tuple:
+        """((Quota, UsageReading), …) for every quota, in report order.
+
+        The one way to walk a snapshot without hard-coding its field names, so a
+        fourth window would reach the log and the status line by being added to
+        QUOTAS alone.
+        """
+        return tuple((quota, getattr(self, quota.field)) for quota in QUOTAS)
+
 
 _EMPTY_READING = UsageReading(None, None)
 _EMPTY_USAGE = Usage(_EMPTY_READING, _EMPTY_READING, _EMPTY_READING, [])
-
-# Response key -> the label its summary line starts with. The labels must keep
-# matching the rules' `label` attributes in limits.py (see Usage.summary_lines).
-_QUOTAS = (
-    ("five_hour", "Current session"),
-    ("seven_day", "Current week (all models)"),
-    ("seven_day_sonnet", "Current week (Sonnet only)"),
-)
 
 
 def _config_dir() -> str:
@@ -196,13 +231,13 @@ def parse_usage(data: dict) -> Usage:
         return _EMPTY_USAGE
     readings = {}
     summary = []
-    for key, label in _QUOTAS:
-        reading = _reading_from(data.get(key))
-        readings[key] = reading
+    for quota in QUOTAS:
+        reading = _reading_from(data.get(quota.key))
+        readings[quota.field] = reading
         if reading.percent is not None:
-            summary.append(_summary_line(label, reading))
-    return Usage(readings["five_hour"], readings["seven_day"],
-                 readings["seven_day_sonnet"], summary)
+            summary.append(_summary_line(quota.label, reading))
+    return Usage(readings["session"], readings["week_all"],
+                 readings["week_sonnet"], summary)
 
 
 class UsageSource:

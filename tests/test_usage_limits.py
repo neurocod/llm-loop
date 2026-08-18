@@ -84,6 +84,61 @@ def test_absent_quota_is_no_figure_not_zero():
     assert not any(ln.startswith("Current week (Sonnet") for ln in u.summary_lines)
 
 
+def test_the_quota_table_is_the_one_naming_of_a_window():
+    """Parser key, Usage field, log label and status-line abbreviation come from
+    one row of usage.QUOTAS, so the four cannot drift apart."""
+    u = usage.parse_usage(SAMPLE)
+    readings = u.readings()
+
+    assert [q.field for q, _ in readings] == ["session", "week_all", "week_sonnet"]
+    assert [q.short for q, _ in readings] == ["session", "week", "week/sonnet"]
+    assert [r for _, r in readings] == [u.session, u.week_all, u.week_sonnet]
+    # The windows every plan has stay on the status line even without a figure;
+    # a plan-specific one is only shown when there is something to show.
+    assert [q.always for q, _ in readings] == [True, True, False]
+    for quota in usage.QUOTAS:
+        assert usage.QUOTA_BY_FIELD[quota.field] is quota
+        assert getattr(u, quota.field) is not None
+
+
+def test_a_rule_selects_its_reading_and_labels_itself_from_that_table():
+    u = usage.parse_usage(SAMPLE)
+
+    assert DayNightLimit().reading(u) == u.session
+    assert WeeklyLimit().reading(u) == u.week_all
+    assert WeeklyLimit(sonnet_only=True).reading(u) == u.week_sonnet
+    assert DayNightLimit().label == usage.QUOTA_BY_FIELD["session"].label
+    assert WeeklyLimit().label == usage.QUOTA_BY_FIELD["week_all"].label
+
+
+def test_the_policy_answers_which_rule_watches_a_window():
+    """What the status line asks to decide whether it has a policy half to show
+    for a window — the provider's own half is shown either way."""
+    policy = LimitPolicy([DayNightLimit(), WeeklyLimit(90)])
+
+    assert isinstance(policy.rule_for("session"), DayNightLimit)
+    assert isinstance(policy.rule_for("week_all"), WeeklyLimit)
+    assert policy.rule_for("week_sonnet") is None
+    assert LimitPolicy([]).rule_for("session") is None
+
+
+def test_a_rules_status_is_its_live_ceiling_by_default():
+    """The default contribution is the one number a rule adds — and for
+    DayNightLimit it moves with the window, exactly as the gate does."""
+    now = time.time()
+    u = usage.parse_usage({"five_hour": {"utilization": 9.0,
+                                         "resets_at": _iso_in(4 * 3600)}})
+    rule = DayNightLimit(day=80, night=80)
+    reading = rule.reading(u)
+
+    assert rule.status(reading, now) == "ceil 80%"
+    assert WeeklyLimit(90).status(u.week_all, now) == "ceil 90%"
+    # 10 minutes from the reset the ceiling has climbed; the row says so too.
+    near = reading.reset_ts - 600
+    assert rule.status(reading, near) == f"ceil {rule.ceiling(reading, near):.0f}%"
+    assert rule.status(reading, near) != "ceil 80%"
+
+
 def test_summary_lines_match_the_rule_labels():
     """log_snapshot picks its lines by matching a rule's `label` against their
     start — so the wording is an interface, not decoration."""

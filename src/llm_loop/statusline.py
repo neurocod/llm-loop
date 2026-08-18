@@ -38,7 +38,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import cmdline, cyclecore
 
@@ -67,6 +67,7 @@ __all__ = [
     "PercentSetting",
     "ProviderSegment",
     "QuotaRefresher",
+    "QuotaRow",
     "QuotaSegment",
     "Resize",
     "Row",
@@ -135,6 +136,11 @@ CLI_DEFAULT_MODEL = "cli default"
 # separation (the rule IS the separation; degrading it to an empty line would
 # merge the toolbar into the scrolling output above).
 SEPARATOR = " | "
+# Sub-separator INSIDE one field, currently only a quota's: to its left the
+# provider's own figures, to its right what our policy says about them
+# ("week 63% (17h27m) / ceil 95%"). A quieter mark than the field separator on
+# purpose — the two halves are one subject seen from two sides, not two fields.
+POLICY_SEPARATOR = " / "
 # U+2500, not an underscore: the box-drawing glyph is designed to touch both
 # cell edges, so a row of them reads as one continuous line, while underscores
 # leave a gap at every cell boundary (and sit on the baseline, below where a
@@ -227,7 +233,11 @@ def format_prompt_block(*, job_id: int, label: str, prompt: str,
 
 def short_quota_label(label: str) -> str:
     """"Current session" -> "session": the rules' labels are prose for the log,
-    and a pinned row has no room for prose."""
+    and a pinned row has no room for prose.
+
+    The fallback path only: a quota the provider reports carries its own `short`
+    in usage.QUOTAS, and this is how a CUSTOM rule watching something else still
+    gets a readable label."""
     text = label.strip().lower()
     if text.startswith("current "):
         text = text[len("current "):]
@@ -345,14 +355,32 @@ class Job:
                        self.model, self.prompt, self.started_at)
 
 
+class QuotaRow(NamedTuple):
+    """One quota as the pinned row shows it — two halves from two sources.
+
+    The first three fields are the PROVIDER's: which window, how much of it is
+    spent, when it resets. They are what the account says and are shown for every
+    window the provider reports, whether or not the run is gated on it.
+
+    `policy` is ours: whatever the LimitRule watching this window contributes
+    (its ceiling, by default), or "" when no rule watches it. Keeping it a
+    rendered string rather than a number is what lets a rule say something other
+    than a ceiling without any change here.
+    """
+
+    label: str
+    percent: Optional[float]
+    reset_ts: Optional[float]
+    policy: str = ""
+
+
 @dataclass
 class LoopStatus:
     """Everything the rows can show. Later waves add Rows and Segments, not flags.
 
-    `quotas` is [(label, percent|None, ceiling|None, reset_ts|None)] and
-    `script_limits` is [(label, text)] — both are lists rather than named fields
-    exactly so a new figure is a new tuple, not a new attribute plus a renderer
-    edit.
+    `quotas` is a list of `QuotaRow` and `script_limits` is [(label, text)] —
+    both are lists rather than named fields exactly so a new figure is a new
+    entry, not a new attribute plus a renderer edit.
     """
 
     jobs: List[Job] = field(default_factory=lambda: [Job(1)])
@@ -574,26 +602,35 @@ class ElapsedSegment(Segment):
 
 
 class QuotaSegment(Segment):
-    """One provider quota: "session 43% (ceil 95%, 2h11m)"."""
+    """One quota window: "session 43% (2h11m) / ceil 95%".
+
+    Left of the slash is the provider's report — the figure and how long the
+    window still has to run, which together are what a percentage actually means
+    (43% with two hours left is a different situation from 43% with ten minutes
+    left). Right of it, when a rule watches this window, is what our own policy
+    makes of it. A window nobody gates on simply has no right-hand half; it is
+    still shown, because it is still spending the account's budget.
+    """
 
     def __init__(self, index: int):
         self.index = index
 
     def text(self, status, now=None):
         try:
-            label, percent, ceiling, reset_ts = status.quotas[self.index]
-        except (IndexError, ValueError):
+            row = QuotaRow(*status.quotas[self.index])
+        except (IndexError, TypeError, ValueError):
             return None
-        if percent is None:
-            return f"{label} n/a"
-        detail = []
-        if ceiling is not None:
-            detail.append(f"ceil {ceiling:.0f}%")
-        if reset_ts:
-            detail.append(cyclecore._fmt_left(
-                reset_ts - (time.time() if now is None else now)))
-        suffix = f" ({', '.join(detail)})" if detail else ""
-        return f"{label} {percent:.0f}%{suffix}"
+        if row.percent is None:
+            # No figure for this window — the provider does not meter it, or the
+            # report was silent. Say so rather than dropping the row, so a quota
+            # that stops being reported is visible instead of invisible.
+            provider = f"{row.label} n/a"
+        else:
+            left = (cyclecore._fmt_left(
+                row.reset_ts - (time.time() if now is None else now))
+                if row.reset_ts else "")
+            provider = f"{row.label} {row.percent:.0f}%" + (f" ({left})" if left else "")
+        return provider + (POLICY_SEPARATOR + row.policy if row.policy else "")
 
 
 class ScriptLimitSegment(Segment):
@@ -1419,9 +1456,32 @@ class SettingsRegistry:
 # --- quota feed ----------------------------------------------------------------
 
 
+def _policy_part(rule, reading, moment: float) -> str:
+    """A rule's own half of its row — never allowed to cost the provider's half.
+
+    A custom `status()` is third-party code running on the repaint path, so a
+    raise here degrades one field to the bare figures instead of blanking the
+    whole quota area (which is what the single outer try/except would do).
+    """
+    if rule is None:
+        return ""
+    try:
+        return rule.status(reading, moment) or ""
+    except Exception:
+        return ""
+
+
 def quota_rows(usage_source, limit_policy=None, *, cache_value: bool = True,
-               now: Optional[float] = None) -> List[Tuple]:
-    """The provider's live quotas as `LoopStatus.quotas` tuples.
+               now: Optional[float] = None) -> List[QuotaRow]:
+    """The provider's live quotas as `LoopStatus.quotas` rows.
+
+    The rows follow the PROVIDER, not the policy: every window the account is
+    metered on gets one — the 5-hour session and the week always, the others when
+    there is something to say about them — so the reader sees the whole budget
+    and not just the slice the run happens to be gated on. That the loop watches
+    one window and not another is a property of the policy, and it shows up as
+    the policy's own half of the row (see `LimitRule.status`), not as a window
+    silently missing from the display.
 
     Reads through the SAME cached UsageSource the limit machinery uses, so
     calling it right after a limit check costs no HTTP round-trip at all. Any
@@ -1431,19 +1491,33 @@ def quota_rows(usage_source, limit_policy=None, *, cache_value: bool = True,
     if usage_source is None:
         return []
     try:
-        usage = usage_source.get_usage(cache_value)
+        snapshot = usage_source.get_usage(cache_value)
         moment = time.time() if now is None else now
-        rules = list(getattr(limit_policy, "rules", None) or ())
-        if rules:
-            rows = []
-            for rule in rules:
-                reading = rule.reading(usage)
-                rows.append((short_quota_label(rule.label), reading.percent,
-                             rule.ceiling(reading, moment), reading.reset_ts))
-            return rows
-        return [(label, reading.percent, None, reading.reset_ts)
-                for label, reading in (("session", usage.session),
-                                       ("week", usage.week_all))]
+        rule_for = getattr(limit_policy, "rule_for", lambda quota: None)
+        rows = []
+        known = set()
+        for quota, reading in snapshot.readings():
+            known.add(quota.field)
+            rule = rule_for(quota.field)
+            # A window this plan does not have (an unused Sonnet-only week) is
+            # noise on a row that has to fit in a terminal — unless a rule gates
+            # on it, in which case its absence is exactly what the reader needs
+            # to see.
+            if not quota.always and reading.percent is None and rule is None:
+                continue
+            rows.append(QuotaRow(quota.short, reading.percent, reading.reset_ts,
+                                 _policy_part(rule, reading, moment)))
+        # A custom rule may watch something the snapshot has no field for; it
+        # still gets a row, built the way it used to be for every rule.
+        for rule in getattr(limit_policy, "rules", None) or ():
+            if rule.quota in known:
+                continue
+            known.add(rule.quota)
+            reading = rule.reading(snapshot)
+            rows.append(QuotaRow(short_quota_label(rule.label), reading.percent,
+                                 reading.reset_ts,
+                                 _policy_part(rule, reading, moment)))
+        return rows
     except Exception:
         return []
 

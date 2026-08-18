@@ -27,7 +27,12 @@ session still has budget). Three ready-made rules cover the common cases:
     or Sonnet-only), waiting out the week-long window when hit.
 
 Write your own rule by subclassing LimitRule (set `quota`/`label`, implement
-`ceiling`).
+`ceiling`; override `status` to change what it contributes to the status line).
+
+A policy decides where the loop PAUSES, not what the status line shows: the
+pinned row lists the provider's own windows either way (see
+statusline.quota_rows), and a rule only adds its half — its ceiling — next to the
+window it watches.
 """
 
 import sys
@@ -37,7 +42,7 @@ from typing import Optional
 
 from .cyclecore import (CLAUDE_SESSION_DURATION, _fmt_clock, _fmt_left,
                         print_percents)
-from .usage import Usage, UsageReading
+from .usage import QUOTA_BY_FIELD, Usage, UsageReading
 
 # Default ceilings for the ready-made rules (all overridable per instance).
 NIGHT_USAGE_LIMIT = 95          # % — overnight, when leftover session budget is wasted
@@ -76,9 +81,13 @@ class LimitRule:
     """One quota + its ceiling policy. Subclass and override; set `quota` to the
     Usage field this rule watches and `label` to its human name.
 
-      quota   — "session" | "week_all" | "week_sonnet"; picks the UsageReading.
+      quota   — the name of the window watched: a `field` from usage.QUOTAS
+                ("session" | "week_all" | "week_sonnet"), which picks the
+                UsageReading out of a snapshot.
       label   — shown in status/snapshot lines (e.g. "Current session").
       ceiling(reading, now) — the allowed % right now (>= it means "pause").
+      status(reading, now)  — this rule's one-line contribution to the pinned
+                status line, appended to the provider's own figures.
 
     Rules are read-only and stateless (all mutable run state lives in the
     UsageSource cache), so a single default instance is safe to share as a class
@@ -90,15 +99,23 @@ class LimitRule:
 
     def reading(self, usage: Usage) -> UsageReading:
         """The UsageReading this rule watches, selected by `quota`."""
-        return {
-            "session": usage.session,
-            "week_all": usage.week_all,
-            "week_sonnet": usage.week_sonnet,
-        }[self.quota]
+        return getattr(usage, self.quota)
 
     def ceiling(self, reading: UsageReading, now: float) -> float:
         """The allowed usage % right now; usage at/above it triggers a pause."""
         raise NotImplementedError
+
+    def status(self, reading: UsageReading, now: float) -> str:
+        """What this rule adds to the status line's row for its quota.
+
+        The row itself belongs to the provider — the percentage and the time to
+        reset are facts about the account and are shown whether or not any rule
+        watches that window. This is the policy's own half of it, so the default
+        is the single number a rule contributes: the ceiling in force right now
+        (which for DayNightLimit moves as the window winds down). Override to say
+        more; return "" to add nothing.
+        """
+        return f"ceil {self.ceiling(reading, now):.0f}%"
 
     def describe(self) -> str:
         """One-line human summary of this rule's quota and ceiling policy, shown
@@ -115,7 +132,7 @@ class SessionLimit(LimitRule):
     """
 
     quota = "session"
-    label = "Current session"
+    label = QUOTA_BY_FIELD["session"].label
 
     def __init__(self, limit: float = DAY_USAGE_LIMIT):
         self.limit = float(limit)
@@ -139,7 +156,7 @@ class DayNightLimit(LimitRule):
     """
 
     quota = "session"
-    label = "Current session"
+    label = QUOTA_BY_FIELD["session"].label
 
     def __init__(self, *, day: float = DAY_USAGE_LIMIT,
                  night: float = NIGHT_USAGE_LIMIT,
@@ -189,8 +206,7 @@ class WeeklyLimit(LimitRule):
                  sonnet_only: bool = False):
         self.limit = float(limit)
         self.quota = "week_sonnet" if sonnet_only else "week_all"
-        self.label = ("Current week (Sonnet only)" if sonnet_only
-                      else "Current week (all models)")
+        self.label = QUOTA_BY_FIELD[self.quota].label
 
     def ceiling(self, reading: UsageReading, now: float) -> float:
         return self.limit
@@ -222,6 +238,20 @@ class LimitPolicy:
         return "pause when any of — " + " | ".join(parts)
 
     # --- inspection helpers ----------------------------------------------------
+
+    def rule_for(self, quota: str) -> Optional[LimitRule]:
+        """The rule watching `quota` (a usage.QUOTAS field), or None for a window
+        this policy does not gate on.
+
+        The status line asks this per quota: the provider's figures are pinned
+        either way, and a rule that is there adds its own part next to them. A
+        lookup rather than a flag on the rules, so the display never has to be
+        told about a new rule — it just finds it.
+        """
+        for rule in self.rules:
+            if rule.quota == quota:
+                return rule
+        return None
 
     def _status(self, usage: Usage, now: float) -> list:
         """[(rule, reading, ceiling)] for every rule at time `now`."""

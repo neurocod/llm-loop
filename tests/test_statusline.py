@@ -28,8 +28,8 @@ def sequential_status(**fields):
                      model="opus", started_at=NOW - 252)],
         iteration=12, max_iterations=40, provider="claude",
         run_started_at=NOW - 3600, phase="running",
-        quotas=[("session", 43.0, 95.0, NOW + 7860),
-                ("week", 61.0, 95.0, None)],
+        quotas=[sl.QuotaRow("session", 43.0, NOW + 7860, "ceil 95%"),
+                sl.QuotaRow("week", 61.0, None, "ceil 95%")],
         script_limits=[("max-runs", "40")],
     )
     status.update(**fields)
@@ -55,8 +55,8 @@ def test_one_job_renders_rule_summary_job_legend_and_note_rows():
     summary, job_row = rows[1], rows[2]
     assert "iter 12/40" in summary
     assert "claude/opus" in summary
-    assert "session 43% (ceil 95%, 2h11m)" in summary
-    assert "week 61% (ceil 95%)" in summary
+    assert "session 43% (2h11m) / ceil 95%" in summary
+    assert "week 61% / ceil 95%" in summary
     assert "max-runs 40" in summary
     assert "job 1" in job_row and "bmx-bike.md" in job_row
 
@@ -150,9 +150,20 @@ def test_the_two_clocks_are_different_clocks():
 
 
 def test_quota_without_a_figure_reads_as_not_available():
-    status = sequential_status(quotas=[("session", None, 95.0, None)])
+    status = sequential_status(quotas=[sl.QuotaRow("session", None, None,
+                                                   "ceil 95%")])
 
-    assert "session n/a" in sl.render_rows(status, 200, now=NOW)[1]
+    assert "session n/a / ceil 95%" in sl.render_rows(status, 200, now=NOW)[1]
+
+
+def test_a_quota_nobody_gates_on_shows_the_providers_half_alone():
+    """The policy owns only the right-hand half; a window with no rule keeps its
+    figures and simply says nothing about a ceiling."""
+    status = sequential_status(quotas=[sl.QuotaRow("week", 61.0, NOW + 7860)])
+
+    summary = sl.render_rows(status, 200, now=NOW)[1]
+    assert "week 61% (2h11m)" in summary
+    assert sl.POLICY_SEPARATOR not in summary
 
 
 def test_note_row_carries_the_transient_message():
@@ -545,18 +556,99 @@ class _FakeUsageSource:
         return self.usage
 
 
-def test_quota_rows_follow_the_policy_rules():
-    from llm_loop.limits import LimitPolicy, SessionLimit
+def _usage(session=(43.0, NOW + 600), week=(61.0, None), sonnet=(None, None)):
     from llm_loop.usage import Usage, UsageReading
 
-    usage = Usage(UsageReading(43.0, NOW + 600), UsageReading(61.0, None),
-                  UsageReading(None, None), [])
-    source = _FakeUsageSource(usage)
+    return Usage(UsageReading(*session), UsageReading(*week),
+                 UsageReading(*sonnet), [])
+
+
+def test_quota_rows_follow_the_provider_and_the_policy_only_adds_its_half():
+    """The row set is the account's windows; a rule contributes its ceiling to
+    the one it watches and says nothing about the others."""
+    from llm_loop.limits import LimitPolicy, SessionLimit
+
+    source = _FakeUsageSource(_usage())
 
     rows = sl.quota_rows(source, LimitPolicy([SessionLimit(80)]), now=NOW)
 
-    assert rows == [("session", 43.0, 80.0, NOW + 600)]
+    assert rows == [sl.QuotaRow("session", 43.0, NOW + 600, "ceil 80%"),
+                    sl.QuotaRow("week", 61.0, None, "")]
     assert source.reads == 1
+
+
+def test_both_windows_are_shown_without_any_policy_at_all():
+    rows = sl.quota_rows(_FakeUsageSource(_usage()), None, now=NOW)
+
+    assert [row.label for row in rows] == ["session", "week"]
+    assert [row.policy for row in rows] == ["", ""]
+
+
+def test_an_unreported_window_is_dropped_unless_a_rule_watches_it():
+    """A plan without a Sonnet-only week has nothing to say about it — but if the
+    run is gated on it, its absence is exactly what the reader needs to see."""
+    from llm_loop.limits import LimitPolicy, WeeklyLimit
+
+    source = _FakeUsageSource(_usage())
+
+    assert [r.label for r in sl.quota_rows(source, now=NOW)] == ["session", "week"]
+
+    policy = LimitPolicy([WeeklyLimit(90, sonnet_only=True)])
+    rows = sl.quota_rows(source, policy, now=NOW)
+
+    assert [r.label for r in rows] == ["session", "week", "week/sonnet"]
+    assert rows[-1] == sl.QuotaRow("week/sonnet", None, None, "ceil 90%")
+
+
+def test_a_rule_on_a_window_the_provider_never_reports_still_gets_a_row():
+    """A custom rule may watch something outside the snapshot's fields; it keeps
+    the old rule-driven row rather than disappearing."""
+    from llm_loop.limits import LimitPolicy, LimitRule
+    from llm_loop.usage import UsageReading
+
+    class _Custom(LimitRule):
+        quota = "burst"
+        label = "Current burst"
+
+        def reading(self, usage):
+            return UsageReading(12.0, NOW + 60)
+
+        def ceiling(self, reading, now):
+            return 50.0
+
+    rows = sl.quota_rows(_FakeUsageSource(_usage()), LimitPolicy([_Custom()]),
+                         now=NOW)
+
+    assert rows[-1] == sl.QuotaRow("burst", 12.0, NOW + 60, "ceil 50%")
+
+
+def test_a_rule_may_say_more_than_a_ceiling():
+    from llm_loop.limits import LimitPolicy, SessionLimit
+
+    class _Chatty(SessionLimit):
+        def status(self, reading, now):
+            return f"ceil {self.ceiling(reading, now):.0f}% (night)"
+
+    rows = sl.quota_rows(_FakeUsageSource(_usage()), LimitPolicy([_Chatty(80)]),
+                         now=NOW)
+
+    assert rows[0].policy == "ceil 80% (night)"
+
+
+def test_a_raising_rule_costs_its_own_half_and_nothing_else():
+    """Third-party `status()` runs on the repaint path; it must not be able to
+    blank the provider's figures."""
+    from llm_loop.limits import LimitPolicy, SessionLimit
+
+    class _Broken(SessionLimit):
+        def status(self, reading, now):
+            raise RuntimeError("bad rule")
+
+    rows = sl.quota_rows(_FakeUsageSource(_usage()), LimitPolicy([_Broken(80)]),
+                         now=NOW)
+
+    assert rows == [sl.QuotaRow("session", 43.0, NOW + 600, ""),
+                    sl.QuotaRow("week", 61.0, None, "")]
 
 
 def test_a_disabled_status_line_never_reads_the_usage_endpoint():

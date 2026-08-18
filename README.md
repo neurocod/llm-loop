@@ -104,7 +104,7 @@ remainder. And since the items are independent, they can run **N at a time**:
 [job 4] 💻 curl.exe -L --fail --output 'D:\g\3d-research\food-and-beverages\eggs-dozen\thirty-…
 
 ──────────────────────────────
- ⟳ iter 4/12 | codex | 4 jobs | 1m37s | session n/a | week 26% (ceil 95%, 6d8h) | max-runs 12
+ ⟳ iter 4/12 | codex | 4 jobs | 1m37s | session n/a | week 26% (6d8h) / ceil 95% | max-runs 12
  job 1 ▶ gpt-5.6-terra | iter 1    | 1m37s  | calculator-desktop.md
  job 2 ▶ gpt-5.6-terra | iter 1    | 1m36s  | terminal-block-connector.md
  job 3 ▶ gpt-5.6-terra | iter 1    | 1m36s  | acoustic-upright-piano.md
@@ -323,9 +323,10 @@ class MyDriver(StateFileDriver):
 Leaving `limit_policy` unset keeps Claude's historical
 `LimitPolicy([DayNightLimit()])`. Codex defaults to the composite session and
 weekly policy because plans may expose both windows or only a weekly window.
-The bookend usage snapshots and per-check status lines report exactly the quotas
-the active policy watches. When `--max-runs N` is given (a short bounded run)
-the limit gate is skipped entirely.
+The bookend usage snapshots and the per-check log lines report exactly the quotas
+the active policy watches — those are records of the gate. The pinned status line
+is not: it lists every window the provider meters (see below). When `--max-runs N`
+is given (a short bounded run) the limit gate is skipped entirely.
 
 **Where the figures come from.** For Claude, `usage.py` reads them over HTTP from the same
 endpoint the CLI's own `/usage` panel and status line are built from,
@@ -372,6 +373,23 @@ On a terminal, a run pins a few rows at the bottom — iteration, provider/model
 elapsed time, the provider's live quota figures and the script's own limits, one
 row per job, and a legend of the keys it answers to. Piped output, CI and
 `--no-statusline` get the plain scrolling output of before.
+
+**The quota fields have two halves**, split by ` / `:
+
+```
+ session 43% (2h11m) / ceil 95% | week 63% (17h27m)
+ └──────── the provider ──────┘ └── the policy ──┘
+```
+
+Left of the slash is the account's own report — how much of the window is spent
+and how long it still has to run. Every window the provider meters gets a field,
+whether or not the run is gated on it, so the reader sees the whole budget and
+not just the slice that happens to be watched: the 5-hour session and the week
+are always there (`n/a` when the provider reports no figure), and a window a plan
+does not have is dropped unless a rule watches it. Right of the slash is what the
+`LimitPolicy` rule for that window makes of it — its live ceiling by default,
+absent entirely when no rule watches it. A custom rule can say something else by
+overriding `LimitRule.status(reading, now)`.
 
 Keys: `s` requests a graceful stop (it creates the same `stop` sentinel, and
 pressing `s` again during the countdown cancels it), `h` or `?` shows the full
