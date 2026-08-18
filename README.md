@@ -154,6 +154,23 @@ dependencies — every import across its modules comes from the standard
 library — so vendoring it adds no transitive dependency to your project and
 cannot conflict with the versions you already pin.
 
+**Plus the CLI you intend to drive, already signed in.** The loop authenticates
+nothing itself: it shells out to `claude` or `codex`, and reads the quota
+figures through that CLI's own login (see *Usage limits*). So an unauthenticated
+CLI fails twice over — every iteration exits without doing any work, and the
+limit gate, having no figures, cannot tell that it should have paused. Check
+before a long run:
+
+```bash
+claude auth status     # JSON; "loggedIn": true is the field that matters
+codex login status     # e.g. "Logged in using ChatGPT"
+```
+
+Sign in with `claude auth login` / `codex login`. Both keep the session on disk,
+so this is a one-off per machine, not per run. For Claude the loop also accepts
+`CLAUDE_CODE_OAUTH_TOKEN`, and honours `CLAUDE_CONFIG_DIR` when looking for the
+credentials — useful on a CI box with no interactive login.
+
 ## Layout
 
 ```
