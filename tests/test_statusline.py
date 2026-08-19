@@ -180,6 +180,17 @@ def test_colorize_styles_percentages_and_chrome_and_nothing_else():
     assert sl.colorize(" no figures here") == " no figures here"
 
 
+def test_the_policy_ceiling_borrows_the_colour_of_its_own_reading():
+    green, red = sl._SGR["green"], sl._SGR["bold red"]
+    line = sl.colorize(f"week 50% (3d14h){sl.POLICY_SEPARATOR}ceil 95%")
+
+    assert line.count(green) == 2 and red not in line   # the ceiling is not alarming
+    # ...but only for the reading in its OWN field: past the chrome pipe the
+    # scale takes over again, and a comfortable ceiling cannot green a hot week.
+    two = sl.colorize(f"week 95%{sl.SEPARATOR}session 50%{sl.POLICY_SEPARATOR}ceil 80%")
+    assert two.count(red) == 1 and two.count(green) == 2
+
+
 # --- chrome: the rule and the value separators ---------------------------------
 
 

@@ -271,16 +271,33 @@ def colorize(line: str) -> str:
     lines agree about what "alarming" looks like. Adding the codes here rather
     than in the Rows keeps the truncation arithmetic counting characters instead
     of escape bytes — and keeps the rows readable as plain strings in tests.
+
+    One exception to the scale: the figure right of POLICY_SEPARATOR
+    ("week 50% (3d14h) / ceil 95%") is a THRESHOLD, not a reading. On the usage
+    scale it would glow red permanently while nothing is wrong — a red that
+    means "the ceiling is high", which is the opposite of what red means
+    everywhere else on the row. So it borrows the colour of the reading it
+    qualifies, and the field as a whole shows one state: how the account is
+    doing against this ceiling.
     """
     out = []
     last = 0
+    reading_style = None    # style of the last provider figure, for its policy half
+    reading_end = 0         # ...and where it ended, to see what separates the two
     for match in _STYLED_RE.finditer(line):
         token = match.group(0)
         if _PERCENT_RE.fullmatch(token):
-            style = _SGR.get(cyclecore.percent_style(
-                float(token.rstrip("% \t"))), "")
+            gap = line[reading_end:match.start()]
+            if reading_style is not None and POLICY_SEPARATOR in gap:
+                style = reading_style       # policy half of the same field
+            else:
+                style = _SGR.get(cyclecore.percent_style(
+                    float(token.rstrip("% \t"))), "")
+                reading_style, reading_end = style, match.end()
         else:
             style = _SGR.get(CHROME_STYLE, "")
+            if token == SEPARATOR.strip():
+                reading_style = None        # next field, next reading
         out.append(line[last:match.start()])
         out.append(f"{style}{token}{_SGR_RESET}" if style else token)
         last = match.end()
