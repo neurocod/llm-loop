@@ -199,9 +199,12 @@ def test_the_summary_row_shows_the_run_counters(tmp_path, monkeypatch):
     app = made["app"]
     assert app.status.max_iterations == 2
     assert app.status.iteration == 2
-    assert ("max-runs", "2") in app.status.script_limits
+    # The cap is the counter's denominator, so it gets no field of its own.
+    assert not [entry for entry in app.status.script_limits
+                if entry[0] == "max-runs"]
     summary = app.render(width=200)[1]
     assert "iter 2/2" in summary and "2 jobs" in summary
+    assert "max-runs" not in summary
 
 
 def test_no_statusline_reaches_the_parallel_runner(tmp_path, monkeypatch):

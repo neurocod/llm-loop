@@ -1347,11 +1347,19 @@ class Setting:
     what lets `SettingsRegistry.overrides()` be handed straight to
     `cmdline.render` — an edited ceiling and the command line that reproduces it
     can then never disagree.
+
+    `show_in_status=False` keeps a knob editable and reproducible while leaving
+    it off the pinned row — for the one case where a field would repeat what
+    another field already says (see the `max-runs` registrations, whose value is
+    the counter's own denominator). Row width is the scarce resource up there:
+    every field costs the quota figures characters, and a second spelling of a
+    number already on screen is the cheapest one to drop.
     """
 
     def __init__(self, name: str, flag: str, getter: Callable[[], object],
                  setter: Callable[[object], None], *, step: float = 1,
-                 minimum: Optional[float] = None, maximum: Optional[float] = None):
+                 minimum: Optional[float] = None, maximum: Optional[float] = None,
+                 show_in_status: bool = True):
         self.name = name
         self.flag = flag
         self._get = getter
@@ -1359,6 +1367,7 @@ class Setting:
         self.step = step
         self.minimum = minimum
         self.maximum = maximum
+        self.show_in_status = show_in_status
         self.initial = getter()
 
     @property
@@ -1402,9 +1411,11 @@ class Setting:
 class PercentSetting(Setting):
     """A quota ceiling (session / weekly / day / night), 0..100."""
 
-    def __init__(self, name, flag, getter, setter, *, step: float = 1):
+    def __init__(self, name, flag, getter, setter, *, step: float = 1,
+                 show_in_status: bool = True):
         super().__init__(name, flag, getter, setter, step=step,
-                         minimum=0, maximum=100)
+                         minimum=0, maximum=100,
+                         show_in_status=show_in_status)
 
     def format(self):
         value = self.get()
@@ -1452,8 +1463,9 @@ class SettingsRegistry:
         return None
 
     def status_entries(self) -> List[Tuple[str, str]]:
-        """[(label, text)] for `LoopStatus.script_limits` — one entry per knob."""
-        return [(s.name, s.format()) for s in self._settings]
+        """[(label, text)] for `LoopStatus.script_limits` — one entry per knob
+        that asked to be shown (`Setting.show_in_status`)."""
+        return [(s.name, s.format()) for s in self._settings if s.show_in_status]
 
     def overrides(self, *, changed_only: bool = True) -> dict:
         """Exactly the dict `cmdline.render` consumes: {canonical flag: value}.

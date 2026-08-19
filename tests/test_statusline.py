@@ -543,6 +543,19 @@ def test_settings_registry_yields_the_overrides_dict_cmdline_consumes():
                                          ("session ceiling", "90%")]
 
 
+def test_a_knob_can_stay_editable_without_taking_a_row_field():
+    box = {"max_runs": 5}
+    registry = sl.SettingsRegistry()
+    hidden = registry.add(sl.NumberSetting(
+        "max-runs", "--max-runs", lambda: box["max_runs"],
+        lambda v: box.__setitem__("max_runs", int(v)), show_in_status=False))
+
+    assert registry.status_entries() == []          # no field of its own
+    assert registry.get("max-runs") is hidden       # but still an editable knob
+    hidden.set(9)
+    assert registry.overrides() == {"--max-runs": "9"}   # …and reproducible
+
+
 def test_percent_setting_is_clamped_to_its_bounds():
     box = {"v": 99.0}
     setting = sl.PercentSetting("session", "--session-limit",
@@ -1066,8 +1079,11 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
                                     on_app=lambda a: setattr(driver, "app", a))
 
     assert driver.calls == 2                          # the raised cap took effect
+    # An edited cap shows up as the counter's denominator — the one place it is
+    # shown at all, since a field of its own would say the same number twice.
     assert app.status.max_iterations == 2
-    assert ("max-runs", "2") in app.status.script_limits
+    assert "max-runs" not in dict(app.status.script_limits)
+    assert app.settings.get("max-runs").get() == 2     # still an editable knob
 
 
 def _counts_down(total):

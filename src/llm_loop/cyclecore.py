@@ -1473,7 +1473,13 @@ def _script_settings(run_settings: RunSettings, statusline) -> "SettingsRegistry
         lambda: run_settings.max_runs,
         lambda value: setattr(run_settings, "max_runs",
                               None if value is None else int(value)),
-        minimum=1))
+        minimum=1,
+        # Editable and reproducible, but not a field of its own: the counter
+        # already ends in this number (`iter 11/40`), or in the list's size when
+        # that is the smaller of the two — see InvocationProgress.summary_fields.
+        # Off the row it also stops printing `max-runs off` for every run that
+        # never set one.
+        show_in_status=False))
     registry.add(statusline.NumberSetting(
         "max-strike", "--max-strike",
         lambda: run_settings.max_strike,

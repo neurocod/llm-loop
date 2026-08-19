@@ -104,7 +104,7 @@ remainder. And since the items are independent, they can run **N at a time**:
 [job 4] 💻 curl.exe -L --fail --output 'D:\g\3d-research\food-and-beverages\eggs-dozen\thirty-…
 
 ──────────────────────────────
- ⟳ iter 4/12 | codex | 4 jobs | 1m37s | session n/a | week 26% (6d8h) / ceil 95% | max-runs 12
+ ⟳ iter 4/12 | codex | 4 jobs | 1m37s | session n/a | week 26% (6d8h) / ceil 95%
  job 1 ▶ gpt-5.6-terra | iter 1    | 1m37s  | calculator-desktop.md
  job 2 ▶ gpt-5.6-terra | iter 1    | 1m36s  | terminal-block-connector.md
  job 3 ▶ gpt-5.6-terra | iter 1    | 1m36s  | acoustic-upright-piano.md
@@ -413,6 +413,12 @@ On a terminal, a run pins a few rows at the bottom — iteration, provider/model
 elapsed time, the provider's live quota figures and the script's own limits, one
 row per job, and a legend of the keys it answers to. Piped output, CI and
 `--no-statusline` get the plain scrolling output of before.
+
+The iteration counter carries the whole of "how much work is this run": its
+denominator is `--max-runs`, the list's size for a `ListFileDriver`, or the
+smaller of the two. `--max-runs` therefore gets no field of its own — a knob
+whose value is already on the row registers with `show_in_status=False` and
+stays editable and reproducible without spending row width twice.
 
 **The quota fields have two halves**, split by ` / `:
 

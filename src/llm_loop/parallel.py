@@ -740,7 +740,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # so they are printed in the header rather than offered as knobs.
         lambda: shared.max_items,
         set_max_items,
-        minimum=1))
+        minimum=1,
+        # Not a field of its own — the summary counter's denominator is this cap
+        # (or the list's size, whichever is smaller). See the sequential
+        # registration in cyclecore._script_settings.
+        show_in_status=False))
     app = statusline.StatusApp(
         # Jobs come from the invocation's pool, so a second batch resumes the
         # rows of the first instead of starting a fresh set at iteration 1.
