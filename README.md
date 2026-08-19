@@ -312,6 +312,29 @@ if __name__ == "__main__":
     FileListParallelDriver.main_parallel()
 ```
 
+### Wrapper options in `--help`
+
+A wrapper that offers a mode of its own has to read it out of `argv` itself —
+the two parsers have disjoint option sets, so the flag choosing between them
+cannot be an option of either. `add_cli_options` is where such a flag gets
+documented, and both entry points call it, so one override covers both `--help`
+texts:
+
+```python
+class FileListDriver(ListFileDriver):
+    @classmethod
+    def add_cli_options(cls, parser):
+        group = parser.add_argument_group("modes", "read before the options above")
+        group.add_argument(MY_FLAG, action=ConsumedByWrapperAction,
+                           help="what it switches on")
+```
+
+`ConsumedByWrapperAction` documents without parsing: it errors if the option
+ever reaches the parser, which means the wrapper's own scan missed a spelling
+(an abbreviation argparse resolves and a plain `argv` scan does not) and the run
+would otherwise have gone ahead in the default mode. Anything the engine *should*
+parse is an ordinary `add_argument` here instead.
+
 ## Usage limits
 
 Before each iteration (and after any failed one) the loop reads the account's

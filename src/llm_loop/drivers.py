@@ -289,7 +289,8 @@ class ListFileDriver(Driver):
         from .parallel import run_parallel
         from .parallel import parse_args as parse_parallel_args
         args = parse_parallel_args(argv, prog=cls.resolved_prog(),
-                                   description=cls.description)
+                                   description=cls.description,
+                                   extra_options=cls.add_cli_options)
         driver = cls()
         if jobs is not None:
             driver.jobs = jobs

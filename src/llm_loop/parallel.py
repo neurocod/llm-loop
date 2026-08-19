@@ -33,7 +33,7 @@ import os
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from . import cyclecore
 from . import limits
@@ -89,12 +89,20 @@ _emit_lock = threading.Lock()
 
 
 def parse_args(argv=None, *, prog: str = "parallel",
-               description: Optional[str] = None) -> argparse.Namespace:
+               description: Optional[str] = None,
+               extra_options: Optional[Callable[[argparse.ArgumentParser],
+                                                None]] = None
+               ) -> argparse.Namespace:
     """CLI for the parallel runner: the family's options plus -j/--jobs.
 
     A trimmed copy of cyclecore.parse_args (it can't be reused directly: it has
     no --jobs, and its --max-runs means *iterations*, which here is redefined as
     a total-files cap). Every long option keeps its single-letter alias.
+
+    `extra_options` is the same wrapper hook cyclecore.parse_args documents — a
+    mode switch is usually spelled the same way in both modes, so the two
+    parsers have to offer the same seam or its --help would depend on which one
+    the wrapper happened to reach.
     """
     p = argparse.ArgumentParser(
         prog=prog,
@@ -134,6 +142,8 @@ def parse_args(argv=None, *, prog: str = "parallel",
     p.add_argument("--no-statusline", dest="no_statusline", action="store_true",
                    help="do not pin the interactive status rows at the bottom of "
                         "the terminal (same as LLM_LOOP_STATUSLINE=0)")
+    if extra_options is not None:
+        extra_options(p)
     return p.parse_args(argv)
 
 

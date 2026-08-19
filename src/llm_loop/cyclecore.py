@@ -56,7 +56,7 @@ from datetime import datetime
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 from .providers import (
     build_agent_argv as provider_argv,
@@ -495,13 +495,55 @@ class _TeeToLog:
         return getattr(self._stream, name)
 
 
+class ConsumedByWrapperAction(argparse.Action):
+    """An option this parser only DOCUMENTS — the wrapper reads it out of argv
+    itself, before parsing (see Driver.add_cli_options).
+
+    Reaching the parser therefore means the wrapper's own scan did not match
+    what was typed. argparse would otherwise accept it (an abbreviation like
+    `--grow` for `--grow-kit` is one this parser resolves and that scan does
+    not), store it in a namespace nobody reads, and run the DEFAULT mode — a
+    flag that appears to work and silently does nothing. Saying so is the whole
+    job of this action.
+
+    Declare a value-taking switch with `nargs=1, metavar="N"` so --help shows
+    its argument; the default `nargs=0` documents a bare flag.
+    """
+
+    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+        super().__init__(option_strings, dest, nargs=nargs,
+                         default=argparse.SUPPRESS, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        # `option_string` is the canonical spelling, not what was typed — which
+        # is the point: it names the option the abbreviation resolved to, and
+        # the one to type instead.
+        parser.error(
+            f"{option_string} never reached the argv scan that reads it, "
+            f"which runs before this parser. Spell it out in full; "
+            f"abbreviations are resolved here and are invisible there. (If it "
+            f"WAS spelled in full, that scan and this help have drifted "
+            f"apart.)")
+
+
 def parse_args(argv=None, *, prog: str = "runCycle.py",
-               description: Optional[str] = None) -> argparse.Namespace:
+               description: Optional[str] = None,
+               extra_options: Optional[Callable[[argparse.ArgumentParser],
+                                                None]] = None
+               ) -> argparse.Namespace:
     """Command-line interface shared by every entry point. Every long option has
     a single-letter alias.
 
     `prog`/`description` let each entry script label its own --help text while
     reusing the exact same option set (so there is no duplicated argument code).
+
+    `extra_options` is handed the parser once the shared options are on it, and
+    is how a wrapper documents the flags IT consumes before this parser ever
+    runs (a mode switch that decides which parser to use cannot be one of this
+    parser's options). Passing the parser rather than a block of help text is
+    what keeps such a flag formatted, aligned and grouped like every other
+    option — and lets the hook add a real, parsed option when the flag is not
+    one the wrapper strips.
     """
     p = argparse.ArgumentParser(
         prog=prog,
@@ -549,6 +591,8 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
     p.add_argument("--no-statusline", dest="no_statusline", action="store_true",
                    help="do not pin the interactive status rows at the bottom of "
                         "the terminal (same as LLM_LOOP_STATUSLINE=0)")
+    if extra_options is not None:
+        extra_options(p)
     return p.parse_args(argv)
 
 
@@ -1524,6 +1568,25 @@ class Driver:
             return cls.prog
         return os.path.basename(sys.argv[0]) or "runCycle.py"
 
+    @classmethod
+    def add_cli_options(cls, parser: argparse.ArgumentParser) -> None:
+        """Add this wrapper's own options to the shared --help. Default: none.
+
+        Called by main() and main_parallel() with the parser that is about to
+        run, so an entry point can document (or genuinely add) options the
+        engine knows nothing about. The usual case is a MODE switch — one the
+        wrapper must read out of argv itself, because it decides which of the
+        two parsers runs at all, and which therefore can never be a plain option
+        of either. Undocumented, such a flag exists only in prose, and `--help`
+        answers "there is no such option" to a user who is looking straight at
+        the one they want.
+
+        Both entry points call it, so a flag spelled the same in both modes is
+        documented in both --helps from one override. Build the option strings
+        from the same constants the wrapper's argv scan uses; a second spelling
+        typed out here is a spelling that can drift.
+        """
+
     def next_command(self) -> Optional[AgentCommand]:
         """The command to run this iteration, or None when work is exhausted and
         the loop should stop normally. May raise LoopStop to abort the run."""
@@ -1561,7 +1624,8 @@ class Driver:
         and ``description`` is the (optional) --help blurb.
         """
         args = parse_args(argv, prog=cls.resolved_prog(),
-                          description=cls.description)
+                          description=cls.description,
+                          extra_options=cls.add_cli_options)
         return run_loop(cls(), args, app_name=cls.resolved_app_name())
 
 

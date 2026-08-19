@@ -48,6 +48,7 @@ from . import cmdline
 from .cyclecore import (
     AgentCommand,
     ClaudeCommand,
+    ConsumedByWrapperAction,
     Driver,
     GitPushPolicy,
     LoopStop,
@@ -118,6 +119,7 @@ __all__ = [
     "AgentCommand",
     "ClaudeCommand",
     "CodexUsageSource",
+    "ConsumedByWrapperAction",
     "DayNightLimit",
     "Driver",
     "GitPushPolicy",
