@@ -67,7 +67,6 @@ from .providers import (
 
 # Claude sessions last ~5 hours; after a token-limit error we wait out that window.
 CLAUDE_SESSION_DURATION = 5 * 60 * 60 + 3  # 5 hours as seconds and + 3s as a safety margin
-SESSION_DURATION = 3600 # or: if session is started at the end of a window, it may continue more from the start next time
 LIMIT_RETRY_THRESHOLD = CLAUDE_SESSION_DURATION
 
 # The usage-limit policy (which quota to gate on, what ceiling to allow,
@@ -551,8 +550,8 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
     )
     # Most option names are kept in sync with continuous_claude.py (kebab-case,
     # and --max-runs for the iteration cap). The former spellings (--max,
-    # --startIn, --maxStrike) stay on as accepted aliases so existing
-    # invocations keep working.
+    # --startIn) stay on as accepted aliases so existing invocations keep
+    # working.
     p.add_argument("-m", "--max-runs", "--max", dest="max", type=int, default=None,
                    metavar="N",
                    help="stop after N iterations (default: run forever); "
@@ -571,9 +570,6 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
                    help="print raw JSON events (for debugging)")
     p.add_argument("-s", "--start-in", "--startIn", dest="start_in", metavar="DURATION",
                    help="wait this long before starting the loop, e.g. 29m, 1h30m")
-    p.add_argument("-S", "--max-strike", "--maxStrike", dest="max_strike",
-                   metavar="DURATION",
-                   help="per-session work budget before a pre-emptive pause, e.g. 3h")
     p.add_argument("-g", "--git-push", dest="git_push",
                    choices=[pol.value for pol in GitPushPolicy],
                    default=GIT_PUSH_POLICY.value,
@@ -1337,10 +1333,10 @@ def _fmt_moment(ts: float) -> str:
 def wait_until(target_ts: float, reason: str = None) -> None:
     """Sleep until wall-clock time reaches target_ts, printing a periodic countdown.
 
-    Used after a probable token-limit error (or once the --max-strike budget is
-    spent): we idle until the 5-hour session window should have refreshed.
-    `reason` overrides the default opening line. Ctrl+C interrupts the wait and
-    stops the script.
+    Used after a probable token-limit error, or once the LimitPolicy decides the
+    account's real usage figures leave no room: we idle until the 5-hour session
+    window should have refreshed. `reason` overrides the default opening line.
+    Ctrl+C interrupts the wait and stops the script.
     """
     if reason is None:
         reason = ("Looks like the token limit is exhausted. Waiting until "
@@ -1433,28 +1429,12 @@ class RunSettings:
     body. The loop now reads this object at every iteration boundary, so moving
     `--max-runs` from 40 to 60 mid-run takes effect at the next boundary and
     nothing else has to change.
-
-    `max_strike_seconds` is derived on every read for the same reason: an edited
-    duration text and the seconds the loop compares against cannot drift apart.
     """
 
     def __init__(self, *, max_runs: Optional[int] = None,
-                 max_strike: Optional[str] = None,
                  git_push: "GitPushPolicy" = None):
         self.max_runs = max_runs
-        self.max_strike = max_strike        # duration text, as spelled on the CLI
         self.git_push = git_push or GitPushPolicy(GIT_PUSH_POLICY)
-
-    @property
-    def max_strike_seconds(self) -> Optional[float]:
-        if not self.max_strike:
-            return None
-        try:
-            return parse_duration(str(self.max_strike))
-        except ValueError:
-            # The startup value is validated (and exits 2); a later edit that
-            # spells nonsense turns the budget off rather than killing the run.
-            return None
 
 
 def _script_settings(run_settings: RunSettings, statusline) -> "SettingsRegistry":
@@ -1480,10 +1460,6 @@ def _script_settings(run_settings: RunSettings, statusline) -> "SettingsRegistry
         # Off the row it also stops printing `max-runs off` for every run that
         # never set one.
         show_in_status=False))
-    registry.add(statusline.NumberSetting(
-        "max-strike", "--max-strike",
-        lambda: run_settings.max_strike,
-        lambda value: setattr(run_settings, "max_strike", value)))
     registry.add(statusline.Setting(
         "git-push", "--git-push",
         lambda: run_settings.git_push.value,
@@ -1524,7 +1500,7 @@ class Driver:
         default.
 
     The loop owns all the scaffolding (stop file, git push, usage limits,
-    --max-runs/--max-strike, streaming render); the Driver only decides *what work to
+    --max-runs, streaming render); the Driver only decides *what work to
     do*. A project wrapper is then just::
 
         class MyDriver(StateFileDriver):
@@ -1667,7 +1643,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # snapshotted into locals, so the status line's editor can move them mid-run.
     run_settings = RunSettings(
         max_runs=args.max,                          # None = no limit
-        max_strike=args.max_strike,                 # e.g. "3h" — per-session work budget
         git_push=GitPushPolicy(args.git_push))      # when to `git push` each iteration
     # When a finite iteration cap is given (-m/--max-runs) the run is short and
     # bounded on purpose, so the usage-limit machinery (the LimitPolicy
@@ -1680,12 +1655,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     dry_run = args.dry_run
     raw = args.raw
     start_in = args.start_in      # e.g. "29m" — delay before the loop starts
-    if args.max_strike:
-        try:
-            parse_duration(args.max_strike)   # reject a bad spelling at startup
-        except ValueError as e:
-            print(f"Invalid --max-strike value {args.max_strike!r}: {e}")
-            sys.exit(2)
 
     # Anchor every project-relative operation (git/provider cwd, the stop file, the
     # log name, the Driver's paths) to the chosen root before anything reads it.
@@ -1838,28 +1807,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 print(f"Iteration limit reached (--max-runs {max_runs}). Stopping.")
                 stop_reason = RunStopReason.LIMIT_REACHED
                 break
-
-            # --maxStrike: once a finished iteration pushes us past the per-session
-            # work budget, pause pre-emptively (same as a token-limit hit) so the
-            # current unit of work stays whole and we don't run into the limit
-            # mid-iteration. Checked between iterations, never in the middle of one.
-            max_strike_seconds = run_settings.max_strike_seconds
-            if max_strike_seconds is not None and iteration > 0:
-                elapsed = time.time() - session_start
-                if elapsed > max_strike_seconds:
-                    print(f"  ⌛ max-strike budget ({run_settings.max_strike}) "
-                          f"reached after "
-                          f"{int(elapsed // 60)} min of work — pausing for the next "
-                          f"session so this run stays whole.")
-                    target_ts = session_start + SESSION_DURATION
-                    app.update(phase="paused")
-                    wait_until(target_ts,
-                               reason=f"maxStrike: pausing pre-emptively until "
-                                      f"{_fmt_clock(target_ts)} (until the 5-hour session "
-                                      f"window refreshes)…")
-                    app.update(phase="idle")
-                    session_start = time.time()
-                    consecutive_errors = 0  # fresh window — start counting errors anew
 
             # Proactive limit check: read the real Current-session usage from the
             # account and pause cleanly between iterations if it is already at/over

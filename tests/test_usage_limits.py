@@ -262,7 +262,6 @@ def _args(project_dir):
     ns.dry_run = False
     ns.raw = False
     ns.start_in = None
-    ns.max_strike = None
     ns.git_push = "none"
     ns.project_dir = project_dir
     ns.cost = False

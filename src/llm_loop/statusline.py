@@ -666,7 +666,7 @@ class QuotaSegment(Segment):
 
 
 class ScriptLimitSegment(Segment):
-    """One of the script's own limits — "max-runs 40", "max-strike 3h", a ceiling.
+    """One of the script's own limits — "max-runs 40", a ceiling.
 
     Indexed rather than named so wave 2 can grow the list from the
     SettingsRegistry (see `SettingsRegistry.status_entries`) without a renderer
@@ -1442,7 +1442,7 @@ class PercentSetting(Setting):
 
 
 class NumberSetting(Setting):
-    """A plain count or duration — --max-runs, --max-strike."""
+    """A plain count or duration — e.g. --max-runs."""
 
 
 class SettingsRegistry:

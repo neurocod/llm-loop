@@ -39,17 +39,6 @@ def test_every_start_in_spelling_is_replaced(argv):
 
 
 @pytest.mark.parametrize("argv", [
-    ["--max-strike", "3h"],
-    ["--maxStrike", "3h"],
-    ["--max-strike=3h"],
-    ["-S", "3h"],
-    ["-S3h"],
-])
-def test_every_max_strike_spelling_is_replaced(argv):
-    assert rebuild_argv(argv, {"--max-strike": "4h"}) == ["--max-strike", "4h"]
-
-
-@pytest.mark.parametrize("argv", [
     ["--project-dir", "D:/proj"],
     ["--project-dir=D:/proj"],
     ["-C", "D:/proj"],
@@ -175,10 +164,9 @@ def test_no_spelling_is_claimed_by_two_flags():
 
 
 def test_deprecated_aliases_are_known():
-    # The three spellings cyclecore.parse_args still accepts for compatibility.
+    # The spellings cyclecore.parse_args still accepts for compatibility.
     assert "--max" in FLAG_ALIASES["--max-runs"].aliases
     assert "--startIn" in FLAG_ALIASES["--start-in"].aliases
-    assert "--maxStrike" in FLAG_ALIASES["--max-strike"].aliases
 
 
 # --- render ---------------------------------------------------------------------

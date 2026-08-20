@@ -756,7 +756,6 @@ def test_a_dry_run_prints_the_prompt_block_for_job_one(tmp_path, capsys):
     args.dry_run = True
     args.raw = False
     args.start_in = None
-    args.max_strike = None
     args.git_push = "none"
     args.project_dir = str(tmp_path)
     args.cost = False
@@ -1021,7 +1020,6 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
     args.dry_run = False
     args.raw = False
     args.start_in = None
-    args.max_strike = None
     args.git_push = "none"
     args.project_dir = str(tmp_path)
     args.cost = False
@@ -1223,7 +1221,7 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
 
     args = type("NS", (), {})()
     for name, value in dict(max=2, dry_run=False, raw=False, start_in=None,
-                            max_strike=None, git_push="none", cost=False,
+                            git_push="none", cost=False,
                             no_statusline=False, provider="codex",
                             project_dir=str(tmp_path)).items():
         setattr(args, name, value)

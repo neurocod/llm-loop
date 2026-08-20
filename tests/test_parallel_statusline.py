@@ -419,7 +419,7 @@ def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
 
     seq_args = type("NS", (), {})()
     for name, value in dict(max=1, dry_run=False, raw=False, start_in=None,
-                            max_strike=None, git_push="none", cost=False,
+                            git_push="none", cost=False,
                             no_statusline=False,
                             project_dir=str(tmp_path)).items():
         setattr(seq_args, name, value)

@@ -30,7 +30,7 @@ overnight.
 | Model choice | one model for the whole run | `model()` per iteration — a cheap model for `cleanup`, a smart one for `implementation` |
 | Quota / rate limits | run until the CLI dies | the account's real figures are read over the provider's API **before** each iteration, and the loop waits under configurable ceilings (session / day-night / weekly), with a reactive `rate_limit_event` backstop |
 | Parallelism | sequential (fan-out only *inside* one agent) | `-j N` concurrent CLI workers draining a work-queue file, one item per job |
-| Stopping | Ctrl+C | `stop` sentinel file, `s` key, `--max-runs`, `--max-strike` time budget, and an `error` state that halts for a human |
+| Stopping | Ctrl+C | `stop` sentinel file, `s` key, `--max-runs`, and an `error` state that halts for a human |
 | Providers | whatever the pipe points at | Claude and Codex adapters (argv vs. stdin prompt transport, both stream-json rendered) |
 | Observability | terminal scrollback | pinned status line (iteration, model, elapsed, live quota, per-job rows), rotating mirror log, optional Markdown rendering |
 | git | your problem | `--git-push none\|after_new_commits\|each_hour` |
@@ -400,7 +400,6 @@ reading before the bounded retry path continues.
 | `-g, --git-push none\|after_new_commits\|each_hour` | when to `git push` |
 | `-C, --project-dir DIR` | project root (default: cwd) |
 | `-s, --start-in 29m` | wait before starting (sequential only); alias `--startIn` |
-| `-S, --max-strike 3h` | per-session work budget before a pre-emptive pause; alias `--maxStrike` |
 | `-j, --jobs N` | concurrent workers (parallel only; else the Driver's `jobs`, else 10) |
 | `-c, --cost` | print per-session cost totals from the mirror log and exit (sequential only) |
 | `--ignore-usage` | don't pause on the session budget (parallel only) |

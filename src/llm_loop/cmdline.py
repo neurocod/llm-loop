@@ -41,7 +41,7 @@ class Flag(NamedTuple):
 #
 # Sourced from cyclecore.parse_args, parallel.parse_args and
 # runGenerateModels.split_mode - including the deprecated aliases those parsers
-# still accept (--max, --startIn, --maxStrike). A spelling missing here is not a
+# still accept (--max, --startIn). A spelling missing here is not a
 # cosmetic bug: the old value would survive next to the new one and argparse
 # would take the LAST occurrence, which happens to be right for a value flag and
 # wrong for anything else - so keep this table complete instead of relying on it.
@@ -55,7 +55,6 @@ class Flag(NamedTuple):
 FLAG_ALIASES: Dict[str, Flag] = {
     # value-taking options
     "--max-runs": Flag(("-m", "--max-runs", "--max"), True),
-    "--max-strike": Flag(("-S", "--max-strike", "--maxStrike"), True),
     "--start-in": Flag(("-s", "--start-in", "--startIn"), True),
     "--git-push": Flag(("-g", "--git-push"), True),
     "--project-dir": Flag(("-C", "--project-dir"), True),

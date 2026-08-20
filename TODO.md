@@ -22,7 +22,7 @@ Legend: priority is rough — `[P1]` do first, `[P3]` nice to have.
   endpoint (no tokens), with the run's own `rate_limit_event` as the backstop.
 - Idempotent list draining (strike each done path out of the list file).
 - Git-push policy (none | after_new_commits | each_hour), final push on exit.
-- Rotating mirror log, `--dry-run`, `--max-runs`, `--start-in`, `--max-strike`, `--raw`.
+- Rotating mirror log, `--dry-run`, `--max-runs`, `--start-in`, `--raw`.
 - Sequential `run_loop` + parallel `run_parallel` (N concurrent workers).
 - Project-root decoupling (`--project-dir` / cwd), stop file.
 - Opt-in per-user completion sound, configured through the platform config
@@ -56,8 +56,8 @@ against silently burning budget.
 Source: continuous-claude (`--max-cost`, `--max-duration`).
 We already extract `total_cost_usd` per iteration from the result event.
 - `--max-cost USD` — stop once cumulative spend crosses the ceiling.
-- `--max-duration 2h` — wall-clock cap for the whole run (complements
-  `--max-strike`, which is about the session window, not total runtime).
+- `--max-duration 2h` — wall-clock cap for the whole run (total runtime, unlike
+  the usage-limit gate, which is about the session window).
 
 ### [P2] Structured per-iteration metrics (JSONL)
 Source: frankbria (`metrics.jsonl`).

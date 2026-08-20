@@ -185,7 +185,6 @@ def _seq_args(project_dir, *, dry_run, max_runs=None):
     ns.dry_run = dry_run
     ns.raw = False
     ns.start_in = None
-    ns.max_strike = None
     ns.git_push = "none"
     ns.project_dir = project_dir
     ns.cost = False
