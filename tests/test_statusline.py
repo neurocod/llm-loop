@@ -191,6 +191,17 @@ def test_the_policy_ceiling_borrows_the_colour_of_its_own_reading():
     assert two.count(red) == 1 and two.count(green) == 2
 
 
+def test_a_ceiling_with_no_reading_behind_it_is_green_not_alarming():
+    green, red = sl._SGR["green"], sl._SGR["bold red"]
+    # --codex reports no session window at all; the ceiling gates nothing.
+    line = sl.colorize(f"session n/a{sl.POLICY_SEPARATOR}ceil 95%")
+
+    assert line.count(green) == 1 and red not in line
+    # ...and the hot field before the pipe must not lend its colour across it.
+    two = sl.colorize(f"week 95%{sl.SEPARATOR}session n/a{sl.POLICY_SEPARATOR}ceil 95%")
+    assert two.count(red) == 1 and two.count(green) == 1
+
+
 # --- chrome: the rule and the value separators ---------------------------------
 
 

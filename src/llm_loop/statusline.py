@@ -279,17 +279,31 @@ def colorize(line: str) -> str:
     everywhere else on the row. So it borrows the colour of the reading it
     qualifies, and the field as a whole shows one state: how the account is
     doing against this ceiling.
+
+    When the provider reported no figure at all ("session n/a / ceil 95%" — the
+    codex source has no session window) there is no reading to borrow from, and
+    the ceiling falls back to green rather than to the scale: nothing is being
+    spent against it, so an alarming colour would announce a problem that
+    cannot exist. The same rule states it: the field shows ONE state, and here
+    that state is "not gating anything".
     """
     out = []
     last = 0
     reading_style = None    # style of the last provider figure, for its policy half
     reading_end = 0         # ...and where it ended, to see what separates the two
+    field_start = 0         # start of the field being painted (after the last pipe)
     for match in _STYLED_RE.finditer(line):
         token = match.group(0)
         if _PERCENT_RE.fullmatch(token):
-            gap = line[reading_end:match.start()]
-            if reading_style is not None and POLICY_SEPARATOR in gap:
-                style = reading_style       # policy half of the same field
+            # Only what stands between this figure and its own field's reading —
+            # never text from the field before the pipe, which would make a
+            # neighbour's separator look like this field's.
+            gap = line[max(field_start, reading_end):match.start()]
+            if POLICY_SEPARATOR in gap:
+                # Policy half of the field: the reading's colour, or green when
+                # the provider had no reading to give.
+                style = (reading_style if reading_style is not None
+                         else _SGR.get(cyclecore.PERCENT_STYLES[0], ""))
             else:
                 style = _SGR.get(cyclecore.percent_style(
                     float(token.rstrip("% \t"))), "")
@@ -298,6 +312,7 @@ def colorize(line: str) -> str:
             style = _SGR.get(CHROME_STYLE, "")
             if token == SEPARATOR.strip():
                 reading_style = None        # next field, next reading
+                field_start = match.end()
         out.append(line[last:match.start()])
         out.append(f"{style}{token}{_SGR_RESET}" if style else token)
         last = match.end()
