@@ -183,6 +183,7 @@ src/
     limits.py      LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
     drivers.py     StateFileDriver (state machine) and ListFileDriver (work queue)
     parallel.py    run_parallel: N concurrent LLM workers over a list file
+    exitlog.py     why a run ended — including the endings it cannot report itself
 examples/
   runCycle.py            state-machine wrapper
   runFileList.py         per-file work-queue wrapper
@@ -405,6 +406,23 @@ reading before the bounded retry path continues.
 | `--ignore-usage` | don't pause on the session budget (parallel only) |
 | `--raw` | print raw JSON events, for debugging (sequential only) |
 | `--no-statusline` | do not pin the status rows (same as `LLM_LOOP_STATUSLINE=0`) |
+
+## Why the run ended
+
+Every run closes the mirror log with one line naming its ending:
+
+```
+=== run ended: no more work in the queue · 21 iteration(s), 21 completed · 4h12m ===
+```
+
+A stop file, `--max-runs`, a driver stop, five provider errors in a row, an
+unhandled exception, Ctrl+C, a signal — each gets its own phrase there. What
+cannot get one is a kill from outside (`Stop-Process`, `taskkill /F`, an OOM
+kill, a power cut): the process is gone, so it writes nothing at all. For those,
+each run keeps a small `<app>-<project>.<pid>.run.json` record beside its log
+and removes it on the way out — a record still on disk whose owner is gone is
+the report, and the next run prints it, naming the pid, the moment it was last
+alive and the item it was working on. `llm_loop.exitlog` is the whole of it.
 
 ## Interactive status line
 

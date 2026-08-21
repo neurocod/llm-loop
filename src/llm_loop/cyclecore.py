@@ -58,6 +58,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
+from . import exitlog
 from .providers import (
     build_agent_argv as provider_argv,
     provider_spec,
@@ -107,6 +108,18 @@ class RunResult(NamedTuple):
     attempted: int = 0
     completed: int = 0
     remaining: Optional[int] = None
+
+
+# What each stop reason is called in the `=== run ended: … ===` line, which is
+# the one place a reader looks when asking "why did this stop?". Phrased for
+# that reader rather than reusing the enum's wire value.
+STOP_REASON_TEXT = {
+    RunStopReason.STOP_FILE: "stop file requested",
+    RunStopReason.LIMIT_REACHED: "iteration limit reached (--max-runs)",
+    RunStopReason.NO_WORK: "no more work in the queue",
+    RunStopReason.DRIVER_STOP: "the driver stopped the run",
+    RunStopReason.DRY_RUN: "dry run finished",
+}
 
 
 # Default push policy. Override on the command line with --git-push.
@@ -1677,6 +1690,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         logger = _setup_file_logging(app_name)
         sys.stdout = _TeeToLog(sys.stdout, logger)
         sys.stderr = _TeeToLog(sys.stderr, logger)
+    if not dry_run:
+        # After the tee, so the report of a run that vanished lands in the very
+        # log whose abrupt end it explains. Idempotent per process: the periodic
+        # wrapper calls this runner repeatedly and keeps one record.
+        exitlog.begin(app_name, LOG_DIR, os.path.basename(PROJECT_DIR))
     print(f"  · project root: {PROJECT_DIR}")
     if dry_run:
         print(f"  · dry run: nothing is mirrored to {log_file_path(app_name)}")
@@ -1829,6 +1847,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             except LoopStop as stop:
                 print(stop.message)
                 if stop.exit_code:
+                    exitlog.set_reason(
+                        f"the driver stopped the run (exit {stop.exit_code}): "
+                        f"{stop.message.splitlines()[0]}")
                     sys.exit(stop.exit_code)
                 stop_reason = RunStopReason.DRIVER_STOP
                 break
@@ -1856,6 +1877,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             if not list_driven:
                 progress.note_iteration()
             app.update(**progress.summary_fields(), phase="running")
+            # What a post-mortem needs from a run that never got to write an
+            # ending: which item it was on when it stopped existing.
+            exitlog.note(phase=f"iteration {iteration} — {state_label}",
+                         iterations=iteration, completed=completed)
             print_markup(
                 f"\n=== Iteration {iteration} === [{state_label} · {model_label}]",
                 f"\n[bold cyan]=== Iteration {iteration} ===[/] "
@@ -1964,6 +1989,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                                else "with the session under the allowed limit")
                 print(f"  ⚠ {consecutive_errors} errors in a row {quota_state} after "
                       f"{int(elapsed // 60)} min. Stopping.")
+                exitlog.set_reason(
+                    f"{consecutive_errors} provider errors in a row "
+                    f"(last exit code {returncode})",
+                    iterations=iteration, completed=completed)
                 sys.exit(returncode)
 
     # Final push: regardless of the EACH_HOUR cadence, push any pending commits
@@ -1989,4 +2018,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     summary = driver.final_summary()
     if summary:
         print(f"\n{summary}")
+    # The reason this runner returned. Recorded rather than printed: a wrapper
+    # may call several runners, and the `=== run ended: … ===` line belongs to
+    # the process, so the last reason set wins and exitlog prints it on exit.
+    exitlog.set_reason(STOP_REASON_TEXT.get(stop_reason, stop_reason.value),
+                       iterations=iteration, completed=completed)
     return RunResult(stop_reason, iteration, completed)

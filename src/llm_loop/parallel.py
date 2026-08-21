@@ -36,6 +36,7 @@ import time
 from typing import Callable, Optional
 
 from . import cyclecore
+from . import exitlog
 from . import limits
 from . import statusline
 from .cyclecore import (
@@ -351,7 +352,15 @@ class Shared:
             line = self.driver.pick(pending)
             self.in_progress.add(line)
             self.claimed += 1
-            return line
+            in_flight = sorted(os.path.basename(ln.strip())
+                               for ln in self.in_progress)
+            claimed, done = self.claimed, self.done
+        # Outside the lock — this writes a file, and every worker contends for
+        # that lock. It leaves behind what the run had in flight, which is what
+        # a post-mortem of a killed run has to start from (see exitlog).
+        exitlog.note(phase=f"in flight: {', '.join(in_flight)}",
+                     iterations=claimed, completed=done)
+        return line
 
     def release(self, line: str) -> None:
         """Return a claimed-but-unprocessed line to the queue.
@@ -637,6 +646,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         logger = cyclecore._setup_file_logging(app_name)
         sys.stdout = cyclecore._TeeToLog(sys.stdout, logger)
         sys.stderr = cyclecore._TeeToLog(sys.stderr, logger)
+    if not args.dry_run:
+        # See the same call in cyclecore.run_loop: after the tee, so a vanished
+        # run's report lands in the log whose abrupt end it explains.
+        exitlog.begin(app_name, cyclecore.LOG_DIR,
+                      os.path.basename(cyclecore.project_dir()))
     print(f"  · project root: {cyclecore.project_dir()}")
     if args.dry_run:
         print("  · dry run: nothing is mirrored to "
@@ -840,4 +854,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         for line in sorted(shared.failed):
             print(f"      {os.path.basename(line.strip())}")
     reason = shared.stop_reason or RunStopReason.NO_WORK
+    # See run_loop's matching call: the closing line belongs to the process, so
+    # the reason is recorded here and printed by exitlog on the way out.
+    exitlog.set_reason(cyclecore.STOP_REASON_TEXT.get(reason, reason.value),
+                       iterations=shared.claimed, completed=shared.done)
     return RunResult(reason, shared.claimed, shared.done, remaining)

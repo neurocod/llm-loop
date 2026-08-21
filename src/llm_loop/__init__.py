@@ -45,6 +45,7 @@ provider quota query layers, and limits for the pausing policy.
 __version__ = "0.1.0"
 
 from . import cmdline
+from . import exitlog
 from .cyclecore import (
     AgentCommand,
     ClaudeCommand,
@@ -156,6 +157,7 @@ __all__ = [
     "completion_sound_enabled",
     "confirm_stop_request",
     "default_policy",
+    "exitlog",
     "find_project_root",
     "last_rate_limit_event",
     "log_file_path",
