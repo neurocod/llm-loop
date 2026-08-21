@@ -1033,6 +1033,26 @@ def print_error(text: str) -> None:
     print_styled(text, "bold red")
 
 
+def report_undelivered_notes(mailbox) -> None:
+    """Say so when the run ends holding notes nobody ever saw.
+
+    A queued note promises "the next iteration" — and there is not always a next
+    one (the list drained, --max-runs, a stop request, a quota pause that
+    outlasts the run). Whoever typed it during the last iteration would
+    otherwise have no way to learn it was never delivered, and the text itself
+    is printed so it can be pasted into the next run rather than retyped.
+    """
+    if mailbox is None:
+        return
+    notes = mailbox.take_queued()
+    if not notes:
+        return
+    print_error(f"\n  ⚠ the run ended holding {len(notes)} undelivered operator "
+                f"note(s) — there was no next iteration to carry them:")
+    for note in notes:
+        print_error(f"      {note}")
+
+
 def print_note(text: str) -> None:
     """An operator note, at the point in the stream where the agent received it.
 
@@ -1063,6 +1083,11 @@ def print_tool(name: str, detail: str = "") -> None:
 # into (assistant replies stream one text block at a time), plus its live renderer.
 _active_text_index = None
 _md_stream = _MarkdownStream()
+
+# The session cost already reported by earlier `result` events of the process
+# now streaming. Reset by run_agent_streaming; see the result branch for why the
+# figure has to be differenced at all.
+_turn_cost_base = 0.0
 
 
 # --- the free half of the limit machinery: the run's own rate-limit events -----
@@ -1218,7 +1243,17 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
         return
 
     if et == "result":
+        global _turn_cost_base
         cost = ev.get("total_cost_usd")
+        if cost is not None:
+            # `total_cost_usd` is the SESSION's running total, not this turn's
+            # (measured: two trivial turns in one process reported $0.2015 then
+            # $0.2204, while their durations were 2243 ms and 1991 ms — the
+            # second figure is the first plus $0.019, not a second $0.2). A
+            # process emits more than one `result` whenever a note typed late is
+            # answered as its own turn, and `report_costs` sums these lines, so
+            # each line shows what its turn ADDED.
+            cost, _turn_cost_base = cost - _turn_cost_base, cost
         dur = ev.get("duration_ms")
         bits = []
         if dur is not None:
@@ -1306,8 +1341,9 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     an unclosed pipe is a run that never returns, and the redundancy is
     deliberate: a crash that swallows `result` must not be able to hang the loop.
     """
-    global _last_rate_limit_event
+    global _last_rate_limit_event, _turn_cost_base
     _last_rate_limit_event = None
+    _turn_cost_base = 0.0     # a new process starts a new cost total
     spec = provider_spec(provider)
     try:
         proc = start_agent_process(cmd, provider, prompt, PROJECT_DIR)
@@ -1316,16 +1352,24 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
               f"Is {spec.display_name} installed and on PATH?")
         sys.exit(2)
 
+    # Built whenever the transport left a pipe open — NOT only when somebody
+    # wants to talk through it. Closing it is what ends the CLI's session, so
+    # tying the close to the mailbox made "nobody is listening to this run" mean
+    # "this run never ends": measured, a `-j 2+` worker sat on a finished turn
+    # for as long as it was allowed to (its result came back in 2.7 s; the call
+    # returned only when the process was killed at 90 s).
     channel = None
-    if (mailbox is not None and live_messages_enabled(provider)
-            and proc.stdin is not None):
+    if live_messages_enabled(provider) and proc.stdin is not None:
         channel = operator.AgentChannel(proc.stdin)
-        mailbox.attach(channel)
+        if mailbox is not None:
+            mailbox.attach(channel)
 
     def close_channel():
-        if channel is not None:
+        if channel is None:
+            return
+        if mailbox is not None:
             mailbox.detach()
-            channel.close()
+        channel.close()
 
     provider_failed = False
     try:
@@ -1738,9 +1782,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     start_in = args.start_in      # e.g. "29m" — delay before the loop starts
     # Decided per invocation, before the first argv is built: the transport is
     # what --no-live-messages turns off, and both the argv and the process's
-    # stdin have to agree about it.
-    if getattr(args, "no_live_messages", False):
-        set_live_messages(False)
+    # stdin have to agree about it. Set in BOTH directions — a wrapper that
+    # calls two runners in one process (see runGenerateModels' periodic mode)
+    # would otherwise have the first `--no-live-messages` phase decide the
+    # transport for every phase after it.
+    set_live_messages(not getattr(args, "no_live_messages", False))
 
     # Anchor every project-relative operation (git/provider cwd, the stop file, the
     # log name, the Driver's paths) to the chosen root before anything reads it.
@@ -2107,6 +2153,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     if not dry_run and usage_source is not None:
         limit_policy.log_snapshot(usage_source, "at end (after last cycle)",
                                   cache_value=False)
+
+    report_undelivered_notes(mailbox)
 
     # Closing line, if the driver has one (e.g. "Final state: …").
     summary = driver.final_summary()

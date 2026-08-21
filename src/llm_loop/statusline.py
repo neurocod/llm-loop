@@ -1346,7 +1346,8 @@ class HelpAction(Action):
 
 
 class Mode:
-    """A screen state on a stack: it may add rows and may consume events."""
+    """A screen state on a stack: it may add rows, consume events, and name its
+    own keys."""
 
     name = "mode"
 
@@ -1355,6 +1356,15 @@ class Mode:
 
     def rows(self, status: LoopStatus) -> List[Row]:
         return []
+
+    def legend(self) -> Optional[Sequence[Tuple[str, str]]]:
+        """(key, label) pairs to show INSTEAD of the Actions', or None.
+
+        A mode that consumes every key makes the registered Actions unreachable,
+        and a legend still advertising them is not decoration — it is wrong
+        about what the next keystroke does.
+        """
+        return None
 
     def handle(self, event: InputEvent) -> bool:
         """True when the event was consumed (and must not fall through)."""
@@ -1390,6 +1400,9 @@ class MessagePromptRow(Row):
 
     prefix = " ✉ "
     caret = "▏"
+    # Shown while the line is empty — which is also the state the editor returns
+    # to after Enter, so it doubles as "you are still in here".
+    hint = "  Enter sends · Esc leaves"
 
     def __init__(self, mode: "MessageMode"):
         self.mode = mode
@@ -1397,7 +1410,10 @@ class MessagePromptRow(Row):
     def render(self, status, width, now=None):
         body = fit_tail(self.mode.buffer + self.caret,
                         max(0, width - cell_width(self.prefix)))
-        return self.prefix + body
+        line = self.prefix + body
+        if not self.mode.buffer:
+            line += self.hint
+        return fit(line, width)
 
 
 class MessageMode(Mode):
@@ -1418,15 +1434,18 @@ class MessageMode(Mode):
     def rows(self, status):
         return [MessagePromptRow(self)]
 
+    def legend(self):
+        """While typing, `s` is a letter — so the legend must not offer it."""
+        return [("Enter", "send"), ("Esc", "clear / leave")]
+
     def handle(self, event):
         if not isinstance(event, Key):
             return False        # Resize and friends still belong to the app
         char = event.char
         if char in ("\r", "\n"):
             self.submit()
-        elif char == "\x1b":    # Esc — only ever delivered as a BARE escape
-            self.app.pop_mode()
-            self.app.note("note discarded")
+        elif char == "\x1b":
+            self.escape()
         elif char in ("\x08", "\x7f"):   # msvcrt / POSIX spellings of backspace
             self.buffer = self.buffer[:-1]
         elif len(char) == 1 and char.isprintable():
@@ -1436,11 +1455,33 @@ class MessageMode(Mode):
         return True
 
     def submit(self):
+        """Send, and STAY in the editor.
+
+        Leaving on Enter looked tidier and had a sharp edge: keys arrive one at
+        a time from one burst, so a pasted `…\\nand stop after this` sent the
+        first line, popped the mode, and handed the `s` of the second line to
+        StopAction — the run halting is not what the person typing a note asked
+        for. Staying means the mode is left only by an explicit Esc, and sending
+        several notes in a row costs nothing.
+        """
         text = self.buffer.strip()
-        self.app.pop_mode()
+        self.buffer = ""
         delivery = self.app.messages.submit(text) if self.app.messages else None
         self.app.note(delivery.message if delivery is not None
                       else "empty note discarded")
+
+    def escape(self):
+        """Esc clears a half-typed line; Esc on an empty line leaves.
+
+        Two steps for the same reason submit no longer pops: a terminal reports
+        Alt+key as ESC followed by the key, so a single-step Esc would let that
+        key through to the normal dispatch.
+        """
+        if self.buffer:
+            self.buffer = ""
+            self.app.note("note discarded — Esc again to leave")
+            return
+        self.app.pop_mode()
 
 
 class MessageAction(Action):
@@ -1463,8 +1504,10 @@ class MessageAction(Action):
         return f"message ({waiting} queued)" if waiting else "message"
 
     def run(self, app):
+        # No note announcing the mode: the editor's own row carries the hint
+        # while the line is empty, and the note row is where each delivery
+        # reports itself a moment later.
         app.push_mode(MessageMode(app))
-        app.note("type a note for the agent — Enter sends, Esc cancels")
 
 
 # --- settings ------------------------------------------------------------------
@@ -2104,7 +2147,14 @@ class StatusApp:
         return None
 
     def legend_entries(self) -> List[Tuple[str, str]]:
-        """(key, label) per available Action — the KeyLegendRow's only source."""
+        """(key, label) per available Action — the KeyLegendRow's only source.
+
+        A Mode that answers `legend()` replaces that list wholesale: while it
+        holds every key, the Actions are not reachable and must not be offered.
+        """
+        own = self.mode.legend()
+        if own is not None:
+            return list(own)
         return [(a.key or (a.all_keys() or ("",))[0], a.help_text(self))
                 for a in self.actions if a.available(self)]
 

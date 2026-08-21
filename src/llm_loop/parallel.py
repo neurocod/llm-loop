@@ -211,16 +211,21 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
         emit_job(job_id, f"executable {spec.executable!r} not found on PATH.", "bold red")
         return 2, None, None
 
+    # Whether or not this run hands out a mailbox (only `-j 1` does), the pipe
+    # the transport left open has to be closed here — see the same seam in
+    # cyclecore.run_agent_streaming for what tying it to the mailbox cost.
     channel = None
-    if (mailbox is not None and live_messages_enabled(provider)
-            and proc.stdin is not None):
+    if live_messages_enabled(provider) and proc.stdin is not None:
         channel = operator.AgentChannel(proc.stdin)
-        mailbox.attach(channel)
+        if mailbox is not None:
+            mailbox.attach(channel)
 
     def close_channel():
-        if channel is not None:
+        if channel is None:
+            return
+        if mailbox is not None:
             mailbox.detach()
-            channel.close()
+        channel.close()
 
     cost_usd = None
     duration_s = None
@@ -310,9 +315,16 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                 # Before the figures: once the turn has reported, the console
                 # must not be able to write into a session that is closing.
                 close_channel()
-                cost_usd = ev.get("total_cost_usd")
+                # A process emits a second `result` when a late note is answered
+                # as its own turn. The two figures then have to be combined
+                # differently, which is measured rather than assumed:
+                # `total_cost_usd` is the session's running total (so the last
+                # one is the job's cost), `duration_ms` is that turn's alone (so
+                # they add up).
+                cost_usd = ev.get("total_cost_usd", cost_usd)
                 dur = ev.get("duration_ms")
-                duration_s = dur / 1000 if dur is not None else None
+                if dur is not None:
+                    duration_s = (duration_s or 0.0) + dur / 1000
     finally:
         # Closing stdin is what ends a streaming-input session, so this is not
         # tidying: a channel left open on any path out of the loop is a worker
@@ -689,9 +701,9 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     set_project_root(getattr(args, "project_dir", None))
 
     # Decided before the first argv is built: the transport is what this turns
-    # off, and the argv and the process's stdin have to agree about it.
-    if getattr(args, "no_live_messages", False):
-        set_live_messages(False)
+    # off, and the argv and the process's stdin have to agree about it. Both
+    # directions, so a previous phase in the same process cannot decide it.
+    set_live_messages(not getattr(args, "no_live_messages", False))
 
     # Mirror all output to the rotating log, same as run_loop — under its own app
     # name so this runner's log doesn't fight the sequential one's. A dry run is
@@ -917,6 +929,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
               f"{MAX_ATTEMPTS} failed attempts:")
         for line in sorted(shared.failed):
             print(f"      {os.path.basename(line.strip())}")
+    cyclecore.report_undelivered_notes(mailbox)
     reason = shared.stop_reason or RunStopReason.NO_WORK
     # See run_loop's matching call: the closing line belongs to the process, so
     # the reason is recorded here and printed by exitlog on the way out.

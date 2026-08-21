@@ -240,13 +240,24 @@ class Mailbox:
             channel = self._channel
         if channel is not None:
             framed = frame_live(text)
+            # Recorded BEFORE the write, and unrecorded if the write fails. The
+            # replay comes back on the RUNNER's thread, which can be inside
+            # claim_echo while this one is still between two statements: an echo
+            # that arrives before its entry exists matches nothing and is
+            # dropped, so the note lands and the log never says so.
+            with self._lock:
+                self._awaiting.append((framed, text))
+                # Keep the newest: a mailbox this far behind is one whose
+                # replays are not coming back at all, and then the entry worth
+                # holding is the one whose note was typed most recently.
+                del self._awaiting[:-MAX_AWAITING_ECHO]
             try:
                 channel.send(framed)
             except ChannelError as exc:
+                with self._lock:
+                    if (framed, text) in self._awaiting:
+                        self._awaiting.remove((framed, text))
                 return self._queue(text, error=str(exc))
-            with self._lock:
-                self._awaiting.append((framed, text))
-                del self._awaiting[:-MAX_AWAITING_ECHO]
             return Delivery(live=True, queued=0)
         return self._queue(text)
 

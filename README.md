@@ -464,8 +464,14 @@ pressing `s` again during the countdown cancels it), `m` sends the agent a note
 ## Talking to the running agent (`m`)
 
 The loop is autonomous, not unattended. `m` opens a one-line editor in the
-pinned area — Enter sends, Esc discards — and what you type reaches the agent
-one of two ways:
+pinned area: Enter sends and leaves the editor open for the next note, Esc
+clears a half-typed line, and Esc on an empty line leaves. (Both are two-step on
+purpose — keys arrive one at a time from a single burst, so an editor that
+closed on Enter would hand the rest of a pasted line to the normal keys, `s`
+included.) While the editor is open the legend shows its keys and not the run's,
+because in there `s` is a letter.
+
+What you type reaches the agent one of two ways:
 
 * **into the turn already running**, over its stdin, if one is in flight. It
   lands at the model's next turn boundary (a tool call in progress is not
@@ -491,9 +497,13 @@ The key exists only when the run has exactly one agent to address: the sequentia
 loop, or `-j 1`. With several workers sharing one terminal there is no
 unambiguous recipient, so `m` is not offered.
 
+A note still queued when the run ends is reported, with its text, rather than
+dropped in silence: "the next iteration" is a promise the last iteration cannot
+keep.
+
 Two things `m` is not: it does not talk to `codex` (its non-interactive mode
 reads one prompt from a stdin it then needs closed), and it is not a paste
-target — one line, and a newline sends.
+target — every newline in a paste sends what precedes it as its own note.
 
 ## Per-user settings
 

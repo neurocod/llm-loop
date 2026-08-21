@@ -195,14 +195,25 @@ def _run_streaming(monkeypatch, lines, sink, mailbox):
                                          prompt="task", mailbox=mailbox)
 
 
-def test_the_result_event_closes_stdin_so_the_session_can_end(monkeypatch):
-    """Closing stdin is how a streaming-input session ends — nothing else does."""
-    sink, mailbox = _Sink(), operator.Mailbox()
+def test_the_result_event_closes_stdin_before_the_stream_ends(monkeypatch):
+    """Closing stdin is how a streaming-input session ends — nothing else does.
 
-    assert _run_streaming(monkeypatch, _events(_RESULT), sink, mailbox) == 0
+    Observed from INSIDE the stream: the close after the loop would satisfy a
+    test that only looks at the sink afterwards, so this one submits a note
+    between the result event and the last line and requires it to be refused.
+    """
+    sink, mailbox = _Sink(), operator.Mailbox()
+    afterwards = []
+
+    def stream():
+        yield json.dumps(_RESULT)
+        afterwards.append(mailbox.submit("a moment too late"))
+        yield json.dumps({"type": "system", "subtype": "anything"})
+
+    assert _run_streaming(monkeypatch, stream(), sink, mailbox) == 0
     assert sink.closed
-    assert mailbox.submit("after the fact").queued == 1, \
-        "the turn is over, so a note now belongs to the next iteration"
+    assert not afterwards[0].live and afterwards[0].queued == 1, \
+        "the turn had reported, so the note belongs to the next iteration"
 
 
 def test_stdin_is_closed_even_when_no_result_ever_arrives(monkeypatch):
@@ -211,6 +222,44 @@ def test_stdin_is_closed_even_when_no_result_ever_arrives(monkeypatch):
 
     _run_streaming(monkeypatch, _events({"type": "system", "subtype": "init"}),
                    sink, mailbox)
+
+    assert sink.closed
+
+
+def test_stdin_is_closed_when_the_render_loop_raises(monkeypatch):
+    """The `finally`: an exception is the one path neither other close covers."""
+    sink, mailbox = _Sink(), operator.Mailbox()
+
+    def stream():
+        yield json.dumps({"type": "system", "subtype": "init"})
+        raise RuntimeError("the renderer blew up")
+
+    with pytest.raises(RuntimeError):
+        _run_streaming(monkeypatch, stream(), sink, mailbox)
+
+    assert sink.closed
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_the_pipe_is_closed_even_with_nobody_listening(monkeypatch, runner):
+    """`-j 2+` hands out no mailbox — and must still not leave the CLI alive.
+
+    Measured before the fix: the turn's result came back in 2.7 s and the call
+    returned only when the process was killed at 90 s, because the close was
+    wired to the mailbox rather than to the transport.
+    """
+    sink = _Sink()
+    proc = _FakeProc(stdout=_events(_RESULT), stdin=sink)
+
+    if runner == "sequential":
+        monkeypatch.setattr(cyclecore, "start_agent_process",
+                            lambda *args: proc)
+        cyclecore.run_agent_streaming(["claude", "-p"], "claude", False,
+                                      prompt="task", mailbox=None)
+    else:
+        monkeypatch.setattr(parallel, "start_agent_process",
+                            lambda *args: proc)
+        parallel.run_job(1, AgentCommand("task", "opus", "item", "claude"))
 
     assert sink.closed
 
@@ -314,6 +363,54 @@ def test_a_queued_note_rides_the_next_iterations_prompt(tmp_path, monkeypatch):
     assert mailboxes[0].queued_count == 0
 
 
+def test_no_live_messages_puts_the_prompt_back_in_argv(tmp_path, monkeypatch):
+    """The rescue hatch, driven the way a user reaches it: through the runner."""
+    seen = {}
+
+    def fake_run(cmd, raw, partial, prompt="", mailbox=None):
+        seen["argv"] = cmd
+        seen["mailbox"] = mailbox
+        return 0
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", fake_run)
+    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
+    args = _seq_args(str(tmp_path))
+    args.no_live_messages = True
+
+    cyclecore.run_loop(_TwoIterationDriver(), args, app_name="pytest-operator",
+                       setup_logging=False, wait_on_start=False)
+
+    assert "Do the task." in seen["argv"], "the prompt has nowhere else to go"
+    assert "--input-format" not in seen["argv"]
+    assert "--replay-user-messages" not in seen["argv"]
+    # The key still works; only the delivery is different, so the mailbox stays.
+    assert seen["mailbox"] is not None
+
+
+def test_a_note_the_run_never_delivered_is_reported(tmp_path, monkeypatch,
+                                                    capsys):
+    """A queued note promises "the next iteration" — there is not always one."""
+    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
+
+    def fake_run(cmd, raw, partial, prompt="", mailbox=None):
+        mailbox.submit("typed while the last item was running")
+        return 0
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", fake_run)
+
+    class _OneItem(_TwoIterationDriver):
+        def next_command(self):
+            return super().next_command() if self.served < 1 else None
+
+    cyclecore.run_loop(_OneItem(), _seq_args(str(tmp_path)),
+                       app_name="pytest-operator", setup_logging=False,
+                       wait_on_start=False)
+
+    out = capsys.readouterr().out
+    assert "1 undelivered operator note" in out
+    assert "typed while the last item was running" in out
+
+
 def test_the_sequential_status_line_is_given_the_runs_mailbox(tmp_path,
                                                               monkeypatch):
     """The console's end of the wire: without this the `m` key is not offered."""
@@ -370,8 +467,49 @@ def test_typing_a_note_and_sending_it(tmp_path):
     app.handle_event(sl.Key("\r"))
 
     assert mailbox.take_queued() == ["use the studs"]
-    assert app.mode.name == "normal", "Enter leaves the editor"
     assert "queued for the next iteration" in app.status.note
+    assert app.mode.name == "message" and app.mode.buffer == "", \
+        "Enter sends and stays: leaving here would hand the rest of a paste " \
+        "to the normal keys"
+
+
+def test_a_pasted_newline_cannot_reach_the_stop_key(tmp_path):
+    """One burst, keys delivered one by one — the tail of a paste is still text."""
+    mailbox = operator.Mailbox()
+    stop = tmp_path / "stop"
+    app = _app(mailbox, stop_file=str(stop))
+
+    app.handle_event(sl.Key("m"))
+    _type(app, "check the sizes\r")
+    _type(app, "stop after this one")
+
+    assert not stop.exists(), "a pasted note requested a stop"
+    assert mailbox.take_queued() == ["check the sizes"]
+    assert app.mode.buffer == "stop after this one"
+
+
+def test_escape_clears_before_it_leaves(tmp_path):
+    """Alt+key arrives as ESC + key, so a one-step Esc would leak that key."""
+    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
+    app.handle_event(sl.Key("m"))
+    _type(app, "half a thought")
+
+    app.handle_event(sl.Key("\x1b"))
+    assert app.mode.name == "message" and app.mode.buffer == ""
+
+    app.handle_event(sl.Key("\x1b"))
+    assert app.mode.name == "normal"
+
+
+def test_the_legend_stops_offering_keys_the_editor_has_taken(tmp_path):
+    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
+    assert "s" in dict(app.legend_entries())
+
+    app.handle_event(sl.Key("m"))
+
+    keys = dict(app.legend_entries())
+    assert "s" not in keys, "`s` is a letter in here — the legend must not lie"
+    assert keys == {"Enter": "send", "Esc": "clear / leave"}
 
 
 def test_the_stop_key_inside_a_note_is_a_letter_not_a_stop(tmp_path):
@@ -386,7 +524,7 @@ def test_the_stop_key_inside_a_note_is_a_letter_not_a_stop(tmp_path):
     assert app.mode.buffer == "stop after this one"
 
 
-def test_backspace_and_escape(tmp_path):
+def test_backspace_in_both_spellings(tmp_path):
     mailbox = operator.Mailbox()
     app = _app(mailbox, stop_file=str(tmp_path / "stop"))
 
@@ -394,23 +532,42 @@ def test_backspace_and_escape(tmp_path):
     _type(app, "abc")
     app.handle_event(sl.Key("\x08"))      # msvcrt spelling
     app.handle_event(sl.Key("\x7f"))      # POSIX spelling
-    assert app.mode.buffer == "a"
 
-    app.handle_event(sl.Key("\x1b"))
-    assert app.mode.name == "normal"
-    assert mailbox.queued_count == 0, "Esc discards"
+    assert app.mode.buffer == "a"
+    assert mailbox.queued_count == 0, "nothing is sent until Enter"
 
 
 def test_the_prompt_row_shows_the_end_of_a_long_line(tmp_path):
+    """Measured in COLUMNS: a note in a double-width script is the normal case
+    for this project, and a row counted in code points would wrap — which pushes
+    the reserved region up a line and desynchronises every later repaint."""
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
     app.handle_event(sl.Key("m"))
-    _type(app, "x" * 200)
+    _type(app, "码" * 100)
 
     row = app.render(width=40)[-1]
 
-    assert len(row) <= 40, "a wrapped row would push the reserved region up"
+    assert sl.cell_width(row) <= 40
     assert row.startswith(" ✉ …")
-    assert row.endswith("x" + sl.MessagePromptRow.caret)
+    assert row.endswith("码" + sl.MessagePromptRow.caret)
+
+
+def test_arrow_keys_are_swallowed_rather_than_dispatched(tmp_path):
+    """Whatever the terminal sends, nothing may fall through to the normal keys.
+
+    Discriminating on the NOTE: an arrow reaching NormalMode is answered with
+    "unknown key", so the hint being replaced is the visible symptom of a key
+    that fell through.
+    """
+    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
+    app.handle_event(sl.Key("m"))
+    hint = app.status.note
+
+    app.handle_event(sl.Key("left"))
+    app.handle_event(sl.Key("pgup"))
+
+    assert app.mode.name == "message" and app.mode.buffer == ""
+    assert app.status.note == hint
 
 
 def test_the_legend_counts_what_is_still_waiting(tmp_path):
@@ -420,17 +577,6 @@ def test_the_legend_counts_what_is_still_waiting(tmp_path):
     mailbox.submit("two")
 
     assert dict(app.legend_entries())["m"] == "message (2 queued)"
-
-
-def test_arrow_keys_are_swallowed_rather_than_dispatched(tmp_path):
-    """Whatever the terminal sends, nothing may fall through to an Action."""
-    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
-
-    app.handle_event(sl.Key("left"))
-    app.handle_event(sl.Key("pgup"))
-
-    assert app.mode.name == "message" and app.mode.buffer == ""
 
 
 def test_fit_tail_keeps_the_end_and_marks_the_cut():
