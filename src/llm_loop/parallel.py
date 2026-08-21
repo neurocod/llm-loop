@@ -38,6 +38,8 @@ from typing import Callable, Optional
 from . import cyclecore
 from . import exitlog
 from . import limits
+from . import operator
+from . import providers
 from . import statusline
 from .cyclecore import (
     AgentCommand,
@@ -54,7 +56,9 @@ from .cyclecore import (
     _describe_tool,
     _short,
 )
-from .providers import provider_spec, start_agent_process, usage_source_for
+from .providers import (live_messages_enabled, provider_spec,
+                        set_live_messages, start_agent_process,
+                        usage_source_for)
 from .drivers import ListFileDriver
 
 # Default worker count. The work is cheap and fully independent, so a handful of
@@ -143,6 +147,12 @@ def parse_args(argv=None, *, prog: str = "parallel",
     p.add_argument("--no-statusline", dest="no_statusline", action="store_true",
                    help="do not pin the interactive status rows at the bottom of "
                         "the terminal (same as LLM_LOOP_STATUSLINE=0)")
+    p.add_argument("--no-live-messages", dest="no_live_messages",
+                   action="store_true",
+                   help="do not keep the agent's stdin open for notes typed "
+                        "during an iteration; they wait for the next prompt "
+                        f"instead (same as {providers.LIVE_MESSAGES_ENV}=0). "
+                        "Notes need a single worker either way")
     if extra_options is not None:
         extra_options(p)
     return p.parse_args(argv)
@@ -180,13 +190,16 @@ def emit_tool(job_id: int, name: str, detail: str) -> None:
 
 # --- one provider round-trip for one file --------------------------------------
 
-def run_job(job_id: int, command: AgentCommand) -> tuple:
+def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     """Run one provider command, rendering a compact per-job trace.
 
     Unlike cyclecore's streaming renderer this prints only the key events — each
     tool call, any failed tool result, and the final cost line — one atomic line
     at a time, so several of these can run at once without their output
     colliding. Returns (returncode, cost_usd, duration_s).
+
+    `mailbox` is passed only by a single-worker run (see run_parallel); it lends
+    the console this turn's stdin, exactly as the sequential runner does.
     """
     provider = command.provider or "claude"
     spec = provider_spec(provider)
@@ -198,6 +211,17 @@ def run_job(job_id: int, command: AgentCommand) -> tuple:
         emit_job(job_id, f"executable {spec.executable!r} not found on PATH.", "bold red")
         return 2, None, None
 
+    channel = None
+    if (mailbox is not None and live_messages_enabled(provider)
+            and proc.stdin is not None):
+        channel = operator.AgentChannel(proc.stdin)
+        mailbox.attach(channel)
+
+    def close_channel():
+        if channel is not None:
+            mailbox.detach()
+            channel.close()
+
     cost_usd = None
     duration_s = None
     provider_failed = False
@@ -207,76 +231,93 @@ def run_job(job_id: int, command: AgentCommand) -> tuple:
     # `exit 1` and no cause anywhere. Kept as a bounded tail — a chatty CLI must
     # not be able to grow a worker's memory — and printed only if the job fails.
     diagnostics = collections.deque(maxlen=FAILURE_TAIL_LINES)
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            diagnostics.append(_short(line))
-            continue  # non-JSON CLI diagnostics — skip in compact mode
-        if not isinstance(ev, dict):
-            continue  # valid JSON can still be a diagnostic, not an event
-        et = ev.get("type")
-        if provider == "codex":
-            item = ev.get("item") or {}
-            item_type = item.get("type")
-            if et == "item.completed" and item_type == "agent_message":
-                for text in str(item.get("text") or "").splitlines():
-                    emit_job(job_id, f"💬 {text}")
-            elif et == "item.started" and item_type == "command_execution":
-                emit_job(job_id, "💻 " + _short(
-                    undouble_backslashes(str(item.get("command", ""))), 160))
-            elif et == "item.completed" and item_type == "command_execution":
-                emit_job(job_id, f"📤 exit {item.get('exit_code', '')}: " + _short(
-                    undouble_backslashes(str(item.get("command", ""))), 140))
-            elif et == "item.completed" and item_type == "file_change":
-                changes = item.get("changes") or []
-                paths = [str(change.get("path")) for change in changes
-                         if isinstance(change, dict) and change.get("path")]
-                emit_job(job_id, f"🛠️ {', '.join(paths) or 'file changes applied'}")
-            elif et == "turn.completed":
-                usage = ev.get("usage") or {}
-                if usage:
-                    emit_job(job_id, "tokens: "
-                             f"input {usage.get('input_tokens', 0)}, "
-                             f"cached {usage.get('cached_input_tokens', 0)}, "
-                             f"output {usage.get('output_tokens', 0)}")
-            elif et in ("error", "turn.failed"):
-                provider_failed = True
-                emit_job(job_id, f"⚠ {_short(ev.get('message') or ev.get('error') or ev)}",
-                         "bold red")
-        elif et == "assistant":
-            for block in ev.get("message", {}).get("content", []):
-                if block.get("type") == "tool_use":
-                    name = block.get("name", "?")
-                    detail = _describe_tool(name, block.get("input", {}) or {})
-                    emit_tool(job_id, name, detail)
-        elif et == "user":
-            # Only surface *failed* tool results; successes would just be noise
-            # at high concurrency.
-            for block in ev.get("message", {}).get("content", []):
-                if block.get("type") == "tool_result" and block.get("is_error"):
-                    content = block.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(
-                            c.get("text", "") for c in content
-                            if isinstance(c, dict)
-                        )
-                    emit_job(job_id, f"  ✗ {_short(content, 160)}", "red")
-        elif et == "rate_limit_event":
-            # The run's own rate-limit verdict (see cyclecore.RateLimitEvent).
-            # Surfaced, not acted on: with N workers the pause belongs to the
-            # shared usage gate, which sees the same wall as a pegged percentage
-            # when the next worker checks in.
-            rl = cyclecore.rate_limit_event_from(ev)
-            if rl is not None and rl.status != "allowed":
-                emit_job(job_id, f"⚠ rate limit: {rl.describe()}", "bold red")
-        elif et == "result":
-            cost_usd = ev.get("total_cost_usd")
-            dur = ev.get("duration_ms")
-            duration_s = dur / 1000 if dur is not None else None
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                diagnostics.append(_short(line))
+                continue  # non-JSON CLI diagnostics — skip in compact mode
+            if not isinstance(ev, dict):
+                continue  # valid JSON can still be a diagnostic, not an event
+            et = ev.get("type")
+            if provider == "codex":
+                item = ev.get("item") or {}
+                item_type = item.get("type")
+                if et == "item.completed" and item_type == "agent_message":
+                    for text in str(item.get("text") or "").splitlines():
+                        emit_job(job_id, f"💬 {text}")
+                elif et == "item.started" and item_type == "command_execution":
+                    emit_job(job_id, "💻 " + _short(
+                        undouble_backslashes(str(item.get("command", ""))), 160))
+                elif et == "item.completed" and item_type == "command_execution":
+                    emit_job(job_id, f"📤 exit {item.get('exit_code', '')}: " + _short(
+                        undouble_backslashes(str(item.get("command", ""))), 140))
+                elif et == "item.completed" and item_type == "file_change":
+                    changes = item.get("changes") or []
+                    paths = [str(change.get("path")) for change in changes
+                             if isinstance(change, dict) and change.get("path")]
+                    emit_job(job_id,
+                             f"🛠️ {', '.join(paths) or 'file changes applied'}")
+                elif et == "turn.completed":
+                    usage = ev.get("usage") or {}
+                    if usage:
+                        emit_job(job_id, "tokens: "
+                                 f"input {usage.get('input_tokens', 0)}, "
+                                 f"cached {usage.get('cached_input_tokens', 0)}, "
+                                 f"output {usage.get('output_tokens', 0)}")
+                elif et in ("error", "turn.failed"):
+                    provider_failed = True
+                    emit_job(job_id,
+                             f"⚠ {_short(ev.get('message') or ev.get('error') or ev)}",
+                             "bold red")
+            elif et == "assistant":
+                for block in ev.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_use":
+                        name = block.get("name", "?")
+                        detail = _describe_tool(name, block.get("input", {}) or {})
+                        emit_tool(job_id, name, detail)
+            elif et == "user":
+                # Only surface *failed* tool results; successes would just be
+                # noise at high concurrency. An operator note replayed back to us
+                # is the exception: it is the receipt for something a human
+                # typed, and it belongs in the log next to the turn it landed in.
+                for block in ev.get("message", {}).get("content", []):
+                    if block.get("type") == "text" and mailbox is not None:
+                        note = mailbox.claim_echo(block.get("text", ""))
+                        if note is not None:
+                            emit_job(job_id, f"✉ operator note: {note}", "magenta")
+                    if block.get("type") == "tool_result" and block.get("is_error"):
+                        content = block.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(
+                                c.get("text", "") for c in content
+                                if isinstance(c, dict)
+                            )
+                        emit_job(job_id, f"  ✗ {_short(content, 160)}", "red")
+            elif et == "rate_limit_event":
+                # The run's own rate-limit verdict (see cyclecore.RateLimitEvent).
+                # Surfaced, not acted on: with N workers the pause belongs to the
+                # shared usage gate, which sees the same wall as a pegged
+                # percentage when the next worker checks in.
+                rl = cyclecore.rate_limit_event_from(ev)
+                if rl is not None and rl.status != "allowed":
+                    emit_job(job_id, f"⚠ rate limit: {rl.describe()}", "bold red")
+            elif et == "result":
+                # Before the figures: once the turn has reported, the console
+                # must not be able to write into a session that is closing.
+                close_channel()
+                cost_usd = ev.get("total_cost_usd")
+                dur = ev.get("duration_ms")
+                duration_s = dur / 1000 if dur is not None else None
+    finally:
+        # Closing stdin is what ends a streaming-input session, so this is not
+        # tidying: a channel left open on any path out of the loop is a worker
+        # thread that never returns and a run whose final join() never finishes.
+        close_channel()
     returncode = proc.wait()
     if returncode == 0 and provider_failed:
         returncode = 1
@@ -506,7 +547,7 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
 
 def worker(job_id: int, shared: Shared, source: Optional[object],
            policy, session_start_box: list, usage_lock: threading.Lock,
-           app=None, progress=None) -> None:
+           app=None, progress=None, mailbox=None) -> None:
     """One worker thread: claim -> (usage gate) -> run -> record, repeat.
 
     Loops until the queue drains, the claim cap closes, or the stop sentinel is
@@ -567,6 +608,15 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             break
 
         command = shared.driver.command_for(line)
+        # Notes typed while no turn was in flight ride this prompt (only a
+        # single-worker run has a mailbox at all — see run_parallel).
+        if mailbox is not None:
+            queued = mailbox.take_queued()
+            if queued:
+                command = command._replace(
+                    prompt=operator.append_notes(command.prompt, queued))
+                for note in queued:
+                    emit_job(job_id, f"✉ operator note: {note}", "magenta")
         # The same three calls the sequential loop makes on its single Job: the
         # Job clock times THIS file, the run clock (latched once) times the run.
         started_at = time.time()
@@ -575,7 +625,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                   prompt=command.prompt, now=started_at)
         app.update(phase="running")
         emit_job(job_id, f"▶ {command.label}", "bold cyan")
-        rc, cost_usd, dur = run_job(job_id, command)
+        rc, cost_usd, dur = run_job(job_id, command, mailbox)
         job.finish()
         ok = rc == 0
         done_total, remaining = shared.finish(line, ok)
@@ -638,6 +688,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # Anchor every project-relative operation before anything reads the root.
     set_project_root(getattr(args, "project_dir", None))
 
+    # Decided before the first argv is built: the transport is what this turns
+    # off, and the argv and the process's stdin have to agree about it.
+    if getattr(args, "no_live_messages", False):
+        set_live_messages(False)
+
     # Mirror all output to the rotating log, same as run_loop — under its own app
     # name so this runner's log doesn't fight the sequential one's. A dry run is
     # a preview, not a run, and stays out of the shared record entirely: see the
@@ -690,7 +745,9 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             command = driver.command_for(line)
             first_command = first_command or command
             print("  " + " ".join(build_agent_argv(command, provider)))
-            if provider == "codex":
+            if providers.prompt_on_stdin(provider):
+                # The argv is complete but not self-contained when the prompt
+                # travels on stdin; without this the preview shows flags only.
                 print("    STDIN: " + command.prompt)
         if listed < would_run:
             print(f"  … and {would_run - listed} more pending — listing capped "
@@ -759,11 +816,18 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # (or the list's size, whichever is smaller). See the sequential
         # registration in cyclecore._script_settings.
         show_in_status=False))
+    # A note is addressed to "the agent", and only a one-worker run has exactly
+    # one of those: with N workers the same keystroke would have to pick a
+    # recipient, and the console shows their output interleaved. So a mailbox
+    # exists here only at jobs == 1 — which is also what keeps the `m` key out of
+    # the legend of a fleet run rather than offering something ambiguous.
+    mailbox = operator.Mailbox() if jobs == 1 else None
     app = statusline.StatusApp(
         # Jobs come from the invocation's pool, so a second batch resumes the
         # rows of the first instead of starting a fresh set at iteration 1.
         status=statusline.LoopStatus(jobs=progress.jobs(jobs)),
         settings=settings,
+        messages=mailbox,
         enabled=not getattr(args, "no_statusline", False))
     app.update(
         provider=provider,
@@ -790,7 +854,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     threads = [
         threading.Thread(target=worker, name=f"job{j}",
                          args=(j, shared, source, policy, session_start_box,
-                               usage_lock, app, progress),
+                               usage_lock, app, progress, mailbox),
                          daemon=True)
         for j in range(1, jobs + 1)
     ]

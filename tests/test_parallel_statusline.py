@@ -153,7 +153,7 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
     seen = {}
     running = threading.Barrier(3, timeout=5)
 
-    def record_job(job_id, command):
+    def record_job(job_id, command, mailbox=None):
         frozen = made["app"].status.snapshot()
         seen[job_id] = [j for j in frozen.jobs if j.job_id == job_id][0]
         running.wait()          # hold all three at once: three rows, three items
@@ -187,7 +187,7 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
 def test_the_summary_row_shows_the_run_counters(tmp_path, monkeypatch):
     """--max-runs caps FILES here; one claimed file is one iteration of work."""
     made = _live_statusline(monkeypatch, {})
-    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
+    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     driver = _MemDriver([f"products/f{i}.md" for i in range(5)])
     previous = cyclecore.project_dir()
     try:
@@ -210,7 +210,7 @@ def test_the_summary_row_shows_the_run_counters(tmp_path, monkeypatch):
 def test_no_statusline_reaches_the_parallel_runner(tmp_path, monkeypatch):
     """The flag the periodic wrapper forwards must actually disable the area."""
     made = _live_statusline(monkeypatch, {})
-    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
+    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     previous = cyclecore.project_dir()
     try:
         parallel.run_parallel(_MemDriver(["products/a.md"]),
@@ -233,7 +233,7 @@ def test_cancelling_the_stop_reopens_claims_while_a_job_runs(tmp_path, monkeypat
     in_flight = threading.Event()
     release = threading.Event()
 
-    def block_the_first_job(job_id, command):
+    def block_the_first_job(job_id, command, mailbox=None):
         if not in_flight.is_set():
             in_flight.set()
             assert release.wait(5), "the test never released the in-flight job"
@@ -274,7 +274,7 @@ def test_an_interactive_stop_left_alone_ends_the_run(tmp_path, monkeypatch):
     in_flight = threading.Event()
     release = threading.Event()
 
-    def block_the_first_job(job_id, command):
+    def block_the_first_job(job_id, command, mailbox=None):
         if not in_flight.is_set():
             in_flight.set()
             assert release.wait(5), "the test never released the in-flight job"
@@ -312,7 +312,7 @@ def test_a_sentinel_this_run_did_not_write_is_not_reopenable(tmp_path, monkeypat
     in_flight = threading.Event()
     release = threading.Event()
 
-    def block_the_first_job(job_id, command):
+    def block_the_first_job(job_id, command, mailbox=None):
         if not in_flight.is_set():
             in_flight.set()
             assert release.wait(5)
@@ -410,7 +410,7 @@ def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
                               **kwargs)
 
     monkeypatch.setattr(sl, "StatusApp", _app)
-    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
+    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
 
     class _NoWork(Driver):
@@ -484,7 +484,7 @@ def test_batches_of_one_invocation_share_one_rising_counter(tmp_path, monkeypatc
     made = _live_statusline(monkeypatch, {})
     samples = []
 
-    def sample_then_finish(job_id, command):
+    def sample_then_finish(job_id, command, mailbox=None):
         # Sampled from inside the work, so a batch is also pinned where it OPENS
         # — before any of its own files have finished.
         samples.append((made["app"].status.iteration,
@@ -518,7 +518,7 @@ def test_the_denominator_is_the_smaller_of_the_queue_and_the_cap(tmp_path,
                                                                  monkeypatch):
     """min(pending at the start, --max), checked both ways round."""
     made = _live_statusline(monkeypatch, {})
-    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
+    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     previous = cyclecore.project_dir()
     try:
         # Cap smaller than the queue: the run promises only what it will do.
@@ -550,7 +550,7 @@ def test_job_rows_resume_in_the_next_call_of_the_invocation(tmp_path, monkeypatc
     made = _live_statusline(monkeypatch, {})
     both = threading.Barrier(2, timeout=5)
 
-    def one_file_each(job_id, command):
+    def one_file_each(job_id, command, mailbox=None):
         both.wait()       # neither worker can take the other's file in a batch
         return 0, 0.0, 0.01
 

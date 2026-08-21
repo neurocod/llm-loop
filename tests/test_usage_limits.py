@@ -276,7 +276,7 @@ def _run_with_verdict(tmp_path, monkeypatch, verdict):
     monkeypatch.setattr(cyclecore, "wait_until",
                         lambda ts, reason=None: waits.append(ts))
 
-    def fake_run(cmd, raw, partial):
+    def fake_run(cmd, raw, partial, prompt="", mailbox=None):
         cyclecore._last_rate_limit_event = verdict
         return 0
 

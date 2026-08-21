@@ -999,7 +999,7 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
     source = _CountingSource()
     monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: source)
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
-                        lambda cmd, raw, partial: 0)
+                        lambda cmd, raw, partial, prompt="", mailbox=None: 0)
     made = {}
     real_app_class = sl.StatusApp        # captured before the patch below
 

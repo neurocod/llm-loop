@@ -74,7 +74,7 @@ def _run_and_wait(driver, args, timeout=10.0):
 
 def test_drain_terminates_with_more_workers_than_files(tmp_path, monkeypatch):
     """20 workers, a few files: everyone must exit once the list drains."""
-    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
+    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     driver = _MemDriver([f"products/f{i}.md" for i in range(3)])
     assert _run_and_wait(driver, _args(str(tmp_path), jobs=20)), \
         "run_parallel did not terminate after the list drained"
@@ -89,7 +89,7 @@ def test_worker_claims_before_touching_the_usage_gate(tmp_path, monkeypatch):
     an empty list every worker must stop at claim(), so the policy's
     check_and_wait is never called.
     """
-    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
+    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     # A source object is truthy so the gate branch is taken *if reached*.
     monkeypatch.setattr(parallel, "usage_source_for", lambda provider: object())
 
@@ -136,7 +136,7 @@ def test_max_runs_closes_claims_without_cancelling_in_flight_work(
     all_started = threading.Event()
     release = threading.Event()
 
-    def blocked_job(job_id, command):
+    def blocked_job(job_id, command, mailbox=None):
         nonlocal started
         with started_lock:
             started += 1

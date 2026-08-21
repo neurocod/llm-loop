@@ -57,6 +57,9 @@ __all__ = [
     "LabelSegment",
     "Layout",
     "LoopStatus",
+    "MessageAction",
+    "MessageMode",
+    "MessagePromptRow",
     "Mode",
     "Mouse",
     "NoteRow",
@@ -83,6 +86,7 @@ __all__ = [
     "Terminal",
     "TerminalInput",
     "colorize",
+    "fit_tail",
     "format_elapsed",
     "format_prompt_block",
     "push_quotas",
@@ -182,6 +186,29 @@ def fit(text: str, width: int) -> str:
         out.append(ch)
         used += w
     return "".join(out) + "…"
+
+
+def fit_tail(text: str, width: int) -> str:
+    """`text` cut to `width` columns from the LEFT, marked with a leading '…'.
+
+    The mirror image of `fit`, for the one place where the END of a string is
+    the part worth showing: a line being typed, whose interesting character is
+    the one just entered. Wrapping is not an option there either — the reserved
+    region is sized in whole rows.
+    """
+    if width <= 0:
+        return ""
+    if cell_width(text) <= width:
+        return text
+    out = []
+    used = 0
+    for ch in reversed(text):
+        w = cell_width(ch)
+        if used + w > width - 1:
+            break
+        out.append(ch)
+        used += w
+    return "…" + "".join(reversed(out))
 
 
 def pad(text: str, width: int) -> str:
@@ -1351,6 +1378,95 @@ class NormalMode(Mode):
         return True
 
 
+# --- typing a note to the running agent ----------------------------------------
+
+
+class MessagePromptRow(Row):
+    """The line being typed, pinned under the status rows.
+
+    Holds the Mode rather than a string so the caret follows the buffer without
+    anything having to push updates into a row object.
+    """
+
+    prefix = " ✉ "
+    caret = "▏"
+
+    def __init__(self, mode: "MessageMode"):
+        self.mode = mode
+
+    def render(self, status, width, now=None):
+        body = fit_tail(self.mode.buffer + self.caret,
+                        max(0, width - cell_width(self.prefix)))
+        return self.prefix + body
+
+
+class MessageMode(Mode):
+    """Typing a note. Consumes EVERY key while it is on the stack.
+
+    A Mode and not just an Action because of what must NOT happen while a
+    sentence is being typed: `s` is the stop key in NormalMode, and a note
+    containing the word "stop" would otherwise halt the run halfway through
+    being written. Consuming everything is the feature.
+    """
+
+    name = "message"
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.buffer = ""
+
+    def rows(self, status):
+        return [MessagePromptRow(self)]
+
+    def handle(self, event):
+        if not isinstance(event, Key):
+            return False        # Resize and friends still belong to the app
+        char = event.char
+        if char in ("\r", "\n"):
+            self.submit()
+        elif char == "\x1b":    # Esc — only ever delivered as a BARE escape
+            self.app.pop_mode()
+            self.app.note("note discarded")
+        elif char in ("\x08", "\x7f"):   # msvcrt / POSIX spellings of backspace
+            self.buffer = self.buffer[:-1]
+        elif len(char) == 1 and char.isprintable():
+            self.buffer += char
+        # Anything else (arrows, page keys, control characters) is swallowed
+        # rather than dispatched: see the class docstring.
+        return True
+
+    def submit(self):
+        text = self.buffer.strip()
+        self.app.pop_mode()
+        delivery = self.app.messages.submit(text) if self.app.messages else None
+        self.app.note(delivery.message if delivery is not None
+                      else "empty note discarded")
+
+
+class MessageAction(Action):
+    """`m` — send the agent a note.
+
+    Registered only when the run has a mailbox, which is what makes the key
+    honest: several concurrent workers share one terminal and one keyboard, so
+    there is no unambiguous "the agent" to talk to, and the runner hands out no
+    mailbox in that case (see parallel.run_parallel).
+    """
+
+    key = "m"
+    help = "message"
+
+    def available(self, app):
+        return getattr(app, "messages", None) is not None
+
+    def help_text(self, app):
+        waiting = app.messages.queued_count if app.messages else 0
+        return f"message ({waiting} queued)" if waiting else "message"
+
+    def run(self, app):
+        app.push_mode(MessageMode(app))
+        app.note("type a note for the agent — Enter sends, Esc cancels")
+
+
 # --- settings ------------------------------------------------------------------
 
 
@@ -1714,11 +1830,16 @@ class StatusApp:
                  input_source: Optional[InputSource] = None,
                  layout: Optional[Layout] = None,
                  settings: Optional[SettingsRegistry] = None,
+                 messages=None,
                  enabled: bool = True, refresh: float = REFRESH_SECONDS,
                  stop_file: Optional[str] = None,
                  default_actions: bool = True):
         self.status = status or LoopStatus()
         self.settings = settings or SettingsRegistry()
+        # This run's operator.Mailbox, or None when there is nobody to address
+        # (a dry run, several concurrent workers). Registering the key on the
+        # same condition keeps the legend from offering what it cannot do.
+        self.messages = messages
         self.terminal = terminal if terminal is not None else terminal_for(
             enabled=enabled)
         self.layout = layout or Layout(self.legend_entries)
@@ -1741,6 +1862,7 @@ class StatusApp:
         self._signal_handlers: List[Tuple[int, object]] = []
         if default_actions:
             self.register_action(StopAction())
+            self.register_action(MessageAction())
             self.register_action(HelpAction())
 
     # --- lifecycle ---------------------------------------------------------

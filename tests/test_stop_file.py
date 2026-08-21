@@ -176,7 +176,7 @@ def test_real_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch, caps
     """A new launch leaves another run's pending stop request alone."""
     monkeypatch.setattr(cyclecore, "STOP_POLL_SECONDS", 0.01)
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
-                        lambda cmd, raw, partial: 0)
+                        lambda cmd, raw, partial, prompt="", mailbox=None: 0)
     stop = _stop_file(tmp_path)
     driver = _OneShotDriver()
     done = threading.Event()
@@ -214,7 +214,7 @@ def test_sequential_stop_file_lives_until_outer_application_exit(
 ):
     stop = tmp_path / "stop"
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
-                        lambda cmd, raw, partial: 0)
+                        lambda cmd, raw, partial, prompt="", mailbox=None: 0)
 
     with cyclecore.stop_file_lifecycle():
         result = cyclecore.run_loop(
@@ -245,7 +245,7 @@ def test_parallel_dry_run_leaves_the_stop_file(tmp_path, capsys):
 
 def test_parallel_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch, capsys):
     """A parallel launch also waits rather than stealing a pending stop."""
-    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd: (0, 0.0, 0.01))
+    monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     monkeypatch.setattr(cyclecore, "STOP_POLL_SECONDS", 0.01)
     stop = _stop_file(tmp_path)
     done = threading.Event()
@@ -276,7 +276,7 @@ def test_parallel_stop_file_lives_until_outer_application_exit(
     stop = tmp_path / "stop"
     calls = 0
 
-    def stop_after_first_job(job_id, command):
+    def stop_after_first_job(job_id, command, mailbox=None):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -308,7 +308,7 @@ def test_parallel_stop_file_is_reported_once_by_competing_workers(
     checked_lock = threading.Lock()
     real_exists = os.path.exists
 
-    def finish_jobs_together(job_id, command):
+    def finish_jobs_together(job_id, command, mailbox=None):
         jobs_ready.wait(timeout=5)
         if job_id == 1:
             stop.write_text("", encoding="utf-8")

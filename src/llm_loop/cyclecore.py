@@ -58,10 +58,13 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
-from . import exitlog
+from . import exitlog, operator, providers
 from .providers import (
     build_agent_argv as provider_argv,
+    live_messages_enabled,
+    prompt_on_stdin,
     provider_spec,
+    set_live_messages,
     start_agent_process,
     usage_source_for,
 )
@@ -600,6 +603,15 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
     p.add_argument("--no-statusline", dest="no_statusline", action="store_true",
                    help="do not pin the interactive status rows at the bottom of "
                         "the terminal (same as LLM_LOOP_STATUSLINE=0)")
+    # Same shape of rescue hatch as --no-statusline, and for the same reason: it
+    # turns off a transport, not a feature. A note typed with the `m` key still
+    # reaches the agent — with the next iteration's prompt instead of the one
+    # already running.
+    p.add_argument("--no-live-messages", dest="no_live_messages",
+                   action="store_true",
+                   help="do not keep the agent's stdin open for notes typed "
+                        "during an iteration; they wait for the next prompt "
+                        f"instead (same as {providers.LIVE_MESSAGES_ENV}=0)")
     if extra_options is not None:
         extra_options(p)
     return p.parse_args(argv)
@@ -1021,6 +1033,18 @@ def print_error(text: str) -> None:
     print_styled(text, "bold red")
 
 
+def print_note(text: str) -> None:
+    """An operator note, at the point in the stream where the agent received it.
+
+    Printed rather than merely shown on the status row because the status row is
+    transient and the mirror log is the run's record: an agent that changes
+    course mid-iteration is unexplainable later unless the sentence that made it
+    do so sits in the log next to the turn it landed in.
+    """
+    print_markup(f"  ✉ operator note: {text}",
+                 f"  [magenta]✉[/] [bold magenta]operator note:[/] {_esc(text)}")
+
+
 def print_tool(name: str, detail: str = "") -> None:
     """A tool-call line: a yellow gear glyph and the bold-yellow tool name,
     followed by the (plain, possibly empty) detail. Multi-segment, so it builds
@@ -1109,12 +1133,18 @@ def last_rate_limit_event() -> Optional[RateLimitEvent]:
     return _last_rate_limit_event
 
 
-def _render_claude_event(ev: dict, partial: bool) -> None:
+def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
     """Print a single stream-json event in the style of interactive mode.
 
     partial=True — --include-partial-messages is enabled: we print text from the
     deltas (`stream_event`), and from the final `assistant` we take only the tool
     calls, so as not to duplicate already-printed text.
+
+    `mailbox` turns the replay of an operator note (`--replay-user-messages`)
+    into a console line. Rendered here rather than where the note was typed
+    because this is the main thread, between two events — the one place a line
+    can be printed without cutting into the live Markdown block — and because
+    the replay is the CLI confirming delivery, not the console assuming it.
     """
     et = ev.get("type")
 
@@ -1166,6 +1196,11 @@ def _render_claude_event(ev: dict, partial: bool) -> None:
 
     if et == "user":
         for block in ev.get("message", {}).get("content", []):
+            if block.get("type") == "text" and mailbox is not None:
+                note = mailbox.claim_echo(block.get("text", ""))
+                if note is not None:
+                    print_note(note)
+                continue
             if block.get("type") != "tool_result":
                 continue
             content = block.get("content", "")
@@ -1256,12 +1291,20 @@ def _render_codex_event(ev: dict) -> None:
 
 
 def run_agent_streaming(cmd: list, provider: str, raw: bool,
-                        partial: bool = True, prompt: str = "") -> int:
+                        partial: bool = True, prompt: str = "",
+                        mailbox=None) -> int:
     """Run one provider CLI, parse its JSONL and render progress live.
 
     Claude's rate-limit verdict, if streamed, is left in
     ``last_rate_limit_event()``. Codex limits are queried separately through
     its app-server before and after turns.
+
+    `mailbox` is this run's `operator.Mailbox`: while the turn is in flight it
+    holds the process's stdin, so a note typed at the console reaches the agent
+    mid-iteration. The channel is closed on the turn's `result` event and again
+    in the `finally` — closing stdin is what ends a streaming-input session, so
+    an unclosed pipe is a run that never returns, and the redundancy is
+    deliberate: a crash that swallows `result` must not be able to hang the loop.
     """
     global _last_rate_limit_event
     _last_rate_limit_event = None
@@ -1272,6 +1315,17 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
         print(f"Executable {spec.executable!r} not found. "
               f"Is {spec.display_name} installed and on PATH?")
         sys.exit(2)
+
+    channel = None
+    if (mailbox is not None and live_messages_enabled(provider)
+            and proc.stdin is not None):
+        channel = operator.AgentChannel(proc.stdin)
+        mailbox.attach(channel)
+
+    def close_channel():
+        if channel is not None:
+            mailbox.detach()
+            channel.close()
 
     provider_failed = False
     try:
@@ -1293,22 +1347,36 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                 print(line)
                 continue
             if provider == "claude":
-                _render_claude_event(ev, partial)
+                # Before rendering, so the console cannot take a note for a turn
+                # that has already reported its result.
+                if ev.get("type") == "result":
+                    close_channel()
+                _render_claude_event(ev, partial, mailbox)
             else:
                 _render_codex_event(ev)
                 provider_failed = provider_failed or ev.get("type") in (
                     "error", "turn.failed")
+        close_channel()
         returncode = proc.wait()
         return 1 if returncode == 0 and provider_failed else returncode
     except KeyboardInterrupt:
+        close_channel()
         proc.terminate()
         print("\nInterrupted by user (Ctrl+C).")
         sys.exit(130)
+    finally:
+        close_channel()
 
 
-def run_claude_streaming(cmd: list, raw: bool, partial: bool) -> int:
-    """Backward-compatible Claude-only wrapper."""
-    return run_agent_streaming(cmd, "claude", raw, partial)
+def run_claude_streaming(cmd: list, raw: bool, partial: bool,
+                         prompt: str = "", mailbox=None) -> int:
+    """Backward-compatible Claude-only wrapper.
+
+    `prompt` is required whenever the live-message transport is on — the argv
+    then carries no task, only flags.
+    """
+    return run_agent_streaming(cmd, "claude", raw, partial, prompt=prompt,
+                               mailbox=mailbox)
 
 
 def _fmt_clock(ts: float) -> str:
@@ -1668,6 +1736,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     dry_run = args.dry_run
     raw = args.raw
     start_in = args.start_in      # e.g. "29m" — delay before the loop starts
+    # Decided per invocation, before the first argv is built: the transport is
+    # what --no-live-messages turns off, and both the argv and the process's
+    # stdin have to agree about it.
+    if getattr(args, "no_live_messages", False):
+        set_live_messages(False)
 
     # Anchor every project-relative operation (git/provider cwd, the stop file, the
     # log name, the Driver's paths) to the chosen root before anything reads it.
@@ -1747,11 +1820,16 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     list_driven = isinstance(driver, ListFileDriver)
     if list_driven:
         progress.track_list(len(driver.pending_lines()))
+    # One mailbox for the whole run: the console writes to it, the loop below
+    # empties it into the next prompt, and run_agent_streaming lends it the
+    # running turn's stdin. A dry run gets none — there is no agent to talk to.
+    mailbox = None if dry_run else operator.Mailbox()
     app = statusline.StatusApp(
         # From the invocation's pool: a wrapper's next runner call resumes this
         # row instead of starting a fresh Job at iteration 1.
         status=statusline.LoopStatus(jobs=progress.jobs(1)),
         settings=settings,
+        messages=mailbox,
         enabled=not dry_run and not getattr(args, "no_statusline", False))
     app.update(
         provider=provider,
@@ -1858,6 +1936,17 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 stop_reason = RunStopReason.NO_WORK
                 break
 
+            # Notes typed while nothing was running (or while the transport was
+            # off) ride this prompt. Spliced before the Job records it, so the
+            # prompt the status line shows is the prompt that was sent.
+            if mailbox is not None:
+                queued = mailbox.take_queued()
+                if queued:
+                    command = command._replace(
+                        prompt=operator.append_notes(command.prompt, queued))
+                    for note in queued:
+                        print_note(note)
+
             iteration += 1
             state_label = command.label or "(no label)"
             # Show the model this iteration will use right in the header, so the
@@ -1890,7 +1979,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             cmd = build_agent_argv(command, provider)
             if dry_run:
                 print("DRY-RUN:", " ".join(cmd))
-                if provider == "codex":
+                if prompt_on_stdin(provider):
+                    # The argv above is complete but not self-contained: the
+                    # prompt travels on stdin, so the preview has to show it
+                    # separately or it shows a command with no task in it.
                     print("STDIN:", command.prompt)
                 if not dry_run_prompt_shown:
                     # The argv line above is what will be executed, but for
@@ -1910,7 +2002,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 continue
 
             if provider == "claude":
-                returncode = run_claude_streaming(cmd, raw, partial=True)
+                returncode = run_claude_streaming(
+                    cmd, raw, partial=True, prompt=command.prompt,
+                    mailbox=mailbox)
             else:
                 returncode = run_agent_streaming(
                     cmd, provider, raw, partial=False, prompt=command.prompt)

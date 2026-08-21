@@ -92,6 +92,19 @@ Source: frankbria (`--backup` / `--rollback`).
 Optionally create a backup branch before each iteration so a bad iteration can
 be reverted. Lower value given push-forward workflow, but cheap insurance.
 
+## Known defects
+
+### [P2] A worker that dies mid-item hangs the whole parallel run
+`parallel.worker` has no `try` around its per-item body. An exception between
+`claim()` and `finish()` (or in `run_job`) ends that thread with the line still
+in `shared.in_progress`, so it is never struck and never returned to the queue —
+and every other worker then loops forever in the claim back-off, because
+`claim()` keeps returning None while neither `stop` nor `claims_closed` is set.
+The run never terminates and its `join()` never returns. Found while changing
+`run_job`'s signature: the stale test stubs raised TypeError inside the workers
+and the suite hung instead of failing. Fix: wrap the body, `shared.release(line)`
+on an unexpected exception, and treat it as a failed attempt.
+
 ## Deferred (revisit later — not now, but worth keeping on the radar)
 
 - **Setup wizard** (frankbria `ralph-enable`) — interactive bootstrap that

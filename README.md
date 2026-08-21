@@ -31,6 +31,7 @@ overnight.
 | Quota / rate limits | run until the CLI dies | the account's real figures are read over the provider's API **before** each iteration, and the loop waits under configurable ceilings (session / day-night / weekly), with a reactive `rate_limit_event` backstop |
 | Parallelism | sequential (fan-out only *inside* one agent) | `-j N` concurrent CLI workers draining a work-queue file, one item per job |
 | Stopping | Ctrl+C | `stop` sentinel file, `s` key, `--max-runs`, and an `error` state that halts for a human |
+| Steering | stop it, edit the prompt, start again | `m` types a note into the turn already running (or queues it for the next one) |
 | Providers | whatever the pipe points at | Claude and Codex adapters (argv vs. stdin prompt transport, both stream-json rendered) |
 | Observability | terminal scrollback | pinned status line (iteration, model, elapsed, live quota, per-job rows), rotating mirror log, optional Markdown rendering |
 | git | your problem | `--git-push none\|after_new_commits\|each_hour` |
@@ -182,6 +183,7 @@ src/
     usage.py       UsageSource: query / cache / parse the account's quota figures
     limits.py      LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
     drivers.py     StateFileDriver (state machine) and ListFileDriver (work queue)
+    operator.py    notes typed at the console, on their way to the running agent
     parallel.py    run_parallel: N concurrent LLM workers over a list file
     exitlog.py     why a run ended — including the endings it cannot report itself
 examples/
@@ -406,6 +408,7 @@ reading before the bounded retry path continues.
 | `--ignore-usage` | don't pause on the session budget (parallel only) |
 | `--raw` | print raw JSON events, for debugging (sequential only) |
 | `--no-statusline` | do not pin the status rows (same as `LLM_LOOP_STATUSLINE=0`) |
+| `--no-live-messages` | notes typed with `m` wait for the next prompt instead of going into the running turn (same as `LLM_LOOP_LIVE_MESSAGES=0`) |
 
 ## Why the run ended
 
@@ -455,8 +458,42 @@ absent entirely when no rule watches it. A custom rule can say something else by
 overriding `LimitRule.status(reading, now)`.
 
 Keys: `s` requests a graceful stop (it creates the same `stop` sentinel, and
-pressing `s` again during the countdown cancels it), `h` or `?` shows the full
-key list.
+pressing `s` again during the countdown cancels it), `m` sends the agent a note
+(see below), `h` or `?` shows the full key list.
+
+## Talking to the running agent (`m`)
+
+The loop is autonomous, not unattended. `m` opens a one-line editor in the
+pinned area — Enter sends, Esc discards — and what you type reaches the agent
+one of two ways:
+
+* **into the turn already running**, over its stdin, if one is in flight. It
+  lands at the model's next turn boundary (a tool call in progress is not
+  interrupted), so advice about the CURRENT task arrives while it can still
+  change the outcome. The note may also be answered right after the turn it was
+  typed in, as a continuation of the same session — either way it is answered.
+* **queued for the next iteration** otherwise (between iterations, or with
+  `--no-live-messages`), appended to that prompt as a named section. The legend
+  counts what is waiting: `m message (2 queued)`.
+
+Notes are framed before the agent sees them: who is speaking, and that a note is
+guidance rather than a replacement for the task. That matters — a bare imperative
+arriving mid-turn reads like a prompt injection, and is treated as one. It also
+means an emphatic note ("stop reading files, do X instead") is obeyed literally:
+say what you mean.
+
+Every note is printed into the scrolling output — and therefore into the mirror
+log — at the point where the agent received it, so an iteration that changed
+course mid-flight is explainable afterwards. The receipt is the CLI's own replay
+of the message, not this end assuming the pipe was read.
+
+The key exists only when the run has exactly one agent to address: the sequential
+loop, or `-j 1`. With several workers sharing one terminal there is no
+unambiguous recipient, so `m` is not offered.
+
+Two things `m` is not: it does not talk to `codex` (its non-interactive mode
+reads one prompt from a stdin it then needs closed), and it is not a paste
+target — one line, and a newline sends.
 
 ## Per-user settings
 

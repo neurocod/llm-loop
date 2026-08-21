@@ -69,6 +69,7 @@ FLAG_ALIASES: Dict[str, Flag] = {
     "--cost": Flag(("-c", "--cost"), False),
     "--ignore-usage": Flag(("--ignore-usage",), False),
     "--no-statusline": Flag(("--no-statusline",), False),
+    "--no-live-messages": Flag(("--no-live-messages",), False),
     "--parallel": Flag(("-p", "--parallel"), False),
     "--grow-kit": Flag(("--grow-kit",), False),
     "--random": Flag(("--random",), False),

@@ -19,11 +19,18 @@ def _restore_streams():
     sys.stdout, sys.stderr = out, err
 
 
-def test_claude_argv_keeps_existing_contract():
+@pytest.fixture
+def no_live_messages(monkeypatch):
+    """The pre-operator-notes transport: prompt in argv, stdin inherited."""
+    monkeypatch.setattr(providers, "_LIVE_MESSAGES", False)
+
+
+def test_claude_argv_keeps_existing_contract(no_live_messages):
     argv = build_agent_argv(AgentCommand("work", "opus"), "claude", "/repo")
     assert argv[:5] == ["claude", "-p", "work", "--model", "opus"]
     assert "--output-format" in argv
     assert "stream-json" in argv
+    assert "--input-format" not in argv
 
 
 def test_codex_argv_is_non_interactive_jsonl():
@@ -200,7 +207,7 @@ def test_codex_process_receives_prompt_via_closed_stdin(monkeypatch):
     assert proc.stdin.closed
 
 
-def test_claude_process_keeps_prompt_out_of_stdin(monkeypatch):
+def test_claude_process_keeps_prompt_out_of_stdin(monkeypatch, no_live_messages):
     created = []
 
     def fake_popen(argv, **kwargs):
