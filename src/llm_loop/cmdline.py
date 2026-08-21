@@ -1,7 +1,7 @@
 """cmdline - answer "what command line would reproduce this run?".
 
 The interactive status line lets a run's settings be edited while it is going
-(iteration cap, strike budget, quota ceilings). Key `c` then has to show a line
+(iteration cap, git-push policy, quota ceilings). Key `c` then has to show a line
 the user can paste to relaunch with exactly those settings. That is this module:
 it takes the run's ORIGINAL argv and a dict of overrides and gives back an argv
 with every existing spelling of each overridden flag removed and the new value
