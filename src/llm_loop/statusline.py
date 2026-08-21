@@ -1096,11 +1096,23 @@ CSI_KEYS = {
     "A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end",
     "1~": "home", "3~": "delete", "4~": "end", "5~": "pgup", "6~": "pgdn",
     "7~": "home", "8~": "end",
+    # Modified arrows: `ESC [ 1 ; <mod> <letter>`, where the modifier is
+    # 1+bitmask (2 shift, 4 alt, 8 ctrl). Ctrl (5) and Alt (3) both mean
+    # word-wise here — which one a terminal actually sends is not the typist's
+    # choice, and no other meaning is on offer in a one-line editor.
+    "1;5C": "wordright", "1;5D": "wordleft",
+    "1;3C": "wordright", "1;3D": "wordleft",
+    "1;5H": "home", "1;5F": "end",
 }
-# msvcrt reports these as a '\x00'/'\xe0' lead byte plus a scan code.
+# msvcrt reports these as a '\x00'/'\xe0' lead byte plus a scan code. The
+# word-wise codes are the console's own (Ctrl+Left 0x73 's', Ctrl+Right 0x74
+# 't', Ctrl+Home 0x77 'w', Ctrl+End 0x75 'u'); the lead byte is what keeps them
+# from colliding with those letters.
 WINDOWS_KEYS = {
     "H": "up", "P": "down", "K": "left", "M": "right", "G": "home", "O": "end",
     "I": "pgup", "Q": "pgdn", "S": "delete",
+    "s": "wordleft", "t": "wordright", "w": "home", "u": "end",
+    "\x93": "delete",                       # Ctrl+Delete
 }
 _WINDOWS_LEAD = ("\x00", "\xe0")
 
@@ -1402,6 +1414,169 @@ class NormalMode(Mode):
 # --- typing a note to the running agent ----------------------------------------
 
 
+class LineEditor:
+    """One editable line: a buffer, a cursor, and the keys that move them.
+
+    Split from MessageMode because the two answer different questions — the Mode
+    decides what Enter and Esc MEAN for a note, this decides what `left` does to
+    a string — and only this half can be exercised without a terminal, a mailbox
+    or a running loop.
+
+    No editing library sits under it on purpose. `readline`, `prompt_toolkit`
+    and the full-screen toolkits all want to own stdin and to draw the line
+    themselves; this app already owns both (a reserved region at the bottom of
+    the scrollback, its own cbreak reader, its own repaint thread), so a second
+    owner would fight it for the cursor rather than add anything. What was
+    actually missing was smaller than the seam: `_EscapeDecoder` has delivered
+    symbolic `Key("left")`/`Key("home")` since wave 1, and the editor simply
+    dropped them.
+
+    A key it does not recognise is REFUSED (False) rather than swallowed, so the
+    Mode above stays free to give that key a meaning of its own.
+    """
+
+    def __init__(self, text: str = ""):
+        self.buffer = text
+        self.cursor = len(text)
+
+    # --- state ---------------------------------------------------------------
+
+    @property
+    def head(self) -> str:
+        """Everything before the cursor."""
+        return self.buffer[:self.cursor]
+
+    @property
+    def tail(self) -> str:
+        """Everything from the cursor on."""
+        return self.buffer[self.cursor:]
+
+    def set(self, text: str, cursor: Optional[int] = None) -> None:
+        self.buffer = text
+        self.cursor = len(text) if cursor is None else self._clamp(cursor)
+
+    def clear(self) -> None:
+        self.set("")
+
+    def _clamp(self, index: int) -> int:
+        return max(0, min(len(self.buffer), index))
+
+    # --- edits ---------------------------------------------------------------
+
+    def insert(self, text: str) -> None:
+        self.buffer = self.head + text + self.tail
+        self.cursor += len(text)
+
+    def backspace(self) -> None:
+        if self.cursor:
+            self.buffer = self.buffer[:self.cursor - 1] + self.tail
+            self.cursor -= 1
+
+    def delete(self) -> None:
+        """Delete forward — the key the old editor had no answer for at all."""
+        self.buffer = self.head + self.buffer[self.cursor + 1:]
+
+    def kill_to_start(self) -> None:
+        self.buffer = self.tail
+        self.cursor = 0
+
+    def kill_to_end(self) -> None:
+        self.buffer = self.head
+
+    def kill_word_left(self) -> None:
+        start = self.word_start()
+        self.buffer = self.buffer[:start] + self.tail
+        self.cursor = start
+
+    # --- motion --------------------------------------------------------------
+
+    def move(self, delta: int) -> None:
+        self.cursor = self._clamp(self.cursor + delta)
+
+    def home(self) -> None:
+        self.cursor = 0
+
+    def end(self) -> None:
+        self.cursor = len(self.buffer)
+
+    def word_start(self) -> int:
+        """Index of the start of the word left of the cursor (readline's rule:
+        skip the whitespace you are sitting in, then the word before it)."""
+        index = self.cursor
+        while index > 0 and self.buffer[index - 1].isspace():
+            index -= 1
+        while index > 0 and not self.buffer[index - 1].isspace():
+            index -= 1
+        return index
+
+    def word_end(self) -> int:
+        """Index just past the word right of the cursor."""
+        index, size = self.cursor, len(self.buffer)
+        while index < size and self.buffer[index].isspace():
+            index += 1
+        while index < size and not self.buffer[index].isspace():
+            index += 1
+        return index
+
+    # --- key dispatch --------------------------------------------------------
+
+    # Symbolic keys (from _EscapeDecoder) and the readline control characters
+    # side by side: the arrows are the discoverable path, the control keys the
+    # fast one — and they are the ONLY path left on a terminal that eats
+    # modified arrows, which many do.
+    ACTIONS = {
+        "left": lambda e: e.move(-1),
+        "right": lambda e: e.move(1),
+        "home": home,
+        "end": end,
+        "delete": delete,
+        "wordleft": lambda e: setattr(e, "cursor", e.word_start()),
+        "wordright": lambda e: setattr(e, "cursor", e.word_end()),
+        "\x08": backspace,          # Backspace (msvcrt) / Ctrl+H
+        "\x7f": backspace,          # Backspace (POSIX)
+        "\x01": home,               # Ctrl+A
+        "\x05": end,                # Ctrl+E
+        "\x02": lambda e: e.move(-1),   # Ctrl+B
+        "\x06": lambda e: e.move(1),    # Ctrl+F
+        "\x04": delete,             # Ctrl+D
+        "\x0b": kill_to_end,        # Ctrl+K
+        "\x15": kill_to_start,      # Ctrl+U
+        "\x17": kill_word_left,     # Ctrl+W
+    }
+
+    def handle(self, char: str) -> bool:
+        """Apply one key. True if it was ours."""
+        action = self.ACTIONS.get(char)
+        if action is not None:
+            action(self)
+            return True
+        # Length 1 keeps the symbolic names out; `isprintable` keeps the
+        # remaining control characters out. A pasted burst arrives one character
+        # at a time and lands here, which is why insertion is at the cursor.
+        if len(char) == 1 and char.isprintable():
+            self.insert(char)
+            return True
+        return False
+
+
+def fit_edit_line(head: str, tail: str, width: int) -> str:
+    """`head`+`tail` windowed to `width` columns with the join kept visible.
+
+    The join is where the caret is drawn, and it is the one column that must
+    never scroll off: it is the only thing telling the typist where the next
+    character goes. Either side may be trimmed, each marked with '…' on the side
+    that was cut, and a slice of what follows the cursor is held back so the
+    caret is not pinned to the right edge in the middle of a long line.
+    """
+    if width <= 0:
+        return ""
+    if cell_width(head) + cell_width(tail) <= width:
+        return head + tail
+    keep = min(cell_width(tail), max(0, (width - 1) // 3))
+    left = fit_tail(head, width - keep)
+    return left + fit(tail, max(0, width - cell_width(left)))
+
+
 class MessagePromptRow(Row):
     """The line being typed, pinned under the status rows.
 
@@ -1419,10 +1594,11 @@ class MessagePromptRow(Row):
         self.mode = mode
 
     def render(self, status, width, now=None):
-        body = fit_tail(self.mode.buffer + self.caret,
-                        max(0, width - cell_width(self.prefix)))
+        editor = self.mode.editor
+        body = fit_edit_line(editor.head + self.caret, editor.tail,
+                             max(0, width - cell_width(self.prefix)))
         line = self.prefix + body
-        if not self.mode.buffer:
+        if not editor.buffer:
             line += self.hint
         return fit(line, width)
 
@@ -1440,14 +1616,20 @@ class MessageMode(Mode):
 
     def __init__(self, app):
         super().__init__(app)
-        self.buffer = ""
+        self.editor = LineEditor()
+
+    @property
+    def buffer(self) -> str:
+        """What has been typed so far. Read-only: edits go through the editor."""
+        return self.editor.buffer
 
     def rows(self, status):
         return [MessagePromptRow(self)]
 
     def legend(self):
         """While typing, `s` is a letter — so the legend must not offer it."""
-        return [("Enter", "send"), ("Esc", "clear / leave")]
+        return [("Enter", "send"), ("Esc", "clear / leave"),
+                ("←/→", "move"), ("^W/^U/^K", "erase")]
 
     def handle(self, event):
         if not isinstance(event, Key):
@@ -1457,12 +1639,10 @@ class MessageMode(Mode):
             self.submit()
         elif char == "\x1b":
             self.escape()
-        elif char in ("\x08", "\x7f"):   # msvcrt / POSIX spellings of backspace
-            self.buffer = self.buffer[:-1]
-        elif len(char) == 1 and char.isprintable():
-            self.buffer += char
-        # Anything else (arrows, page keys, control characters) is swallowed
-        # rather than dispatched: see the class docstring.
+        else:
+            self.editor.handle(char)
+        # Whatever the editor refused (page keys, unbound control characters) is
+        # swallowed rather than dispatched: see the class docstring.
         return True
 
     def submit(self):
@@ -1475,8 +1655,8 @@ class MessageMode(Mode):
         for. Staying means the mode is left only by an explicit Esc, and sending
         several notes in a row costs nothing.
         """
-        text = self.buffer.strip()
-        self.buffer = ""
+        text = self.editor.buffer.strip()
+        self.editor.clear()
         delivery = self.app.messages.submit(text) if self.app.messages else None
         self.app.note(delivery.message if delivery is not None
                       else "empty note discarded")
@@ -1488,8 +1668,8 @@ class MessageMode(Mode):
         Alt+key as ESC followed by the key, so a single-step Esc would let that
         key through to the normal dispatch.
         """
-        if self.buffer:
-            self.buffer = ""
+        if self.editor.buffer:
+            self.editor.clear()
             self.app.note("note discarded — Esc again to leave")
             return
         self.app.pop_mode()

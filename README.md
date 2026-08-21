@@ -479,6 +479,13 @@ closed on Enter would hand the rest of a pasted line to the normal keys, `s`
 included.) While the editor is open the legend shows its keys and not the run's,
 because in there `s` is a letter.
 
+The line is properly editable, not append-only: ←/→ move the cursor and typing
+lands where it points, Ctrl+←/→ move by word, Home/End (Ctrl+A / Ctrl+E) jump to
+either end, Delete cuts forward, and Ctrl+W / Ctrl+U / Ctrl+K erase the word
+before the cursor / everything before it / everything after it. The view scrolls
+to keep the caret visible when the note outgrows the row. Both spellings of
+every key are decoded, so the same bindings work on Windows and POSIX.
+
 What you type reaches the agent one of two ways:
 
 * **into the turn already running**, over its stdin, if one is in flight. It

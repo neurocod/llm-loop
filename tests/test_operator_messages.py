@@ -542,7 +542,8 @@ def test_the_legend_stops_offering_keys_the_editor_has_taken(tmp_path):
 
     keys = dict(app.legend_entries())
     assert "s" not in keys, "`s` is a letter in here — the legend must not lie"
-    assert keys == {"Enter": "send", "Esc": "clear / leave"}
+    assert keys == {"Enter": "send", "Esc": "clear / leave",
+                    "←/→": "move", "^W/^U/^K": "erase"}
 
 
 def test_the_stop_key_inside_a_note_is_a_letter_not_a_stop(tmp_path):
@@ -585,10 +586,10 @@ def test_the_prompt_row_shows_the_end_of_a_long_line(tmp_path):
     assert row.endswith("码" + sl.MessagePromptRow.caret)
 
 
-def test_arrow_keys_are_swallowed_rather_than_dispatched(tmp_path):
+def test_an_unbound_key_is_swallowed_rather_than_dispatched(tmp_path):
     """Whatever the terminal sends, nothing may fall through to the normal keys.
 
-    Discriminating on the NOTE: an arrow reaching NormalMode is answered with
+    Discriminating on the NOTE: a key reaching NormalMode is answered with
     "unknown key", so the hint being replaced is the visible symptom of a key
     that fell through.
     """
@@ -596,11 +597,120 @@ def test_arrow_keys_are_swallowed_rather_than_dispatched(tmp_path):
     app.handle_event(sl.Key("m"))
     hint = app.status.note
 
-    app.handle_event(sl.Key("left"))
     app.handle_event(sl.Key("pgup"))
+    app.handle_event(sl.Key("\x00"))
 
     assert app.mode.name == "message" and app.mode.buffer == ""
     assert app.status.note == hint
+
+
+# --- editing the line ----------------------------------------------------------
+
+
+def test_the_cursor_moves_and_typing_lands_where_it_points(tmp_path):
+    """The report this fixes: the line was append-only, so a typo three words
+    back could only be reached by erasing everything after it."""
+    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
+    app.handle_event(sl.Key("m"))
+    _type(app, "use the studs")
+
+    for _ in range(len("studs")):
+        app.handle_event(sl.Key("left"))
+    _type(app, "big ")
+
+    assert app.mode.buffer == "use the big studs"
+
+    app.handle_event(sl.Key("home"))
+    _type(app, "please ")
+    app.handle_event(sl.Key("end"))
+    _type(app, "!")
+
+    assert app.mode.buffer == "please use the big studs!"
+
+
+def test_backspace_and_delete_work_off_the_cursor(tmp_path):
+    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
+    app.handle_event(sl.Key("m"))
+    _type(app, "abXcd")
+    for _ in range(3):
+        app.handle_event(sl.Key("left"))
+
+    app.handle_event(sl.Key("delete"))          # forward: eats the X
+    assert app.mode.buffer == "abcd"
+
+    app.handle_event(sl.Key("\x7f"))            # backward: eats the b
+    assert app.mode.buffer == "acd"
+
+
+def test_word_moves_and_word_erase(tmp_path):
+    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
+    app.handle_event(sl.Key("m"))
+    _type(app, "measure the second shelf")
+
+    app.handle_event(sl.Key("wordleft"))        # Ctrl+Left, both platforms
+    app.handle_event(sl.Key("\x17"))            # Ctrl+W: erase "second "
+    assert app.mode.buffer == "measure the shelf"
+
+    app.handle_event(sl.Key("wordright"))       # to the end of "shelf"
+    _type(app, "!")
+    assert app.mode.buffer == "measure the shelf!"
+
+
+def test_the_kill_keys_cut_from_the_cursor(tmp_path):
+    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
+    app.handle_event(sl.Key("m"))
+    _type(app, "keep this drop that")
+    for _ in range(len("drop that")):
+        app.handle_event(sl.Key("left"))
+
+    app.handle_event(sl.Key("\x0b"))            # Ctrl+K
+    assert app.mode.buffer == "keep this "
+
+    app.handle_event(sl.Key("\x15"))            # Ctrl+U
+    assert app.mode.buffer == ""
+
+
+def test_the_cursor_stays_visible_in_a_line_wider_than_the_row(tmp_path):
+    """A window that only ever showed the tail would scroll the caret off the
+    moment the typist went back to fix something."""
+    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
+    app.handle_event(sl.Key("m"))
+    _type(app, "码" * 100)
+    for _ in range(60):
+        app.handle_event(sl.Key("left"))
+
+    row = app.render(width=40)[-1]
+
+    assert sl.cell_width(row) <= 40
+    assert sl.MessagePromptRow.caret in row
+    assert row.startswith(" ✉ …") and row.endswith("…")
+
+
+def test_sending_resets_the_cursor_with_the_buffer(tmp_path):
+    """A cursor left behind would put the next note's first character in the
+    middle of nothing."""
+    mailbox = operator.Mailbox()
+    app = _app(mailbox, stop_file=str(tmp_path / "stop"))
+    app.handle_event(sl.Key("m"))
+    _type(app, "first note")
+    app.handle_event(sl.Key("home"))
+    app.handle_event(sl.Key("\r"))
+
+    _type(app, "second")
+
+    assert app.mode.editor.cursor == len("second")
+    assert app.mode.buffer == "second"
+
+
+def test_the_editor_refuses_what_it_does_not_own():
+    """MessageMode gives Enter and Esc their own meaning, so the editor must not
+    quietly consume them — nor any other key a later Mode may want."""
+    editor = sl.LineEditor("ab")
+
+    assert editor.handle("pgup") is False
+    assert editor.handle("\r") is False
+    assert editor.handle("\x1b") is False
+    assert editor.buffer == "ab"
 
 
 def test_the_legend_counts_what_is_still_waiting(tmp_path):
