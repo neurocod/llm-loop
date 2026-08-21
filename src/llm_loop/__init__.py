@@ -79,6 +79,7 @@ from .providers import (
     runtime_argv,
     usage_source_for,
 )
+from .operator import Mailbox
 from .codex_usage import CodexUsageSource, parse_rate_limits
 from .usage import Usage, UsageReading, UsageSource, oauth_token, parse_usage
 from .limits import (
@@ -130,6 +131,10 @@ __all__ = [
     "LimitRule",
     "ListFileDriver",
     "LoopStatus",
+    # The only valid argument to run_agent_streaming's and StatusApp's
+    # `mailbox=`/`messages=`, so an embedder building its own front end needs it
+    # from the front door rather than from llm_loop.operator.
+    "Mailbox",
     "LoopStop",
     "Mode",
     "NumberSetting",

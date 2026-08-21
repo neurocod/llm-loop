@@ -37,6 +37,7 @@ __all__ = [
     "ChannelError",
     "Delivery",
     "Mailbox",
+    "NullChannel",
     "append_notes",
     "frame_live",
     "user_message_line",
@@ -113,12 +114,21 @@ class AgentChannel:
     thread closes it when the turn's `result` event arrives, and a note that
     loses that race is refused rather than written into a pipe nobody is
     reading any more.
+
+    A `mailbox` is attached on construction and detached on close, because
+    those two are one pair: a mailbox still holding a closed channel would keep
+    offering the console a pipe nobody reads. Left None, the channel exists only
+    to be closed — which every process of a streaming-input CLI needs, whether
+    or not anybody is listening (see `providers.note_channel`).
     """
 
-    def __init__(self, stream):
+    def __init__(self, stream, mailbox: Optional["Mailbox"] = None):
         self._stream = stream
         self._lock = threading.Lock()
         self._closed = False
+        self._mailbox = mailbox
+        if mailbox is not None:
+            mailbox.attach(self)
 
     @property
     def closed(self) -> bool:
@@ -143,8 +153,14 @@ class AgentChannel:
         """Close the pipe: for a streaming-input CLI this is what ends the session.
 
         Safe to call twice; never raises, because it runs on the way out of a
-        run that may already be failing for another reason.
+        run that may already be failing for another reason. Detaches first, so
+        the window in which the console can still reach a closing pipe is as
+        small as it can be — and a note that lands inside it is refused and
+        queued rather than lost.
         """
+        mailbox, self._mailbox = self._mailbox, None
+        if mailbox is not None:
+            mailbox.detach()
         with self._lock:
             if self._closed:
                 return
@@ -153,6 +169,24 @@ class AgentChannel:
                 self._stream.close()
             except (OSError, ValueError):
                 pass
+
+
+class NullChannel:
+    """No pipe to talk through, and closing it is a no-op.
+
+    Exists so a runner can hold "the channel for this process" unconditionally:
+    the alternative is an `if channel is None` before every use, which is
+    exactly the guard that once tied closing the pipe to whether anyone wanted
+    to write to it.
+    """
+
+    closed = True
+
+    def send(self, text: str) -> None:
+        raise ChannelError("this run has no live channel")
+
+    def close(self) -> None:
+        return None
 
 
 class Delivery(NamedTuple):
@@ -204,6 +238,19 @@ class Mailbox:
         with self._lock:
             queued, self._queued = self._queued, []
             return queued
+
+    def splice(self, prompt: str) -> Tuple[str, List[str]]:
+        """(`prompt` with the queued notes in it, the notes that went in).
+
+        Both runners do this at the same moment - after the driver names the
+        next command and BEFORE the status line records its prompt, so the
+        prompt shown is the prompt sent. That ordering is policy, and policy
+        that lives at two call sites is policy only one of them will follow the
+        next time it changes; what legitimately differs between them - how a
+        note is announced - stays with the caller.
+        """
+        notes = self.take_queued()
+        return append_notes(prompt, notes), notes
 
     def claim_echo(self, replayed: str) -> Optional[str]:
         """The human's text for a replayed user message, or None if it is not ours.

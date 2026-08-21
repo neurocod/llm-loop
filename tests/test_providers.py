@@ -20,9 +20,12 @@ def _restore_streams():
 
 
 @pytest.fixture
-def no_live_messages(monkeypatch):
+def no_live_messages():
     """The pre-operator-notes transport: prompt in argv, stdin inherited."""
-    monkeypatch.setattr(providers, "_LIVE_MESSAGES", False)
+    previous = providers.live_messages_enabled("claude")
+    providers.set_live_messages(False)
+    yield
+    providers.set_live_messages(previous)
 
 
 def test_claude_argv_keeps_existing_contract(no_live_messages):

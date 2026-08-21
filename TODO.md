@@ -105,6 +105,29 @@ The run never terminates and its `join()` never returns. Found while changing
 and the suite hung instead of failing. Fix: wrap the body, `shared.release(line)`
 on an unexpected exception, and treat it as a failed attempt.
 
+## Structure worth doing when something takes you there anyway
+
+Three findings from the structural pass over the operator-note commits. None is
+worth its churn on its own; each has a trigger that makes it cheap.
+
+- **`statusline.py`, lines ~894–1290 are a separable front end.** `Terminal`,
+  `NullTerminal`, `terminal_for`, the `InputEvent` family, `decode_escape`,
+  `InputSource`, `TerminalInput`, `_EscapeDecoder` — ~400 lines that reference
+  `LoopStatus`, `Row` and `Segment` exactly zero times. Trigger: a second front
+  end, or a platform that needs its own reader. Not before — the operator-note
+  change touched three regions of this file at once, and under any split that
+  would have been a three-file change with two new import edges.
+- **`operator.py` vs `providers.py` could be split by ownership** — providers
+  owns the pipe (open, wire format, channel, close), operator owns the policy
+  (framing, queue, receipts). Today `user_message_line` (a stream-json fact)
+  lives in operator because `AgentChannel` needs it. Trigger: a second transport
+  with a different wire format.
+- **Test fixtures: three `_MemDriver` subclasses and seven args namespaces**
+  across `test_parallel_statusline`, `test_parallel_termination` and
+  `test_operator_messages`, with no `conftest.py` anywhere. The cost is three
+  copies of a driver that must stay behaviourally identical for the parallel
+  tests to mean the same thing. Trigger: the next test file that needs a fourth.
+
 ## Deferred (revisit later — not now, but worth keeping on the radar)
 
 - **Setup wizard** (frankbria `ralph-enable`) — interactive bootstrap that

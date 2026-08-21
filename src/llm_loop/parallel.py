@@ -56,9 +56,8 @@ from .cyclecore import (
     _describe_tool,
     _short,
 )
-from .providers import (live_messages_enabled, provider_spec,
-                        set_live_messages, start_agent_process,
-                        usage_source_for)
+from .providers import (note_channel, provider_spec, set_live_messages,
+                        start_agent_process, usage_source_for)
 from .drivers import ListFileDriver
 
 # Default worker count. The work is cheap and fully independent, so a handful of
@@ -177,6 +176,16 @@ def emit_job(job_id: int, plain: str, style: Optional[str] = None) -> None:
     _emit_markup(f"{tag_plain} {plain}", f"{tag_markup} {body_markup}")
 
 
+def emit_note(job_id: int, note: str) -> None:
+    """An operator note attributed to a worker — this runner's `print_note`.
+
+    One place for the glyph, the colour and the label, because a note is
+    announced twice (when it rides a prompt, and when the CLI replays one that
+    went in live) and the two must not drift into looking like different things.
+    """
+    emit_job(job_id, f"✉ operator note: {note}", "magenta")
+
+
 def emit_tool(job_id: int, name: str, detail: str) -> None:
     """A tool-call line for a worker: '[job k] ⚙ Write: path'."""
     tag_plain, tag_markup = _job_tag(job_id)
@@ -211,22 +220,6 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
         emit_job(job_id, f"executable {spec.executable!r} not found on PATH.", "bold red")
         return 2, None, None
 
-    # Whether or not this run hands out a mailbox (only `-j 1` does), the pipe
-    # the transport left open has to be closed here — see the same seam in
-    # cyclecore.run_agent_streaming for what tying it to the mailbox cost.
-    channel = None
-    if live_messages_enabled(provider) and proc.stdin is not None:
-        channel = operator.AgentChannel(proc.stdin)
-        if mailbox is not None:
-            mailbox.attach(channel)
-
-    def close_channel():
-        if channel is None:
-            return
-        if mailbox is not None:
-            mailbox.detach()
-        channel.close()
-
     cost_usd = None
     duration_s = None
     provider_failed = False
@@ -236,7 +229,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # `exit 1` and no cause anywhere. Kept as a bounded tail — a chatty CLI must
     # not be able to grow a worker's memory — and printed only if the job fails.
     diagnostics = collections.deque(maxlen=FAILURE_TAIL_LINES)
-    try:
+    with note_channel(proc, provider, mailbox) as channel:
         for line in proc.stdout:
             line = line.rstrip("\n")
             if not line:
@@ -294,7 +287,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     if block.get("type") == "text" and mailbox is not None:
                         note = mailbox.claim_echo(block.get("text", ""))
                         if note is not None:
-                            emit_job(job_id, f"✉ operator note: {note}", "magenta")
+                            emit_note(job_id, note)
                     if block.get("type") == "tool_result" and block.get("is_error"):
                         content = block.get("content", "")
                         if isinstance(content, list):
@@ -314,7 +307,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
             elif et == "result":
                 # Before the figures: once the turn has reported, the console
                 # must not be able to write into a session that is closing.
-                close_channel()
+                channel.close()
                 # A process emits a second `result` when a late note is answered
                 # as its own turn. The two figures then have to be combined
                 # differently, which is measured rather than assumed:
@@ -325,11 +318,9 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                 dur = ev.get("duration_ms")
                 if dur is not None:
                     duration_s = (duration_s or 0.0) + dur / 1000
-    finally:
-        # Closing stdin is what ends a streaming-input session, so this is not
-        # tidying: a channel left open on any path out of the loop is a worker
-        # thread that never returns and a run whose final join() never finishes.
-        close_channel()
+    # Outside the `with`, so the pipe is closed before we wait on the process:
+    # a worker waiting on a CLI whose stdin is still open never returns, and a
+    # run whose final join() never finishes is the whole fleet.
     returncode = proc.wait()
     if returncode == 0 and provider_failed:
         returncode = 1
@@ -623,12 +614,11 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # Notes typed while no turn was in flight ride this prompt (only a
         # single-worker run has a mailbox at all — see run_parallel).
         if mailbox is not None:
-            queued = mailbox.take_queued()
-            if queued:
-                command = command._replace(
-                    prompt=operator.append_notes(command.prompt, queued))
-                for note in queued:
-                    emit_job(job_id, f"✉ operator note: {note}", "magenta")
+            spliced, notes = mailbox.splice(command.prompt)
+            if notes:
+                command = command._replace(prompt=spliced)
+                for note in notes:
+                    emit_note(job_id, note)
         # The same three calls the sequential loop makes on its single Job: the
         # Job clock times THIS file, the run clock (latched once) times the run.
         started_at = time.time()

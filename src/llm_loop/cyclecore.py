@@ -61,7 +61,7 @@ from typing import Callable, NamedTuple, Optional
 from . import exitlog, operator, providers
 from .providers import (
     build_agent_argv as provider_argv,
-    live_messages_enabled,
+    note_channel,
     prompt_on_stdin,
     provider_spec,
     set_live_messages,
@@ -1352,64 +1352,45 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
               f"Is {spec.display_name} installed and on PATH?")
         sys.exit(2)
 
-    # Built whenever the transport left a pipe open — NOT only when somebody
-    # wants to talk through it. Closing it is what ends the CLI's session, so
-    # tying the close to the mailbox made "nobody is listening to this run" mean
-    # "this run never ends": measured, a `-j 2+` worker sat on a finished turn
-    # for as long as it was allowed to (its result came back in 2.7 s; the call
-    # returned only when the process was killed at 90 s).
-    channel = None
-    if live_messages_enabled(provider) and proc.stdin is not None:
-        channel = operator.AgentChannel(proc.stdin)
-        if mailbox is not None:
-            mailbox.attach(channel)
-
-    def close_channel():
-        if channel is None:
-            return
-        if mailbox is not None:
-            mailbox.detach()
-        channel.close()
-
     provider_failed = False
     try:
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            if raw:
-                print(line)
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                # non-JSON line (e.g. CLI diagnostics) — print it as is
-                print(line)
-                continue
-            if not isinstance(ev, dict):
-                # A JSON scalar/array is diagnostic output, not a JSONL event.
-                print(line)
-                continue
-            if provider == "claude":
-                # Before rendering, so the console cannot take a note for a turn
-                # that has already reported its result.
-                if ev.get("type") == "result":
-                    close_channel()
-                _render_claude_event(ev, partial, mailbox)
-            else:
-                _render_codex_event(ev)
-                provider_failed = provider_failed or ev.get("type") in (
-                    "error", "turn.failed")
-        close_channel()
+        with note_channel(proc, provider, mailbox) as channel:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                if raw:
+                    print(line)
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    # non-JSON line (e.g. CLI diagnostics) — print it as is
+                    print(line)
+                    continue
+                if not isinstance(ev, dict):
+                    # A JSON scalar/array is diagnostic output, not a JSONL event.
+                    print(line)
+                    continue
+                if provider == "claude":
+                    # Before rendering, so the console cannot take a note for a
+                    # turn that has already reported its result.
+                    if ev.get("type") == "result":
+                        channel.close()
+                    _render_claude_event(ev, partial, mailbox)
+                else:
+                    _render_codex_event(ev)
+                    provider_failed = provider_failed or ev.get("type") in (
+                        "error", "turn.failed")
+        # Outside the `with`, so the pipe is already closed: waiting on a
+        # process whose stdin is still open is the hang this whole seam exists
+        # to prevent.
         returncode = proc.wait()
         return 1 if returncode == 0 and provider_failed else returncode
     except KeyboardInterrupt:
-        close_channel()
         proc.terminate()
         print("\nInterrupted by user (Ctrl+C).")
         sys.exit(130)
-    finally:
-        close_channel()
 
 
 def run_claude_streaming(cmd: list, raw: bool, partial: bool,
@@ -1983,14 +1964,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 break
 
             # Notes typed while nothing was running (or while the transport was
-            # off) ride this prompt. Spliced before the Job records it, so the
-            # prompt the status line shows is the prompt that was sent.
+            # off) ride this prompt — see Mailbox.splice for the ordering.
             if mailbox is not None:
-                queued = mailbox.take_queued()
-                if queued:
-                    command = command._replace(
-                        prompt=operator.append_notes(command.prompt, queued))
-                    for note in queued:
+                spliced, notes = mailbox.splice(command.prompt)
+                if notes:
+                    command = command._replace(prompt=spliced)
+                    for note in notes:
                         print_note(note)
 
             iteration += 1

@@ -27,9 +27,16 @@ from llm_loop.providers import build_agent_argv, start_agent_process
 
 
 @pytest.fixture(autouse=True)
-def _live_messages_on(monkeypatch):
-    """The default transport, whatever the environment of the test machine says."""
-    monkeypatch.setattr(providers, "_LIVE_MESSAGES", True)
+def _live_messages_on():
+    """The default transport, whatever the environment of the test machine says.
+
+    Through the setter, not the private global: a runner flips it the same way,
+    so a test that leaves it wrong leaves it wrong for the rest of the session.
+    """
+    previous = providers.live_messages_enabled("claude")
+    providers.set_live_messages(True)
+    yield
+    providers.set_live_messages(previous)
 
 
 # --- the transport ------------------------------------------------------------
@@ -51,6 +58,28 @@ def test_codex_is_untouched_by_the_live_transport():
     assert argv[-1] == "-"
     assert "--input-format" not in argv
     assert not providers.live_messages_enabled("codex")
+
+
+def _capture_status_app(monkeypatch):
+    """Make both runners build a headless StatusApp, and report what it was given.
+
+    Returns a dict that gains `messages` — the mailbox the runner handed to the
+    console — once the runner has built its status line. Both the sequential and
+    the parallel test need exactly this, and they are asserting the same thing
+    about two runners, so they share the patch rather than each carrying a copy.
+    """
+    seen = {}
+    real_app_class = sl.StatusApp
+
+    def _build(**kwargs):
+        seen["messages"] = kwargs.get("messages")
+        return real_app_class(terminal=sl.NullTerminal(),
+                              input_source=sl.NullInputSource(), refresh=60,
+                              **{k: v for k, v in kwargs.items()
+                                 if k != "enabled"})
+
+    monkeypatch.setattr(sl, "StatusApp", _build)
+    return seen
 
 
 class _Sink:
@@ -131,7 +160,7 @@ def test_a_live_note_is_framed_before_the_agent_sees_it():
     """A bare imperative arriving mid-turn reads like a prompt injection."""
     sink = _Sink()
     mailbox = operator.Mailbox()
-    mailbox.attach(operator.AgentChannel(sink))
+    operator.AgentChannel(sink, mailbox)      # attaches itself
 
     delivery = mailbox.submit("use the kit's lathe")
 
@@ -141,25 +170,39 @@ def test_a_live_note_is_framed_before_the_agent_sees_it():
     assert operator.LIVE_NOTE_HEADER in written
 
 
-def test_a_note_that_loses_the_race_with_the_end_of_the_turn_is_queued():
+def test_a_closed_channel_takes_the_mailbox_with_it():
+    """Closing detaches, so a note typed afterwards is simply a queued note."""
     sink = _Sink()
     mailbox = operator.Mailbox()
-    channel = operator.AgentChannel(sink)
-    mailbox.attach(channel)
-    channel.close()             # the result event arrived first
+    operator.AgentChannel(sink, mailbox).close()   # the result event won
 
     delivery = mailbox.submit("too late")
 
     assert not delivery.live and delivery.queued == 1
-    assert "the turn is over" in delivery.error
+    assert delivery.error == "", "there was no live attempt to report"
     assert mailbox.take_queued() == ["too late"], "a lost note is never dropped"
+
+
+def test_a_note_that_loses_the_race_with_the_pipe_is_queued():
+    """The window the detach cannot close: the channel is still attached and
+    the pipe under it is already gone."""
+    sink = _Sink()
+    mailbox = operator.Mailbox()
+    operator.AgentChannel(sink, mailbox)
+    sink.close()                    # the process died mid-turn
+
+    delivery = mailbox.submit("too late")
+
+    assert not delivery.live and delivery.queued == 1
+    assert delivery.error, "a failed live attempt has to say so"
+    assert mailbox.take_queued() == ["too late"]
 
 
 def test_only_this_mailboxs_own_notes_are_claimed_from_the_replay():
     """--replay-user-messages echoes the ITERATION PROMPT back too."""
     sink = _Sink()
     mailbox = operator.Mailbox()
-    mailbox.attach(operator.AgentChannel(sink))
+    operator.AgentChannel(sink, mailbox)      # attaches itself
     mailbox.submit("mind the bevels")
     framed = sink.messages()[0]
 
@@ -414,17 +457,7 @@ def test_a_note_the_run_never_delivered_is_reported(tmp_path, monkeypatch,
 def test_the_sequential_status_line_is_given_the_runs_mailbox(tmp_path,
                                                               monkeypatch):
     """The console's end of the wire: without this the `m` key is not offered."""
-    seen = {}
-    real_app_class = sl.StatusApp
-
-    def _capture(**kwargs):
-        seen["messages"] = kwargs.get("messages")
-        return real_app_class(terminal=sl.NullTerminal(),
-                              input_source=sl.NullInputSource(), refresh=60,
-                              **{k: v for k, v in kwargs.items()
-                                 if k != "enabled"})
-
-    monkeypatch.setattr(sl, "StatusApp", _capture)
+    seen = _capture_status_app(monkeypatch)
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
     monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
@@ -627,17 +660,7 @@ def _par_args(project_dir, jobs):
 @pytest.mark.parametrize("jobs, addressable", [(1, True), (2, False)])
 def test_only_a_single_worker_run_has_a_mailbox(tmp_path, monkeypatch, jobs,
                                                 addressable):
-    seen = {}
-    real_app_class = sl.StatusApp
-
-    def _capture(**kwargs):
-        seen["messages"] = kwargs.get("messages")
-        return real_app_class(terminal=sl.NullTerminal(),
-                              input_source=sl.NullInputSource(), refresh=60,
-                              **{k: v for k, v in kwargs.items()
-                                 if k != "enabled"})
-
-    monkeypatch.setattr(sl, "StatusApp", _capture)
+    seen = _capture_status_app(monkeypatch)
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
 

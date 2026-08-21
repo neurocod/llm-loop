@@ -4,12 +4,14 @@ The loop lifecycle is provider-neutral. This module owns the small part that is
 not: executable names, non-interactive flags, and command-line construction.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 import shutil
 import subprocess
-from typing import Protocol
+from typing import Optional, Protocol
 
+from . import operator
 from .operator import user_message_line
 
 
@@ -114,10 +116,9 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
 
       * claude with live messages - the prompt is the first JSON line on a stdin
         that STAYS OPEN, so the console can send more user messages while the
-        turn runs. Whoever opened it must close it (see
-        ``cyclecore.run_agent_streaming``): a streaming-input CLI keeps its
-        session alive until stdin reaches EOF, so an unclosed pipe is a run that
-        never ends.
+        turn runs. A pipe left open that way is a session that never ends, so
+        every caller must hand the process to ``note_channel`` below rather than
+        arrange the closing itself.
       * claude without them - the prompt sits in argv, stdin is inherited, and
         the process exits on its own when the turn is done.
       * codex - the prompt is read from a stdin closed immediately after: this
@@ -156,6 +157,37 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
                 except (BrokenPipeError, OSError):
                     pass
     return proc
+
+
+@contextmanager
+def note_channel(proc, provider: str, mailbox: Optional[object] = None):
+    """The live-note pipe of one process, closed however the caller leaves.
+
+    The other half of `start_agent_process`: it decided to leave stdin open, so
+    the same module owns the closing rather than lending the obligation to a
+    runner. Both runners had their own copy of this before, and the copies were
+    not the same one - the parallel one closed the pipe only when a mailbox
+    existed, which `-j 2+` never has, so its workers started CLIs they could
+    never end (the turn finished in 2.7 s; the call returned when the process
+    was killed at 90 s).
+
+    Yields something with `.close()` in every case, including "this run has no
+    transport" - so a caller closing at the turn's `result` event needs no
+    None-check, and the guard that caused the bug has nowhere to come back.
+
+    The caller must still close before `proc.wait()`: waiting on a process whose
+    stdin is open is the same hang seen from the other end. The context manager
+    covers the paths a caller cannot - an exception, KeyboardInterrupt, a stream
+    that ends without ever reporting a result.
+    """
+    if live_messages_enabled(provider) and proc.stdin is not None:
+        channel = operator.AgentChannel(proc.stdin, mailbox)
+    else:
+        channel = operator.NullChannel()
+    try:
+        yield channel
+    finally:
+        channel.close()
 
 
 def build_agent_argv(command: AgentCommandLike, provider: str,
