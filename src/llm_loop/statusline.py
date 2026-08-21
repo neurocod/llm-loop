@@ -451,7 +451,10 @@ class LoopStatus:
     phase: str = "idle"                      # idle|running|paused|waiting|stopping
     quotas: List[Tuple] = field(default_factory=list)
     script_limits: List[Tuple[str, str]] = field(default_factory=list)
-    stop_pending: bool = False
+    # "" when nothing is pending, else the cyclecore.StopSource value that is
+    # asking for the stop. The SOURCE, not a bool, because the two read
+    # differently on the row: only a `s` request can be taken back from here.
+    stop_pending: str = ""
     note: str = ""
 
     def __post_init__(self) -> None:
@@ -716,7 +719,10 @@ class ScriptLimitSegment(Segment):
 
 class StopSegment(Segment):
     """The pending-stop marker. Loud on purpose: the loop may take minutes to
-    notice the sentinel, and the user needs to know cancelling is still possible."""
+    notice the request, and the user needs to know cancelling is still possible.
+
+    A stop FILE is somebody else's request — this run only obeys it — so the row
+    must not offer a cancel the `s` key will not perform."""
 
     def text(self, status, now=None):
         if not status.stop_pending:
@@ -725,7 +731,10 @@ class StopSegment(Segment):
         # glyph, and printing it twice on one line reads as noise, not urgency.
         glyph = "" if PHASE_GLYPHS.get(status.phase) == STOP_GLYPH \
             else f"{STOP_GLYPH} "
-        return f"{glyph}STOP pending — press s to cancel"
+        tail = ("press s to cancel"
+                if status.stop_pending == cyclecore.StopSource.KEY.value
+                else "stop file present")
+        return f"{glyph}STOP pending — {tail}"
 
 
 # --- rows ----------------------------------------------------------------------
@@ -1313,22 +1322,24 @@ class Action:
 
 
 class StopAction(Action):
-    """Graceful stop, implemented as the existing `stop` sentinel file.
+    """Graceful stop of THIS run, as an in-process request (see StopSource.KEY).
 
-    Writing the file rather than setting a flag reuses the whole tested
-    lifecycle — sequential loop, parallel workers, periodic batches, removal at
-    application exit — instead of adding a second, parallel stop path. The loop
-    may not look at the file for minutes, so the same key cancels the request.
+    Deliberately not the `stop` sentinel file: several loops are routinely
+    launched in one project root, and a file stops all of them at once, which
+    makes the key unusable for "stop this one". The file stays the cross-process
+    channel; the key addresses the run whose terminal it was typed into. The
+    loop may not look at the request for minutes, so the same key withdraws it —
+    but only its own: a stop file this run merely obeys is not ours to remove.
     """
 
     key = "s"
     help = "stop"
 
     def help_text(self, app):
-        return "cancel stop" if app.status.stop_pending else "stop"
+        return "cancel stop" if app.stop_requested_here else "stop"
 
     def run(self, app):
-        if app.status.stop_pending:
+        if app.stop_requested_here:
             app.cancel_stop()
         else:
             app.request_stop()
@@ -1897,9 +1908,9 @@ class StatusApp:
         self._reserved = 0
         self._started = False
         self._services: List[object] = []
-        self._requested_stop = False      # did WE write the sentinel? (see below)
-        # Guards the ownership flag against the sentinel itself: the key press,
-        # the cancel and the repaint's re-sync all move the pair together.
+        self._requested_stop = False      # has `s` been pressed here? (see below)
+        # Guards the request flag against the sentinel poll: the key press, the
+        # cancel and the repaint's re-sync all move the pair together.
         self._stop_lock = threading.Lock()
         self._atexit_registered = False
         self._signal_handlers: List[Tuple[int, object]] = []
@@ -1934,7 +1945,8 @@ class StatusApp:
             return self
         self._started = True
         try:
-            self.status.update(stop_pending=os.path.exists(self.stop_file))
+            with self._stop_lock:
+                self.status.update(stop_pending=self._sentinel_pending())
             if isinstance(self.terminal, NullTerminal):
                 return self   # disabled: no region to pin, no keys to read
             if not self._reserve(len(self.rows())):
@@ -2090,49 +2102,44 @@ class StatusApp:
 
     @property
     def stop_requested_here(self) -> bool:
-        """True while the PENDING sentinel is the one this app's `s` key wrote.
+        """True while THIS run's `s` key is asking it to stop.
+
+        In-process by design (see `cyclecore.StopSource`): it addresses the one
+        run whose terminal the key was typed into, so concurrent loops sharing a
+        project root can be stopped one at a time.
 
         `cyclecore.confirm_stop_request`'s cancel grace hangs off this rather
-        than off `enabled`: a sentinel written by somebody else (a script's
+        than off `enabled`: a stop file written by somebody else (a script's
         `touch stop`, another run) must halt this run as promptly as it always
         did — nobody is sitting at this terminal waiting to press `s` again.
         """
-        return self._requested_stop and self.status.stop_pending
+        return self._requested_stop
 
     def request_stop(self) -> None:
-        """Create the sentinel. The loop claims and removes it (see
-        `cyclecore.stop_file_lifecycle`); we deliberately do not latch it here,
-        so a cancel before the loop notices leaves no trace."""
+        """Ask this run to stop. Sets the flag only — no file is written, so a
+        cancel before the loop notices leaves no trace, an abrupt kill leaves no
+        sentinel to clean up, and the loop next door keeps running."""
         with self._stop_lock:
-            # Claim ownership BEFORE the sentinel exists, never after: a runner
-            # polling in between would find a sentinel nobody owns, read this
-            # key press as somebody else's `touch stop`, and skip the cancel
-            # grace — losing precisely the mis-press the grace exists for. The
-            # claim is unobservable until the file is there, so it is free.
             self._requested_stop = True
-            self.status.update(stop_pending=True)
-            try:
-                with open(self.stop_file, "w", encoding="utf-8") as fh:
-                    fh.write("")
-            except OSError as exc:
-                self._requested_stop = False
-                self.status.update(stop_pending=False)
-                self.note(f"could not create {self.stop_file}: {exc}")
-                return
-        self.note("stop requested — the loop halts at the next iteration boundary")
+            self.status.update(stop_pending=cyclecore.StopSource.KEY.value)
+        self.note("stop requested — this run halts at the next iteration "
+                  "boundary (other runs are unaffected)")
 
     def cancel_stop(self) -> None:
+        """Withdraw this run's own request. A stop file is left alone: it is not
+        ours to remove, and the run stays pending on it."""
         with self._stop_lock:
-            try:
-                os.remove(self.stop_file)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                self.note(f"could not remove {self.stop_file}: {exc}")
-                return
             self._requested_stop = False
-            self.status.update(stop_pending=False)
+            self.status.update(stop_pending=self._sentinel_pending())
         self.note("stop request cancelled")
+
+    def _sentinel_pending(self) -> str:
+        """The stop-file half of `stop_pending` (call under `_stop_lock`)."""
+        try:
+            return (cyclecore.StopSource.FILE.value
+                    if os.path.exists(self.stop_file) else "")
+        except OSError:
+            return ""
 
     # --- actions, modes, events --------------------------------------------
 
@@ -2244,16 +2251,16 @@ class StatusApp:
                     self._note_at = 0.0
                     self.status.update(note="")
                 if ticks % 4 == 0:
-                    # Also catches a sentinel created by hand (`touch stop`).
-                    # Under the same lock as the key press, so a re-sync landing
-                    # mid-request cannot disown a sentinel we are still writing.
+                    # Catches a sentinel created by hand (`touch stop`) or by a
+                    # neighbouring run. It never touches `_requested_stop`: the
+                    # key's request is this process's own and outlives whatever
+                    # anyone does to the file. Under the same lock as the key
+                    # press so the flag and the row cannot disagree.
                     with self._stop_lock:
-                        pending = os.path.exists(self.stop_file)
+                        pending = (cyclecore.StopSource.KEY.value
+                                   if self._requested_stop
+                                   else self._sentinel_pending())
                         if pending != self.status.stop_pending:
-                            if not pending:
-                                # Removed behind our back: whatever `s` asked
-                                # for is void, so the grace must not claim it.
-                                self._requested_stop = False
                             self.status.update(stop_pending=pending)
                 # Re-assert the region on the periodic repaint: see Terminal.paint.
                 self._paint(reassert=True)

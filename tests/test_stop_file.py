@@ -1,4 +1,4 @@
-"""The `stop` sentinel and who may claim it.
+"""The `stop` sentinel, who may claim it, and what the `s` key does instead.
 
 A stop file is a one-shot signal: the run that honours it keeps it through its
 complete application cleanup, then removes it immediately before exit so the
@@ -12,6 +12,10 @@ So: the already-running owner claims it at an iteration boundary, a new real
 launch waits for it to disappear, and a dry run reports it without touching it.
 The owner removes it only at its outermost lifecycle exit. Both runners are
 covered, since either entry point could regress independently.
+
+The status line's `s` key is the other half of the story and is deliberately NOT
+this file: it sets an in-process flag, so one of several loops sharing a project
+root can be stopped on its own (see cyclecore.StopSource).
 """
 
 import os
@@ -22,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_loop import cyclecore, parallel
+from llm_loop import cyclecore, parallel, statusline
 from llm_loop.cyclecore import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
@@ -59,6 +63,23 @@ class _StopAfterOneDriver(_OneShotDriver):
 
     def on_success(self, returncode):
         self.stop.write_text("", encoding="utf-8")
+
+
+class _PressStopAfterOneDriver(_OneShotDriver):
+    """Presses `s` on the captured status line after its first provider call."""
+
+    def __init__(self, captured: dict):
+        super().__init__()
+        self.captured = captured
+
+    def next_command(self):
+        # Unlike the one-shot base, keep offering work: the run must end because
+        # of the key press, not because the queue ran dry.
+        self.served += 1
+        return ClaudeCommand("do the thing", "", "the-thing")
+
+    def on_success(self, returncode):
+        self.captured["app"].request_stop()
 
 
 class _StubPolicy:
@@ -227,6 +248,33 @@ def test_sequential_stop_file_lives_until_outer_application_exit(
     assert not stop.exists(), "application exit left the stop mutex behind"
     out = capsys.readouterr().out
     assert out.index("remains in place") < out.index("removed on application exit")
+
+
+def test_the_s_key_stops_the_sequential_run_without_writing_a_sentinel(
+    tmp_path, monkeypatch
+):
+    """A key press must not become a project-wide brake: the neighbouring loop in
+    the same root sees no sentinel, and this one still ends on the request."""
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda cmd, raw, partial, prompt="", mailbox=None: 0)
+    captured = {}
+    real_app_class = statusline.StatusApp
+
+    def _app(**kwargs):
+        kwargs["enabled"] = False   # no terminal in pytest; the flag is the point
+        captured["app"] = real_app_class(**kwargs)
+        return captured["app"]
+
+    monkeypatch.setattr(statusline, "StatusApp", _app)
+
+    with cyclecore.stop_file_lifecycle():
+        result = cyclecore.run_loop(_PressStopAfterOneDriver(captured),
+                                    _seq_args(str(tmp_path), dry_run=False),
+                                    app_name="pytest-stop")
+
+    assert result.reason == cyclecore.RunStopReason.STOP_KEY
+    assert result.completed == 1, "the key press did not stop at the boundary"
+    assert not (tmp_path / "stop").exists(), "the s key wrote a stop file"
 
 
 # -- parallel runner -----------------------------------------------------------

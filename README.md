@@ -30,7 +30,7 @@ overnight.
 | Model choice | one model for the whole run | `model()` per iteration — a cheap model for `cleanup`, a smart one for `implementation` |
 | Quota / rate limits | run until the CLI dies | the account's real figures are read over the provider's API **before** each iteration, and the loop waits under configurable ceilings (session / day-night / weekly), with a reactive `rate_limit_event` backstop |
 | Parallelism | sequential (fan-out only *inside* one agent) | `-j N` concurrent CLI workers draining a work-queue file, one item per job |
-| Stopping | Ctrl+C | `stop` sentinel file, `s` key, `--max-runs`, and an `error` state that halts for a human |
+| Stopping | Ctrl+C | `s` key (this run only), `stop` sentinel file (every run in the root), `--max-runs`, and an `error` state that halts for a human |
 | Steering | stop it, edit the prompt, start again | `m` types a note into the turn already running (or queues it for the next one) |
 | Providers | whatever the pipe points at | Claude and Codex adapters (argv vs. stdin prompt transport, both stream-json rendered) |
 | Observability | terminal scrollback | pinned status line (iteration, model, elapsed, live quota, per-job rows), rotating mirror log, optional Markdown rendering |
@@ -419,7 +419,7 @@ Every run closes the mirror log with one line naming its ending:
 === run ended: no more work in the queue · 21 iteration(s), 21 completed · 4h12m ===
 ```
 
-A stop file, `--max-runs`, a driver stop, five provider errors in a row, an
+A stop file, the `s` key, `--max-runs`, a driver stop, five provider errors in a row, an
 unhandled exception, Ctrl+C, a signal — each gets its own phrase there. What
 cannot get one is a kill from outside (`Stop-Process`, `taskkill /F`, an OOM
 kill, a power cut): the process is gone, so it writes nothing at all. For those,
@@ -458,9 +458,16 @@ does not have is dropped unless a rule watches it. Right of the slash is what th
 absent entirely when no rule watches it. A custom rule can say something else by
 overriding `LimitRule.status(reading, now)`.
 
-Keys: `s` requests a graceful stop (it creates the same `stop` sentinel, and
-pressing `s` again during the countdown cancels it), `m` sends the agent a note
-(see below), `h` or `?` shows the full key list.
+Keys: `s` requests a graceful stop of **this** run (pressing `s` again during
+the countdown cancels it), `m` sends the agent a note (see below), `h` or `?`
+shows the full key list.
+
+`s` sets an in-process flag and writes nothing to disk, so several loops
+launched in one project root are stopped one at a time — the terminal you type
+it into is the run that halts. The `stop` file below is the other channel: it
+stops every run watching the root, survives the process, and is therefore what
+scripts and run-chaining use. A stop file this run merely obeys is not the key's
+to withdraw, so `s` neither writes nor removes it.
 
 ## Talking to the running agent (`m`)
 
@@ -522,10 +529,12 @@ macOS it is `${XDG_CONFIG_HOME:-~/.config}/llm-loop/settings.json`. Set
 `LLM_LOOP_SETTINGS` to use a different absolute path. Windows wrappers use
 the native system notification sound; other platforms emit a terminal bell.
 
-Create a file named `stop` in the project root to halt the loop at the next
-iteration boundary; it is removed on stop so the next launch starts clean. A
-`--dry-run` never removes it — previewing commands while a real run has a stop
-pending must not cancel that stop — it only reports that the file is there.
+Create a file named `stop` in the project root to halt **every** loop rooted
+there at its next iteration boundary; it is removed on stop so the next launch
+starts clean. A `--dry-run` never removes it — previewing commands while a real
+run has a stop pending must not cancel that stop — it only reports that the file
+is there. To stop just one of several concurrent loops, press `s` in its
+terminal instead (see above): that request is in-process and leaves no file.
 
 A launch that finds the sentinel already in place does not start and does not
 consume it: it waits (sequential and parallel alike, before `--start-in`) until

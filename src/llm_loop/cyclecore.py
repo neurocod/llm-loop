@@ -98,10 +98,30 @@ class RunStopReason(Enum):
     """Why a runner returned normally."""
 
     STOP_FILE = "stop_file"
+    STOP_KEY = "stop_key"
     LIMIT_REACHED = "limit_reached"
     NO_WORK = "no_work"
     DRIVER_STOP = "driver_stop"
     DRY_RUN = "dry_run"
+
+
+class StopSource(Enum):
+    """Which channel is asking a run to stop. The two are NOT interchangeable.
+
+    KEY is in-process and belongs to one run: the `s` key sets a flag inside
+    that process, so several loops launched in the same project root can be
+    stopped one at a time. It leaves nothing on disk — nothing to clean up, and
+    nothing for a concurrent run to trip over.
+
+    FILE is the shared `stop` sentinel in the project root: it halts EVERY run
+    watching that root, and it survives the process. That is what makes it the
+    cross-process handshake — one run ends, and a launch waiting on the file
+    (wait_for_stop_file_clear) starts once the file is gone — so the key must
+    not write it and a key-stop must not remove it.
+    """
+
+    KEY = "key"
+    FILE = "file"
 
 
 class RunResult(NamedTuple):
@@ -118,6 +138,7 @@ class RunResult(NamedTuple):
 # that reader rather than reusing the enum's wire value.
 STOP_REASON_TEXT = {
     RunStopReason.STOP_FILE: "stop file requested",
+    RunStopReason.STOP_KEY: "stop requested with the s key",
     RunStopReason.LIMIT_REACHED: "iteration limit reached (--max-runs)",
     RunStopReason.NO_WORK: "no more work in the queue",
     RunStopReason.DRIVER_STOP: "the driver stopped the run",
@@ -151,12 +172,16 @@ except (AttributeError, ValueError):
 # calls from the --project-dir/-C option. Use project_dir() to read it so a
 # later set_project_root() is always picked up.
 PROJECT_DIR = os.getcwd()
-# A manual brake: `touch stop` (create a file named "stop" in the project root)
-# and the loop halts at the next iteration boundary - the running iteration
-# finishes its one state transition first. The file stays present while the
-# application winds down, then the outermost stop-file lifecycle removes it just
-# before exit so other launchers can use it as a mutex. Recomputed by
-# set_project_root().
+# A manual brake shared by every run rooted here: `touch stop` (create a file
+# named "stop" in the project root) and the loop halts at the next iteration
+# boundary - the running iteration finishes its one state transition first. The
+# file stays present while the application winds down, then the outermost
+# stop-file lifecycle removes it just before exit so other launchers can use it
+# as a mutex. Recomputed by set_project_root().
+#
+# Deliberately NOT what the status line's `s` key writes: see StopSource. The
+# file is the cross-process channel (and the handshake for chaining runs); the
+# key is the per-run one.
 STOP_FILE = os.path.join(PROJECT_DIR, "stop")
 
 # How often wait_for_stop_file_clear() re-checks the sentinel while it holds a
@@ -210,25 +235,44 @@ def mark_stop_file_detected() -> None:
         _detected_stop_file = STOP_FILE
 
 
+def pending_stop(app=None) -> Optional[StopSource]:
+    """What is asking this run to stop right now, and through which channel.
+
+    The single place that answers "should we be stopping?", so the two channels
+    cannot drift apart between the sequential and the parallel runner. The key
+    is checked first: when a run holds both, the interactive request is the one
+    with a human behind it, and it is the one that can still be cancelled.
+    """
+    if getattr(app, "stop_requested_here", False):
+        return StopSource.KEY
+    if os.path.exists(STOP_FILE):
+        return StopSource.FILE
+    return None
+
+
 # How long an interactive run counts down before it acts on a stop request. The
-# status line's `s` key both sets and clears the sentinel, so a mis-press must be
-# undoable — but a runner that latched the file and exited a millisecond later
-# would make "press s again" a race the user always loses. Five seconds is long
-# enough to notice the countdown row and press the key again, short enough that
-# a deliberate stop still feels immediate.
+# status line's `s` key both sets and clears the request, so a mis-press must be
+# undoable — but a runner that ended a millisecond later would make "press s
+# again" a race the user always loses. Five seconds is long enough to notice the
+# countdown row and press the key again, short enough that a deliberate stop
+# still feels immediate.
 STOP_GRACE_SECONDS = 5.0
 
 
 def confirm_stop_request(app=None, grace: float = STOP_GRACE_SECONDS,
                          poll: float = 0.25) -> bool:
-    """True if the pending stop sentinel should be acted on now.
+    """True if the pending stop request should be acted on now.
 
-    The grace exists ONLY for a sentinel this run's own `s` key created
+    The grace exists ONLY for a request this run's own `s` key made
     (`app.stop_requested_here`): a piped run, a CI run, or a script that wrote
-    the file itself gets today's behaviour, unslowed — automation must not wait
+    the stop file gets today's behaviour, unslowed — automation must not wait
     out a countdown for a keypress that is never coming. Intended as the one
     definition of "the user really meant it" for both runners; the parallel
     claim-loop adopts it when it grows a status line of its own.
+
+    Cancelling means BOTH channels went quiet: pressing `s` again while a stop
+    file is also present does not resume the run, because the file was never
+    this key's to withdraw.
     """
     if (app is None or not getattr(app, "enabled", False)
             or not getattr(app, "stop_requested_here", False) or grace <= 0):
@@ -236,8 +280,8 @@ def confirm_stop_request(app=None, grace: float = STOP_GRACE_SECONDS,
     app.update(phase="stopping")
     deadline = time.time() + grace
     while True:
-        if not os.path.exists(STOP_FILE):   # pressed `s` again — undo everything
-            app.update(phase="idle", stop_pending=False)
+        if pending_stop(app) is None:       # pressed `s` again — undo everything
+            app.update(phase="idle", stop_pending="")
             app.note("stop cancelled — continuing")
             return False
         remaining = deadline - time.time()
@@ -1912,28 +1956,39 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 progress.max_items = run_settings.max_runs
             app.update(**progress.summary_fields(),
                        script_limits=settings.status_entries())
-            if os.path.exists(STOP_FILE):
+            pending = pending_stop(app)
+            if pending is StopSource.FILE and dry_run:
                 # The sentinel is removed only after the outer application has
                 # finished cleanup. A dry run must not claim it. `-d` is routinely
                 # used to preview commands while a real loop is running — and that is
                 # exactly when a
                 # stop request is pending — so removing it here would silently cancel
                 # someone else's stop, and the loop it was meant to halt would run on.
-                # Report it and leave it for whoever it was written for.
-                if dry_run:
-                    if not stop_file_noted:
-                        print("Stop file present — a real run would have waited for "
-                              "it at startup, and stops here if it appears mid-run. "
-                              "Left in place (a dry run never consumes it).")
-                        stop_file_noted = True
-                elif confirm_stop_request(app):
+                # Report it and leave it for whoever it was written for. (A key
+                # press is this run's own and stops even a dry run: there is
+                # nothing on disk to consume.)
+                if not stop_file_noted:
+                    print("Stop file present — a real run would have waited for "
+                          "it at startup, and stops here if it appears mid-run. "
+                          "Left in place (a dry run never consumes it).")
+                    stop_file_noted = True
+            elif pending is not None and confirm_stop_request(app):
+                # Re-read the source: the grace may have outlived the key press
+                # that opened it (a stop file arriving mid-countdown keeps the
+                # run stopping, but for the other reason).
+                pending = pending_stop(app) or pending
+                if pending is StopSource.FILE:
                     mark_stop_file_detected()
                     print("Stop file detected — stopping; it remains in place until "
                           "the application exits.")
-                    app.update(phase="stopping")
                     stop_reason = RunStopReason.STOP_FILE
-                    break
-                # Cancelled inside the interactive grace — carry on with no trace.
+                else:
+                    print("Stop requested with the s key — stopping this run "
+                          "(no stop file written; other runs are unaffected).")
+                    stop_reason = RunStopReason.STOP_KEY
+                app.update(phase="stopping")
+                break
+            # Cancelled inside the interactive grace — carry on with no trace.
 
             # Git push policy: evaluated at the start of every iteration.
             if not dry_run:

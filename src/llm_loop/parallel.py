@@ -472,17 +472,22 @@ class Shared:
             self.stop_owner = None
             return True
 
-    def latch_stop(self) -> bool:
-        """End the run on the sentinel, for good. True for the worker that did it.
+    def latch_stop(self, source) -> bool:
+        """End the run on a stop request, for good. True for the worker that did it.
 
         Returning True exactly once is what keeps the announcement (and the
-        lifecycle latch) single when every worker sees the file at the same time.
+        lifecycle latch) single when every worker sees the request at the same
+        time. Only a stop FILE is latched for removal at application exit — a
+        key request never touched the disk.
         """
         with self.lock:
             if self.stop.is_set():
                 return False
-            cyclecore.mark_stop_file_detected()
-            self.stop_reason = RunStopReason.STOP_FILE
+            if source is cyclecore.StopSource.FILE:
+                cyclecore.mark_stop_file_detected()
+                self.stop_reason = RunStopReason.STOP_FILE
+            else:
+                self.stop_reason = RunStopReason.STOP_KEY
             self.claims_closed.set()
             self.stop.set()
             return True
@@ -496,24 +501,24 @@ class Shared:
 # --- worker loop ---------------------------------------------------------------
 
 def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
-    """React to the stop sentinel from one worker. True => leave the run now.
+    """React to a pending stop from one worker. True => leave the run now.
 
     Three outcomes, and telling them apart is the whole point:
 
-      * no sentinel — carry on claiming (and reopen claims if a request that
+      * nothing pending — carry on claiming (and reopen claims if a request that
         closed them has since been withdrawn, so a mis-pressed `s` costs
         nothing but the files not claimed in between);
-      * this run's own interactive request — close new claims and HOLD while any
-        job is still in flight, leaving the toggle usable for as long as the
-        user can see a job row moving;
-      * anything else — latch it and end the run.
+      * this run's own interactive request (`s`) — close new claims and HOLD
+        while any job is still in flight, leaving the toggle usable for as long
+        as the user can see a job row moving;
+      * a stop file — latch it and end the run.
 
     The grace is interactive-only, exactly as in `cyclecore.confirm_stop_request`:
-    a sentinel this run did not write (a script's `touch stop`, another run) has
-    nobody sitting here to press `s` again, so it must stop the run as promptly
-    as it always did.
+    a stop file (a script's `touch stop`, another run) has nobody sitting here to
+    press `s` again, so it must stop the run as promptly as it always did.
     """
-    if not os.path.exists(cyclecore.STOP_FILE):
+    pending = cyclecore.pending_stop(app)
+    if pending is None:
         if shared.reopen_claims():
             emit_job(job_id, "stop request withdrawn — claiming files again.",
                      "cyan")
@@ -521,29 +526,36 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
         return False
 
     owner, first = shared.request_stop(job_id)
-    if app.enabled and app.stop_requested_here:
+    if pending is cyclecore.StopSource.KEY:
         if first:
             app.update(phase="stopping")
             emit_job(job_id, "stop requested — no new files will be claimed; "
                      "press s again to cancel while a job is still running.",
                      "yellow")
-        # Held, not ended, while the owner decides: the sentinel may yet
-        # disappear. `stop.wait` rather than sleep so the latch releases this
+        # Held, not ended, while the owner decides: the request may yet be
+        # withdrawn. `stop.wait` rather than sleep so the latch releases this
         # worker at once instead of after the poll interval.
         if not owner or shared.busy():
             shared.stop.wait(STOP_RECHECK_SECONDS)
             return False
         # Nothing left in flight: the same countdown the sequential loop holds
         # at its iteration boundary, so both runners define "the user really
-        # meant it" identically. False => the sentinel went away, and the next
+        # meant it" identically. False => the request went away, and the next
         # pass reopens the claims.
         if not cyclecore.confirm_stop_request(app):
             return False
-    if shared.latch_stop():
-        # The outermost application lifecycle removes the sentinel only after all
-        # workers and wrapper-level cleanup have finished.
-        emit_job(job_id, "stop file detected — stopping; kept until "
-                 "application exit.", "bold red")
+        # A stop file that arrived during the countdown outranks the key press
+        # it interrupted — it is the one that must be latched for removal.
+        pending = cyclecore.pending_stop(app) or pending
+    if shared.latch_stop(pending):
+        if pending is cyclecore.StopSource.FILE:
+            # The outermost application lifecycle removes the sentinel only after
+            # all workers and wrapper-level cleanup have finished.
+            emit_job(job_id, "stop file detected — stopping; kept until "
+                     "application exit.", "bold red")
+        else:
+            emit_job(job_id, "stop requested with the s key — stopping this run "
+                     "(no stop file written).", "bold red")
         app.update(phase="stopping")
     return True
 

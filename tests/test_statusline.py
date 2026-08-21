@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from llm_loop import statusline as sl
+from llm_loop import cyclecore, statusline as sl
 
 
 NOW = 1_700_000_000.0
@@ -126,19 +126,30 @@ def test_an_empty_model_reads_as_cli_default():
 
 
 def test_stop_pending_marker_appears_only_while_pending():
+    key = cyclecore.StopSource.KEY.value
     assert "STOP pending" not in sl.render_rows(
         sequential_status(), 200, now=NOW)[1]
-    pending = sl.render_rows(sequential_status(stop_pending=True), 200,
+    pending = sl.render_rows(sequential_status(stop_pending=key), 200,
                              now=NOW)[1]
     assert f"{sl.STOP_GLYPH} STOP pending — press s to cancel" in pending
 
     # …but not twice on one line: once the phase is "stopping" the row already
     # opens with the same glyph.
-    status = sequential_status(stop_pending=True)
+    status = sequential_status(stop_pending=key)
     status.update(phase="stopping")
     stopping = sl.render_rows(status, 200, now=NOW)[1]
     assert stopping.count(sl.STOP_GLYPH) == 1
     assert "STOP pending — press s to cancel" in stopping
+
+
+def test_a_stop_file_marker_does_not_offer_a_cancel_the_key_cannot_do():
+    """`s` withdraws only its own request, so the row must not promise otherwise."""
+    row = sl.render_rows(
+        sequential_status(stop_pending=cyclecore.StopSource.FILE.value),
+        200, now=NOW)[1]
+
+    assert "STOP pending — stop file present" in row
+    assert "press s to cancel" not in row
 
 
 def test_the_two_clocks_are_different_clocks():
@@ -301,16 +312,49 @@ def test_an_unknown_key_points_at_the_help_key():
 # --- the stop key --------------------------------------------------------------
 
 
-def test_stop_key_creates_the_sentinel_and_pressing_it_again_cancels(tmp_path):
+def test_stop_key_requests_a_stop_and_pressing_it_again_cancels(tmp_path):
     sentinel = tmp_path / "stop"
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
     app.handle_event(sl.Key("s"))
-    assert sentinel.exists() and app.status.stop_pending is True
+    assert app.stop_requested_here is True
+    assert app.status.stop_pending == cyclecore.StopSource.KEY.value
     assert "cancel stop" in app.render(width=200, now=NOW)[-2]
 
     app.handle_event(sl.Key("s"))
-    assert not sentinel.exists() and app.status.stop_pending is False
+    assert app.stop_requested_here is False and app.status.stop_pending == ""
+
+
+def test_the_stop_key_writes_no_sentinel_so_a_neighbouring_run_keeps_going(tmp_path):
+    """Why the key is a flag and not the file: several loops share one project
+    root, and a file stops every one of them."""
+    sentinel = tmp_path / "stop"
+    one = sl.StatusApp(enabled=False, stop_file=str(sentinel))
+    two = sl.StatusApp(enabled=False, stop_file=str(sentinel))
+
+    one.handle_event(sl.Key("s"))
+
+    assert not sentinel.exists(), "the key press left a cross-process sentinel"
+    assert cyclecore.pending_stop(one) is cyclecore.StopSource.KEY
+    assert cyclecore.pending_stop(two) is None
+
+
+def test_the_stop_file_remains_the_cross_process_channel(tmp_path, monkeypatch):
+    """The fallback the key deliberately does not use: a file stops every run
+    watching the root, and `s` neither writes nor withdraws it."""
+    sentinel = tmp_path / "stop"
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
+    sentinel.write_text("", encoding="utf-8")           # another run's `touch stop`
+
+    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
+    # `s` is offered as "stop", not "cancel stop": this request is not ours.
+    assert app.action_for("s").help_text(app) == "stop"
+
+    app.handle_event(sl.Key("s"))                       # …and then pressed twice
+    app.handle_event(sl.Key("s"))
+    assert sentinel.exists(), "the s key removed somebody else's stop file"
+    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
 
 
 def test_stop_file_defaults_to_the_engine_sentinel(monkeypatch):
@@ -329,11 +373,11 @@ class _FakeApp:
     "the user pressed s again" happen at a defined moment."""
 
     enabled = True
-    stop_requested_here = True     # as if the sentinel came from the `s` key
 
-    def __init__(self, on_note=None):
+    def __init__(self, on_note=None, requested_here=True):
         self.notes = []
         self.fields = {}
+        self.stop_requested_here = requested_here   # as if `s` was pressed here
         self._on_note = on_note
 
     def update(self, **fields):
@@ -348,23 +392,37 @@ class _FakeApp:
 def test_a_stop_request_cancelled_inside_the_grace_leaves_no_trace(monkeypatch, tmp_path):
     from llm_loop import cyclecore
 
-    sentinel = tmp_path / "stop"
-    sentinel.write_text("", encoding="utf-8")
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
-    app = _FakeApp(on_note=lambda: sentinel.unlink(missing_ok=True))
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(tmp_path / "stop"))
+    app = _FakeApp()
+    app._on_note = lambda: setattr(app, "stop_requested_here", False)  # `s` again
 
     assert cyclecore.confirm_stop_request(app, grace=5.0, poll=0.01) is False
-    assert app.fields["phase"] == "idle" and app.fields["stop_pending"] is False
+    assert app.fields["phase"] == "idle" and app.fields["stop_pending"] == ""
     assert "stop cancelled" in app.notes[-1]
     assert "press s to cancel" in app.notes[0]
+
+
+def test_a_stop_file_arriving_mid_grace_outlives_the_cancel(monkeypatch, tmp_path):
+    """Taking back your own `s` cannot withdraw a request that was never yours."""
+    from llm_loop import cyclecore
+
+    sentinel = tmp_path / "stop"
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    app = _FakeApp()
+
+    def cancel_but_a_file_appears():
+        app.stop_requested_here = False
+        sentinel.write_text("", encoding="utf-8")
+
+    app._on_note = cancel_but_a_file_appears
+
+    assert cyclecore.confirm_stop_request(app, grace=0.2, poll=0.01) is True
 
 
 def test_a_stop_request_still_pending_after_the_grace_stops_the_run(monkeypatch, tmp_path):
     from llm_loop import cyclecore
 
-    sentinel = tmp_path / "stop"
-    sentinel.write_text("", encoding="utf-8")
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(tmp_path / "stop"))
     app = _FakeApp()
 
     assert cyclecore.confirm_stop_request(app, grace=0.05, poll=0.01) is True
@@ -386,15 +444,14 @@ def test_a_non_interactive_run_stops_without_any_grace(monkeypatch, tmp_path):
     assert time.monotonic() - started < 1.0
 
 
-def test_a_sentinel_this_run_did_not_write_stops_it_at_once(monkeypatch, tmp_path):
+def test_a_stop_this_run_did_not_request_stops_it_at_once(monkeypatch, tmp_path):
     """`touch stop` from a script: the grace waits for a key nobody will press."""
     from llm_loop import cyclecore
 
     sentinel = tmp_path / "stop"
     sentinel.write_text("", encoding="utf-8")
     monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
-    external = _FakeApp()
-    external.stop_requested_here = False    # written by somebody else
+    external = _FakeApp(requested_here=False)   # requested by somebody else
     started = time.monotonic()
 
     assert cyclecore.confirm_stop_request(external, grace=1.0, poll=0.01) is True
@@ -402,22 +459,26 @@ def test_a_sentinel_this_run_did_not_write_stops_it_at_once(monkeypatch, tmp_pat
     assert external.notes == []             # no countdown was ever announced
 
 
-def test_the_stop_key_is_what_marks_the_sentinel_as_ours(tmp_path):
+def test_the_stop_key_is_what_marks_the_request_as_ours(tmp_path, monkeypatch):
     """The grace is keyed on `s`, so the flag must follow the key, not the file."""
+    from llm_loop import cyclecore
+
     sentinel = tmp_path / "stop"
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
     assert app.stop_requested_here is False
     sentinel.write_text("", encoding="utf-8")       # an external `touch stop`
-    app.status.update(stop_pending=True)
     assert app.stop_requested_here is False
+    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
 
-    app.handle_event(sl.Key("s"))                   # toggle: removes it
-    app.handle_event(sl.Key("s"))                   # and writes it as ours
-    assert sentinel.exists() and app.stop_requested_here is True
+    app.handle_event(sl.Key("s"))                   # ours, on top of theirs
+    assert app.stop_requested_here is True
+    assert cyclecore.pending_stop(app) is cyclecore.StopSource.KEY
 
-    app.handle_event(sl.Key("s"))
+    app.handle_event(sl.Key("s"))                   # withdrawn — theirs remains
     assert app.stop_requested_here is False
+    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
 
 
 # --- disabled / no-TTY paths ---------------------------------------------------

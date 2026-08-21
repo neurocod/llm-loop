@@ -267,7 +267,8 @@ def test_cancelling_the_stop_reopens_claims_while_a_job_runs(tmp_path, monkeypat
 
 def test_an_interactive_stop_left_alone_ends_the_run(tmp_path, monkeypatch):
     """The other half of the toggle: not cancelled means stopped, in-flight work
-    finished, nothing new claimed."""
+    finished, nothing new claimed — and no sentinel anywhere, so a second run in
+    the same root is untouched by this one's `s`."""
     made = _live_statusline(monkeypatch, {})
     monkeypatch.setattr(cyclecore, "STOP_GRACE_SECONDS", 0.05)
     driver = _MemDriver(["products/a.md", "products/b.md"])
@@ -290,12 +291,12 @@ def test_an_interactive_stop_left_alone_ends_the_run(tmp_path, monkeypatch):
             assert not done.wait(0.3), "in-flight work was cut short"
             release.set()
             assert done.wait(10), "the stop request was never acted on"
-            assert (tmp_path / "stop").exists(), "sentinel dropped before exit"
+            assert not (tmp_path / "stop").exists(), "the s key wrote a sentinel"
     finally:
         release.set()
         cyclecore.set_project_root(previous)
 
-    assert result["value"].reason is cyclecore.RunStopReason.STOP_FILE
+    assert result["value"].reason is cyclecore.RunStopReason.STOP_KEY
     assert driver.pending_lines() == ["products/b.md"]   # nothing new claimed
 
 
