@@ -92,8 +92,10 @@ __all__ = [
     "push_quotas",
     "quota_rows",
     "render_rows",
+    "running_items",
     "screen_width",
     "terminal_for",
+    "title_text",
 ]
 
 # Environment kill switch, honoured next to --no-statusline so a hostile terminal
@@ -151,6 +153,30 @@ POLICY_SEPARATOR = " / "
 # separator belongs).
 RULE_CHAR = "─"
 CHROME_STYLE = "dim"
+
+# --- window/tab title ---
+# The title says the same two things the pinned rows open with — where the run
+# is ("iter 12/40") and what it is chewing on right now — because that is what a
+# person reads off a taskbar button or a tab strip while the terminal itself is
+# behind another window. It is BUILT from the same Segment and the same Job
+# fields the rows use (see `title_text`), so the two cannot drift apart.
+TITLE_SEPARATOR = " · "
+# Titles are shown in a tab or a taskbar button, both of which cut long text
+# themselves and at a width we cannot know; cutting here at least puts the '…'
+# where we chose. Generous enough for the counter plus a couple of paths.
+TITLE_MAX = 120
+# OSC 0: sets the window title AND the icon/tab name, so one escape covers both
+# a tab strip and a taskbar button. BEL-terminated rather than ST — every
+# emulator this runs under accepts BEL, some older ones only accept BEL.
+TITLE_SET = "\x1b]0;{}\x07"
+# The empty title is the documented way back: Windows Terminal (and Tabby, and
+# the usual POSIX emulators) fall back to the profile's own title, which is
+# nearer to "as we found it" than any string we could invent.
+TITLE_RESET = TITLE_SET.format("")
+# A control character here would end the escape early and spray the rest of the
+# title into the scrollback as text; an item label is arbitrary text, so it is
+# never trusted to be free of them.
+_TITLE_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 # --- text helpers --------------------------------------------------------------
@@ -641,6 +667,17 @@ class JobCountSegment(Segment):
         return f"{len(status.jobs)} jobs" if len(status.jobs) > 1 else None
 
 
+def running_items(status: LoopStatus) -> List[str]:
+    """What each job that is actually working is working ON, in job order.
+
+    The one reading of "the item in flight": a job that is idle has none, and a
+    running job that never got a label has nothing to say either. Shared so the
+    summary label, the title and any later consumer cannot disagree about which
+    jobs count as busy.
+    """
+    return [job.item for job in status.jobs if job.running and job.item]
+
+
 class LabelSegment(Segment):
     """The unit of work in flight.
 
@@ -650,10 +687,8 @@ class LabelSegment(Segment):
     """
 
     def text(self, status, now=None):
-        for job in status.jobs:
-            if job.running and job.item:
-                return job.item
-        return None
+        items = running_items(status)
+        return items[0] if items else None
 
 
 class ElapsedSegment(Segment):
@@ -900,6 +935,27 @@ def render_rows(status: LoopStatus, width: int, *, now: Optional[float] = None,
     return [row.render(snapshot, width, now) for row in layout.rows(snapshot)]
 
 
+def title_text(status: LoopStatus, now: Optional[float] = None) -> str:
+    """The window/tab title: "⟳ iter 12/40 · bmx-bike.md".
+
+    Same two facts as the rows, in the same words: the summary row's FIRST field
+    verbatim (the very `IterationSegment` the row builds, so a change there
+    reaches the title with no second edit), then the last cell of every job row
+    that is running — the item, which is the field a person is actually waiting
+    on. Idle jobs contribute nothing rather than a column of "idle": a title is
+    read at a glance and out of the corner of an eye, and with `-j N` the busy
+    items are the whole of what it can usefully carry.
+
+    Pure, like `render_rows`, and for the same reason: the terminal only writes
+    what this returns.
+    """
+    snapshot = status.snapshot()
+    parts = [IterationSegment().text(snapshot, now) or ""]
+    parts += running_items(snapshot)
+    text = TITLE_SEPARATOR.join(part for part in parts if part)
+    return fit(_TITLE_UNSAFE_RE.sub(" ", text), TITLE_MAX)
+
+
 # --- terminal ------------------------------------------------------------------
 
 
@@ -938,6 +994,7 @@ class Terminal:
         self._lock = threading.Lock()
         self._rows = 0
         self._size = (0, 0)
+        self._title = None    # last title written (None = we never set one)
         self.failed = False
 
     @property
@@ -979,6 +1036,27 @@ class Terminal:
                 + f"\x1b[1;{lines - rows}r"        # DECSTBM: shrink the scroll area
                 + f"\x1b[{lines - rows};1H")       # park at the bottom of it
 
+    def set_title(self, text: str) -> bool:
+        """Name the window/tab. Repeats are dropped, so this is cheap to call
+        on every repaint — and an emulator that ignores OSC 0 simply swallows a
+        few bytes that never reach the scrollback.
+
+        Not gated on `active`: the title is one self-contained escape with no
+        geometry behind it, so it stays correct even when the pinned region had
+        to be given up (a resize the screen no longer fits).
+        """
+        if self.failed:
+            return False
+        with self._lock:
+            # Compared UNDER the lock, with the write: two threads painting
+            # different states could otherwise leave the newer text recorded and
+            # the older one on screen, and every later repaint would then skip
+            # the correction as a duplicate.
+            if text == self._title:
+                return False
+            self._title = text
+            return self._write(TITLE_SET.format(text))
+
     def paint(self, lines: Sequence[str], *, reassert: bool = False) -> bool:
         if not self.active:
             return False
@@ -1001,8 +1079,17 @@ class Terminal:
             return self._write("".join(out))
 
     def release(self) -> None:
-        """Reset the scroll region, clear the rows, leave a clean cursor."""
+        """Reset the scroll region and the title, clear the rows, leave a clean
+        cursor.
+
+        The title is put back BEFORE the early return: a run that never managed
+        to pin a row may still have named the window, and a finished run whose
+        name still says "iter 7/40" is worse than no name at all.
+        """
         with self._lock:
+            if self._title is not None:
+                self._title = None
+                self._write(TITLE_RESET)
             if self._rows <= 0:
                 return
             _columns, total = self._size
@@ -1033,6 +1120,9 @@ class NullTerminal(Terminal):
         return (0, 0)
 
     def reserve(self, rows):
+        return False
+
+    def set_title(self, text):
         return False
 
     def paint(self, lines, *, reassert=False):
@@ -2433,6 +2523,15 @@ class StatusApp:
         return False
 
     def _paint(self, *, reassert: bool = False) -> None:
+        # Before the `active` gate, and on the same path as the rows: the title
+        # is what a person sees while the terminal is behind another window, so
+        # it must follow every state change the rows follow — including the ones
+        # that arrive with no region pinned (a run naming its window before
+        # start(), a screen too small for the rows).
+        try:
+            self.terminal.set_title(title_text(self.status))
+        except Exception:
+            pass
         if not self.terminal.active:
             return
         try:

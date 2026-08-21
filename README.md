@@ -435,6 +435,12 @@ elapsed time, the provider's live quota figures and the script's own limits, one
 row per job, and a legend of the keys it answers to. Piped output, CI and
 `--no-statusline` get the plain scrolling output of before.
 
+The same run also names the window (and the tab, and the taskbar button):
+`⟳ iter 12/40 · bmx-bike.md` — the row's first field, then what each still-busy
+job is on, so a run left in the background stays readable with the terminal
+itself out of sight. It travels with the rows: no rows, no title, and the name
+is handed back on the way out.
+
 The iteration counter carries the whole of "how much work is this run": its
 denominator is `--max-runs`, the list's size for a `ListFileDriver`, or the
 smaller of the two. `--max-runs` therefore gets no field of its own — a knob

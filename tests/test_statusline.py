@@ -584,6 +584,62 @@ def test_start_is_a_no_op_when_the_terminal_cannot_reserve(monkeypatch):
     assert isinstance(app.terminal, sl.NullTerminal)
 
 
+# --- window/tab title ----------------------------------------------------------
+
+
+def test_the_title_is_the_summary_rows_first_field_then_the_running_items():
+    """Literally the row's own words — that is the point of building it from the
+    same Segment."""
+    status = sequential_status()
+    first_field = sl.render_rows(status, 200, now=NOW)[1].split(sl.SEPARATOR)[0]
+
+    title = sl.title_text(status, now=NOW)
+
+    assert title == "⟳ iter 12/40 · bmx-bike.md"
+    assert title.startswith(first_field.strip())
+
+
+def test_the_title_names_every_busy_job_and_no_idle_one():
+    title = sl.title_text(parallel_status(3), now=NOW)
+
+    assert title == "⟳ iter 7/40 · item-1.md · item-2.md"   # job 3 is idle
+
+
+def test_an_idle_run_still_says_where_it_is():
+    assert sl.title_text(sl.LoopStatus(iteration=4, max_iterations=9)) \
+        == "· iter 4/9"
+
+
+def test_control_characters_never_reach_the_title():
+    """An item label is arbitrary text; a stray BEL would end the escape early
+    and spill the rest of the title into the scrollback."""
+    status = sequential_status()
+    status.jobs[0].update(item="a\x07b\x1b[2Jc")
+
+    assert "\x07" not in sl.title_text(status) and "\x1b" not in sl.title_text(status)
+
+
+def test_the_title_is_written_on_change_only_and_given_back_on_exit(monkeypatch):
+    stream = _FakeStream(True)
+    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+                        lambda fallback=(0, 0): os.terminal_size((100, 30)))
+    app = sl.StatusApp(terminal=sl.terminal_for(stream),
+                       input_source=sl.NullInputSource(), refresh=60)
+
+    escape = sl.TITLE_SET.format("⟳ iter 4/9 · garlic.md")
+    with app:
+        app.update(iteration=4, max_iterations=9, phase="running")
+        app.job(1).start(item="garlic.md", model="opus", now=NOW)
+        app.update(phase="running")             # the item reaches the title here
+        mark = len(stream.getvalue())
+        app.update(note="anything")             # state the title does not carry
+        assert "\x1b]0;" not in stream.getvalue()[mark:]   # so: no second write
+        assert stream.getvalue().count(escape) == 1
+
+    assert sl.TITLE_RESET in stream.getvalue()  # the window gets its name back
+
+
 # --- Job / LoopStatus bookkeeping ---------------------------------------------
 
 
