@@ -469,6 +469,11 @@ stops every run watching the root, survives the process, and is therefore what
 scripts and run-chaining use. A stop file this run merely obeys is not the key's
 to withdraw, so `s` neither writes nor removes it.
 
+Where the two meet, the file wins: a run that stops while a sentinel is on disk
+consumes it, whether or not `s` was also pressed. Otherwise the file would
+outlive the loop it was written for and the launch queued behind it would wait
+forever.
+
 ## Talking to the running agent (`m`)
 
 The loop is autonomous, not unattended. `m` opens a one-line editor in the

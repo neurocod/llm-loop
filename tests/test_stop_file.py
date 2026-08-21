@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -66,11 +67,16 @@ class _StopAfterOneDriver(_OneShotDriver):
 
 
 class _PressStopAfterOneDriver(_OneShotDriver):
-    """Presses `s` on the captured status line after its first provider call."""
+    """Presses `s` on the captured status line after its first provider call.
 
-    def __init__(self, captured: dict):
+    `also_touch` additionally writes the sentinel, for the case where both
+    channels are up at once.
+    """
+
+    def __init__(self, captured: dict, also_touch: Optional[Path] = None):
         super().__init__()
         self.captured = captured
+        self.also_touch = also_touch
 
     def next_command(self):
         # Unlike the one-shot base, keep offering work: the run must end because
@@ -80,6 +86,8 @@ class _PressStopAfterOneDriver(_OneShotDriver):
 
     def on_success(self, returncode):
         self.captured["app"].request_stop()
+        if self.also_touch is not None:
+            self.also_touch.write_text("", encoding="utf-8")
 
 
 class _StubPolicy:
@@ -275,6 +283,39 @@ def test_the_s_key_stops_the_sequential_run_without_writing_a_sentinel(
     assert result.reason == cyclecore.RunStopReason.STOP_KEY
     assert result.completed == 1, "the key press did not stop at the boundary"
     assert not (tmp_path / "stop").exists(), "the s key wrote a stop file"
+
+
+def test_a_sentinel_present_at_stop_time_is_consumed_even_if_s_was_pressed(
+    tmp_path, monkeypatch
+):
+    """The chaining handshake outranks the key press.
+
+    A script that writes the sentinel to end run A and start run B behind it
+    (run B waits in wait_for_stop_file_clear, which has NO timeout) must get its
+    file consumed even when the user also pressed `s` — reporting the key press
+    and walking past the file would strand run B forever.
+    """
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda cmd, raw, partial, prompt="", mailbox=None: 0)
+    stop = tmp_path / "stop"
+    captured = {}
+    real_app_class = statusline.StatusApp
+
+    def _app(**kwargs):
+        kwargs["enabled"] = False
+        captured["app"] = real_app_class(**kwargs)
+        return captured["app"]
+
+    monkeypatch.setattr(statusline, "StatusApp", _app)
+
+    with cyclecore.stop_file_lifecycle():
+        result = cyclecore.run_loop(
+            _PressStopAfterOneDriver(captured, also_touch=stop),
+            _seq_args(str(tmp_path), dry_run=False), app_name="pytest-stop")
+        assert stop.exists(), "consumed before the application finished cleanup"
+
+    assert result.reason == cyclecore.RunStopReason.STOP_FILE
+    assert not stop.exists(), "the sentinel outlived the run it stopped"
 
 
 # -- parallel runner -----------------------------------------------------------

@@ -472,7 +472,7 @@ class Shared:
             self.stop_owner = None
             return True
 
-    def latch_stop(self, source) -> bool:
+    def latch_stop(self, source, app=None) -> bool:
         """End the run on a stop request, for good. True for the worker that did it.
 
         Returning True exactly once is what keeps the announcement (and the
@@ -484,7 +484,7 @@ class Shared:
             if self.stop.is_set():
                 return False
             if source is cyclecore.StopSource.FILE:
-                cyclecore.mark_stop_file_detected()
+                cyclecore.mark_stop_file_detected(cyclecore.stop_file_for(app))
                 self.stop_reason = RunStopReason.STOP_FILE
             else:
                 self.stop_reason = RunStopReason.STOP_KEY
@@ -544,10 +544,11 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
         # pass reopens the claims.
         if not cyclecore.confirm_stop_request(app):
             return False
-        # A stop file that arrived during the countdown outranks the key press
-        # it interrupted — it is the one that must be latched for removal.
-        pending = cyclecore.pending_stop(app) or pending
-    if shared.latch_stop(pending):
+    # NOT `pending`: what may still be cancelled and what must be cleaned up are
+    # different questions once the run is committed to stopping — a sentinel on
+    # disk is consumed by whichever run stops on it. See cyclecore.latched_stop.
+    pending = cyclecore.latched_stop(app) or pending
+    if shared.latch_stop(pending, app):
         if pending is cyclecore.StopSource.FILE:
             # The outermost application lifecycle removes the sentinel only after
             # all workers and wrapper-level cleanup have finished.

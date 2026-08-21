@@ -325,10 +325,13 @@ def test_stop_key_requests_a_stop_and_pressing_it_again_cancels(tmp_path):
     assert app.stop_requested_here is False and app.status.stop_pending == ""
 
 
-def test_the_stop_key_writes_no_sentinel_so_a_neighbouring_run_keeps_going(tmp_path):
+def test_the_stop_key_writes_no_sentinel_so_a_neighbouring_run_keeps_going(
+    tmp_path, monkeypatch
+):
     """Why the key is a flag and not the file: several loops share one project
     root, and a file stops every one of them."""
     sentinel = tmp_path / "stop"
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
     one = sl.StatusApp(enabled=False, stop_file=str(sentinel))
     two = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
@@ -337,6 +340,36 @@ def test_the_stop_key_writes_no_sentinel_so_a_neighbouring_run_keeps_going(tmp_p
     assert not sentinel.exists(), "the key press left a cross-process sentinel"
     assert cyclecore.pending_stop(one) is cyclecore.StopSource.KEY
     assert cyclecore.pending_stop(two) is None
+
+
+def test_the_sentinel_a_run_watches_is_the_one_its_row_reports(tmp_path):
+    """An app given an explicit stop_file must not have the runner obeying the
+    project root's file while the row talks about another one."""
+    sentinel = tmp_path / "elsewhere-stop"
+    app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
+    assert cyclecore.stop_file_for(app) == str(sentinel)
+    assert cyclecore.pending_stop(app) is None
+
+    sentinel.write_text("", encoding="utf-8")
+
+    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
+    assert cyclecore.latched_stop(app) is cyclecore.StopSource.FILE
+
+
+def test_what_may_be_cancelled_and_what_must_be_consumed_are_different(
+    tmp_path, monkeypatch
+):
+    """Both channels up at once. The key is the pending request (a human can
+    still take it back), but the FILE is what a run stopping now must consume —
+    both runners latch on `latched_stop` for exactly this case."""
+    sentinel = tmp_path / "stop"
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
+    app.handle_event(sl.Key("s"))
+    sentinel.write_text("", encoding="utf-8")
+
+    assert cyclecore.pending_stop(app) is cyclecore.StopSource.KEY
+    assert cyclecore.latched_stop(app) is cyclecore.StopSource.FILE
 
 
 def test_the_stop_file_remains_the_cross_process_channel(tmp_path, monkeypatch):

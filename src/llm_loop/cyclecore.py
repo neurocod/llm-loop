@@ -145,6 +145,16 @@ STOP_REASON_TEXT = {
     RunStopReason.DRY_RUN: "dry run finished",
 }
 
+# The reasons that mean "a human asked this INVOCATION to stop", as opposed to
+# "this runner call ran out of work". A wrapper that slices one invocation into
+# several runner calls — the periodic batch loop in a host project — must end on
+# any of them: each call builds its own StatusApp, so a key request that only
+# ended one batch is gone by the next, and the keypress is silently absorbed
+# batch after batch. Membership, never `== STOP_FILE`, so a new channel here
+# reaches those wrappers by itself.
+REQUESTED_STOP_REASONS = frozenset(
+    {RunStopReason.STOP_FILE, RunStopReason.STOP_KEY})
+
 
 # Default push policy. Override on the command line with --git-push.
 GIT_PUSH_POLICY = GitPushPolicy.EACH_HOUR
@@ -228,11 +238,22 @@ def stop_file_lifecycle():
                 print("Stop file removed on application exit.")
 
 
-def mark_stop_file_detected() -> None:
-    """Latch the current stop path for outermost-lifecycle exit cleanup."""
+def mark_stop_file_detected(path: Optional[str] = None) -> None:
+    """Latch a stop path for outermost-lifecycle exit cleanup (default: this
+    project root's). Take the path from `stop_file_for(app)` when there is an
+    app, so the file that is removed is the file that was obeyed."""
     global _detected_stop_file
     with _stop_file_lifecycle_lock:
-        _detected_stop_file = STOP_FILE
+        _detected_stop_file = path or STOP_FILE
+
+
+def stop_file_for(app=None) -> str:
+    """The sentinel path this run watches: the app's own, else this root's.
+
+    One reader for both, because a StatusApp built with an explicit `stop_file=`
+    would otherwise show a row about one file while the runner obeyed another.
+    """
+    return getattr(app, "stop_file", None) or STOP_FILE
 
 
 def pending_stop(app=None) -> Optional[StopSource]:
@@ -241,13 +262,29 @@ def pending_stop(app=None) -> Optional[StopSource]:
     The single place that answers "should we be stopping?", so the two channels
     cannot drift apart between the sequential and the parallel runner. The key
     is checked first: when a run holds both, the interactive request is the one
-    with a human behind it, and it is the one that can still be cancelled.
+    with a human behind it, and it is the one that can still be cancelled —
+    which is what this answer is for. For what to ACT on, see `latched_stop`.
     """
     if getattr(app, "stop_requested_here", False):
         return StopSource.KEY
-    if os.path.exists(STOP_FILE):
+    if os.path.exists(stop_file_for(app)):
         return StopSource.FILE
     return None
+
+
+def latched_stop(app=None) -> Optional[StopSource]:
+    """The channel a run that is stopping NOW must record and clean up after.
+
+    Differs from `pending_stop` in the one case that matters: while both are up,
+    `pending_stop` names KEY, because that is the request a human can still take
+    back — but a run that stops with a sentinel on disk is the run that has to
+    consume it. Report the key press instead and the file outlives the loop it
+    was written for, and the next launch (`wait_for_stop_file_clear`, which has
+    no timeout) waits on it forever.
+    """
+    if os.path.exists(stop_file_for(app)):
+        return StopSource.FILE
+    return pending_stop(app)
 
 
 # How long an interactive run counts down before it acts on a stop request. The
@@ -1964,21 +2001,20 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 # exactly when a
                 # stop request is pending — so removing it here would silently cancel
                 # someone else's stop, and the loop it was meant to halt would run on.
-                # Report it and leave it for whoever it was written for. (A key
-                # press is this run's own and stops even a dry run: there is
-                # nothing on disk to consume.)
+                # Report it and leave it for whoever it was written for. (There is
+                # no key branch to write here: a dry run's status line is disabled,
+                # so `s` is never even read.)
                 if not stop_file_noted:
                     print("Stop file present — a real run would have waited for "
                           "it at startup, and stops here if it appears mid-run. "
                           "Left in place (a dry run never consumes it).")
                     stop_file_noted = True
             elif pending is not None and confirm_stop_request(app):
-                # Re-read the source: the grace may have outlived the key press
-                # that opened it (a stop file arriving mid-countdown keeps the
-                # run stopping, but for the other reason).
-                pending = pending_stop(app) or pending
-                if pending is StopSource.FILE:
-                    mark_stop_file_detected()
+                # NOT `pending`: what may still be cancelled and what must be
+                # cleaned up are different questions once the run is committed to
+                # stopping. See latched_stop.
+                if latched_stop(app) is StopSource.FILE:
+                    mark_stop_file_detected(stop_file_for(app))
                     print("Stop file detected — stopping; it remains in place until "
                           "the application exits.")
                     stop_reason = RunStopReason.STOP_FILE
