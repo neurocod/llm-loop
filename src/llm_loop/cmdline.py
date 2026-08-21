@@ -62,6 +62,7 @@ FLAG_ALIASES: Dict[str, Flag] = {
     "--session-limit": Flag(("--session-limit",), True),
     "--weekly-limit": Flag(("--weekly-limit",), True),
     "--grow-kit-periodically": Flag(("--grow-kit-periodically",), True),
+    "--cost-log": Flag(("--cost-log",), True),
     # store_true / store_const options
     "--codex": Flag(("--codex",), False),
     "--dry-run": Flag(("-d", "--dry-run"), False),

@@ -56,7 +56,7 @@ from datetime import datetime
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional, Union
 
 from . import exitlog, operator, providers
 from .providers import (
@@ -303,9 +303,9 @@ def find_project_root(start: Optional[str] = None) -> Optional[str]:
 # projects/entry points write to separate logs instead of fighting over one file.
 LOG_DIR = Path.home() / ".runCycle" / "logs"
 
-# Rotation policy for the mirror log. Exposed as module-level constants so other
-# tools (e.g. sum_session_costs.py) can report how full the log is against the
-# same limit instead of hard-coding it.
+# Rotation policy for the mirror log. Module-level constants rather than numbers
+# inside the handler setup, so anything reporting how full the log is measures it
+# against the very limit that rotates it instead of restating the figure.
 LOG_MAX_BYTES = 25 * 1024 * 1024
 # Deep enough that a burst of output cannot rotate an interesting segment off
 # the end of the chain before anyone reads it: at 3 backups a single preview run
@@ -335,17 +335,24 @@ _SESSION_RE = re.compile(r"=== Iteration 1 ===")
 _COST_RE = re.compile(r"done \(\s*[\d.]+ c,\s*\$([\d.]+)\)")
 
 
-def report_costs(app_name: str = "runCycle") -> None:
+def report_costs(app_name: str = "runCycle",
+                 path: Optional[Union[str, Path]] = None) -> None:
     """Print per-session (per-run) cost totals parsed from the mirror log, then
     exit — the standalone counterpart reached via the --cost flag.
 
     A "session" is one run of the loop, delimited by its "=== Iteration 1 ==="
     header; within it every "done (… c, $…)" line contributes its dollar cost. We
     print a line per session, a grand total, and how full the log is against the
-    rotation limit (LOG_MAX_BYTES). Resolve the log via log_file_path(app_name),
-    so --cost reports on the very log this entry point writes.
+    rotation limit (LOG_MAX_BYTES). With no `path`, the log is resolved via
+    log_file_path(app_name), so --cost reports on the very log this entry point
+    writes — under the project root already chosen by --project-dir.
+
+    `path` (the --cost-log flag) names a log this entry point does NOT write:
+    a rotated backup (`<app>-<project>.log.1`) or a copy taken elsewhere. It is
+    the one case app_name cannot reach, since rotation renames files out from
+    under log_file_path.
     """
-    path = log_file_path(app_name)
+    path = Path(path) if path else log_file_path(app_name)
     # Always name the log we are reading, so an empty report is unambiguous
     # (right file, no data) rather than looking like a silent failure.
     print(f"Reading mirror log: {path}")
@@ -580,6 +587,10 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
     p.add_argument("-c", "--cost", action="store_true",
                    help="print per-session cost totals from the mirror log and "
                         "exit (no loop is run)")
+    p.add_argument("--cost-log", dest="cost_log", metavar="LOG",
+                   help="report on this log file instead of this entry point's "
+                        "own — a rotated backup (<app>-<project>.log.1) or a "
+                        "copy; implies --cost")
     # No -r short flag: -r is --review-prompt in continuous_claude.py, so it is
     # left free here rather than reused for --raw.
     p.add_argument("--raw", action="store_true",
@@ -1776,8 +1787,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # --cost: report per-run spend from the mirror log and exit, without touching
     # the loop, the tee, git, or the usage gate. Done here (after the root is
     # set, so the log path resolves) rather than in the loop body proper.
-    if getattr(args, "cost", False):
-        report_costs(app_name)
+    # --cost-log implies --cost: naming a log to read and getting a loop run
+    # instead would be a silent misfire, and there is nothing else it could mean.
+    cost_log = getattr(args, "cost_log", None)
+    if getattr(args, "cost", False) or cost_log:
+        report_costs(app_name, cost_log)
         return RunResult(RunStopReason.NO_WORK)
 
     # Mirror all screen output into a rotating log file under the home dir —

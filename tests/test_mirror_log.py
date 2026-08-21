@@ -293,3 +293,48 @@ def test_an_explicit_max_runs_lists_exactly_that_many(tmp_path, log_dir, capsys)
     out = capsys.readouterr().out
     assert out.count("--output-format") == 3
     assert "more pending" not in out
+
+
+# Two sessions, one of them billed twice: enough to tell "summed the right file"
+# from "summed something".
+_TWO_SESSIONS = (
+    "2026-08-01 00:00:00 === Iteration 1 === [Current state: plan mode]\n"
+    "· done (12.0 c, $1.5000)\n"
+    "· done (12.0 c, $0.5000)\n"
+    "2026-08-02 00:00:00 === Iteration 1 === [Current state: plan mode]\n"
+    "· done (12.0 c, $0.2500)\n"
+)
+
+
+def test_a_named_log_is_read_instead_of_this_entry_points_own(
+        tmp_path, log_dir, capsys):
+    """Rotation renames a log out from under log_file_path, so summing a backup
+    is reachable only by naming the file."""
+    backup = tmp_path / "runCycle-elsewhere.log.1"
+    backup.write_text(_TWO_SESSIONS, encoding="utf-8")
+
+    cyclecore.report_costs("pytest-costs", backup)
+
+    out = capsys.readouterr().out
+    assert str(backup) in out
+    assert "Session 1: 2 costs, $2.0000" in out
+    assert "Session 2: 1 costs, $0.2500" in out
+    assert "TOTAL: 2 sessions, 3 costs, $2.2500" in out
+
+
+def test_naming_a_log_reports_instead_of_running_the_loop(
+        tmp_path, log_dir, capsys):
+    """--cost-log implies --cost: the alternative is a silent full run."""
+    named = tmp_path / "named.log"
+    named.write_text(_TWO_SESSIONS, encoding="utf-8")
+    args = _seq_args(str(tmp_path), dry_run=False)
+    args.cost_log = str(named)
+
+    driver = _OneShotDriver()
+    cyclecore.run_loop(driver, args, app_name="pytest-costs-flag",
+                       wait_on_start=False)
+
+    assert driver.served == 0, "the loop ran instead of reporting"
+    out = capsys.readouterr().out
+    assert str(named) in out
+    assert "TOTAL: 2 sessions, 3 costs, $2.2500" in out
