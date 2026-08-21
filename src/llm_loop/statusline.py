@@ -1173,8 +1173,21 @@ class _EscapeDecoder:
         # and treating it as a lead byte would swallow the key after it.
         self.scan_codes = scan_codes
         self._buf = ""
+        self._high = ""
 
     def feed(self, char: str) -> List[InputEvent]:
+        if self._high:
+            char, self._high = self._combine(self._high, char), ""
+            if not char:
+                return []
+        elif "\ud800" <= char <= "\udbff":
+            # msvcrt.getwch() hands over UTF-16 code UNITS, so anything outside
+            # the BMP (an emoji in a pasted line) arrives as two lone surrogates.
+            # Each half is unprintable on its own, so passing them through drops
+            # the character silently — join them here, where the platform quirk
+            # already lives, and every consumer keeps seeing one printable Key.
+            self._high = char
+            return []
         if self._buf in _WINDOWS_LEAD and self._buf:   # lead byte + scan code
             name = WINDOWS_KEYS.get(char)
             self._buf = ""
@@ -1197,7 +1210,16 @@ class _EscapeDecoder:
             return [event] if event is not None else []
         return []
 
+    @staticmethod
+    def _combine(high: str, low: str) -> str:
+        """One character from a UTF-16 surrogate pair, or "" if it was not one."""
+        try:
+            return (high + low).encode("utf-16", "surrogatepass").decode("utf-16")
+        except UnicodeError:
+            return ""
+
     def flush(self) -> List[InputEvent]:
+        self._high = ""      # a half pair that never completed is not a keypress
         if self._buf == "\x1b":
             self._buf = ""
             return [Key("\x1b")]
@@ -1284,12 +1306,19 @@ class TerminalInput(InputSource):
             self._stop.wait(self.poll_seconds)
 
     def _run_posix(self, handler):
+        import codecs
         import select
         import termios
         import tty
 
         fd = self._stream.fileno()
         saved = termios.tcgetattr(fd)
+        # INCREMENTAL, not a plain .decode() per read: a paste arrives as a byte
+        # stream cut at arbitrary offsets, and a read that ends mid-character
+        # (every non-ASCII one is 2-4 bytes) would decode to U+FFFD and eat the
+        # start of the next character with it. Keeping the decoder across reads
+        # is what makes a pasted Russian sentence survive a chunk boundary.
+        utf8 = codecs.getincrementaldecoder("utf-8")("replace")
         try:
             tty.setcbreak(fd)  # cbreak, not raw: ISIG (Ctrl+C) stays enabled
             # Published so a signal handler / atexit can undo it: this thread is
@@ -1301,8 +1330,7 @@ class TerminalInput(InputSource):
                     for event in self._decoder.flush():
                         handler(event)
                     continue
-                data = os.read(fd, 64).decode("utf-8", "replace")
-                for char in data:
+                for char in utf8.decode(os.read(fd, 1024)):
                     self._emit(handler, char)
         finally:
             # Guaranteed restore: a terminal left in cbreak is unusable.
@@ -1542,6 +1570,9 @@ class LineEditor:
         "\x0b": kill_to_end,        # Ctrl+K
         "\x15": kill_to_start,      # Ctrl+U
         "\x17": kill_word_left,     # Ctrl+W
+        # A tab is not printable, so pasted text containing one would otherwise
+        # lose it — and lose the word boundary with it, joining two words.
+        "\t": lambda e: e.insert(" "),
     }
 
     def handle(self, char: str) -> bool:

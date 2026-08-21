@@ -702,6 +702,21 @@ def test_sending_resets_the_cursor_with_the_buffer(tmp_path):
     assert app.mode.buffer == "second"
 
 
+def test_a_pasted_line_lands_intact_at_the_cursor(tmp_path):
+    """Ctrl+V is the terminal's own key: the clipboard arrives as an ordinary
+    burst of characters, so paste is insertion — including into the middle."""
+    app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
+    app.handle_event(sl.Key("m"))
+    _type(app, "измерь полку")
+    for _ in range(len("полку")):
+        app.handle_event(sl.Key("left"))
+
+    _type(app, "вторую\tсправа ")        # a tab inside the pasted fragment
+
+    assert app.mode.buffer == "измерь вторую справа полку", \
+        "a tab dropped outright would join the two words it separated"
+
+
 def test_the_editor_refuses_what_it_does_not_own():
     """MessageMode gives Enter and Esc their own meaning, so the editor must not
     quietly consume them — nor any other key a later Mode may want."""

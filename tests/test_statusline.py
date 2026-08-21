@@ -1418,6 +1418,21 @@ def test_the_word_wise_arrows_are_named_on_both_platforms():
     assert [e.char for e in windows.feed("t")] == ["t"]
 
 
+def test_the_decoder_rejoins_a_utf16_surrogate_pair():
+    """msvcrt hands over code UNITS: an emoji in a pasted line arrives as two
+    lone surrogates, each unprintable on its own and therefore dropped."""
+    windows = sl._EscapeDecoder(scan_codes=True)
+
+    assert windows.feed("\ud83d") == []
+    assert [e.char for e in windows.feed("\ude80")] == ["🚀"]
+
+    # A half pair that never completes is not a keypress, and must not glue
+    # itself to whatever is typed next.
+    windows.feed("\ud83d")
+    assert windows.flush() == []
+    assert [e.char for e in windows.feed("a")] == ["a"]
+
+
 def test_escape_decoder_drops_sequences_nothing_understands():
     decoder = sl._EscapeDecoder(scan_codes=False)
 
