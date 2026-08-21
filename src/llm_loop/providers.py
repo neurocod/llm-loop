@@ -18,6 +18,7 @@ from .operator import user_message_line
 class AgentCommandLike(Protocol):
     prompt: str
     model: str
+    sandbox_mode: str
 
 
 # Whether a claude iteration is started with its stdin open for more user
@@ -222,9 +223,21 @@ def build_agent_argv(command: AgentCommandLike, provider: str,
         spec.executable,
         "exec",
         "--json",
+    ]
+    sandbox_mode = getattr(command, "sandbox_mode", "")
+    if sandbox_mode:
+        # --approve-for-me itself selects workspace-write and cannot be combined
+        # with an explicit sandbox. An unattended explicit mode also needs an
+        # explicit non-interactive approval policy.
+        argv += [
+            "--sandbox", sandbox_mode,
+            "--config", 'approval_policy="never"',
+        ]
+    else:
         # --approve-for-me already selects the workspace-write sandbox. Current
         # Codex CLI versions reject combining it with an explicit --sandbox.
-        "--approve-for-me",
+        argv.append("--approve-for-me")
+    argv += [
         "--skip-git-repo-check",
         "-C", project_dir,
     ]

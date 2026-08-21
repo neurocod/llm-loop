@@ -832,6 +832,7 @@ class AgentCommand(NamedTuple):
     model: str = ""
     label: str = ""
     provider: str = ""
+    sandbox_mode: str = ""
 
 
 ClaudeCommand = AgentCommand
@@ -1698,8 +1699,9 @@ class Driver:
         typical wrapper need not set them at all; ``description`` (the --help
         description) is free prose, so set it if you want one; ``limit_policy``
         (a limits.LimitPolicy) picks the usage-limit specialisation, defaulting
-        to a day/night session rule when unset. Override any of them on your
-        subclass to pin an explicit value.
+        to a day/night session rule when unset; ``sandbox_mode`` selects an
+        explicit Codex sandbox for this driver's commands. Override any of them
+        on your subclass to pin an explicit value.
       * methods for behaviour — ``next_command()``, ``model()``, ``on_success()``,
         ``final_summary()``. Override the ones you need; the rest keep their
         default.
@@ -1726,6 +1728,10 @@ class Driver:
     prog: Optional[str] = None          # --help program name
     description: Optional[str] = None   # --help description (None = generic)
     provider: str = "claude"            # may be overridden by --codex
+    # Optional explicit Codex sandbox for every command this driver builds.
+    # Claude ignores it. Keeping this on the driver lets one trusted workflow
+    # opt into a broader boundary without changing every shared-loop invocation.
+    sandbox_mode: str = ""
 
     # --- usage-limit specialisation (declarative, like the labels above) ------
     # A limits.LimitPolicy picking which quota(s) to gate on and at what

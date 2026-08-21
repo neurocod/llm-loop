@@ -47,6 +47,16 @@ def test_codex_argv_is_non_interactive_jsonl():
     assert argv[-1] == "-"
 
 
+def test_codex_argv_can_select_a_workflow_specific_sandbox():
+    command = AgentCommand("work", "gpt-test",
+                           sandbox_mode="danger-full-access")
+    argv = build_agent_argv(command, "codex", "/repo")
+
+    assert "--approve-for-me" not in argv
+    assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
+    assert argv[argv.index("--config") + 1] == 'approval_policy="never"'
+
+
 def test_unknown_provider_is_rejected():
     with pytest.raises(ValueError, match="Unknown LLM provider"):
         provider_spec("gemini")

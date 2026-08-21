@@ -85,7 +85,8 @@ class StateFileDriver(Driver):
                 exit_code=1,
             )
         label = state or f"{self.state_file} not found"
-        return AgentCommand(self.prompt(), self.model(), label, self.provider)
+        return AgentCommand(self.prompt(), self.model(), label, self.provider,
+                            self.sandbox_mode)
 
     def final_summary(self) -> Optional[str]:
         return f"Final state: {self.first_line()}"
@@ -211,7 +212,8 @@ class ListFileDriver(Driver):
         target_abs = self.target_path(source_abs)
         label = os.path.basename(source_abs)
         return AgentCommand(self.prompt(source_abs, target_abs),
-                            self.model(), label, self.provider)
+                            self.model(), label, self.provider,
+                            self.sandbox_mode)
 
     def strike(self, line: str) -> bool:
         """Remove the first list entry exactly matching `line`; rewrite the file.
