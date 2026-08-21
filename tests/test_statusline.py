@@ -639,6 +639,56 @@ def test_the_title_is_written_on_change_only_and_given_back_on_exit(monkeypatch)
 
     assert sl.TITLE_RESET in stream.getvalue()  # the window gets its name back
 
+    # A worker still finishing past a parallel Ctrl+C, or the quota refresher
+    # whose join timed out: both paint after the teardown, and a name written
+    # then is a name nothing is left to clear.
+    mark = len(stream.getvalue())
+    app.update(iteration=5)
+    assert stream.getvalue()[mark:] == ""
+
+
+def test_disabling_mid_paint_cannot_leave_a_name_on_the_window(monkeypatch):
+    """`_paint` reads `self.terminal`, then writes to it — and another thread
+    may release that very terminal in between (a resize the screen cannot fit,
+    any painting error). The released terminal has to refuse the write."""
+    stream = _FakeStream(True)
+    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+                        lambda fallback=(0, 0): os.terminal_size((100, 30)))
+    terminal = sl.terminal_for(stream)
+    app = sl.StatusApp(terminal=terminal, input_source=sl.NullInputSource(),
+                       refresh=60)
+
+    with app:
+        app.update(iteration=8, phase="running")
+        app.disable()                      # the app now holds a NullTerminal…
+        mark = len(stream.getvalue())
+        terminal.set_title("⟳ iter 9")     # …and the old one is asked anyway
+
+    assert stream.getvalue()[mark:] == ""
+
+
+def test_the_git_push_value_is_lit_like_a_healthy_figure():
+    """Through `_script_settings`, not a hand-written field: the colouring is
+    anchored on the knob's NAME, and this is what makes renaming it move the
+    colour instead of quietly losing it."""
+    settings = cyclecore._script_settings(cyclecore.RunSettings(), sl)
+    line = sl.render_rows(sequential_status(script_limits=settings.status_entries()),
+                          200, now=NOW)[1]
+
+    assert "git-push each_hour" in line       # the plain row is unchanged
+    assert f"git-push {sl._SGR['green']}each_hour{sl._SGR_RESET}" in sl.colorize(line)
+
+
+def test_a_policy_word_is_coloured_only_where_it_is_the_git_push_value():
+    """`none` is ordinary English — an item called none.md must stay plain."""
+    status = sequential_status(script_limits=[("git-push", "none")])
+    status.jobs[0].update(item="none")
+    rows = sl.render_rows(status, 200, now=NOW)
+
+    assert sl._SGR["green"] not in sl.colorize(rows[2])          # the job row
+    assert f"git-push {sl._SGR['green']}none" in sl.colorize(rows[1])
+
 
 # --- Job / LoopStatus bookkeeping ---------------------------------------------
 

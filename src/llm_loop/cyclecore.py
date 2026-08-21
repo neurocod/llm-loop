@@ -159,6 +159,13 @@ REQUESTED_STOP_REASONS = frozenset(
 # Default push policy. Override on the command line with --git-push.
 GIT_PUSH_POLICY = GitPushPolicy.EACH_HOUR
 
+# What this knob is called on the pinned row (see `_script_settings`). A
+# constant because `statusline.colorize` anchors on it to find the VALUE it has
+# to light up: the policy words are ordinary English ("none"), so the label is
+# what tells a mode word from a file called none.md on a job row. Renaming the
+# knob here therefore moves the colouring with it instead of silently losing it.
+GIT_PUSH_SETTING = "git-push"
+
 # EACH_HOUR cadence: push no more often than this many seconds.
 GIT_PUSH_INTERVAL = 3600  # seconds — one hour
 
@@ -1659,7 +1666,7 @@ def _script_settings(run_settings: RunSettings, statusline) -> "SettingsRegistry
         # never set one.
         show_in_status=False))
     registry.add(statusline.Setting(
-        "git-push", "--git-push",
+        GIT_PUSH_SETTING, "--git-push",
         lambda: run_settings.git_push.value,
         lambda value: setattr(run_settings, "git_push", GitPushPolicy(value))))
     return registry

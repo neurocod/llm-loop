@@ -309,16 +309,31 @@ _SGR = {
     "dim": "\x1b[2m",
 }
 _SGR_RESET = "\x1b[0m"
-# One pass over the line: a percentage takes the usage scale's colour, a pipe or
-# a run of rule glyphs takes the muted chrome style. Built from RULE_CHAR so the
-# two cannot drift apart when the glyph changes.
-_PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
+# A knob whose value is a WORD rather than a figure: the git-push policy. It is
+# the field's data just as much as a percentage is, so it is lit rather than
+# left at label intensity — and the words come from the enum itself, so a policy
+# added there is coloured with no edit here. Anchored on the knob's own name
+# (`cyclecore.GIT_PUSH_SETTING`, fixed width, hence a legal lookbehind) because
+# "none" is ordinary English: unanchored it would also light up a job row
+# working on a file called none.md.
+_MODE_VALUE_PATTERN = (rf"(?<={re.escape(cyclecore.GIT_PUSH_SETTING)} )(?:"
+                       + "|".join(re.escape(policy.value)
+                                  for policy in cyclecore.GitPushPolicy)
+                       + r")")
+# One pass over the line: a percentage takes the usage scale's colour, a mode
+# word the healthy end of it, a pipe or a run of rule glyphs the muted chrome
+# style. Named groups because what a token MEANS is which alternative matched —
+# re-testing the matched text cannot tell a mode word from the label it must
+# follow. Built from RULE_CHAR so the glyph and its styling cannot drift apart.
 _STYLED_RE = re.compile(
-    rf"\d+(?:\.\d+)?\s*%|{re.escape(RULE_CHAR)}{{2,}}|\|")
+    rf"(?P<percent>\d+(?:\.\d+)?\s*%)"
+    rf"|(?P<mode>{_MODE_VALUE_PATTERN})"
+    rf"|(?P<chrome>{re.escape(RULE_CHAR)}{{2,}}|\|)")
 
 
 def colorize(line: str) -> str:
-    """Colour a rendered row: percentages on the usage scale, chrome muted.
+    """Colour a rendered row: percentages on the usage scale, the git-push value
+    green, chrome muted.
 
     Reuses `cyclecore.percent_style` so the pinned rows and the scrolling log
     lines agree about what "alarming" looks like. Adding the codes here rather
@@ -339,6 +354,11 @@ def colorize(line: str) -> str:
     spent against it, so an alarming colour would announce a problem that
     cannot exist. The same rule states it: the field shows ONE state, and here
     that state is "not gating anything".
+
+    A mode word ("git-push each_hour") is not on that scale at all — no policy
+    is healthier than another — so it simply takes the scale's calm end, which
+    is what "this is the value, and nothing is wrong" already looks like
+    everywhere else on the row.
     """
     out = []
     last = 0
@@ -347,7 +367,9 @@ def colorize(line: str) -> str:
     field_start = 0         # start of the field being painted (after the last pipe)
     for match in _STYLED_RE.finditer(line):
         token = match.group(0)
-        if _PERCENT_RE.fullmatch(token):
+        if match.lastgroup == "mode":
+            style = _SGR.get(cyclecore.PERCENT_STYLES[0], "")
+        elif match.lastgroup == "percent":
             # Only what stands between this figure and its own field's reading —
             # never text from the field before the pipe, which would make a
             # neighbour's separator look like this field's.
@@ -995,6 +1017,7 @@ class Terminal:
         self._rows = 0
         self._size = (0, 0)
         self._title = None    # last title written (None = we never set one)
+        self._released = False  # torn down: writes no more title (see set_title)
         self.failed = False
 
     @property
@@ -1024,6 +1047,9 @@ class Terminal:
         if columns < MIN_COLUMNS or lines < MIN_LINES or rows >= lines - 1:
             return False
         with self._lock:
+            # Pinning rows is a run starting here, so the title ban lifts: a
+            # Terminal that was released and is now reserved again is in use.
+            self._released = False
             # Scroll only for the rows we are *adding*: re-establishing the
             # region on every resize must not walk the output up the screen.
             grown = max(0, rows - self._rows)
@@ -1041,11 +1067,16 @@ class Terminal:
         on every repaint — and an emulator that ignores OSC 0 simply swallows a
         few bytes that never reach the scrollback.
 
-        Not gated on `active`: the title is one self-contained escape with no
-        geometry behind it, so it stays correct even when the pinned region had
-        to be given up (a resize the screen no longer fits).
+        Not gated on `active`, because a title has no geometry behind it: it is
+        written as soon as the run has something to say, before any region is
+        pinned. It IS refused once `release()` has run, and that is not
+        symmetry for its own sake — nothing would ever clear a name written
+        after the teardown. Two threads reach here after it routinely: a worker
+        still finishing its job past a parallel run's Ctrl+C, and the quota
+        refresher whose 1 s join timed out. Both used to leave the dead run's
+        name on the window for good.
         """
-        if self.failed:
+        if self.failed or self._released:
             return False
         with self._lock:
             # Compared UNDER the lock, with the write: two threads painting
@@ -1090,6 +1121,7 @@ class Terminal:
             if self._title is not None:
                 self._title = None
                 self._write(TITLE_RESET)
+            self._released = True
             if self._rows <= 0:
                 return
             _columns, total = self._size
@@ -2526,8 +2558,10 @@ class StatusApp:
         # Before the `active` gate, and on the same path as the rows: the title
         # is what a person sees while the terminal is behind another window, so
         # it must follow every state change the rows follow — including the ones
-        # that arrive with no region pinned (a run naming its window before
-        # start(), a screen too small for the rows).
+        # that arrive before any region is pinned (a run names its window as
+        # soon as `update` gives it a state, which is before `start()`).
+        # Once the terminal has been released it refuses the write, so a late
+        # painter cannot re-name a window nobody will clean up again.
         try:
             self.terminal.set_title(title_text(self.status))
         except Exception:
