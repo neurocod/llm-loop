@@ -324,10 +324,18 @@ def test_a_named_log_is_read_instead_of_this_entry_points_own(
 
 def test_naming_a_log_reports_instead_of_running_the_loop(
         tmp_path, log_dir, capsys):
-    """--cost-log implies --cost: the alternative is a silent full run."""
+    """--cost-log implies --cost: the alternative is a silent full run.
+
+    `dry_run=True` although the cost branch sits BEFORE the dry-run branch and
+    would be reached either way: this pin's failure mode is "the loop ran", and
+    a real run here would spawn a billed provider session against the test's own
+    tmp dir (measured: one such regression cost $0.17 and an unsupervised turn).
+    A dry run still serves the command, so `served` catches the regression just
+    as well while executing nothing.
+    """
     named = tmp_path / "named.log"
     named.write_text(_TWO_SESSIONS, encoding="utf-8")
-    args = _seq_args(str(tmp_path), dry_run=False)
+    args = _seq_args(str(tmp_path), dry_run=True)
     args.cost_log = str(named)
 
     driver = _OneShotDriver()

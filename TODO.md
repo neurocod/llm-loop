@@ -63,8 +63,8 @@ We already extract `total_cost_usd` per iteration from the result event.
 Source: frankbria (`metrics.jsonl`).
 Append one line per iteration next to the mirror log:
 `{loop, label, duration_s, cost_usd, returncode, status}`. We already compute all
-of this for the console output — just persist it. Makes `sum_session_costs.py`
-trivial and gives per-run analytics.
+of this for the console output — just persist it. Would let `--cost` read
+numbers instead of re-parsing its own prose, and gives per-run analytics.
 
 ### [P2] Configurable allowed-tools
 Source: continuous-claude / frankbria.
@@ -104,6 +104,17 @@ The run never terminates and its `join()` never returns. Found while changing
 `run_job`'s signature: the stale test stubs raised TypeError inside the workers
 and the suite hung instead of failing. Fix: wrap the body, `shared.release(line)`
 on an unexpected exception, and treat it as a failed attempt.
+
+### [P3] Nothing ties `FLAG_ALIASES` to the parsers it mirrors
+`cmdline.FLAG_ALIASES` is hand-kept in step with `cyclecore.parse_args`,
+`parallel.parse_args` and the host wrapper's own flags — its comment says so and
+says a missing spelling is not cosmetic. But no test asserts the coverage, so
+forgetting an entry leaves the suite fully green; the symptom appears later, in
+the status line's "reproduce this run" command, where the forgotten flag's value
+token is read as a flag. A parametrized case needs the parser objects, which
+`parse_args` builds locally and never returns — so the fix starts with splitting
+out a `build_parser()`. Found by review of the `--cost-log` commit (that entry
+was added, and would have been just as green if it had not been).
 
 ## Structure worth doing when something takes you there anyway
 

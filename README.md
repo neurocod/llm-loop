@@ -405,7 +405,7 @@ reading before the bounded retry path continues.
 | `-s, --start-in 29m` | wait before starting (sequential only); alias `--startIn` |
 | `-j, --jobs N` | concurrent workers (parallel only; else the Driver's `jobs`, else 10) |
 | `-c, --cost` | print per-session cost totals from the mirror log and exit (sequential only) |
-| `--cost-log LOG` | report on this log instead of this entry point's own — a rotated backup or a copy; implies `--cost` |
+| `--cost-log LOG` | report on this log instead of this entry point's own — a rotated backup or a copy; implies `--cost` (sequential only) |
 | `--ignore-usage` | don't pause on the session budget (parallel only) |
 | `--raw` | print raw JSON events, for debugging (sequential only) |
 | `--no-statusline` | do not pin the status rows (same as `LLM_LOOP_STATUSLINE=0`) |
