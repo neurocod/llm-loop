@@ -300,6 +300,9 @@ def test_a_queued_note_rides_the_next_iterations_prompt(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", fake_run)
+    # Bounded runs skip the quota GATE but still bookend themselves with a usage
+    # snapshot; a unit test has no business on the network for either.
+    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
 
     cyclecore.run_loop(_TwoIterationDriver(), _seq_args(str(tmp_path)),
                        app_name="pytest-operator", setup_logging=False,
@@ -309,6 +312,31 @@ def test_a_queued_note_rides_the_next_iterations_prompt(tmp_path, monkeypatch):
     assert operator.QUEUED_NOTES_HEADER in prompts[1]
     assert prompts[1].rstrip().endswith("- prefer the kit's lathe")
     assert mailboxes[0].queued_count == 0
+
+
+def test_the_sequential_status_line_is_given_the_runs_mailbox(tmp_path,
+                                                              monkeypatch):
+    """The console's end of the wire: without this the `m` key is not offered."""
+    seen = {}
+    real_app_class = sl.StatusApp
+
+    def _capture(**kwargs):
+        seen["messages"] = kwargs.get("messages")
+        return real_app_class(terminal=sl.NullTerminal(),
+                              input_source=sl.NullInputSource(), refresh=60,
+                              **{k: v for k, v in kwargs.items()
+                                 if k != "enabled"})
+
+    monkeypatch.setattr(sl, "StatusApp", _capture)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda cmd, raw, partial, prompt="", mailbox=None: 0)
+    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
+
+    cyclecore.run_loop(_TwoIterationDriver(), _seq_args(str(tmp_path)),
+                       app_name="pytest-operator", setup_logging=False,
+                       wait_on_start=False)
+
+    assert isinstance(seen["messages"], operator.Mailbox)
 
 
 # --- the console --------------------------------------------------------------
