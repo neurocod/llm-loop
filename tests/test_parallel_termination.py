@@ -99,7 +99,8 @@ def test_worker_claims_before_touching_the_usage_gate(tmp_path, monkeypatch):
         def log_snapshot(self, *a, **k):
             pass
 
-        def check_and_wait(self, source, session_start, note="", cache_value=True):
+        def check_and_wait(self, source, session_start, note="",
+                           cache_value=True, should_stop=None):
             gate_calls.append(1)
             return False, session_start
 

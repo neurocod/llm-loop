@@ -252,7 +252,8 @@ class _NeverPauses:
     def log_snapshot(self, *args, **kwargs):
         pass
 
-    def check_and_wait(self, source, session_start, note="", cache_value=True):
+    def check_and_wait(self, source, session_start, note="",
+                       cache_value=True, should_stop=None):
         return False, session_start
 
 
@@ -274,7 +275,8 @@ def _run_with_verdict(tmp_path, monkeypatch, verdict):
     waits = []
     monkeypatch.setattr(usage, "UsageSource", lambda *a, **k: _StubSource())
     monkeypatch.setattr(cyclecore, "wait_until",
-                        lambda ts, reason=None: waits.append(ts))
+                        lambda ts, reason=None, should_stop=None:
+                            waits.append(ts))
 
     def fake_run(cmd, raw, partial, prompt="", mailbox=None):
         cyclecore._last_rate_limit_event = verdict

@@ -41,7 +41,7 @@ from datetime import datetime
 from typing import Optional
 
 from .cyclecore import (CLAUDE_SESSION_DURATION, _fmt_clock, _fmt_left,
-                        print_percents)
+                        print_percents, sleep_unless)
 from .usage import QUOTA_BY_FIELD, Usage, UsageReading
 
 # Default ceilings for the ready-made rules (all overridable per instance).
@@ -267,7 +267,7 @@ class LimitPolicy:
     # --- the public entry point ------------------------------------------------
 
     def check_and_wait(self, source, session_start: float, note: str = "",
-                       cache_value: bool = True) -> tuple:
+                       cache_value: bool = True, should_stop=None) -> tuple:
         """Read the usage figures; if any rule is at/over its ceiling, pause until
         they all clear (a window reset, or — for DayNightLimit — the ceiling rising
         above the usage as the reset nears).
@@ -275,6 +275,11 @@ class LimitPolicy:
         Returns (paused, session_start). `session_start` is refreshed to now only
         when the *session* window actually reset, so callers can reset their
         per-session bookkeeping; otherwise it is returned unchanged.
+
+        `should_stop` is the caller's stop channels (see cyclecore.sleep_unless).
+        The pause here is the longest hold in the engine — hours, with every
+        worker parked in it — so it must be abandonable: the caller re-reads its
+        own stop state after this returns and decides what to do about it.
         """
         usage = source.get_usage(cache_value)
         now = time.time()
@@ -295,9 +300,9 @@ class LimitPolicy:
 
         if not self._violations(status):
             return False, session_start
-        return self._wait(source, session_start)
+        return self._wait(source, session_start, should_stop)
 
-    def _wait(self, source, session_start: float) -> tuple:
+    def _wait(self, source, session_start: float, should_stop=None) -> tuple:
         """Hold while any rule is over its ceiling.
 
         The usage percentages are frozen for the duration (we are not burning
@@ -308,6 +313,10 @@ class LimitPolicy:
 
         Returns (True, session_start): session_start bumped to now if the session
         window reset during the wait, else unchanged.
+
+        A pending stop (`should_stop`) ends the hold immediately. It is reported
+        as a pause like any other, because that is what it was — what to do next
+        is the caller's decision, and it reads its own stop channels for that.
         """
         usage = source.get_usage()  # snapshot, frozen until a window refreshes
         labels = ", ".join(r.label for r, _, _ in
@@ -316,6 +325,10 @@ class LimitPolicy:
               f"the window resets…")
         try:
             while True:
+                if should_stop is not None and should_stop():
+                    print("  ⏹ Stop requested while over the usage limit — "
+                          "leaving the wait without resuming.")
+                    return True, session_start
                 now = time.time()
                 status = self._status(usage, now)
                 violated = self._violations(status)
@@ -350,7 +363,7 @@ class LimitPolicy:
                     for r, rd, c in violated)
                 print_percents(f"    … {over}; {_fmt_left(next_reset - now)} "
                                f"to next reset (now {_fmt_clock(now)})")
-                time.sleep(min(next_reset - now, 60))
+                sleep_unless(min(next_reset - now, 60), should_stop)
         except KeyboardInterrupt:
             print("\nWait interrupted by user (Ctrl+C).")
             sys.exit(130)

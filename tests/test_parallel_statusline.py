@@ -582,7 +582,7 @@ def test_a_capped_run_never_reports_more_than_it_promised():
     """`done` follows the list, and a preflight can strike items this run never
     touched — but the row must not report past the cap it displayed."""
     progress = sl.InvocationProgress(max_items=2)
-    progress.track_list(5)
+    progress.track_total(5)
     progress.note_remaining(1)      # four gone: two run, two struck as finished
 
     assert progress.summary_fields() == {"iteration": 2, "max_iterations": 2}

@@ -573,10 +573,10 @@ class InvocationProgress:
       * the Job pool, reused by job_id — the Job objects already ARE the
         per-worker state, so a worker resuming with the same Job keeps its count
         correct by construction, with no second bookkeeping to disagree with it;
-      * list progress, where `done` is DERIVED as (pending when the invocation
+      * queue progress, where `done` is DERIVED as (pending when the invocation
         began − pending now) rather than counted. That is self-correcting: items
         a preflight strikes, or work a previous run finished, move the figure
-        with the list instead of leaving a counter to drift away from it.
+        with the queue instead of leaving a counter to drift away from it.
 
     The cap is one global number for the whole invocation (`max_items`), never
     the wrapper's per-batch cap — a batch cap is an internal detail of how the
@@ -587,9 +587,9 @@ class InvocationProgress:
         self._lock = threading.Lock()
         self.max_items = max_items   # the invocation's --max (None = uncapped)
         self._pool = {}              # job_id -> Job, reused by every runner call
-        self._baseline = None        # list items pending when the invocation began
-        self._remaining = None       # list items pending now
-        self._iterations = 0         # non-list runs count iterations instead
+        self._baseline = None        # items pending when the invocation began
+        self._remaining = None       # items pending now
+        self._iterations = 0         # runs with no total count iterations instead
 
     def jobs(self, count: int) -> List[Job]:
         """The `count` job rows of one runner call, reused across calls.
@@ -605,10 +605,10 @@ class InvocationProgress:
                     self._pool[job_id] = Job(job_id)
             return [self._pool[job_id] for job_id in range(1, count + 1)]
 
-    def track_list(self, pending: int) -> None:
-        """Latch the list's size at the start of the invocation (first call wins).
+    def track_total(self, pending: int) -> None:
+        """Latch the work total at the start of the invocation (first call wins).
 
-        Later calls must NOT re-baseline: their list is already short by whatever
+        Later calls must NOT re-baseline: the queue is already short by whatever
         the earlier batches finished, and re-reading it there is what made the
         denominator describe a batch instead of the run.
         """
@@ -618,24 +618,24 @@ class InvocationProgress:
                 self._remaining = pending
 
     def note_remaining(self, remaining: int) -> None:
-        """Record how many list items are still pending (the source of `done`)."""
+        """Record how many items are still pending (the source of `done`)."""
         with self._lock:
             if self._baseline is not None:
                 self._remaining = remaining
 
     def note_iteration(self) -> None:
-        """Count one iteration of a non-list run (a list run derives it instead)."""
+        """Count one iteration of a run with no total (a tracked run derives it)."""
         with self._lock:
             self._iterations += 1
 
     def summary_fields(self) -> dict:
         """`iteration`/`max_iterations` for the summary row, as update() kwargs.
 
-        A list-backed run reads as items COMPLETED out of the smaller of what the
-        list held at the start and the cap — `done` clamped into the total, so a
-        capped run cannot report more than it promised even when a preflight
-        strikes extra items. Any other driver counts its own iterations and gets a
-        denominator only when one was actually given.
+        A run whose driver reports a total reads as items COMPLETED out of the
+        smaller of what the queue held at the start and the cap — `done` clamped
+        into the total, so a capped run cannot report more than it promised even
+        when a preflight strikes extra items. A driver with no total counts its
+        own iterations and gets a denominator only when one was actually given.
         """
         with self._lock:
             if self._baseline is None:
@@ -1062,7 +1062,7 @@ class Terminal:
                 + f"\x1b[1;{lines - rows}r"        # DECSTBM: shrink the scroll area
                 + f"\x1b[{lines - rows};1H")       # park at the bottom of it
 
-    def set_title(self, text: str) -> bool:
+    def set_title(self, text: str, *, reassert: bool = False) -> bool:
         """Name the window/tab. Repeats are dropped, so this is cheap to call
         on every repaint — and an emulator that ignores OSC 0 simply swallows a
         few bytes that never reach the scrollback.
@@ -1075,6 +1075,15 @@ class Terminal:
         still finishing its job past a parallel run's Ctrl+C, and the quota
         refresher whose 1 s join timed out. Both used to leave the dead run's
         name on the window for good.
+
+        `reassert` writes even when the text has not changed, and the periodic
+        repaint passes it for the same reason it re-states the scroll region
+        (see `paint`): the name is not ours alone. Anything the run launches can
+        take it — an escape from a provider CLI or a pager, and on Windows a
+        child that calls SetConsoleTitle, which no escape of ours is answering.
+        Without a re-assert the dedupe below then holds the window on somebody
+        else's name for the rest of the run, because as far as we know we
+        already wrote ours.
         """
         if self.failed or self._released:
             return False
@@ -1083,7 +1092,7 @@ class Terminal:
             # different states could otherwise leave the newer text recorded and
             # the older one on screen, and every later repaint would then skip
             # the correction as a duplicate.
-            if text == self._title:
+            if text == self._title and not reassert:
                 return False
             self._title = text
             return self._write(TITLE_SET.format(text))
@@ -1154,7 +1163,7 @@ class NullTerminal(Terminal):
     def reserve(self, rows):
         return False
 
-    def set_title(self, text):
+    def set_title(self, text, *, reassert=False):
         return False
 
     def paint(self, lines, *, reassert=False):
@@ -2563,7 +2572,7 @@ class StatusApp:
         # Once the terminal has been released it refuses the write, so a late
         # painter cannot re-name a window nobody will clean up again.
         try:
-            self.terminal.set_title(title_text(self.status))
+            self.terminal.set_title(title_text(self.status), reassert=reassert)
         except Exception:
             pass
         if not self.terminal.active:

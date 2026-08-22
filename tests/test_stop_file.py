@@ -30,6 +30,8 @@ import pytest
 from llm_loop import cyclecore, parallel, statusline
 from llm_loop.cyclecore import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
+from llm_loop.limits import LimitPolicy, SessionLimit
+from llm_loop.usage import Usage, UsageReading
 
 
 @pytest.fixture(autouse=True)
@@ -99,7 +101,8 @@ class _StubPolicy:
     def log_snapshot(self, *args, **kwargs):
         pass
 
-    def check_and_wait(self, source, session_start, note="", cache_value=True):
+    def check_and_wait(self, source, session_start, note="",
+                       cache_value=True, should_stop=None):
         return False, session_start
 
 
@@ -427,6 +430,123 @@ def test_parallel_stop_file_is_reported_once_by_competing_workers(
 
     assert result.reason == cyclecore.RunStopReason.STOP_FILE
     assert capsys.readouterr().out.lower().count("stop file detected") == 1
+
+
+# -- asking a run that is parked on the usage wall to stop -----------------------
+#
+# The pause on the account's budget is the longest hold in the engine: hours,
+# with every worker inside it and nothing else running. A hold that does not
+# watch the stop channels therefore takes the brakes with it — there is nobody
+# left to notice `s` or the sentinel until the window resets, and from outside
+# the run is indistinguishable from a hung one.
+
+
+class _PeggedSource:
+    """A usage source stuck over any sane ceiling, with a distant reset."""
+
+    def __init__(self, percent: float = 99.0, resets_in: float = 3600.0):
+        reading = UsageReading(percent, time.time() + resets_in)
+        self.usage = Usage(session=reading, week_all=reading,
+                           week_sonnet=reading, summary_lines=[])
+
+    def get_usage(self, cache_value=True):
+        return self.usage
+
+    def invalidate(self):
+        pass
+
+
+class _NeverEndingDriver(Driver):
+    """Always has work, and gates on a real (flat 80%) session limit."""
+
+    limit_policy = LimitPolicy([SessionLimit(80)])
+
+    def next_command(self):
+        return ClaudeCommand("do the thing", "", "the-thing")
+
+
+def _capture_disabled_app(monkeypatch) -> dict:
+    """Capture the run's StatusApp, screenless (pytest has no terminal).
+
+    Disabled is what the `s` key needs here anyway: the flag it sets is
+    in-process, and a screenless app skips the cancel countdown, which is only
+    offered to somebody who can see the row it counts down on.
+    """
+    captured = {}
+    real_app_class = statusline.StatusApp
+
+    def _app(**kwargs):
+        kwargs["enabled"] = False
+        captured["app"] = real_app_class(**kwargs)
+        return captured["app"]
+
+    monkeypatch.setattr(statusline, "StatusApp", _app)
+    return captured
+
+
+def test_the_s_key_ends_a_sequential_run_parked_on_the_usage_limit(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda cmd, raw, partial, prompt="", mailbox=None: 0)
+    monkeypatch.setattr(cyclecore, "usage_source_for",
+                        lambda provider: _PeggedSource())
+    captured = _capture_disabled_app(monkeypatch)
+    result = {}
+    done = threading.Event()
+
+    def go():
+        try:
+            result["run"] = cyclecore.run_loop(
+                _NeverEndingDriver(), _seq_args(str(tmp_path), dry_run=False),
+                app_name="pytest-stop")
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert "Over usage limit" in _await_output(capsys, "Over usage limit"), \
+        "the run never reached the usage hold"
+    captured["app"].request_stop()
+
+    assert done.wait(10), "the s key was ignored while the run sat on the limit"
+    assert result["run"].reason == cyclecore.RunStopReason.STOP_KEY
+    assert not (tmp_path / "stop").exists(), "the s key wrote a stop file"
+
+
+def test_the_s_key_ends_a_parallel_fleet_parked_on_the_usage_limit(
+    tmp_path, monkeypatch, capsys
+):
+    """The reported symptom: with the budget spent and every job paused, `s`
+    did nothing at all — the one moment the key is most likely to be pressed."""
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
+    monkeypatch.setattr(parallel, "usage_source_for",
+                        lambda provider: _PeggedSource())
+    captured = _capture_disabled_app(monkeypatch)
+    driver = _MemListDriver(["products/a.md", "products/b.md"])
+    driver.limit_policy = LimitPolicy([SessionLimit(80)])
+    args = _par_args(str(tmp_path), dry_run=False)
+    args.ignore_usage = False
+    result = {}
+    done = threading.Event()
+
+    def go():
+        try:
+            result["run"] = parallel.run_parallel(
+                driver, args, app_name="pytest-stop-parallel")
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert "Over usage limit" in _await_output(capsys, "Over usage limit"), \
+        "no worker ever reached the usage hold"
+    captured["app"].request_stop()
+
+    assert done.wait(10), "the s key was ignored while the fleet sat on the limit"
+    assert result["run"].reason == cyclecore.RunStopReason.STOP_KEY
+    # Nothing ran, so nothing may be struck: a file claimed and handed back is
+    # still pending work for the next run.
+    assert driver.pending_lines() == ["products/a.md", "products/b.md"]
 
 
 def test_stop_file_path_follows_the_project_root(tmp_path):

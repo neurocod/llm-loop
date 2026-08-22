@@ -371,6 +371,11 @@ the active policy watches — those are records of the gate. The pinned status l
 is not: it lists every window the provider meters (see below). When `--max-runs N`
 is given (a short bounded run) the limit gate is skipped entirely.
 
+The hold itself watches both stop channels, so a run parked on the wall — which
+in a parallel run means every worker at once, with nothing else left to notice a
+keypress — still answers `s` and the `stop` file within a quarter-second instead
+of only when the window resets.
+
 **Where the figures come from.** For Claude, `usage.py` reads them over HTTP from the same
 endpoint the CLI's own `/usage` panel and status line are built from,
 authenticated with the OAuth token the CLI keeps in `~/.claude/.credentials.json`
@@ -443,8 +448,12 @@ itself out of sight. It shares the rows' kill switch — piped output, CI and
 ends, whichever way it ends.
 
 The iteration counter carries the whole of "how much work is this run": its
-denominator is `--max-runs`, the list's size for a `ListFileDriver`, or the
-smaller of the two. `--max-runs` therefore gets no field of its own — a knob
+denominator is `--max-runs`, whatever the driver reports from
+`Driver.pending_total()` (a `ListFileDriver` answers with its list; override it
+wherever the queue is something else), or the smaller of the two. A driver that
+reports none counts bare iterations, which is right for a state machine meant to
+run forever and wrong for anything with a finish line. `--max-runs` therefore
+gets no field of its own — a knob
 whose value is already on the row registers with `show_in_status=False` and
 stays editable and reproducible without spending row width twice.
 

@@ -205,6 +205,11 @@ STOP_FILE = os.path.join(PROJECT_DIR, "stop")
 # launch back. Short enough that removing the file feels immediate.
 STOP_POLL_SECONDS = 2
 
+# How often a wait that is holding the run re-reads the stop channels. It is the
+# responsiveness of `s` while nothing is running — the cancel countdown polls at
+# the same rate — and the only cost is one os.path.exists per interval.
+STOP_RECHECK_SECONDS = 0.25
+
 _stop_file_lifecycle_lock = threading.Lock()
 _stop_file_lifecycle_depth = 0
 _detected_stop_file: Optional[str] = None
@@ -303,8 +308,34 @@ def latched_stop(app=None) -> Optional[StopSource]:
 STOP_GRACE_SECONDS = 5.0
 
 
+def sleep_unless(seconds: float, should_stop=None,
+                 poll: float = STOP_RECHECK_SECONDS) -> bool:
+    """Sleep up to `seconds`, cutting it short as soon as `should_stop()` says so.
+
+    Returns True when it returned early. A hold that outlasts an iteration takes
+    this rather than `time.sleep`, because an uninterruptible one is a run that
+    ignores its own brakes: with the fleet parked on the usage gate there is
+    nobody left to notice `s` or the stop file, and the keypress reads as "the
+    program hung" — which from outside is exactly what it looks like.
+    `should_stop` None keeps the plain sleep, for callers with no stop channel
+    to watch.
+    """
+    if should_stop is None:
+        if seconds > 0:
+            time.sleep(seconds)
+        return False
+    deadline = time.time() + seconds
+    while True:
+        if should_stop():
+            return True
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        time.sleep(min(poll, remaining))
+
+
 def confirm_stop_request(app=None, grace: float = STOP_GRACE_SECONDS,
-                         poll: float = 0.25) -> bool:
+                         poll: float = STOP_RECHECK_SECONDS) -> bool:
     """True if the pending stop request should be acted on now.
 
     The grace exists ONLY for a request this run's own `s` key made
@@ -1536,13 +1567,17 @@ def _fmt_moment(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
 
 
-def wait_until(target_ts: float, reason: str = None) -> None:
+def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
     """Sleep until wall-clock time reaches target_ts, printing a periodic countdown.
 
     Used after a probable token-limit error, or once the LimitPolicy decides the
     account's real usage figures leave no room: we idle until the 5-hour session
     window should have refreshed. `reason` overrides the default opening line.
     Ctrl+C interrupts the wait and stops the script.
+
+    `should_stop` is the run's stop channels (see `sleep_unless`): a hold that
+    can last hours must end the moment a human asks it to, and returns True when
+    that is why it returned. Without one the wait runs to `target_ts` as before.
     """
     if reason is None:
         reason = ("Looks like the token limit is exhausted. Waiting until "
@@ -1556,11 +1591,14 @@ def wait_until(target_ts: float, reason: str = None) -> None:
                 break
             print(f"    … {_fmt_left(remaining)} left (now {_fmt_clock(now)})",
                   flush=True)
-            time.sleep(min(remaining, 60))
+            if sleep_unless(min(remaining, 60), should_stop):
+                print("  ⏹ Stop requested — leaving the wait.")
+                return True
     except KeyboardInterrupt:
         print("\nWait interrupted by user (Ctrl+C).")
         sys.exit(130)
     print("  ▶ The session window should have refreshed — continuing the loop.")
+    return False
 
 
 def wait_for_stop_file_clear() -> None:
@@ -1797,6 +1835,23 @@ class Driver:
         """
         return ""
 
+    def pending_total(self) -> Optional[int]:
+        """How many units of work are still waiting, or None when unknowable.
+
+        This is the summary row's denominator, and it is asked of the driver
+        because only the driver knows what its queue is: a list file's pending
+        lines, a folder of requests, rows in a table. Re-read on every call (not
+        cached) — the first answer is latched as the invocation's baseline and
+        every later one moves the counter, so a queue that grows or shrinks under
+        the run stays honestly described.
+
+        None means "no total to report": the row then counts bare iterations,
+        which is the right answer for a state machine that is meant to run
+        forever, and the wrong one for anything with a finish line — a run whose
+        row reads `iter 1` with no `/N` is usually a driver that forgot this.
+        """
+        return None
+
     def on_success(self, returncode: int) -> None:
         """Called after an iteration whose provider CLI exited 0 — record progress
         here (mark a file done, advance a cursor). Default: nothing to do."""
@@ -1838,10 +1893,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     """
     # The usage-limit query/parse (UsageSource) and pausing policy (LimitPolicy)
     # live in their own modules; imported here to avoid an import cycle
-    # (limits/usage/statusline import cyclecore for its helpers). drivers imports
-    # this module, so ListFileDriver comes in here rather than at module level.
+    # (limits/usage/statusline import cyclecore for its helpers).
     from . import limits, statusline
-    from .drivers import ListFileDriver
 
     owns_progress = progress is None
     if owns_progress:
@@ -1948,13 +2001,16 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # the status line separates it from `-j N`. Disabled it is a Null object, so
     # every call below stays a no-op and the loop behaves exactly as before.
     settings = _script_settings(run_settings, statusline)
-    # A list driver's list is the source of truth for how much work this
-    # invocation has: the summary row counts items STRUCK out of it, not
+    # A driver that knows how much work it has is the source of truth for it:
+    # the summary row then counts items FINISHED out of that total, not
     # iterations, so a retried item is not progress and a preflight that strikes
-    # finished ones is. Any other Driver has no such total and counts iterations.
-    list_driven = isinstance(driver, ListFileDriver)
-    if list_driven:
-        progress.track_list(len(driver.pending_lines()))
+    # finished ones is. Asked of the driver (Driver.pending_total) rather than
+    # read off a list file, so a queue that is not a list — the kit-promotion
+    # pass draining its requests folder — gets a denominator too instead of
+    # counting bare iterations into a row that reads "iter 1" forever.
+    tracked_total = driver.pending_total()
+    if tracked_total is not None:
+        progress.track_total(tracked_total)
     # One mailbox for the whole run: the console writes to it, the loop below
     # empties it into the next prompt, and run_agent_streaming lends it the
     # running turn's stdin. A dry run gets none — there is no agent to talk to.
@@ -1980,6 +2036,16 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     stop_reason = RunStopReason.NO_WORK
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     dry_run_prompt_shown = False  # dry-run: show job 1's prompt once, not per pass
+
+    def stop_pending() -> bool:
+        """Is either stop channel asking for this run right now?
+
+        Handed to every hold that can outlast an iteration (the usage gate, the
+        post-refusal wait). It only reports — the loop head is the single place
+        that decides what a request means, cancel grace included.
+        """
+        return pending_stop(app) is not None
+
     with app:
         if usage_source is not None:
             # Inside `with`, not before it: push_quotas is silent until start()
@@ -2054,7 +2120,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # the threshold, instead of running an iteration that would hit the wall.
             if not dry_run and not ignore_usage_limits:
                 app.update(phase="waiting")
-                paused, session_start = limit_policy.check_and_wait(usage_source, session_start)
+                paused, session_start = limit_policy.check_and_wait(
+                    usage_source, session_start, should_stop=stop_pending)
                 # The check just paid for a usage reading; publishing it here is
                 # what puts the provider's live limits on the status row without
                 # a second HTTP round-trip (the UsageSource cache serves it).
@@ -2062,6 +2129,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 app.update(phase="idle")
                 if paused:
                     consecutive_errors = 0  # fresh window — start counting errors anew
+                if stop_pending():
+                    # Asked to stop while parked on the limit. Back to the loop
+                    # head, which owns the decision (a key press still gets its
+                    # cancel grace, a stop file still ends the run at once) —
+                    # deciding it here would be a second, divergent copy of it.
+                    continue
 
             # Ask the driver what to do next. None => no more work (stop cleanly);
             # LoopStop => abort the run (e.g. an error state needing a human).
@@ -2106,7 +2179,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # kept a periodic run's job rows at 1.
             app.job(1).start(item=state_label, model=command.model,
                              prompt=command.prompt, now=started_at)
-            if not list_driven:
+            if tracked_total is None:
                 progress.note_iteration()
             app.update(**progress.summary_fields(), phase="running")
             # What a post-mortem needs from a run that never got to write an
@@ -2158,11 +2231,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 consecutive_errors = 0
                 completed += 1
                 driver.on_success(returncode)
-                if list_driven:
-                    # on_success struck the item, so the list itself now says how
-                    # far the invocation has got.
-                    progress.note_remaining(len(driver.pending_lines()))
-                    app.update(**progress.summary_fields())
+                if tracked_total is not None:
+                    # on_success recorded the item, so the driver's own count now
+                    # says how far the invocation has got.
+                    remaining = driver.pending_total()
+                    if remaining is not None:
+                        progress.note_remaining(remaining)
+                        app.update(**progress.summary_fields())
 
             # The backstop under the proactive check (see RateLimitEvent): this run's
             # own verdict from the wire. A refusal needs no figure and no query to be
@@ -2180,7 +2255,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 wait_until(target_ts,
                            reason=f"Hit the {refusal.label} — this run was refused. "
                                   f"Waiting until {_fmt_moment(target_ts)} for that "
-                                  f"window to refresh…")
+                                  f"window to refresh…",
+                           should_stop=stop_pending)
                 usage_source.invalidate()  # the figures behind the refusal are stale
                 statusline.push_quotas(app, usage_source, limit_policy)
                 app.update(phase="idle")
@@ -2204,10 +2280,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             if not ignore_usage_limits:
                 app.update(phase="waiting")
                 paused, session_start = limit_policy.check_and_wait(
-                    usage_source, session_start, note=" (checked after error)")
+                    usage_source, session_start, note=" (checked after error)",
+                    should_stop=stop_pending)
                 statusline.push_quotas(app, usage_source, limit_policy)
                 app.update(phase="idle")
-                if paused:
+                if paused or stop_pending():
                     consecutive_errors = 0  # fresh window — start counting errors anew
                     continue
 

@@ -25,7 +25,8 @@ class _StubPolicy:
     def log_snapshot(self, *args, **kwargs):
         pass
 
-    def check_and_wait(self, source, session_start, note="", cache_value=True):
+    def check_and_wait(self, source, session_start, note="",
+                       cache_value=True, should_stop=None):
         return False, session_start
 
 

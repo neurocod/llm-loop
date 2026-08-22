@@ -204,6 +204,10 @@ class ListFileDriver(Driver):
         return [ln for ln in _read_list_lines(self.list_path())
                 if self.is_pending(ln)]
 
+    def pending_total(self) -> int:
+        """The list itself is the total (see Driver.pending_total)."""
+        return len(self.pending_lines())
+
     def command_for(self, line: str) -> AgentCommand:
         """Build the command for one raw list line, without touching driver
         state — safe to call from any thread (used by the parallel runner)."""

@@ -606,8 +606,17 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         if source is not None:
             with usage_lock:
                 if not shared.stop.is_set():
+                    # The pause watches both stop channels. Without that, a fleet
+                    # parked on the wall is a fleet with nobody left to notice
+                    # `s`: every worker is inside this hold (or blocked on the
+                    # lock in front of it), the loop head that reads the request
+                    # is unreachable, and the keypress looks like a hung program
+                    # until the window resets hours later.
                     paused, new_start = policy.check_and_wait(
-                        source, session_start_box[0])
+                        source, session_start_box[0],
+                        should_stop=lambda: (shared.stop.is_set()
+                                             or cyclecore.pending_stop(app)
+                                             is not None))
                     if paused:
                         session_start_box[0] = new_start
                     # The check just paid for a usage reading; publishing it here
@@ -622,6 +631,12 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         if shared.stop.is_set():
             shared.release(line)
             break
+        if cyclecore.pending_stop(app) is not None:
+            # Requested, not yet latched — hand the file back and go round to
+            # apply_stop_request, the one place that decides what a request
+            # means (the key keeps its cancel grace, a stop file does not).
+            shared.release(line)
+            continue
 
         command = shared.driver.command_for(line)
         # Notes typed while no turn was in flight ride this prompt (only a
@@ -800,7 +815,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     # What the list holds right now: the baseline on the first call of the
     # invocation, and how far it has got on every later one.
-    progress.track_list(len(pending_now))
+    progress.track_total(len(pending_now))
     progress.note_remaining(len(pending_now))
 
     def set_max_items(value):

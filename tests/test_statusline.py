@@ -647,6 +647,35 @@ def test_the_title_is_written_on_change_only_and_given_back_on_exit(monkeypatch)
     assert stream.getvalue()[mark:] == ""
 
 
+def test_the_window_keeps_its_name_when_something_else_takes_it(monkeypatch):
+    """The title is not ours alone, exactly as the scroll region is not (see
+    `Terminal.paint`): a provider CLI or a pager can reset it with an escape,
+    and on Windows a child process renames the window through SetConsoleTitle,
+    which no escape of ours is answering. Without a re-assert on the periodic
+    repaint the dedupe holds the window on that other name for the rest of the
+    run — we already wrote ours, as far as we know.
+    """
+    stream = _FakeStream(True)
+    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+                        lambda fallback=(0, 0): os.terminal_size((100, 30)))
+    app = sl.StatusApp(terminal=sl.terminal_for(stream),
+                       input_source=sl.NullInputSource(), refresh=0.01)
+
+    escape = sl.TITLE_SET.format("⟳ iter 4/9 · garlic.md")
+    with app:
+        app.update(iteration=4, max_iterations=9, phase="running")
+        app.job(1).start(item="garlic.md", model="opus", now=NOW)
+        app.update(phase="running")
+        # Nothing about the run changes from here on: only the repaint ticks.
+        deadline = time.time() + 5
+        while stream.getvalue().count(escape) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+
+    assert stream.getvalue().count(escape) >= 2, \
+        "the repaint never re-asserted the window title"
+
+
 def test_disabling_mid_paint_cannot_leave_a_name_on_the_window(monkeypatch):
     """`_paint` reads `self.terminal`, then writes to it — and another thread
     may release that very terminal in between (a resize the screen cannot fit,
@@ -1318,9 +1347,9 @@ def _counts_down(total):
     return _CountsDown()
 
 
-def test_a_driver_with_no_list_gets_no_invented_denominator(monkeypatch, tmp_path):
-    """Only a list says how much work a run has. Without one an uncapped run
-    counts, and says nothing it cannot know."""
+def test_a_driver_with_no_total_gets_no_invented_denominator(monkeypatch, tmp_path):
+    """Only the driver says how much work a run has (Driver.pending_total).
+    Reporting none, an uncapped run counts, and says nothing it cannot know."""
     from llm_loop import cyclecore
 
     monkeypatch.setattr(cyclecore, "run_agent_streaming",
@@ -1332,6 +1361,44 @@ def test_a_driver_with_no_list_gets_no_invented_denominator(monkeypatch, tmp_pat
     assert app.status.max_iterations is None
     summary = app.render(width=200)[1]
     assert "iter 3" in summary and "iter 3/" not in summary
+
+
+def test_a_driver_with_a_queue_of_its_own_gets_a_denominator(monkeypatch,
+                                                              tmp_path):
+    """A queue does not have to be a list file to be countable: the kit-promotion
+    pass drains a folder of requests, and its row used to read a bare `iter 1`
+    however much was left in it — the one number a watcher wants.
+    """
+    from llm_loop import cyclecore
+    from llm_loop.cyclecore import AgentCommand, Driver
+
+    class _DrainsAFolder(Driver):
+        """Two requests; one iteration clears one of them."""
+
+        def __init__(self):
+            self.left = 2
+
+        def pending_total(self):
+            return self.left
+
+        def next_command(self):
+            if not self.left:
+                return None
+            return AgentCommand("promote", "", f"{self.left} request(s)")
+
+        def on_success(self, returncode):
+            self.left -= 1
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda cmd, raw, partial, prompt="", mailbox=None: 0)
+    app, _source = _run_with_status(monkeypatch, tmp_path, _DrainsAFolder(),
+                                    max=None)
+
+    assert (app.status.iteration, app.status.max_iterations) == (2, 2)
+    assert "iter 2/2" in app.render(width=200)[1]
+    # The window name is the summary row's first field verbatim, so it carries
+    # the same total — that is the whole point of building it from the Segment.
+    assert sl.title_text(app.status).startswith("· iter 2/2")
 
 
 def test_a_capped_run_with_no_list_shows_the_cap_it_was_given(monkeypatch,
