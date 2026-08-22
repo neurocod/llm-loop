@@ -484,6 +484,46 @@ def _capture_disabled_app(monkeypatch) -> dict:
     return captured
 
 
+def cancel_it(app=None, **kwargs):
+    """Stand-in for `confirm_stop_request` when the user presses `s` again.
+
+    The countdown itself is pinned elsewhere; what these tests are about is what
+    a runner does with a request that turns out to be withdrawn.
+    """
+    app.cancel_stop()
+    return False
+
+
+class _Held:
+    """A runner started on a thread, so the test can press `s` while it holds.
+
+    Every test below needs the same three moments — start it, catch it inside
+    the hold (by the line it prints, never by a sleep), then let it finish — and
+    each of them is a race written the same way three times if it is written at
+    all.
+    """
+
+    def __init__(self, call):
+        self.result = None
+        self.done = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(call,),
+                                        daemon=True)
+        self._thread.start()
+
+    def _run(self, call):
+        try:
+            self.result = call()
+        finally:
+            self.done.set()
+
+    def wait_until_held(self, capsys, needle: str = "Over usage limit") -> None:
+        assert needle in _await_output(capsys, needle), \
+            f"the run never reached the hold ({needle!r} never printed)"
+
+    def wait_for_exit(self, why: str) -> None:
+        assert self.done.wait(10), why
+
+
 def test_the_s_key_ends_a_sequential_run_parked_on_the_usage_limit(
     tmp_path, monkeypatch, capsys
 ):
@@ -492,24 +532,15 @@ def test_the_s_key_ends_a_sequential_run_parked_on_the_usage_limit(
     monkeypatch.setattr(cyclecore, "usage_source_for",
                         lambda provider: _PeggedSource())
     captured = _capture_disabled_app(monkeypatch)
-    result = {}
-    done = threading.Event()
 
-    def go():
-        try:
-            result["run"] = cyclecore.run_loop(
-                _NeverEndingDriver(), _seq_args(str(tmp_path), dry_run=False),
-                app_name="pytest-stop")
-        finally:
-            done.set()
-
-    threading.Thread(target=go, daemon=True).start()
-    assert "Over usage limit" in _await_output(capsys, "Over usage limit"), \
-        "the run never reached the usage hold"
+    held = _Held(lambda: cyclecore.run_loop(
+        _NeverEndingDriver(), _seq_args(str(tmp_path), dry_run=False),
+        app_name="pytest-stop"))
+    held.wait_until_held(capsys)
     captured["app"].request_stop()
 
-    assert done.wait(10), "the s key was ignored while the run sat on the limit"
-    assert result["run"].reason == cyclecore.RunStopReason.STOP_KEY
+    held.wait_for_exit("the s key was ignored while the run sat on the limit")
+    assert held.result.reason == cyclecore.RunStopReason.STOP_KEY
     assert not (tmp_path / "stop").exists(), "the s key wrote a stop file"
 
 
@@ -527,23 +558,14 @@ def test_the_s_key_ends_a_parallel_fleet_parked_on_the_usage_limit(
     driver.limit_policy = LimitPolicy([SessionLimit(80)])
     args = _par_args(str(tmp_path), dry_run=False)
     args.ignore_usage = False
-    result = {}
-    done = threading.Event()
 
-    def go():
-        try:
-            result["run"] = parallel.run_parallel(
-                driver, args, app_name="pytest-stop-parallel")
-        finally:
-            done.set()
-
-    threading.Thread(target=go, daemon=True).start()
-    assert "Over usage limit" in _await_output(capsys, "Over usage limit"), \
-        "no worker ever reached the usage hold"
+    held = _Held(lambda: parallel.run_parallel(
+        driver, args, app_name="pytest-stop-parallel"))
+    held.wait_until_held(capsys)
     captured["app"].request_stop()
 
-    assert done.wait(10), "the s key was ignored while the fleet sat on the limit"
-    assert result["run"].reason == cyclecore.RunStopReason.STOP_KEY
+    held.wait_for_exit("the s key was ignored while the fleet sat on the limit")
+    assert held.result.reason == cyclecore.RunStopReason.STOP_KEY
     # Nothing ran, so nothing may be struck: a file claimed and handed back is
     # still pending work for the next run.
     assert driver.pending_lines() == ["products/a.md", "products/b.md"]
@@ -566,12 +588,6 @@ def test_cancelling_the_stop_keeps_the_file_a_parked_worker_had_claimed(
                             ran.append(cmd.label), (0, 0.0, 0.01))[1])
     monkeypatch.setattr(parallel, "usage_source_for",
                         lambda provider: _PeggedSource())
-    # The countdown itself is not what this pins — the worker's answer to a
-    # withdrawn request is. So the grace stands in for the second key press.
-    def cancel_it(app=None, **kwargs):
-        app.cancel_stop()
-        return False
-
     monkeypatch.setattr(cyclecore, "confirm_stop_request", cancel_it)
     captured = _capture_disabled_app(monkeypatch)
     driver = _MemListDriver(["products/a.md", "products/b.md"])
@@ -579,24 +595,15 @@ def test_cancelling_the_stop_keeps_the_file_a_parked_worker_had_claimed(
     args = _par_args(str(tmp_path), dry_run=False)
     args.ignore_usage = False
     args.max = 1               # claims shut the moment the one claim is made
-    result = {}
-    done = threading.Event()
 
-    def go():
-        try:
-            result["run"] = parallel.run_parallel(
-                driver, args, app_name="pytest-stop-parallel")
-        finally:
-            done.set()
-
-    threading.Thread(target=go, daemon=True).start()
-    assert "Over usage limit" in _await_output(capsys, "Over usage limit"), \
-        "no worker ever reached the usage hold"
+    held = _Held(lambda: parallel.run_parallel(
+        driver, args, app_name="pytest-stop-parallel"))
+    held.wait_until_held(capsys)
     captured["app"].request_stop()
 
-    assert done.wait(10), "the withdrawn request did not release the worker"
+    held.wait_for_exit("the withdrawn request did not release the worker")
     assert len(ran) == 1, f"the claimed file was dropped by the cancel: {ran}"
-    assert result["run"].completed == 1
+    assert held.result.completed == 1
     assert len(driver.pending_lines()) == 1, "the finished file was not struck"
 
 
@@ -614,10 +621,6 @@ def test_a_withdrawn_request_does_not_reset_the_consecutive_error_brake(
             captured["app"].request_stop()
         return 1
 
-    def cancel_it(app=None, **kwargs):
-        app.cancel_stop()
-        return False
-
     monkeypatch.setattr(cyclecore, "run_claude_streaming", always_fails)
     monkeypatch.setattr(cyclecore, "confirm_stop_request", cancel_it)
     captured = _capture_disabled_app(monkeypatch)
@@ -629,6 +632,23 @@ def test_a_withdrawn_request_does_not_reset_the_consecutive_error_brake(
 
     assert len(calls) == 5, \
         f"the brake was reset by the withdrawn request: {len(calls)} attempts"
+
+
+def test_the_post_refusal_wait_answers_a_stop_request_too():
+    """The other hold that outlasts an iteration: a run refused on the wire
+    parks until that window refreshes, which is hours — and `s` has to reach it
+    there as well, not only in the proactive usage gate."""
+    started = time.time()
+
+    # The real horizon is a window reset, hours out. Ninety seconds is the same
+    # shape and keeps a REGRESSION bounded: a wait that ignores the request has
+    # to sit through a full sleep slice before it can return, so the assertion
+    # below fails in a minute and a half instead of hanging out the hour.
+    left_early = cyclecore.wait_until(started + 90, reason="parked for a test",
+                                      should_stop=lambda: True)
+
+    assert left_early is True
+    assert time.time() - started < 5, "the wait ran its clock instead of stopping"
 
 
 def test_stop_file_path_follows_the_project_root(tmp_path):

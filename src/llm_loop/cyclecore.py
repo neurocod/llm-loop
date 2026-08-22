@@ -1567,6 +1567,29 @@ def _fmt_moment(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
 
 
+def _count_down_to(target_ts: float, should_stop=None) -> bool:
+    """Idle until `target_ts`, printing what is left about once a minute.
+
+    The body every timed wait shares; they differ only in the lines they print
+    around it, which is why this holds none of them. Returns True when it left
+    early because `should_stop()` asked it to. Ctrl+C ends the process from
+    here, as it always did.
+    """
+    try:
+        while True:
+            now = time.time()
+            remaining = target_ts - now
+            if remaining <= 0:
+                return False
+            print(f"    … {_fmt_left(remaining)} left (now {_fmt_clock(now)})",
+                  flush=True)
+            if sleep_unless(min(remaining, 60), should_stop):
+                return True
+    except KeyboardInterrupt:
+        print("\nWait interrupted by user (Ctrl+C).")
+        sys.exit(130)
+
+
 def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
     """Sleep until wall-clock time reaches target_ts, printing a periodic countdown.
 
@@ -1583,20 +1606,9 @@ def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
         reason = ("Looks like the token limit is exhausted. Waiting until "
                   f"{_fmt_clock(target_ts)} (until the 5-hour session window refreshes)…")
     print(f"  ⏳ {reason}")
-    try:
-        while True:
-            now = time.time()
-            remaining = target_ts - now
-            if remaining <= 0:
-                break
-            print(f"    … {_fmt_left(remaining)} left (now {_fmt_clock(now)})",
-                  flush=True)
-            if sleep_unless(min(remaining, 60), should_stop):
-                print("  ⏹ Stop requested — leaving the wait.")
-                return True
-    except KeyboardInterrupt:
-        print("\nWait interrupted by user (Ctrl+C).")
-        sys.exit(130)
+    if _count_down_to(target_ts, should_stop):
+        print("  ⏹ Stop requested — leaving the wait.")
+        return True
     print("  ▶ The session window should have refreshed — continuing the loop.")
     return False
 
@@ -1640,6 +1652,11 @@ def wait_before_start(spec: str) -> None:
 
     Lets you launch the script and walk away; work kicks off after the delay.
     Ctrl+C interrupts the wait and stops the script.
+
+    The only wait that runs its clock out (no `should_stop`), because there is
+    nothing here to stop yet: this is before the status line exists, so there is
+    no `s` key to press, and a sentinel that appears meanwhile was waited out
+    just above and is honoured at the first iteration boundary anyway.
     """
     try:
         seconds = parse_duration(spec)
@@ -1650,18 +1667,7 @@ def wait_before_start(spec: str) -> None:
         return
     target_ts = time.time() + seconds
     print(f"  ⏳ --start-in {spec}: waiting until {_fmt_clock(target_ts)} before starting…")
-    try:
-        while True:
-            now = time.time()
-            remaining = target_ts - now
-            if remaining <= 0:
-                break
-            print(f"    … {_fmt_left(remaining)} left (now {_fmt_clock(now)})",
-                  flush=True)
-            time.sleep(min(remaining, 60))
-    except KeyboardInterrupt:
-        print("\nWait interrupted by user (Ctrl+C).")
-        sys.exit(130)
+    _count_down_to(target_ts)
     print("  ▶ Starting the loop.")
 
 

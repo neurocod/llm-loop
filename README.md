@@ -449,10 +449,7 @@ ends, whichever way it ends.
 
 The iteration counter carries the whole of "how much work is this run": its
 denominator is `--max-runs`, whatever the driver reports from
-`Driver.pending_total()` (a `ListFileDriver` answers with its list; override it
-wherever the queue is something else), or the smaller of the two. A driver that
-reports none counts bare iterations, which is right for a state machine meant to
-run forever and wrong for anything with a finish line. `--max-runs` therefore
+`Driver.pending_total()`, or the smaller of the two. `--max-runs` therefore
 gets no field of its own — a knob
 whose value is already on the row registers with `show_in_status=False` and
 stays editable and reproducible without spending row width twice.

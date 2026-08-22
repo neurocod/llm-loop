@@ -416,6 +416,10 @@ class Shared:
         """
         with self.lock:
             self.in_progress.discard(line)
+            # Defence only: every release today happens before start_turn, so
+            # there is no running turn to forget. Kept because the alternative —
+            # a release that leaves a line in `running` — would make busy() true
+            # forever and hang every later stop request.
             self.running.discard(line)
             if self.claimed > 0:
                 self.claimed -= 1
@@ -424,6 +428,16 @@ class Shared:
         """This claim is about to become a running provider turn (see busy())."""
         with self.lock:
             self.running.add(line)
+
+    def stop_asked(self, app=None) -> bool:
+        """Is anything asking this run to stop — its own latch, or a channel?
+
+        The worker's one reading of the question. It used to be spelled three
+        ways in one function (the gate's predicate, the hold loop's condition,
+        the checks around them), which is three places that have to agree about
+        a question with two sources.
+        """
+        return self.stop.is_set() or cyclecore.pending_stop(app) is not None
 
     def finish(self, line: str, ok: bool) -> tuple:
         """Record an item's outcome: strike it on success, or count/park a fail.
@@ -442,7 +456,7 @@ class Shared:
                 self.attempts[line] = self.attempts.get(line, 0) + 1
                 if self.attempts[line] >= MAX_ATTEMPTS:
                     self.failed.add(line)
-            remaining = len(self.driver.pending_lines())
+            remaining = self.driver.pending_total()
             return self.done, remaining
 
     # --- the stop request: closing claims is not the same as ending the run ----
@@ -629,9 +643,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                     # until the window resets hours later.
                     paused, new_start = policy.check_and_wait(
                         source, session_start_box[0],
-                        should_stop=lambda: (shared.stop.is_set()
-                                             or cyclecore.pending_stop(app)
-                                             is not None))
+                        should_stop=lambda: shared.stop_asked(app))
                     if paused:
                         session_start_box[0] = new_start
                     # The check just paid for a usage reading; publishing it here
@@ -639,25 +651,21 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                     # without a second round-trip (the cache serves it).
                     statusline.push_quotas(app, source, policy)
 
-        # A stop file may have arrived while we waited for the lock or paused on
-        # the budget: return the claimed file to the queue and exit without
-        # starting another provider run. A max-items boundary only closes new
-        # claims, so already-claimed work deliberately continues past this check.
-        if shared.stop.is_set():
-            shared.release(line)
-            break
-        # Requested but not yet latched. HOLD the claimed file here rather than
-        # handing it back and going round: an `s` request can still be
-        # withdrawn, and a claim that --max-runs or a drained queue has closed
-        # cannot be made a second time — releasing it there loses that file for
-        # the whole run, which is exactly what "a mis-pressed `s` costs nothing"
-        # promises it will not do. Parked like this the worker is not busy (no
-        # turn is running), so the verdict below is not waiting on it either.
-        while (cyclecore.pending_stop(app) is not None
-               and not shared.stop.is_set()):
+        # A stop may have been latched, or a channel may have opened, while we
+        # waited for the lock or paused on the budget. HOLD the claimed file
+        # here rather than handing it back and going round: an `s` request can
+        # still be withdrawn, and a claim that --max-runs or a drained queue has
+        # closed cannot be made a second time — releasing it there loses that
+        # file for the whole run, which is exactly what "a mis-pressed `s` costs
+        # nothing" promises it will not do. Parked like this the worker is not
+        # busy (no turn is running), so the verdict is not waiting on it either.
+        # A max-items boundary only closes new claims, so already-claimed work
+        # deliberately continues past all of this.
+        while cyclecore.pending_stop(app) is not None and not shared.stop.is_set():
             # The one place that decides what a request means — the key keeps
-            # its cancel grace, a stop file does not. Its answer is `shared.stop`
-            # (set whenever it decides to leave), which both loops read.
+            # its cancel grace, a stop file does not. Read its verdict off
+            # `shared.stop` rather than its return value: the loop has to end on
+            # a stop latched by ANY worker, not only on this call's answer.
             apply_stop_request(job_id, shared, app)
         if shared.stop.is_set():
             shared.release(line)
@@ -666,7 +674,9 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # From here the claim is a turn in flight, so a stop request waits for
         # it. Marked before the command is built rather than around run_job:
         # everything below is part of starting this file, and the gap would be a
-        # window in which the fleet looks idle while it is not.
+        # window in which the fleet looks idle while it is not. Paired with
+        # `job.start(...)` below, which says the same thing to the status line;
+        # move one and the other has to move with it.
         shared.start_turn(line)
         command = shared.driver.command_for(line)
         # Notes typed while no turn was in flight ride this prompt (only a
@@ -679,6 +689,9 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                     emit_note(job_id, note)
         # The same three calls the sequential loop makes on its single Job: the
         # Job clock times THIS file, the run clock (latched once) times the run.
+        # This is the display's half of `shared.start_turn(line)` above — the row
+        # a stop request's grace is about; `shared.finish` and `job.finish` close
+        # the pair the same way.
         started_at = time.time()
         app.mark_run_started(started_at)
         job.start(item=command.label, model=command.model,
@@ -843,10 +856,14 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     shared = Shared(driver, args.max)
 
-    # What the list holds right now: the baseline on the first call of the
-    # invocation, and how far it has got on every later one.
-    progress.track_total(len(pending_now))
-    progress.note_remaining(len(pending_now))
+    # What the queue holds right now: the baseline on the first call of the
+    # invocation, and how far it has got on every later one. Through the
+    # driver's own count, not `len(pending_now)`, so a driver that overrides
+    # `pending_total` cannot end up counted one way here and another way by the
+    # sequential runner — the same driver serves both.
+    pending_total = driver.pending_total()
+    progress.track_total(pending_total)
+    progress.note_remaining(pending_total)
 
     def set_max_items(value):
         value = None if value is None else int(value)
@@ -969,7 +986,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     if source is not None:
         policy.log_snapshot(source, "at end (parallel)", cache_value=False)
 
-    remaining = len(driver.pending_lines())
+    remaining = driver.pending_total()
     print(f"\nProcessed {shared.done} file(s) this run; "
           f"{remaining} still pending in {list_file_rel}.")
     if shared.failed:
