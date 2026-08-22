@@ -350,6 +350,12 @@ class Shared:
         self.driver = driver
         self.lock = threading.Lock()
         self.in_progress = set()      # raw lines a worker is currently handling
+        # The subset of those whose provider turn is actually in flight. Not the
+        # same question as `in_progress`, and the difference is what a pending
+        # stop turns on: a worker parked on the usage gate holds a claim but is
+        # not doing anything a stop would interrupt, so it must not be counted as
+        # work in flight — see busy().
+        self.running = set()
         self.failed = set()           # raw lines parked after MAX_ATTEMPTS
         self.attempts = {}            # raw line -> failed-attempt count
         self.claimed = 0              # files claimed this run (for --max-runs)
@@ -416,8 +422,14 @@ class Shared:
         """
         with self.lock:
             self.in_progress.discard(line)
+            self.running.discard(line)
             if self.claimed > 0:
                 self.claimed -= 1
+
+    def start_turn(self, line: str) -> None:
+        """This claim is about to become a running provider turn (see busy())."""
+        with self.lock:
+            self.running.add(line)
 
     def finish(self, line: str, ok: bool) -> tuple:
         """Record an item's outcome: strike it on success, or count/park a fail.
@@ -427,6 +439,7 @@ class Shared:
         """
         with self.lock:
             self.in_progress.discard(line)
+            self.running.discard(line)
             if ok:
                 self.done += 1
                 self.driver.strike(line)
@@ -493,9 +506,17 @@ class Shared:
             return True
 
     def busy(self) -> bool:
-        """Is any file in flight? (claimed and not yet finished or released)."""
+        """Is any provider turn actually running right now?
+
+        The question a pending stop asks, and it is deliberately narrower than
+        "is any line claimed": the grace exists so the toggle stays usable for
+        as long as the user can see a job row MOVING, and a worker parked on the
+        usage gate moves nothing. Counting its claim here would hang the
+        decision on the very hold the user is trying to escape — the worker
+        waits for the verdict while the verdict waits for the worker.
+        """
         with self.lock:
-            return bool(self.in_progress)
+            return bool(self.running)
 
 
 # --- worker loop ---------------------------------------------------------------
@@ -631,13 +652,28 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         if shared.stop.is_set():
             shared.release(line)
             break
-        if cyclecore.pending_stop(app) is not None:
-            # Requested, not yet latched — hand the file back and go round to
-            # apply_stop_request, the one place that decides what a request
-            # means (the key keeps its cancel grace, a stop file does not).
+        # Requested but not yet latched. HOLD the claimed file here rather than
+        # handing it back and going round: an `s` request can still be
+        # withdrawn, and a claim that --max-runs or a drained queue has closed
+        # cannot be made a second time — releasing it there loses that file for
+        # the whole run, which is exactly what "a mis-pressed `s` costs nothing"
+        # promises it will not do. Parked like this the worker is not busy (no
+        # turn is running), so the verdict below is not waiting on it either.
+        while (cyclecore.pending_stop(app) is not None
+               and not shared.stop.is_set()):
+            # The one place that decides what a request means — the key keeps
+            # its cancel grace, a stop file does not. Its answer is `shared.stop`
+            # (set whenever it decides to leave), which both loops read.
+            apply_stop_request(job_id, shared, app)
+        if shared.stop.is_set():
             shared.release(line)
-            continue
+            break
 
+        # From here the claim is a turn in flight, so a stop request waits for
+        # it. Marked before the command is built rather than around run_job:
+        # everything below is part of starting this file, and the gap would be a
+        # window in which the fleet looks idle while it is not.
+        shared.start_turn(line)
         command = shared.driver.command_for(line)
         # Notes typed while no turn was in flight ride this prompt (only a
         # single-worker run has a mailbox at all — see run_parallel).

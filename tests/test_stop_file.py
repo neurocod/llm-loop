@@ -549,6 +549,88 @@ def test_the_s_key_ends_a_parallel_fleet_parked_on_the_usage_limit(
     assert driver.pending_lines() == ["products/a.md", "products/b.md"]
 
 
+def test_cancelling_the_stop_keeps_the_file_a_parked_worker_had_claimed(
+    tmp_path, monkeypatch, capsys
+):
+    """"A mis-pressed `s` costs nothing but the files not claimed in between."
+
+    The worker that wakes out of the usage hold is holding a claim, and a claim
+    closed by --max-runs (or a drained queue) cannot be made a second time. Hand
+    it back to go and read the request, and a withdrawn request has silently
+    eaten a whole item of the run's budget: claims are shut, so nobody ever
+    picks it up again.
+    """
+    ran = []
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, cmd, mailbox=None: (
+                            ran.append(cmd.label), (0, 0.0, 0.01))[1])
+    monkeypatch.setattr(parallel, "usage_source_for",
+                        lambda provider: _PeggedSource())
+    # The countdown itself is not what this pins — the worker's answer to a
+    # withdrawn request is. So the grace stands in for the second key press.
+    def cancel_it(app=None, **kwargs):
+        app.cancel_stop()
+        return False
+
+    monkeypatch.setattr(cyclecore, "confirm_stop_request", cancel_it)
+    captured = _capture_disabled_app(monkeypatch)
+    driver = _MemListDriver(["products/a.md", "products/b.md"])
+    driver.limit_policy = LimitPolicy([SessionLimit(80)])
+    args = _par_args(str(tmp_path), dry_run=False)
+    args.ignore_usage = False
+    args.max = 1               # claims shut the moment the one claim is made
+    result = {}
+    done = threading.Event()
+
+    def go():
+        try:
+            result["run"] = parallel.run_parallel(
+                driver, args, app_name="pytest-stop-parallel")
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert "Over usage limit" in _await_output(capsys, "Over usage limit"), \
+        "no worker ever reached the usage hold"
+    captured["app"].request_stop()
+
+    assert done.wait(10), "the withdrawn request did not release the worker"
+    assert len(ran) == 1, f"the claimed file was dropped by the cancel: {ran}"
+    assert result["run"].completed == 1
+    assert len(driver.pending_lines()) == 1, "the finished file was not struck"
+
+
+def test_a_withdrawn_request_does_not_reset_the_consecutive_error_brake(
+    tmp_path, monkeypatch
+):
+    """The five-errors-in-a-row brake is the only thing that ends a run whose
+    provider is simply broken. Pressing `s` and taking it back must not hand
+    that provider a fresh set of five."""
+    calls = []
+
+    def always_fails(cmd, raw, partial, prompt="", mailbox=None):
+        calls.append(1)
+        if len(calls) == 2:
+            captured["app"].request_stop()
+        return 1
+
+    def cancel_it(app=None, **kwargs):
+        app.cancel_stop()
+        return False
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", always_fails)
+    monkeypatch.setattr(cyclecore, "confirm_stop_request", cancel_it)
+    captured = _capture_disabled_app(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        cyclecore.run_loop(_PressStopAfterOneDriver(captured),
+                           _seq_args(str(tmp_path), dry_run=False),
+                           app_name="pytest-stop")
+
+    assert len(calls) == 5, \
+        f"the brake was reset by the withdrawn request: {len(calls)} attempts"
+
+
 def test_stop_file_path_follows_the_project_root(tmp_path):
     """The sentinel is resolved against the chosen root, not the cwd — otherwise
     a -C run would watch the wrong file (and the tests would pass by accident)."""

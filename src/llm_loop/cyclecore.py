@@ -1849,6 +1849,15 @@ class Driver:
         which is the right answer for a state machine that is meant to run
         forever, and the wrong one for anything with a finish line — a run whose
         row reads `iter 1` with no `/N` is usually a driver that forgot this.
+
+        Report it in the unit an ITERATION works through, where you can: the row
+        clamps the total against `--max-runs`, which counts iterations, so a
+        driver whose one iteration clears several items (the kit-promotion pass
+        empties its whole requests folder in one) reads `iter 3/3` under
+        `--max-runs 3` while a dozen items are still waiting. Only the display
+        is affected — no cap, gate or queue decision reads this — and only when
+        such a driver is given a cap, which is why the honest count of what is
+        left is still the better answer for it.
         """
         return None
 
@@ -2284,8 +2293,14 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     should_stop=stop_pending)
                 statusline.push_quotas(app, usage_source, limit_policy)
                 app.update(phase="idle")
-                if paused or stop_pending():
+                if paused:
                     consecutive_errors = 0  # fresh window — start counting errors anew
+                    continue
+                if stop_pending():
+                    # Kept separate from the reset above: a request that is
+                    # withdrawn inside the grace must not have zeroed the
+                    # five-errors-in-a-row brake on its way past, or a genuinely
+                    # broken provider gets to loop for free.
                     continue
 
             # Session is under the limit — this was a transient failure, not token
