@@ -81,12 +81,6 @@ MAX_ATTEMPTS = 3
 # way, so the cap costs no information about the size of the queue.
 DRY_RUN_LIST_LIMIT = 10
 
-# How often a worker holding an interactive stop request re-reads the sentinel.
-# It is the responsiveness of "press s again to cancel" — the sequential loop's
-# countdown polls at the same rate (cyclecore.confirm_stop_request) — and the
-# only cost is one os.path.exists per idle worker.
-STOP_RECHECK_SECONDS = 0.25
-
 # Serialises every line printed by any worker so the compact per-job lines never
 # interleave mid-line (each print is atomic, the renderers are not thread-safe).
 _emit_lock = threading.Lock()
@@ -557,7 +551,7 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
         # withdrawn. `stop.wait` rather than sleep so the latch releases this
         # worker at once instead of after the poll interval.
         if not owner or shared.busy():
-            shared.stop.wait(STOP_RECHECK_SECONDS)
+            shared.stop.wait(cyclecore.STOP_RECHECK_SECONDS)
             return False
         # Nothing left in flight: the same countdown the sequential loop holds
         # at its iteration boundary, so both runners define "the user really
