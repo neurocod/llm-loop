@@ -4,14 +4,22 @@ Regression coverage for the fix where a worker could keep running (or block in
 the session-limit gate) after the list had drained to empty. The worker must:
 
   * claim work *before* touching the usage gate, so an empty/drained queue stops
-    it via claim() -> stop and it never enters the gate with nothing to do; and
+    it via claim() -> stop and it never enters the gate with nothing to do;
   * exit promptly once the queue is drained, even with far more workers than
-    files (the spare workers must not spin forever).
+    files (the spare workers must not spin forever); and
+  * give its claim back if it dies holding one, so the queue can still read as
+    drained — a worker killed by an exception latches no stop, and a line stuck
+    in `in_progress` keeps every surviving worker in the back-off for ever.
+
+The last group is time-bounded on purpose: without the fix the run does not end
+at all, so an unbounded pin would look like a wedged CI rather than a failure.
 """
 
 import os
 import threading
 import time
+
+import pytest
 
 from llm_loop import parallel, stopchannel
 from llm_loop.drivers import ListFileDriver
@@ -56,13 +64,20 @@ def _args(project_dir, jobs, *, ignore_usage=True, max_runs=None):
     return ns
 
 
-def _run_and_wait(driver, args, timeout=10.0):
-    """Run run_parallel on a thread; return True iff it returned within timeout."""
+def _run_and_wait(driver, args, timeout=10.0, result_box=None):
+    """Run run_parallel on a thread; return True iff it returned within timeout.
+
+    `result_box` is appended the RunResult for the tests that assert on the
+    run's own bookkeeping (attempted/completed) rather than only on the list.
+    """
     done = threading.Event()
 
     def go():
         try:
-            parallel.run_parallel(driver, args, app_name="pytest-parallel")
+            outcome = parallel.run_parallel(driver, args,
+                                            app_name="pytest-parallel")
+            if result_box is not None:
+                result_box.append(outcome)
         except SystemExit:
             pass
         finally:
@@ -207,6 +222,111 @@ def test_release_returns_claim_to_queue():
     assert shared.claimed == 0 and line not in shared.in_progress
     # The line is still pending (never struck), so a re-run picks it up.
     assert set(driver.pending_lines()) == {"a", "b"}
+
+
+# How long the "a dying worker must not hang the fleet" pins wait for
+# run_parallel to return. Generous next to a healthy run (which ends as soon as
+# the last thread joins — well under a second here) and short next to the defect
+# it pins, where the run never ends at all: measured at 2 workers / 4 files, the
+# survivor was still spinning in the claim back-off 25 s in. The bound is what
+# keeps a red pin a failure instead of a wedged CI.
+HANG_TIMEOUT_S = 15.0
+
+# The two pins below kill worker threads on purpose, and pytest reports every
+# thread that dies of an exception. Here that IS the fixture, so the warning is
+# silenced per-test rather than globally — a worker dying anywhere else in the
+# suite is still news.
+_EXPECTED_THREAD_DEATH = pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning")
+
+
+@_EXPECTED_THREAD_DEATH
+def test_a_worker_dying_mid_turn_does_not_hang_the_run(tmp_path, monkeypatch):
+    """An exception inside `run_job` must not strand the claim it was holding.
+
+    Nothing about a dying worker sets `stop`, so the line it abandons in
+    `in_progress` makes `_exhausted` (`not pending and not in_progress`) false
+    for ever: `claim()` answers None, and every surviving worker sits in the
+    two-second back-off until the run is killed by hand.
+
+    The counters are the other half of the pin, and they are what distinguishes
+    the two ways of giving a claim back (see `Shared.abandon`). A turn that had
+    already started is recorded as a FAILED attempt, not released: `attempts` is
+    the only thing that can ever park a poison line in `failed`, so a released
+    one would go on killing worker after worker.
+    """
+    poison = "products/poison.md"
+    good = [f"products/f{i}.md" for i in range(3)]
+
+    def exploding_job(job_id, command, mailbox=None):
+        if command.label == os.path.basename(poison):
+            raise BrokenPipeError("the provider CLI died mid-stream")
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", exploding_job)
+    driver = _MemDriver(good + [poison])
+    # List order, so the poison line is only ever reached after the healthy
+    # ones: with the default random pick the same run could kill both workers
+    # early and the counts below would depend on the draw.
+    driver.pick_order = "list"
+
+    box = []
+    assert _run_and_wait(driver, _args(str(tmp_path), jobs=2),
+                         timeout=HANG_TIMEOUT_S, result_box=box), \
+        "a worker died holding a claim and run_parallel never returned"
+    assert driver.pending_lines() == [poison], \
+        "the healthy files did not all get struck"
+    result = box[0]
+    assert result.completed == 3
+    # Two workers, each killed once by the poison file, plus the three healthy
+    # claims. A claim released instead of failed would leave this at 3 and the
+    # line at zero attempts — retried for ever, one dead worker at a time.
+    assert result.attempted == 5, \
+        f"a started-then-crashed turn was not counted: {result}"
+
+
+@_EXPECTED_THREAD_DEATH
+def test_a_worker_dying_in_the_usage_gate_gives_the_file_back(
+    tmp_path, monkeypatch
+):
+    """The gate is inside the guarded region too — and its claim goes back WHOLE.
+
+    The gate does network I/O and prints, so it fails for the same reasons the
+    console does. Nothing has been attempted at that point, so the line must
+    return to the queue verbatim and the run must still complete it: releasing
+    it also undoes the --max-runs reservation, which is why `attempted` counts
+    the one real claim rather than both.
+    """
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
+    monkeypatch.setattr(parallel, "usage_source_for", lambda provider: object())
+
+    calls = []
+
+    class ExplodesOncePolicy:
+        def log_snapshot(self, *a, **k):
+            pass
+
+        def check_and_wait(self, source, session_start, note="",
+                           cache_value=True, should_stop=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("usage endpoint blew up")
+            return False, session_start
+
+    driver = _MemDriver(["products/only.md"])
+    driver.limit_policy = ExplodesOncePolicy()
+
+    box = []
+    assert _run_and_wait(driver, _args(str(tmp_path), jobs=2,
+                                       ignore_usage=False),
+                         timeout=HANG_TIMEOUT_S, result_box=box), \
+        "a worker died in the usage gate and run_parallel never returned"
+    assert len(calls) >= 2, "the second worker never reached the gate"
+    assert driver.pending_lines() == [], \
+        "the released file was not picked up and finished by another worker"
+    assert box[0].attempted == 1, \
+        f"the abandoned claim's --max reservation was not undone: {box[0]}"
 
 
 def test_max_runs_closes_claims_without_cancelling_in_flight_work(

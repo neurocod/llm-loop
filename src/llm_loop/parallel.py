@@ -469,6 +469,42 @@ class Shared:
         with self.lock:
             self.running.add(line)
 
+    def abandon(self, line: str, started: bool) -> None:
+        """Give a claim back when its worker is dying, so the run can still end.
+
+        Called from the guard in `worker` when anything between the claim and
+        `finish` raises. Whatever else it does, it must drop the line from
+        `in_progress`: a dying worker latches no stop, so a claim left there
+        makes `_exhausted` false for ever and every surviving worker spins in
+        the back-off until the run is killed by hand.
+
+        `started` picks between the two ways of giving a claim back, and they
+        are not interchangeable:
+
+          * BEFORE `start_turn` nothing has been attempted — the provider was
+            never launched, the target file was never touched, and the claim's
+            --max-runs reservation was paid for a file nobody started. So the
+            line goes back to the queue verbatim (`release`) and the next worker
+            picks it up; the run must be able to complete it.
+          * AFTER `start_turn` a turn really was attempted, so it is recorded as
+            a failed one (`finish(line, False)`). Not cosmetic: `finish` is what
+            increments `attempts`, and `attempts` is the only thing that can
+            ever park a line in `failed`. A file whose turn reliably kills its
+            worker (a provider CLI that dies mid-stream, a console that refuses
+            a write) would otherwise be handed back untouched and kill the next
+            worker, and the next — a fleet of ten dies ten times over one line.
+            Counted, the same line stops the run after MAX_ATTEMPTS workers and
+            is reported as failed, which is also what it is.
+
+        The exception itself is not caught here: the guard re-raises, so the
+        thread still ends the way it was always going to. What changes is that
+        the REST of the fleet can now finish the run.
+        """
+        if started:
+            self.finish(line, False)
+        else:
+            self.release(line)
+
     def stop_asked(self, app=None) -> bool:
         """Is anything asking this run to stop — its own latch, or a channel?
 
@@ -712,39 +748,56 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             time.sleep(2)  # busy: others hold the rest — back off and retry
             continue
 
-        # Session-limit gate, now that we hold real work: one worker checks at a
-        # time (cheap, the reading is TTL-cached), and a pause blocks every worker that
-        # reaches it — so the whole fleet idles together when the budget is spent.
-        if source is not None:
-            with usage_lock:
-                if not shared.stop.is_set():
-                    # The pause watches both stop channels. Without that, a fleet
-                    # parked on the wall is a fleet with nobody left to notice
-                    # `s`: every worker is inside this hold (or blocked on the
-                    # lock in front of it), the loop head that reads the request
-                    # is unreachable, and the keypress looks like a hung program
-                    # until the window resets hours later.
-                    paused, new_start = policy.check_and_wait(
-                        source, session_start_box[0],
-                        should_stop=lambda: shared.stop_asked(app))
-                    if paused:
-                        session_start_box[0] = new_start
-                    # The check just paid for a usage reading; publishing it here
-                    # is what keeps the provider's live figures on the pinned row
-                    # without a second round-trip (the cache serves it).
-                    statusline.push_quotas(app, source, policy)
-
-        # A stop may have been latched, or a channel may have opened, while we
-        # waited for the lock or paused on the budget. HOLD the claimed file
-        # here rather than handing it back and going round: an `s` request can
-        # still be withdrawn, and a claim that --max-runs or a drained queue has
-        # closed cannot be made a second time — releasing it there loses that
-        # file for the whole run, which is exactly what "a mis-pressed `s` costs
-        # nothing" promises it will not do. Parked like this the worker is not
-        # busy (no turn is running), so the verdict is not waiting on it either.
-        # A max-items boundary only closes new claims, so already-claimed work
-        # deliberately continues past all of this.
+        # EVERYTHING from here down to `shared.finish` runs while this worker
+        # holds a claim, and every step of it can raise: the usage gate does
+        # network I/O and prints, the console can refuse any of these lines,
+        # `command_for`/`splice` build the prompt, and `run_job` drives a child
+        # process. An exception here ends one thread and latches no stop, so the
+        # claim it walks away from keeps `_exhausted` (`not pending and not
+        # in_progress`) false for ever — `claim()` answers None, and the workers
+        # still alive spin in the two-second back-off until somebody kills the
+        # run. Measured 2026-08-24: 2 workers, 4 files, one BrokenPipeError
+        # raised inside run_job — the second worker finished its three files and
+        # `run_parallel` had still not returned 25 s later. The guard therefore
+        # spans the whole region; `turn_started` is what tells `Shared.abandon`
+        # which of its two ways of giving the claim back applies.
+        turn_started = False
         try:
+            # Session-limit gate, now that we hold real work: one worker checks at a
+            # time (cheap, the reading is TTL-cached), and a pause blocks every worker that
+            # reaches it — so the whole fleet idles together when the budget is spent.
+            if source is not None:
+                with usage_lock:
+                    if not shared.stop.is_set():
+                        # The pause watches both stop channels. Without that, a
+                        # fleet parked on the wall is a fleet with nobody left to
+                        # notice `s`: every worker is inside this hold (or blocked
+                        # on the lock in front of it), the loop head that reads the
+                        # request is unreachable, and the keypress looks like a
+                        # hung program until the window resets hours later.
+                        paused, new_start = policy.check_and_wait(
+                            source, session_start_box[0],
+                            should_stop=lambda: shared.stop_asked(app))
+                        if paused:
+                            session_start_box[0] = new_start
+                        # The check just paid for a usage reading; publishing it
+                        # here is what keeps the provider's live figures on the
+                        # pinned row without a second round-trip (cache serves it).
+                        statusline.push_quotas(app, source, policy)
+
+            # A stop may have been latched, or a channel may have opened, while we
+            # waited for the lock or paused on the budget. HOLD the claimed file
+            # here rather than handing it back and going round: an `s` request can
+            # still be withdrawn, and a claim that --max-runs or a drained queue has
+            # closed cannot be made a second time — releasing it there loses that
+            # file for the whole run, which is exactly what "a mis-pressed `s` costs
+            # nothing" promises it will not do. Parked like this the worker is not
+            # busy (no turn is running), so the verdict is not waiting on it either.
+            # A max-items boundary only closes new claims, so already-claimed work
+            # deliberately continues past all of this. This is also the hold whose
+            # exception is EXPECTED by design: the worker parked here may be the one
+            # that wins the latch, and its console write can fail for reasons that
+            # have nothing to do with the run (see `Shared.latch_stop`).
             while (stopchannel.pending_stop(app) is not None
                    and not shared.stop.is_set()):
                 # The one place that decides what a request means — the key keeps
@@ -752,60 +805,49 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                 # `shared.stop` rather than its return value: the loop has to end
                 # on a stop latched by ANY worker, not only on this call's answer.
                 apply_stop_request(job_id, shared, app)
-        except BaseException:
-            # The hold whose exception is EXPECTED by design: the worker parked
-            # here may be the one that wins the latch, and its console write can
-            # fail for reasons that have nothing to do with the run (see
-            # `Shared.latch_stop`). It is NOT the only place that can raise
-            # holding a claim — the usage gate above and everything down to
-            # `run_job` can too, and there the damage is worse than a miscount
-            # (the line stays in `in_progress`, `_exhausted` never fires and the
-            # remaining workers spin in the back-off for ever). That one is an
-            # open defect, not something this guard covers; it is written up in
-            # refactor/backlog.md. Falling out of `worker` without this leaves
-            # the line in `in_progress` and `claimed` one too high, so the run
-            # reports one more file attempted than any worker ever started — in
-            # `RunResult.attempted` and in the exit log's `iterations`. The file
-            # itself was never at risk (nothing struck it), which is why this is
-            # a release rather than a rescue: hand the claim back, let the
-            # exception go on ending the thread it was always going to end.
-            shared.release(line)
-            raise
-        if shared.stop.is_set():
-            shared.release(line)
-            break
+            if shared.stop.is_set():
+                shared.release(line)
+                break
 
-        # From here the claim is a turn in flight, so a stop request waits for
-        # it. Marked before the command is built rather than around run_job:
-        # everything below is part of starting this file, and the gap would be a
-        # window in which the fleet looks idle while it is not. Paired with
-        # `job.start(...)` below, which says the same thing to the status line;
-        # move one and the other has to move with it.
-        shared.start_turn(line)
-        command = shared.driver.command_for(line)
-        # Notes typed while no turn was in flight ride this prompt (only a
-        # single-worker run has a mailbox at all — see run_parallel).
-        if mailbox is not None:
-            spliced, notes = mailbox.splice(command.prompt)
-            if notes:
-                command = command._replace(prompt=spliced)
-                for note in notes:
-                    emit_note(out, note)
-        # The same three calls the sequential loop makes on its single Job: the
-        # Job clock times THIS file, the run clock (latched once) times the run.
-        # This is the display's half of `shared.start_turn(line)` above — the row
-        # a stop request's grace is about; `shared.finish` and `job.finish` close
-        # the pair the same way.
-        started_at = time.time()
-        app.mark_run_started(started_at)
-        job.start(item=command.label, model=command.model,
-                  prompt=command.prompt, now=started_at)
-        app.update(phase="running")
-        out.line(f"▶ {command.label}", "bold cyan")
-        rc, cost_usd, dur = run_job(job_id, command, mailbox)
-        job.finish()
-        ok = rc == 0
-        done_total, remaining = shared.finish(line, ok)
+            # From here the claim is a turn in flight, so a stop request waits for
+            # it. Marked before the command is built rather than around run_job:
+            # everything below is part of starting this file, and the gap would be a
+            # window in which the fleet looks idle while it is not. Paired with
+            # `job.start(...)` below, which says the same thing to the status line;
+            # move one and the other has to move with it.
+            shared.start_turn(line)
+            turn_started = True
+            command = shared.driver.command_for(line)
+            # Notes typed while no turn was in flight ride this prompt (only a
+            # single-worker run has a mailbox at all — see run_parallel).
+            if mailbox is not None:
+                spliced, notes = mailbox.splice(command.prompt)
+                if notes:
+                    command = command._replace(prompt=spliced)
+                    for note in notes:
+                        emit_note(out, note)
+            # The same three calls the sequential loop makes on its single Job: the
+            # Job clock times THIS file, the run clock (latched once) times the run.
+            # This is the display's half of `shared.start_turn(line)` above — the row
+            # a stop request's grace is about; `shared.finish` and `job.finish` close
+            # the pair the same way.
+            started_at = time.time()
+            app.mark_run_started(started_at)
+            job.start(item=command.label, model=command.model,
+                      prompt=command.prompt, now=started_at)
+            app.update(phase="running")
+            out.line(f"▶ {command.label}", "bold cyan")
+            rc, cost_usd, dur = run_job(job_id, command, mailbox)
+            job.finish()
+            ok = rc == 0
+            done_total, remaining = shared.finish(line, ok)
+        except BaseException:
+            # Hand the claim back (see `Shared.abandon` for which way and why),
+            # then let the exception go on ending the thread it was always going
+            # to end. Rescuing the worker is not this guard's job; letting the
+            # other workers reach the end of the run is.
+            shared.abandon(line, turn_started)
+            raise
         # The summary counter moves on COMPLETION, not on the claim: a claimed
         # file is in flight, and counting it as progress would report N jobs'
         # worth of work that nothing has finished yet.
