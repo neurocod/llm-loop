@@ -73,18 +73,13 @@ from .console import (
     _fmt_clock,
     _fmt_left,
     _fmt_moment,
-    _log_plain,
     _MarkdownStream,
-    _real_stream,
     _render_markdown_block,
-    markup_percents,
-    percent_style,
     print_done,
     print_error,
     print_markup,
     print_note,
     print_percents,
-    print_styled,
 )
 # The vocabulary of stopping and pausing is `stopchannel`, its own module,
 # because both runners and a host wrapper speak it and none of them should have
