@@ -560,9 +560,10 @@ def test_a_worker_that_dies_announcing_a_stop_hands_its_claim_back(
     file no worker ever started — `RunResult.attempted` and the exit log's
     `iterations` both overstate the run by one.
 
-    So the pin is on the COUNT, not on the queue: nothing was ever struck, so
-    the file itself was never in danger (asserted anyway, since a fix that
-    rescued the claim by finishing it would satisfy the count).
+    So the pin is on the COUNT. The queue is asserted too, but as a statement
+    of what the run left behind, not as a second bite: a fix that "rescued" the
+    claim by finishing it trips `completed == 0` first — measured, so do not
+    read the queue line as covering a case the count misses.
     """
     stop = tmp_path / "stop"
     real_claim = parallel.Shared.claim

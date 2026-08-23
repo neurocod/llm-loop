@@ -753,11 +753,16 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                 # on a stop latched by ANY worker, not only on this call's answer.
                 apply_stop_request(job_id, shared, app)
         except BaseException:
-            # This is the ONE hold that can raise with a claim in hand, and the
-            # thing that raises is the stop announcement: the worker parked here
-            # may be the one that wins the latch, and its console write can fail
-            # for reasons that have nothing to do with the run (see
-            # `Shared.latch_stop`). Falling out of `worker` without this leaves
+            # The hold whose exception is EXPECTED by design: the worker parked
+            # here may be the one that wins the latch, and its console write can
+            # fail for reasons that have nothing to do with the run (see
+            # `Shared.latch_stop`). It is NOT the only place that can raise
+            # holding a claim — the usage gate above and everything down to
+            # `run_job` can too, and there the damage is worse than a miscount
+            # (the line stays in `in_progress`, `_exhausted` never fires and the
+            # remaining workers spin in the back-off for ever). That one is an
+            # open defect, not something this guard covers; it is written up in
+            # refactor/backlog.md. Falling out of `worker` without this leaves
             # the line in `in_progress` and `claimed` one too high, so the run
             # reports one more file attempted than any worker ever started — in
             # `RunResult.attempted` and in the exit log's `iterations`. The file
