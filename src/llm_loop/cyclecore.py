@@ -853,8 +853,8 @@ def git_push() -> bool:
     if proc.returncode == 0:
         print_done("  · git push: done.")
         return True
-    print_error(f"  · git push failed (exit {proc.returncode}): "
-                f"{_short(proc.stdout or '')}")
+    head = f"  · git push failed (exit {proc.returncode}): "
+    print_error(head + _short(proc.stdout or "", line_limit(head)))
     return False
 
 
@@ -926,8 +926,33 @@ def build_claude_argv(command: ClaudeCommand) -> list:
     return build_agent_argv(command, "claude")
 
 
-def _short(text: str, limit: int = 200) -> str:
-    """Single-line truncated version of text for compact output."""
+def line_limit(prefix: str = "") -> int:
+    """Characters of variable text that still fit on one line of this terminal,
+    once `prefix` — the fixed head the caller prints in front of it — is there.
+
+    The single source of every compact renderer's truncation width, on both
+    sides of the fence: the sequential stream renderer here and the per-worker
+    lines in `parallel`. Both used to carry their own fixed figures (200 for a
+    Claude tool call, 160 or 140 for the same field coming from codex), so how
+    much of a command reached the screen depended on the provider rather than on
+    the screen. See `statusline.line_budget` for what is measured and why.
+
+    Pass the prefix, not its length: it is measured in terminal cells, and these
+    heads are full of double-width glyphs (⚙, 💻, 📤) that `len` counts as one.
+    """
+    from . import statusline  # lazy: statusline imports cyclecore
+    return statusline.line_budget(prefix)
+
+
+def _short(text: str, limit: Optional[int] = None) -> str:
+    """Single-line truncated version of text for compact output.
+
+    `limit` defaults to a bare terminal line (`line_limit()`); a caller that
+    prints a head in front of the result passes `line_limit(that_head)` so the
+    two together fill the width instead of overflowing it.
+    """
+    if limit is None:
+        limit = line_limit()
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -959,10 +984,21 @@ def undouble_backslashes(text: str) -> str:
     return _BACKSLASH_RUN_RE.sub(lambda m: "\\" * (len(m.group(0)) // 2), text)
 
 
-def _describe_tool(name: str, ti: dict) -> str:
-    """Short human-readable description of a tool call and its arguments."""
+def _describe_tool(name: str, ti: dict, limit: Optional[int] = None) -> str:
+    """Short human-readable description of a tool call and its arguments.
+
+    `limit` is what the caller's own line leaves for this text — the tool-call
+    line is printed as `<indent>⚙ <name>: <this>`, so only the caller knows how
+    wide the head in front of it is (parallel mode adds a `[job k]` tag). Left
+    out, the description is cut to a bare terminal line.
+    """
+    if limit is None:
+        limit = line_limit()
     if name == "Bash":
-        return f"$ {_short(undouble_backslashes(str(ti.get('command', ''))))}"
+        # The "$ " below is part of the line too, so the command gets what is
+        # left after it rather than the whole budget.
+        command = undouble_backslashes(str(ti.get("command", "")))
+        return f"$ {_short(command, limit - 2)}"
     if name in ("Read", "Edit", "Write", "NotebookEdit"):
         return ti.get("file_path", ti.get("notebook_path", ""))
     if name in ("Glob", "Grep"):
@@ -971,15 +1007,15 @@ def _describe_tool(name: str, ti: dict) -> str:
     if name == "Skill":
         return ti.get("skill", "")
     if name == "Task" or name == "Agent":
-        return _short(ti.get("description", ti.get("prompt", "")))
+        return _short(ti.get("description", ti.get("prompt", "")), limit)
     if name == "TodoWrite":
         todos = ti.get("todos", [])
         return f"{len(todos)} items"
     # fallback: the first meaningful field
     for key in ("url", "query", "description", "prompt"):
         if ti.get(key):
-            return _short(ti[key])
-    return _short(json.dumps(ti, ensure_ascii=False)) if ti else ""
+            return _short(ti[key], limit)
+    return _short(json.dumps(ti, ensure_ascii=False), limit) if ti else ""
 
 
 # Optional pretty Markdown rendering of the assistant's streamed text via Rich.
@@ -1235,18 +1271,36 @@ def print_note(text: str) -> None:
                  f"  [magenta]✉[/] [bold magenta]operator note:[/] {_esc(text)}")
 
 
+# What stands between a tool-call line's head and its detail. Named because two
+# places need it as a value rather than as a literal: the width arithmetic
+# (`tool_line_head`) counts it, and the printer drops it when there is no detail.
+TOOL_DETAIL_SEP = ": "
+
+
+def tool_line_head(name: str) -> str:
+    """Everything a tool-call line prints in FRONT of its detail.
+
+    Exists for the width arithmetic: `line_limit(tool_line_head(name))` is how
+    much of the detail fits beside it. Kept here, next to the printer, so a head
+    measured somewhere else cannot drift from the head printed; parallel mode
+    prepends its own `[job k] ` tag to both (see `parallel.emit_tool`).
+    """
+    return f"  ⚙ {name}{TOOL_DETAIL_SEP}"
+
+
 def print_tool(name: str, detail: str = "") -> None:
     """A tool-call line: a yellow gear glyph and the bold-yellow tool name,
     followed by the (plain, possibly empty) detail. Multi-segment, so it builds
     markup and calls `print_markup` rather than print_styled; the shared head is
     written once instead of being repeated across the with/without-detail forms.
     """
-    head_plain = f"  ⚙ {name}"
-    head_markup = f"  [yellow]⚙[/] [bold yellow]{_esc(name)}[/]"
+    head_plain = tool_line_head(name)
+    head_markup = f"  [yellow]⚙[/] [bold yellow]{_esc(name)}[/]{TOOL_DETAIL_SEP}"
     if detail:
-        print_markup(f"{head_plain}: {detail}", f"{head_markup}: {_esc(detail)}")
+        print_markup(head_plain + detail, head_markup + _esc(detail))
     else:
-        print_markup(head_plain, head_markup)
+        cut = len(TOOL_DETAIL_SEP)
+        print_markup(head_plain[:-cut], head_markup[:-cut])
 
 
 # Streaming print state: the single content-block index text is currently flowing
@@ -1385,7 +1439,8 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
                 _render_markdown_block(block.get("text", ""))
             elif bt == "tool_use":
                 name = block.get("name", "?")
-                detail = _describe_tool(name, block.get("input", {}) or {})
+                detail = _describe_tool(name, block.get("input", {}) or {},
+                                        line_limit(tool_line_head(name)))
                 print_tool(name, detail)
         return
 
@@ -1405,7 +1460,7 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
                 )
             is_err = block.get("is_error")
             mark = "✗" if is_err else "✓"
-            line = _short(content, 160)
+            line = _short(content, line_limit(f"    {mark} "))
             if line:
                 color = "red" if is_err else "green"
                 print_markup(f"    {mark} {line}",
@@ -1454,15 +1509,23 @@ def _render_codex_event(ev: dict) -> None:
         return
 
     if event_type == "item.started" and item_type == "command_execution":
-        command = _short(undouble_backslashes(str(item.get("command", ""))))
+        command = _short(undouble_backslashes(str(item.get("command", ""))),
+                         line_limit(tool_line_head("Bash")))
         print_tool("Bash", command)
         return
 
     if event_type == "item.completed" and item_type == "command_execution":
         exit_code = item.get("exit_code")
-        command = _short(undouble_backslashes(str(item.get("command", ""))), 160)
-        output = _short(item.get("aggregated_output", ""), 160)
         mark = "✓" if exit_code in (None, 0) else "✗"
+        # Two variable fields on one line, so the command is capped at half of
+        # what the line has left and lends the rest of its half to the output —
+        # the field that says WHY a command failed, and the one a short command
+        # would otherwise leave no room for.
+        budget = line_limit(f"    {mark} exit {exit_code}:  — ")
+        command = _short(undouble_backslashes(str(item.get("command", ""))),
+                         budget // 2)
+        output = _short(item.get("aggregated_output", ""),
+                        max(1, budget - len(command)))
         detail = f"exit {exit_code}: {command}" if exit_code is not None else command
         if output:
             detail += f" — {output}"
@@ -1492,7 +1555,7 @@ def _render_codex_event(ev: dict) -> None:
 
     if event_type in ("error", "turn.failed"):
         error = ev.get("message") or ev.get("error") or item.get("error") or ev
-        print_error(f"  ⚠ result: {_short(error)}")
+        print_error(f"  ⚠ result: {_short(error, line_limit('  ⚠ result: '))}")
 
 
 def run_agent_streaming(cmd: list, provider: str, raw: bool,

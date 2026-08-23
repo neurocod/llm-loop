@@ -1080,6 +1080,53 @@ def test_fit_truncates_with_an_ellipsis():
     assert sl.fit("abcdef", 0) == ""
 
 
+# --- how wide one scrolling line may be ---------------------------------------
+#
+# The compact renderers used to cut their variable field at 140, 160 or 200
+# characters depending on the call site and the provider. `line_budget` replaces
+# all three with the terminal's own width; what the renderers do with it is
+# pinned in test_providers.py.
+
+
+def _columns(monkeypatch, columns):
+    """Pretend the terminal is `columns` wide (0 = there is no terminal)."""
+    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+                        lambda fallback=(0, 0): os.terminal_size((columns, 30)))
+
+
+def test_the_budget_is_the_terminal_minus_the_prefix(monkeypatch):
+    _columns(monkeypatch, 240)
+
+    assert sl.terminal_columns() == 240
+    assert sl.line_budget() == 240 - sl.LINE_RIGHT_MARGIN
+    assert sl.line_budget("[job 7] ") == 240 - 8 - sl.LINE_RIGHT_MARGIN
+
+
+def test_a_prefix_is_measured_in_cells_not_characters(monkeypatch):
+    """The heads are full of double-width glyphs; `len` would under-count them
+    by one column each and the line would wrap by exactly that much."""
+    pytest.importorskip("rich.cells")
+    _columns(monkeypatch, 200)
+
+    assert sl.cell_width("💻 ") == 3            # two cells plus the space
+    assert sl.line_budget("💻 ") == sl.line_budget("xx ")
+
+
+def test_no_terminal_falls_back_wide_rather_than_to_eighty(monkeypatch):
+    """Redirected to a file or a pipe there is no screen to fit, and the only
+    reader left is the mirror log — where a cut cannot be undone."""
+    _columns(monkeypatch, 0)
+
+    assert sl.terminal_columns() == sl.UNKNOWN_TERMINAL_COLUMNS
+    assert sl.line_budget() == sl.UNKNOWN_TERMINAL_COLUMNS - sl.LINE_RIGHT_MARGIN
+
+
+def test_a_narrow_terminal_wraps_instead_of_cutting_to_nothing(monkeypatch):
+    _columns(monkeypatch, 30)
+
+    assert sl.line_budget("[job 12]   ⚙ NotebookEdit: ") == sl.MIN_LINE_COLUMNS
+
+
 def test_format_prompt_block_heads_the_prompt_and_keeps_it_verbatim():
     block = sl.format_prompt_block(job_id=2, label="garlic.md",
                                    prompt="line one\nline two\n", width=60)
