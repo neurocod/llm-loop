@@ -6,16 +6,21 @@ the session-limit gate) after the list had drained to empty. The worker must:
   * claim work *before* touching the usage gate, so an empty/drained queue stops
     it via claim() -> stop and it never enters the gate with nothing to do;
   * exit promptly once the queue is drained, even with far more workers than
-    files (the spare workers must not spin forever); and
+    files (the spare workers must not spin forever);
   * give its claim back if it dies holding one, so the queue can still read as
     drained — a worker killed by an exception latches no stop, and a line stuck
-    in `in_progress` keeps every surviving worker in the back-off for ever.
+    in `in_progress` keeps every surviving worker in the back-off for ever; and
+  * take its provider child with it, so a run that ends leaves nothing of itself
+    still running in the terminal.
 
 The last group is time-bounded on purpose: without the fix the run does not end
 at all, so an unbounded pin would look like a wedged CI rather than a failure.
 """
 
+import json
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -350,6 +355,88 @@ def test_a_worker_dying_in_the_usage_gate_gives_the_file_back(
     result = _result(box)
     assert result.attempted == 1, \
         f"the abandoned claim's --max reservation was not undone: {result}"
+
+
+# The fake provider writes one event and then simply stays alive. Long enough
+# that "still running when the run ended" cannot be a race with a child about to
+# exit by itself — the question this pin asks is whether anything ENDED it.
+_ORPHAN_LIFETIME_S = 120
+
+# The tool name whose line the console refuses to print. `LineWriter.tool` puts
+# the name in the plain text, so this is what lets the stub writer fail on the
+# ONE line that run_job emits with a child running, and stay quiet for the
+# worker's own `▶`/verdict lines around it.
+_KILLS_THE_WRITER = "boom"
+
+_FAKE_PROVIDER_SRC = "import sys, time\nsys.stdout.write(%r)\nsys.stdout.flush()\ntime.sleep(%d)\n" % (
+    json.dumps({"type": "assistant",
+                "message": {"content": [{"type": "tool_use",
+                                         "name": _KILLS_THE_WRITER,
+                                         "input": {}}]}}) + "\n",
+    _ORPHAN_LIFETIME_S,
+)
+
+# How long a child gets to be dead once run_parallel has returned. The reaping is
+# synchronous inside run_job, so a healthy run has already collected it before
+# the run ends and this bound is never approached; it is here so the FAILING
+# case reports an orphan instead of blocking for `_ORPHAN_LIFETIME_S`.
+REAP_WAIT_S = 5.0
+
+
+def _outlived_the_run(proc, timeout=REAP_WAIT_S) -> bool:
+    """Is `proc` still running `timeout` after the run that started it ended?
+
+    Always leaves the child dead: a pin that fails must not also leak the very
+    process it is complaining about into the rest of the suite.
+    """
+    try:
+        proc.wait(timeout=timeout)
+        return False
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=REAP_WAIT_S)
+        return True
+
+
+@_EXPECTED_THREAD_DEATH
+def test_a_dying_job_does_not_leave_the_provider_running(tmp_path, monkeypatch):
+    """A `run_job` that raises must not walk away from a live child process.
+
+    `proc.wait()` at the bottom of run_job is its only reaping exit, and the
+    console write behind every `out.*` line sits above it — a real
+    BrokenPipeError there (the same one the fleet pin above is built on) used to
+    unwind straight past the child. The provider CLI then kept running: unreaped,
+    still holding the stdout it inherited, printing over whatever the terminal
+    did next.
+
+    A real subprocess rather than a stub, because the defect is exactly the
+    thing a stub does not have — an OS process that outlives the function that
+    started it.
+    """
+    children = []
+
+    def fake_provider(argv, provider, prompt, project_dir):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _FAKE_PROVIDER_SRC],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", bufsize=1)
+        children.append(proc)
+        return proc
+
+    def console_that_dies(plain, markup):
+        if _KILLS_THE_WRITER in plain:
+            raise BrokenPipeError("the terminal went away mid-line")
+
+    monkeypatch.setattr(parallel, "start_agent_process", fake_provider)
+    monkeypatch.setattr(parallel, "print_markup", console_that_dies)
+
+    driver = _MemDriver(["products/only.md"])
+    assert _run_and_wait(driver, _args(str(tmp_path), jobs=1),
+                         timeout=HANG_TIMEOUT_S), \
+        "the worker died holding a claim and run_parallel never returned"
+    assert children, "the fake provider was never started — the pin proved nothing"
+    assert not _outlived_the_run(children[0]), \
+        "run_job unwound past a live provider child: orphaned, not reaped"
 
 
 def test_max_runs_closes_claims_without_cancelling_in_flight_work(

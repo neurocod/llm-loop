@@ -200,6 +200,13 @@ class _FakeAgentProcess:
     def wait(self):
         return self.returncode
 
+    def poll(self):
+        # Always "already exited": this fake's stdout is a fixed string, so it
+        # models a process whose stream has ended, never one still running.
+        # `run_job` asks before reaping (see `_reap_agent_process`), and a fake
+        # that answered None would have the reaper signalling a pid nobody owns.
+        return self.returncode
+
 
 def test_codex_process_receives_prompt_via_closed_stdin(monkeypatch):
     created = []

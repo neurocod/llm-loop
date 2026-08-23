@@ -30,6 +30,7 @@ import argparse
 import collections
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -196,6 +197,83 @@ def emit_note(lines: compactline.LineWriter, note: str) -> None:
 
 # --- one provider round-trip for one file --------------------------------------
 
+# How long a provider child gets to end on its own before it is killed outright.
+# It is asked first because it may be mid-write to its own session store, and the
+# bound is what keeps the reaping from becoming a second hang inside the guard
+# that exists to end the first one: this runs on a thread that is ALREADY dying,
+# so nothing above it is left to notice a wait that never returns.
+REAP_GRACE_S = 2.0
+
+
+def _ask_agent_process_to_end(proc) -> None:
+    """Aim the signal at the provider CLI, not at the shim standing in front of it.
+
+    On Windows the handle we hold is usually `cmd.exe`: `runtime_argv` resolves
+    the provider to an npm `.cmd` shim and CreateProcess runs a batch file
+    through the interpreter, so the CLI itself is a GRANDCHILD. TerminateProcess
+    on the shim leaves it running, still holding the stdout handle it inherited
+    and still printing over whatever the terminal does next — which is the whole
+    symptom being fixed, so the Windows branch has to reach the tree
+    (`taskkill /T`). On POSIX an npm bin is the executable itself (a shebang
+    script), so the handle IS the provider and SIGTERM lands where it is aimed.
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=REAP_GRACE_S)
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass  # no taskkill, or it hung — fall back to the handle we hold
+    try:
+        proc.terminate()
+    except OSError:
+        pass  # it died between the poll and here; `wait` below collects it
+
+
+def _reap_agent_process(proc) -> None:
+    """End and collect a provider child whose reader is not coming back.
+
+    `run_job`'s only reaping exit is the `proc.wait()` at the bottom, and every
+    step above it can raise while the CLI runs: the console write behind each
+    `out.*` line (a `BrokenPipeError` there is exactly what the pin uses),
+    `note_channel`'s close, a decoder error on the child's own stream. Without
+    this the exception unwinds past `wait()` and the provider is simply left
+    ALIVE — nothing has asked it to stop, and it goes on writing into the same
+    terminal, over the output of whatever the run does next.
+
+    Why it took until now to be worth fixing: before 27e34c3 such an exception
+    hung the entire run, so an orphan nobody could see was the smaller half of
+    the damage. Now the run ends cleanly and the orphan is all that is left of
+    it.
+
+    Safe on the healthy path (`poll()` answers, so this is a no-op) and bounded
+    on every other: asked to end, then killed if it will not.
+    """
+    if proc.poll() is not None:
+        return
+    _ask_agent_process_to_end(proc)
+    # Before the wait, not after: a child blocked writing into a pipe nobody
+    # will read again cannot act on the signal it was just sent, and the read
+    # end is a descriptor this worker would otherwise leak until GC.
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=REAP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=REAP_GRACE_S)
+        except subprocess.TimeoutExpired:
+            # Unkillable (a stuck kernel-mode handle) — deliberately not waited
+            # on any longer. The thread is dying either way, and hanging here
+            # would take the rest of the fleet with it, which is the one thing
+            # this whole seam exists to prevent.
+            pass
+
+
 def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     """Run one provider command, rendering a compact per-job trace.
 
@@ -227,98 +305,106 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # `exit 1` and no cause anywhere. Kept as a bounded tail — a chatty CLI must
     # not be able to grow a worker's memory — and printed only if the job fails.
     diagnostics = collections.deque(maxlen=FAILURE_TAIL_LINES)
-    with note_channel(proc, provider, mailbox) as channel:
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                # Printed indented under a head of its own if the job fails.
-                diagnostics.append(compactline.short(line, out.budget("  ")))
-                continue  # non-JSON CLI diagnostics — skip in compact mode
-            if not isinstance(ev, dict):
-                continue  # valid JSON can still be a diagnostic, not an event
-            et = ev.get("type")
-            if provider == "codex":
-                item = ev.get("item") or {}
-                item_type = item.get("type")
-                if et == "item.completed" and item_type == "agent_message":
-                    for text in str(item.get("text") or "").splitlines():
-                        out.line(f"💬 {text}")
-                elif et == "item.started" and item_type == "command_execution":
-                    out.fitted("💻 ", compactline.undouble_backslashes(
-                        str(item.get("command", ""))))
-                elif et == "item.completed" and item_type == "command_execution":
-                    out.fitted(f"📤 exit {item.get('exit_code', '')}: ",
-                               compactline.undouble_backslashes(
-                                   str(item.get("command", ""))))
-                elif et == "item.completed" and item_type == "file_change":
-                    changes = item.get("changes") or []
-                    paths = [str(change.get("path")) for change in changes
-                             if isinstance(change, dict) and change.get("path")]
-                    out.line(f"🛠️ {', '.join(paths) or 'file changes applied'}")
-                elif et == "turn.completed":
-                    usage = ev.get("usage") or {}
-                    if usage:
-                        out.line("tokens: "
-                                 f"input {usage.get('input_tokens', 0)}, "
-                                 f"cached {usage.get('cached_input_tokens', 0)}, "
-                                 f"output {usage.get('output_tokens', 0)}")
-                elif et in ("error", "turn.failed"):
-                    provider_failed = True
-                    error = ev.get("message") or ev.get("error") or ev
-                    out.fitted("⚠ ", error, "bold red")
-            elif et == "assistant":
-                for block in ev.get("message", {}).get("content", []):
-                    if block.get("type") == "tool_use":
-                        out.tool_use(block.get("name", "?"),
-                                     block.get("input", {}) or {})
-            elif et == "user":
-                # Only surface *failed* tool results; successes would just be
-                # noise at high concurrency. An operator note replayed back to us
-                # is the exception: it is the receipt for something a human
-                # typed, and it belongs in the log next to the turn it landed in.
-                for block in ev.get("message", {}).get("content", []):
-                    if block.get("type") == "text" and mailbox is not None:
-                        note = mailbox.claim_echo(block.get("text", ""))
-                        if note is not None:
-                            emit_note(out, note)
-                    if block.get("type") == "tool_result" and block.get("is_error"):
-                        content = block.get("content", "")
-                        if isinstance(content, list):
-                            content = " ".join(
-                                c.get("text", "") for c in content
-                                if isinstance(c, dict)
-                            )
-                        out.fitted("  ✗ ", content, "red")
-            elif et == "rate_limit_event":
-                # The run's own rate-limit verdict (see cyclecore.RateLimitEvent).
-                # Surfaced, not acted on: with N workers the pause belongs to the
-                # shared usage gate, which sees the same wall as a pegged
-                # percentage when the next worker checks in.
-                rl = cyclecore.rate_limit_event_from(ev)
-                if rl is not None and rl.status != "allowed":
-                    out.line(f"⚠ rate limit: {rl.describe()}", "bold red")
-            elif et == "result":
-                # Before the figures: once the turn has reported, the console
-                # must not be able to write into a session that is closing.
-                channel.close()
-                # A process emits a second `result` when a late note is answered
-                # as its own turn. The two figures then have to be combined
-                # differently, which is measured rather than assumed:
-                # `total_cost_usd` is the session's running total (so the last
-                # one is the job's cost), `duration_ms` is that turn's alone (so
-                # they add up).
-                cost_usd = ev.get("total_cost_usd", cost_usd)
-                dur = ev.get("duration_ms")
-                if dur is not None:
-                    duration_s = (duration_s or 0.0) + dur / 1000
-    # Outside the `with`, so the pipe is closed before we wait on the process:
-    # a worker waiting on a CLI whose stdin is still open never returns, and a
-    # run whose final join() never finishes is the whole fleet.
-    returncode = proc.wait()
+    # Everything from here down to `proc.wait()` runs with a child process
+    # alive, and every step of it can raise: the console write behind each
+    # `out.*` line, `note_channel`'s close, a decoder error on the child's own
+    # stream. `wait()` is the only exit that reaps, so an exception used to
+    # walk away from a running provider — see `_reap_agent_process`.
+    try:
+        with note_channel(proc, provider, mailbox) as channel:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    # Printed indented under a head of its own if the job fails.
+                    diagnostics.append(compactline.short(line, out.budget("  ")))
+                    continue  # non-JSON CLI diagnostics — skip in compact mode
+                if not isinstance(ev, dict):
+                    continue  # valid JSON can still be a diagnostic, not an event
+                et = ev.get("type")
+                if provider == "codex":
+                    item = ev.get("item") or {}
+                    item_type = item.get("type")
+                    if et == "item.completed" and item_type == "agent_message":
+                        for text in str(item.get("text") or "").splitlines():
+                            out.line(f"💬 {text}")
+                    elif et == "item.started" and item_type == "command_execution":
+                        out.fitted("💻 ", compactline.undouble_backslashes(
+                            str(item.get("command", ""))))
+                    elif et == "item.completed" and item_type == "command_execution":
+                        out.fitted(f"📤 exit {item.get('exit_code', '')}: ",
+                                   compactline.undouble_backslashes(
+                                       str(item.get("command", ""))))
+                    elif et == "item.completed" and item_type == "file_change":
+                        changes = item.get("changes") or []
+                        paths = [str(change.get("path")) for change in changes
+                                 if isinstance(change, dict) and change.get("path")]
+                        out.line(f"🛠️ {', '.join(paths) or 'file changes applied'}")
+                    elif et == "turn.completed":
+                        usage = ev.get("usage") or {}
+                        if usage:
+                            out.line("tokens: "
+                                     f"input {usage.get('input_tokens', 0)}, "
+                                     f"cached {usage.get('cached_input_tokens', 0)}, "
+                                     f"output {usage.get('output_tokens', 0)}")
+                    elif et in ("error", "turn.failed"):
+                        provider_failed = True
+                        error = ev.get("message") or ev.get("error") or ev
+                        out.fitted("⚠ ", error, "bold red")
+                elif et == "assistant":
+                    for block in ev.get("message", {}).get("content", []):
+                        if block.get("type") == "tool_use":
+                            out.tool_use(block.get("name", "?"),
+                                         block.get("input", {}) or {})
+                elif et == "user":
+                    # Only surface *failed* tool results; successes would just be
+                    # noise at high concurrency. An operator note replayed back to us
+                    # is the exception: it is the receipt for something a human
+                    # typed, and it belongs in the log next to the turn it landed in.
+                    for block in ev.get("message", {}).get("content", []):
+                        if block.get("type") == "text" and mailbox is not None:
+                            note = mailbox.claim_echo(block.get("text", ""))
+                            if note is not None:
+                                emit_note(out, note)
+                        if block.get("type") == "tool_result" and block.get("is_error"):
+                            content = block.get("content", "")
+                            if isinstance(content, list):
+                                content = " ".join(
+                                    c.get("text", "") for c in content
+                                    if isinstance(c, dict)
+                                )
+                            out.fitted("  ✗ ", content, "red")
+                elif et == "rate_limit_event":
+                    # The run's own rate-limit verdict (see cyclecore.RateLimitEvent).
+                    # Surfaced, not acted on: with N workers the pause belongs to the
+                    # shared usage gate, which sees the same wall as a pegged
+                    # percentage when the next worker checks in.
+                    rl = cyclecore.rate_limit_event_from(ev)
+                    if rl is not None and rl.status != "allowed":
+                        out.line(f"⚠ rate limit: {rl.describe()}", "bold red")
+                elif et == "result":
+                    # Before the figures: once the turn has reported, the console
+                    # must not be able to write into a session that is closing.
+                    channel.close()
+                    # A process emits a second `result` when a late note is answered
+                    # as its own turn. The two figures then have to be combined
+                    # differently, which is measured rather than assumed:
+                    # `total_cost_usd` is the session's running total (so the last
+                    # one is the job's cost), `duration_ms` is that turn's alone (so
+                    # they add up).
+                    cost_usd = ev.get("total_cost_usd", cost_usd)
+                    dur = ev.get("duration_ms")
+                    if dur is not None:
+                        duration_s = (duration_s or 0.0) + dur / 1000
+        # Outside the `with`, so the pipe is closed before we wait on the process:
+        # a worker waiting on a CLI whose stdin is still open never returns, and a
+        # run whose final join() never finishes is the whole fleet.
+        returncode = proc.wait()
+    finally:
+        _reap_agent_process(proc)
     if returncode == 0 and provider_failed:
         returncode = 1
     # Last resort only: a codex error/turn.failed already printed its own ⚠ line

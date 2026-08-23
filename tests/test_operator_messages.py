@@ -117,6 +117,13 @@ class _FakeProc:
     def wait(self):
         return self._returncode
 
+    def poll(self):
+        # Always "already exited": stdout here is a finite iterable, so this
+        # fake models a process whose stream has ended, never one still running.
+        # `run_job` asks before reaping (see `_reap_agent_process`), and a fake
+        # that answered None would have the reaper signalling a pid nobody owns.
+        return self._returncode
+
     def terminate(self):
         pass
 
