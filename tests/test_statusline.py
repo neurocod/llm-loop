@@ -152,6 +152,28 @@ def test_a_stop_file_marker_does_not_offer_a_cancel_the_key_cannot_do():
     assert "press s to cancel" not in row
 
 
+def test_the_paused_marker_appears_only_while_paused():
+    assert "PAUSED" not in sl.render_rows(sequential_status(), 200, now=NOW)[1]
+
+    row = sl.render_rows(sequential_status(paused=True), 200, now=NOW)[1]
+
+    assert "PAUSED — press p to resume" in row
+    # The glyph outranks the phase: the run says "running" right up to the
+    # boundary it will hold at, and a row that opened with ⟳ would deny the
+    # marker next to it.
+    assert row.lstrip().startswith(sl.PAUSE_GLYPH)
+    assert row.count(sl.PAUSE_GLYPH) == 1
+
+
+def test_a_rate_limit_hold_wears_the_glyph_without_claiming_to_be_the_p_key():
+    """Both stand still and both show ⏸ — only the marker says which is which,
+    and a run waiting out a window must not read as one a human held."""
+    row = sl.render_rows(sequential_status(phase="paused"), 200, now=NOW)[1]
+
+    assert row.lstrip().startswith(sl.PAUSE_GLYPH)
+    assert "PAUSED" not in row
+
+
 def test_the_two_clocks_are_different_clocks():
     """The job row times the CURRENT iteration; the summary times the whole run."""
     rows = sl.render_rows(sequential_status(), 200, now=NOW)
@@ -396,6 +418,99 @@ def test_stop_file_defaults_to_the_engine_sentinel(monkeypatch):
     monkeypatch.setattr(cyclecore, "STOP_FILE", "/somewhere/stop")
 
     assert sl.StatusApp(enabled=False).stop_file == "/somewhere/stop"
+
+
+# --- the pause key -------------------------------------------------------------
+
+
+def test_pause_key_holds_the_run_and_pressing_it_again_resumes():
+    app = sl.StatusApp(enabled=False)
+
+    app.handle_event(sl.Key("p"))
+    assert app.paused is True and app.status.paused is True
+    assert cyclecore.pause_requested(app) is True
+    assert "p resume" in app.render(width=200, now=NOW)[-2]
+
+    app.handle_event(sl.Key("p"))
+    assert app.paused is False and app.status.paused is False
+    assert cyclecore.pause_requested(app) is False
+    assert "p pause" in app.render(width=200, now=NOW)[-2]
+
+
+def test_pausing_writes_nothing_to_disk_and_leaves_the_stop_channels_alone(
+    tmp_path, monkeypatch
+):
+    """A pause is one run's own, like `s` — and it is not a stop: a run holding
+    on `p` must not report a stop pending to anything that asks."""
+    sentinel = tmp_path / "stop"
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
+
+    app.handle_event(sl.Key("p"))
+
+    assert not sentinel.exists()
+    assert cyclecore.pending_stop(app) is None
+    assert app.stop_requested_here is False
+
+
+def test_a_run_with_no_status_line_is_never_paused():
+    """Piped output, CI, --no-statusline: nobody can press the key, and both
+    runners must not have to ask whether there is a status line at all."""
+    assert cyclecore.pause_requested(None) is False
+    assert cyclecore.pause_requested(sl.StatusApp(enabled=False)) is False
+    assert cyclecore.wait_while_paused(None) == 0.0
+
+
+class _PausedApp:
+    """An app whose `p` key is released after `polls` reads of the flag."""
+
+    enabled = True
+
+    def __init__(self, polls=3, stop_after=None):
+        self.polls = 0
+        self.limit = polls
+        self.stop_after = stop_after    # reads after which `s` is pressed too
+        self.fields = {}
+        self.notes = []
+
+    @property
+    def paused(self):
+        self.polls += 1
+        return self.polls <= self.limit
+
+    @property
+    def stop_requested_here(self):
+        return self.stop_after is not None and self.polls > self.stop_after
+
+    def update(self, **fields):
+        self.fields.update(fields)
+
+    def note(self, text):
+        self.notes.append(text)
+
+
+def test_the_hold_lasts_exactly_as_long_as_the_key_is_up():
+    app = _PausedApp(polls=3)
+
+    held = cyclecore.wait_while_paused(app, poll=0.01)
+
+    assert held > 0.0
+    assert app.polls == 4          # three "still paused", then the release
+
+
+def test_a_stop_pressed_during_the_hold_releases_it_at_once(monkeypatch, tmp_path):
+    """The hold has no timer, so `s` must be answered by it and not only by
+    whatever the run does next — and the decision stays with the loop head."""
+    monkeypatch.setattr(cyclecore, "STOP_FILE", str(tmp_path / "stop"))
+    app = _PausedApp(polls=1000, stop_after=2)
+
+    held = cyclecore.wait_while_paused(
+        app, should_stop=lambda: cyclecore.pending_stop(app) is not None,
+        poll=0.01)
+
+    assert held > 0.0
+    assert app.polls < 10          # left on the stop, not on the pause
+    assert app.paused is True      # …and the pause itself is untouched
 
 
 # --- the cancel grace (cyclecore.confirm_stop_request) -------------------------
@@ -1322,6 +1437,41 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
     assert app.status.max_iterations == 2
     assert "max-runs" not in dict(app.status.script_limits)
     assert app.settings.get("max-runs").get() == 2     # still an editable knob
+
+
+def test_a_paused_loop_holds_before_it_asks_the_driver_for_work(monkeypatch,
+                                                                tmp_path):
+    """The hold is only worth anything where it is: the state file the driver
+    reads must be quiet while a human edits it, so a pause taken after
+    `next_command()` would hold the run with the edit already missed."""
+    from llm_loop import cyclecore
+    from llm_loop.cyclecore import AgentCommand, Driver
+
+    class _TwoItems(Driver):
+        calls = 0
+
+        def next_command(self):
+            self.calls += 1
+            return AgentCommand("do the thing", "", f"item-{self.calls}")
+
+    driver = _TwoItems()
+    seen = []          # driver.calls at each read of the key, in order
+
+    def pressed_after_the_first_iteration(app=None):
+        seen.append(driver.calls)
+        return 2 <= len(seen) <= 4      # up for three reads, then released
+
+    monkeypatch.setattr(cyclecore, "pause_requested",
+                        pressed_after_the_first_iteration)
+
+    app, _source = _run_with_status(monkeypatch, tmp_path, driver, max=2)
+
+    # Read once before iteration 1 (nothing to hold yet), then held at the
+    # boundary after it — and for the whole hold the driver stayed on one call.
+    assert seen[0] == 0
+    assert seen[1:4] == [1, 1, 1]
+    assert driver.calls == 2
+    assert app.status.iteration == 2
 
 
 def _counts_down(total):

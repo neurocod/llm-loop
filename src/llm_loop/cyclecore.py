@@ -366,6 +366,45 @@ def confirm_stop_request(app=None, grace: float = STOP_GRACE_SECONDS,
         time.sleep(min(poll, remaining))
 
 
+def pause_requested(app=None) -> bool:
+    """Is the `p` key holding this run at its iteration boundaries?
+
+    The one reader of the flag, so the two runners cannot drift apart about what
+    a pause is — and so a run with no status line at all (piped output, CI,
+    --no-statusline) answers "no" without either of them testing for it.
+
+    In-process only, and deliberately: unlike a stop there is no file channel to
+    pause a fleet with. A pause is what somebody watching this terminal asks
+    for, and the run they are watching is the one that holds.
+    """
+    return bool(getattr(app, "paused", False))
+
+
+def wait_while_paused(app=None, should_stop=None,
+                      poll: float = STOP_RECHECK_SECONDS) -> float:
+    """Hold while `p` is up; returns how long the hold lasted (0.0 if never).
+
+    Called at an iteration BOUNDARY, which is the only point where holding is
+    free: nothing is in flight, no API request is open, and the files the loop
+    reads next are nobody's to race — which is the whole point, since the run is
+    usually held in order to edit one of them.
+
+    `should_stop` is the run's stop channels (see `sleep_unless`): a hold with no
+    timer on it must end the moment somebody asks the run to stop, or `s` would
+    be answered only by whatever is holding it. It does not DECIDE the stop —
+    the caller goes back to its loop head, which is the single place that knows
+    what a request means (cancel grace for a key, none for a file).
+    """
+    if not pause_requested(app):
+        return 0.0
+    started = time.time()
+    while pause_requested(app):
+        if should_stop is not None and should_stop():
+            break
+        time.sleep(poll)
+    return time.time() - started
+
+
 def set_project_root(path: Optional[str]) -> str:
     """Point the engine at the project root (cwd for git/provider CLI, base for the
     stop file and relative Driver paths). `path` None/empty means "keep the
@@ -2129,6 +2168,25 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 print(f"Iteration limit reached (--max-runs {max_runs}). Stopping.")
                 stop_reason = RunStopReason.LIMIT_REACHED
                 break
+
+            # The `p` key's hold. AFTER the cap check, so a run that has no
+            # iteration left to hold back ends instead of standing paused for a
+            # boundary that will never come; BEFORE `driver.next_command()`,
+            # which is what the key is for — the state file, the queue and the
+            # tree are all quiet while it holds, so an edit made now is what the
+            # next iteration reads.
+            if pause_requested(app):
+                print(f"\n  {statusline.PAUSE_GLYPH} Paused — press p to resume, "
+                      f"s to stop, m to queue a note for the next iteration.")
+                exitlog.note(phase="paused (p key)", iterations=iteration,
+                             completed=completed)
+                held = wait_while_paused(app, should_stop=stop_pending)
+                print(f"  ▶ Pause released after "
+                      f"{statusline.format_elapsed(held)}.")
+                # Back to the head rather than on: a stop pressed during the hold
+                # is the head's to act on (with its cancel grace), and the caps
+                # and quotas are re-read there.
+                continue
 
             # Proactive limit check: read the real Current-session usage from the
             # account and pause cleanly between iterations if it is already at/over

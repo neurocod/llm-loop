@@ -31,7 +31,7 @@ overnight.
 | Quota / rate limits | run until the CLI dies | the account's real figures are read over the provider's API **before** each iteration, and the loop waits under configurable ceilings (session / day-night / weekly), with a reactive `rate_limit_event` backstop |
 | Parallelism | sequential (fan-out only *inside* one agent) | `-j N` concurrent CLI workers draining a work-queue file, one item per job |
 | Stopping | Ctrl+C | `s` key (this run only), `stop` sentinel file (every run in the root), `--max-runs`, and an `error` state that halts for a human |
-| Steering | stop it, edit the prompt, start again | `m` types a note into the turn already running (or queues it for the next one) |
+| Steering | stop it, edit the prompt, start again | `m` types a note into the turn already running (or queues it for the next one); `p` holds the loop at an iteration boundary so the files it reads can be edited, `p` again lets it go |
 | Providers | whatever the pipe points at | Claude and Codex adapters (argv vs. stdin prompt transport, both stream-json rendered) |
 | Observability | terminal scrollback | pinned status line (iteration, model, elapsed, live quota, per-job rows), rotating mirror log, optional Markdown rendering |
 | git | your problem | `--git-push none\|after_new_commits\|each_hour` |
@@ -110,7 +110,7 @@ remainder. And since the items are independent, they can run **N at a time**:
  job 2 ▶ gpt-5.6-terra | iter 1    | 1m36s  | terminal-block-connector.md
  job 3 ▶ gpt-5.6-terra | iter 1    | 1m36s  | acoustic-upright-piano.md
  job 4 ▶ gpt-5.6-terra | iter 1    | 1m36s  | eggs-dozen.md
- keys: s stop | h help
+ keys: s stop | p pause | h help
 ```
 
 ## A playbook worth stealing
@@ -472,7 +472,8 @@ absent entirely when no rule watches it. A custom rule can say something else by
 overriding `LimitRule.status(reading, now)`.
 
 Keys: `s` requests a graceful stop of **this** run (pressing `s` again during
-the countdown cancels it), `m` sends the agent a note (see below), `h` or `?`
+the countdown cancels it), `p` holds it at the next iteration boundary and `p`
+again lets it go (see below), `m` sends the agent a note (see below), `h` or `?`
 shows the full key list.
 
 `s` sets an in-process flag and writes nothing to disk, so several loops
@@ -486,6 +487,27 @@ Where the two meet, the file wins: a run that stops while a sentinel is on disk
 consumes it, whether or not `s` was also pressed. Otherwise the file would
 outlive the loop it was written for and the launch queued behind it would wait
 forever.
+
+## Holding the run (`p`)
+
+`p` pauses the loop and `p` again resumes it. The iteration in flight is never
+interrupted — it finishes its one state transition, and the next one does not
+begin; the pinned row shows `⏸ … PAUSED — press p to resume` for as long as the
+hold lasts. In a parallel run the same key stops new files being claimed, and
+whatever is already running finishes.
+
+The hold sits where it does on purpose: after the `--max-runs` check, so a run
+with no iteration left to hold back ends instead of standing paused for a
+boundary that will never come, and before the driver is asked for the next unit
+of work, which is the whole point of the key. While it holds, the files the loop
+reads — a state file, a task list, the tree itself — are nobody's to race, so
+they can be edited and the next iteration reads the edit.
+
+Held, a run still answers everything else: `s` ends the hold and stops the run
+(with its usual cancel countdown), the `stop` file does the same, and `m` queues
+a note that rides the next iteration's prompt. Like `s`, `p` is in-process and
+writes nothing to disk — it holds the run whose terminal it was typed into, and
+the ones next door work on.
 
 ## Talking to the running agent (`m`)
 

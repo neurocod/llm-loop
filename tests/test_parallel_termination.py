@@ -115,6 +115,45 @@ def test_worker_claims_before_touching_the_usage_gate(tmp_path, monkeypatch):
     assert len(gate_calls) <= 1, f"idle workers entered the usage gate: {gate_calls}"
 
 
+def test_a_paused_fleet_claims_nothing_until_it_is_let_go(tmp_path, monkeypatch):
+    """`p` holds the workers BEFORE the claim, so a paused run holds no file.
+
+    Pausing after the claim would park a line in `in_progress` for the length of
+    the hold — where a stop latched meanwhile releases it — and the point of the
+    key is that it costs the run nothing.
+    """
+    from llm_loop import cyclecore
+
+    paused = threading.Event()
+    paused.set()
+    started = threading.Event()
+
+    def watched_job(job_id, command, mailbox=None):
+        started.set()
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", watched_job)
+    monkeypatch.setattr(cyclecore, "pause_requested",
+                        lambda app=None: paused.is_set())
+    driver = _MemDriver(["products/a.md", "products/b.md"])
+    done = threading.Event()
+
+    def go():
+        try:
+            parallel.run_parallel(driver, _args(str(tmp_path), jobs=3),
+                                  app_name="pytest-parallel")
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+
+    assert not started.wait(1.0), "a paused fleet started a file anyway"
+    assert len(driver.pending_lines()) == 2, "a paused fleet struck a line"
+    paused.clear()
+    assert done.wait(10), "the released run did not terminate"
+    assert driver.pending_lines() == []
+
+
 def test_release_returns_claim_to_queue():
     """release() drops the line from in_progress and undoes its --max reservation."""
     driver = _MemDriver(["a", "b"])

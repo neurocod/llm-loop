@@ -67,6 +67,7 @@ from .cyclecore import (
     log_file_path,
     parse_args,
     parse_duration,
+    pause_requested,
     pending_stop,
     project_dir,
     stop_file_for,
@@ -75,6 +76,7 @@ from .cyclecore import (
     run_loop,
     run_agent_streaming,
     set_project_root,
+    wait_while_paused,
 )
 from .providers import (
     PROVIDER_NAMES,
@@ -180,6 +182,7 @@ __all__ = [
     "parse_duration",
     "parse_rate_limits",
     "parse_usage",
+    "pause_requested",
     "pending_stop",
     "play_completion_sound",
     "project_dir",
@@ -197,4 +200,5 @@ __all__ = [
     "settings_path",
     "stop_file_for",
     "usage_source_for",
+    "wait_while_paused",
 ]

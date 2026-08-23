@@ -364,6 +364,10 @@ class Shared:
         self.stop_requested = threading.Event()
         self.stop_owner = None        # job_id deciding the request's fate
         self.stop_reason = None
+        # Whether the fleet has already said it is paused (see note_pause): the
+        # `p` key is read by every worker, and a fleet of eight would otherwise
+        # announce one keypress eight times.
+        self.paused_noted = False
 
     def claim(self) -> Optional[str]:
         """Reserve the next pending list line, or signal why there is none.
@@ -513,6 +517,19 @@ class Shared:
             self.stop.set()
             return True
 
+    def note_pause(self, paused: bool) -> bool:
+        """True for the worker that should announce this pause (or its release).
+
+        One line per transition, whoever gets here first — the alternative is a
+        line per worker per poll, which would bury the run's own output under
+        the very hold it is reporting.
+        """
+        with self.lock:
+            if paused == self.paused_noted:
+                return False
+            self.paused_noted = paused
+            return True
+
     def busy(self) -> bool:
         """Is any provider turn actually running right now?
 
@@ -614,6 +631,23 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             break
         if shared.stop_requested.is_set():
             continue  # holding the grace: do not fall into the claim back-off
+
+        # The `p` key's hold, and the reason it sits BEFORE the claim: a paused
+        # worker must hold no file. Claiming first and then pausing would park
+        # a line in `in_progress` for the length of the hold, where a stop
+        # latched meanwhile releases it — and the whole promise of the key is
+        # that it costs the run nothing. Files already in flight are not held
+        # back: as in the sequential loop, what pauses is the START of work.
+        # `shared.stop.wait` rather than sleep, so a latched stop releases this
+        # worker at once, and the loop head above is what acts on it.
+        if cyclecore.pause_requested(app):
+            if shared.note_pause(True):
+                emit_job(job_id, f"{statusline.PAUSE_GLYPH} paused — no new "
+                         "files will be claimed; press p to resume.", "yellow")
+            shared.stop.wait(cyclecore.STOP_RECHECK_SECONDS)
+            continue
+        if shared.note_pause(False):
+            emit_job(job_id, "▶ pause released — claiming files again.", "cyan")
 
         # Claim work FIRST, before the session-limit gate. The gate can block for a
         # long time when the budget is spent, and its wait loop does not watch the

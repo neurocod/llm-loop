@@ -67,6 +67,8 @@ __all__ = [
     "NullInputSource",
     "NullTerminal",
     "NumberSetting",
+    "PauseAction",
+    "PauseSegment",
     "PercentSetting",
     "ProviderSegment",
     "QuotaRefresher",
@@ -125,10 +127,16 @@ CODEX_QUOTA_REFRESH = 300.0
 # measure it with `cell_width`, never len().
 STOP_GLYPH = "🚫"
 
+# Shown while the run is standing still: the `p` key's hold, and the phase a run
+# parked on a rate-limit window reports. One glyph for both because from across
+# the room they are the same fact — the loop is not working — and the row says
+# WHICH of the two it is in words (see PauseSegment).
+PAUSE_GLYPH = "⏸"
+
 PHASE_GLYPHS = {
     "idle": "·",
     "running": "⟳",
-    "paused": "⏸",
+    "paused": PAUSE_GLYPH,
     "waiting": "⏳",
     "stopping": STOP_GLYPH,
 }
@@ -503,6 +511,10 @@ class LoopStatus:
     # asking for the stop. The SOURCE, not a bool, because the two read
     # differently on the row: only a `s` request can be taken back from here.
     stop_pending: str = ""
+    # The `p` key's hold. A field of its own rather than a phase, because it
+    # outlives the phases: it is set while an iteration is still RUNNING (that
+    # iteration finishes first) and it is what the loop reads at the boundary.
+    paused: bool = False
     note: str = ""
 
     def __post_init__(self) -> None:
@@ -551,6 +563,7 @@ class LoopStatus:
                 quotas=list(self.quotas),
                 script_limits=list(self.script_limits),
                 stop_pending=self.stop_pending,
+                paused=self.paused,
                 note=self.note,
             )
         return copy
@@ -658,10 +671,17 @@ class Segment:
 
 
 class IterationSegment(Segment):
-    """"⟳ iter 12/40 rand" — phase glyph, counter, optional cap and order marker."""
+    """"⟳ iter 12/40 rand" — phase glyph, counter, optional cap and order marker.
+
+    A pause outranks the phase: the phase describes the ITERATION (running,
+    waiting on the gate, idle between two), and while `p` is up there is no next
+    iteration to describe. Reading it off the flag also means neither runner has
+    to set a phase for the hold and then guess what to set it back to.
+    """
 
     def text(self, status, now=None):
-        glyph = PHASE_GLYPHS.get(status.phase, "·")
+        glyph = (PAUSE_GLYPH if status.paused
+                 else PHASE_GLYPHS.get(status.phase, "·"))
         text = f"{glyph} iter {status.iteration}"
         if status.max_iterations is not None:
             text += f"/{status.max_iterations}"
@@ -772,6 +792,21 @@ class ScriptLimitSegment(Segment):
         except (IndexError, TypeError, ValueError):
             return None
         return f"{label} {value}" if value else label
+
+
+class PauseSegment(Segment):
+    """The paused marker — "PAUSED — press p to resume".
+
+    Carries no glyph of its own: `IterationSegment` already opens the row with
+    ⏸ whenever this field is shown. What it adds is the half the glyph cannot
+    say — that the run is standing still because somebody asked it to, and not
+    because it is waiting out a rate-limit window, which wears the same glyph.
+    """
+
+    def text(self, status, now=None):
+        if not status.paused:
+            return None
+        return "PAUSED — press p to resume"
 
 
 class StopSegment(Segment):
@@ -934,6 +969,7 @@ class Layout:
         # touching this file.
         segments += [QuotaSegment(i) for i in range(len(status.quotas))]
         segments += [ScriptLimitSegment(i) for i in range(len(status.script_limits))]
+        segments.append(PauseSegment())
         segments.append(StopSegment())
         return SegmentRow(segments)
 
@@ -1514,6 +1550,33 @@ class StopAction(Action):
             app.cancel_stop()
         else:
             app.request_stop()
+
+
+class PauseAction(Action):
+    """`p` — hold the loop at the next iteration boundary, and let it go again.
+
+    The iteration in flight is never interrupted: it finishes its one state
+    transition, and the NEXT one does not begin. That is what makes the hold
+    useful — while it lasts, the files the loop reads (a state file, a queue)
+    are nobody's to race, so they can be edited, and the agent picks the edit up
+    when the run is let go.
+
+    In-process, exactly like StopAction and for the same reason: it addresses
+    the run whose terminal the key was typed into, so one of several loops
+    sharing a project root can be held while the others work on.
+    """
+
+    key = "p"
+    help = "pause"
+
+    def help_text(self, app):
+        return "resume" if app.paused else "pause"
+
+    def run(self, app):
+        if app.paused:
+            app.resume()
+        else:
+            app.request_pause()
 
 
 class HelpAction(Action):
@@ -2256,8 +2319,14 @@ class StatusApp:
         self._stop_lock = threading.Lock()
         self._atexit_registered = False
         self._signal_handlers: List[Tuple[int, object]] = []
+        # The `p` key's flag. Written by the input thread, read by the loop's —
+        # a plain bool, like `_requested_stop`, and unlike it under no lock: it
+        # pairs with no second state (the row reads `status.paused`, which
+        # LoopStatus already guards), so there is nothing here to keep in step.
+        self._paused = False
         if default_actions:
             self.register_action(StopAction())
+            self.register_action(PauseAction())
             self.register_action(MessageAction())
             self.register_action(HelpAction())
 
@@ -2474,6 +2543,30 @@ class StatusApp:
             self._requested_stop = False
             self.status.update(stop_pending=self._sentinel_pending())
         self.note("stop request cancelled")
+
+    @property
+    def paused(self) -> bool:
+        """True while `p` is holding this run at its iteration boundaries.
+
+        Says nothing about what the loop is doing RIGHT NOW: the flag can be
+        raised mid-iteration, and that iteration still finishes. What it
+        promises is that no new one starts while it is up — see
+        `cyclecore.wait_while_paused`, which is where both runners honour it.
+        """
+        return self._paused
+
+    def request_pause(self) -> None:
+        """Hold this run at the next iteration boundary."""
+        self._paused = True
+        self.update(paused=True)
+        self.note("paused — the iteration in flight finishes, then the loop "
+                  "holds (p resumes, s stops, m queues a note)")
+
+    def resume(self) -> None:
+        """Let a held run go again."""
+        self._paused = False
+        self.update(paused=False)
+        self.note("resumed")
 
     def _sentinel_pending(self) -> str:
         """The stop-file half of `stop_pending` (call under `_stop_lock`)."""
