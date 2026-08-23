@@ -847,6 +847,14 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # to end. Rescuing the worker is not this guard's job; letting the
             # other workers reach the end of the run is.
             shared.abandon(line, turn_started)
+            if turn_started:
+                # The display's half of the same pair: `shared.start_turn` and
+                # `job.start` opened it together, so both have to be closed
+                # together here too, or a dead worker leaves a row that says it
+                # is still running for the rest of the run. Second, because it is
+                # cosmetic and `abandon` is what keeps the run able to end — a
+                # status line that threw here must not take the claim with it.
+                job.finish()
             raise
         # The summary counter moves on COMPLETION, not on the claim: a claimed
         # file is in flight, and counting it as progress would report N jobs'

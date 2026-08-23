@@ -18,6 +18,8 @@ import os
 import sys
 import threading
 
+import pytest
+
 from llm_loop import cyclecore, parallel, stopchannel
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
@@ -183,6 +185,38 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
     assert all(not job.running and job.started_at == 0
                for job in app.status.jobs)
     assert app.status.iteration == 3     # the run's own counter, not a job's
+
+
+@pytest.mark.filterwarnings(
+    # The worker below is killed on purpose; that IS the fixture. Silenced here
+    # rather than globally, so a worker dying anywhere else is still news.
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_dead_worker_leaves_no_row_claiming_to_run(tmp_path, monkeypatch):
+    """A worker killed mid-turn must close its own row, not freeze it mid-file.
+
+    `shared.start_turn` and `job.start` open the pair together, so the guard that
+    gives the claim back has to close both. Otherwise the row of a thread that no
+    longer exists goes on saying "running", with its clock still ticking, for the
+    rest of the run — the display's version of the claim the guard hands back.
+    """
+    made = _live_statusline(monkeypatch, {})
+
+    def explode(job_id, command, mailbox=None):
+        raise BrokenPipeError("the provider CLI died mid-stream")
+
+    monkeypatch.setattr(parallel, "run_job", explode)
+    driver = _MemDriver(["products/only.md"])
+    previous = cyclecore.project_dir()
+    try:
+        # One worker and one file: nothing here depends on the fleet outliving
+        # the death, only on the row the dead worker leaves behind.
+        parallel.run_parallel(driver, _args(str(tmp_path), jobs=1),
+                              app_name="pytest-parallel-statusline")
+    finally:
+        cyclecore.set_project_root(previous)
+
+    assert [(j.job_id, j.running, j.started_at)
+            for j in made["app"].status.jobs] == [(1, False, 0.0)]
 
 
 def test_the_summary_row_shows_the_run_counters(tmp_path, monkeypatch):
