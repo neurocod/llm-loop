@@ -1,11 +1,13 @@
 import io
 import json
+import os
 import subprocess
 import sys
 
 import pytest
 
-from llm_loop import codex_usage, cyclecore, limits, parallel, providers
+from llm_loop import (codex_usage, cyclecore, limits, parallel, providers,
+                      statusline)
 from llm_loop.cyclecore import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
@@ -277,6 +279,25 @@ def test_parallel_job_tag_remains_visible_in_rich_markup():
     assert rich_markup.render(markup).plain == plain
 
 
+@pytest.mark.parametrize("emit,args", [
+    (parallel.emit_job, (3, "$ grep '[job 3]' *.md")),
+    (parallel.emit_tool, (3, "Grep", "[job 3] in products")),
+])
+def test_a_bracket_in_a_worker_line_reaches_the_screen(monkeypatch, emit, args):
+    """rich reads '[' as the start of a style tag and drops what follows it
+    without complaining, so the screen quietly lost text the log still had."""
+    rich_markup = pytest.importorskip("rich.markup")
+    printed = []
+    monkeypatch.setattr(parallel, "print_markup",
+                        lambda plain, markup: printed.append((plain, markup)))
+
+    emit(*args)
+
+    plain, markup = printed[0]
+    assert "[job 3]" in plain                     # twice: the tag and the text
+    assert rich_markup.render(markup).plain == plain
+
+
 @pytest.mark.parametrize("line", ["0", "null", "true", '"text"', "[]", "[1]"])
 def test_sequential_runner_treats_non_object_json_as_diagnostic(
         monkeypatch, capsys, line):
@@ -465,3 +486,115 @@ def test_both_renderers_use_the_helper_on_command_execution(monkeypatch, capsys)
 def test_the_claude_bash_tool_line_uses_the_helper():
     assert cyclecore._describe_tool("Bash", {"command": r"type C:\\a\\b.txt"}) \
         == r"$ type C:\a\b.txt"
+
+
+# --- one event, one line, the width of the terminal ---------------------------
+#
+# Each renderer used to cut its variable field at a figure of its own: 200
+# characters for a Claude tool call, 160 or 140 for the same command coming from
+# codex. How much of a command reached the screen therefore depended on the
+# provider rather than on the screen — a wide terminal showed a halved command
+# beside a third of a blank row, a narrow one wrapped anyway. All of them now
+# ask `statusline.line_budget`, whose own arithmetic is pinned in
+# test_statusline.py; what follows is that the renderers use it, prefix
+# included.
+
+LONG_COMMAND = "echo " + "x" * 500
+
+
+@pytest.fixture
+def plain_lines(monkeypatch):
+    """Every rendered line, as the PLAIN copy that goes to the mirror log.
+
+    Collected here rather than from capsys because with rich installed the
+    styled copy is wrapped at rich's own console width (80 when stdout is not a
+    terminal), so the capture would show that wrapping instead of our cut.
+    """
+    lines = []
+
+    def record(plain, _markup):
+        lines.append(plain)
+
+    monkeypatch.setattr(cyclecore, "print_markup", record)
+    monkeypatch.setattr(parallel, "print_markup", record)   # imported by name
+    return lines
+
+
+def _terminal(monkeypatch, columns):
+    """Pretend the terminal is `columns` wide; return what one line may fill."""
+    monkeypatch.setattr(statusline.shutil, "get_terminal_size",
+                        lambda fallback=(0, 0): os.terminal_size((columns, 30)))
+    return columns - statusline.LINE_RIGHT_MARGIN
+
+
+def _bash_tool_use(command):
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Bash", "input": {"command": command}}]}}
+
+
+def test_a_tool_line_is_cut_to_the_terminal_not_to_two_hundred(
+        monkeypatch, plain_lines):
+    fits = _terminal(monkeypatch, 300)
+
+    cyclecore._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
+
+    line, = plain_lines
+    assert line.endswith("…")                        # it was cut
+    assert statusline.cell_width(line) == fits       # ...to the terminal
+    assert len(line) > 200                           # ...not to the old figure
+
+
+def test_the_same_command_is_cut_the_same_from_either_provider(
+        monkeypatch, plain_lines):
+    """200 for claude and 160 for codex was the provider deciding the width."""
+    fits = _terminal(monkeypatch, 300)
+
+    cyclecore._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
+    cyclecore._render_codex_event({"type": "item.started", "item": {
+        "type": "command_execution", "command": LONG_COMMAND}})
+
+    claude_line, codex_line = plain_lines
+    assert statusline.cell_width(claude_line) == fits
+    assert statusline.cell_width(codex_line) == fits
+
+
+def test_a_worker_line_leaves_room_for_its_job_tag(monkeypatch, plain_lines):
+    """`[job 4] ` is furniture too: cut to a bare line, a worker's text would
+    overflow by exactly the tag."""
+    fits = _terminal(monkeypatch, 300)
+
+    _codex_job(monkeypatch, json.dumps({"type": "item.started", "item": {
+        "type": "command_execution", "command": LONG_COMMAND}}) + "\n",
+        returncode=0)
+
+    line, = plain_lines
+    assert line.startswith("[job 4] ")
+    assert statusline.cell_width(line) == fits
+
+
+def test_a_worker_tool_line_leaves_room_for_its_job_tag(
+        monkeypatch, plain_lines):
+    fits = _terminal(monkeypatch, 300)
+    monkeypatch.setattr(
+        parallel, "start_agent_process",
+        lambda *args: _FakeAgentProcess(
+            has_stdin=False,
+            stdout=json.dumps(_bash_tool_use(LONG_COMMAND)) + "\n"))
+
+    parallel.run_job(4, AgentCommand("p", "opus", "job", "claude"))
+
+    line, = plain_lines
+    assert line.startswith("[job 4]   ⚙ Bash: $ ")
+    assert statusline.cell_width(line) == fits
+
+
+def test_a_narrow_terminal_still_records_what_the_old_limits_did(
+        monkeypatch, plain_lines):
+    """The mirror log reads these lines too, so a small window is allowed to
+    wrap them rather than shrink what the run recorded."""
+    _terminal(monkeypatch, 40)
+
+    cyclecore._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
+
+    line, = plain_lines
+    assert statusline.cell_width(line) > statusline.MIN_LINE_COLUMNS

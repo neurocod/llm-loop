@@ -54,6 +54,7 @@ from .cyclecore import (
     set_project_root,
     undouble_backslashes,
     _describe_tool,
+    _esc,
     _short,
 )
 from .providers import (note_channel, provider_spec, set_live_messages,
@@ -163,10 +164,28 @@ def _job_tag(job_id: int) -> tuple:
     return f"[job {job_id}]", f"[cyan]\\[job {job_id}][/]"
 
 
+def _job_line_limit(job_id: int, head: str = "") -> int:
+    """`cyclecore.line_limit` for a worker's line, tag included.
+
+    Every line here is printed as `[job k] <head><variable part>`, and the tag
+    is as much of the line's furniture as the glyph after it — a worker whose
+    text was cut to the bare terminal width would overflow by exactly the tag.
+    """
+    return cyclecore.line_limit(f"{_job_tag(job_id)[0]} {head}")
+
+
 def emit_job(job_id: int, plain: str, style: Optional[str] = None) -> None:
-    """One compact line attributed to a worker (styled on screen, plain in log)."""
+    """One compact line attributed to a worker (styled on screen, plain in log).
+
+    The body is escaped on its way into the markup: these lines carry commands,
+    paths and error text, and rich reads a '[' in them as the start of a style
+    tag. It does not complain — `[job 3]` inside a Grep pattern simply vanishes
+    from the screen while the log copy still has it.
+    """
     tag_plain, tag_markup = _job_tag(job_id)
-    body_markup = f"[{style}]{plain}[/]" if style else plain
+    body_markup = _esc(plain)
+    if style:
+        body_markup = f"[{style}]{body_markup}[/]"
     _emit_markup(f"{tag_plain} {plain}", f"{tag_markup} {body_markup}")
 
 
@@ -181,14 +200,22 @@ def emit_note(job_id: int, note: str) -> None:
 
 
 def emit_tool(job_id: int, name: str, detail: str) -> None:
-    """A tool-call line for a worker: '[job k] ⚙ Write: path'."""
+    """A tool-call line for a worker: '[job k]   ⚙ Write: path'.
+
+    The plain head comes from `cyclecore.tool_line_head`, the same one the
+    sequential renderer prints and the same one `_job_line_limit` measures to
+    size the detail — three places that have to agree about the width of one
+    prefix, so only one of them owns it.
+    """
     tag_plain, tag_markup = _job_tag(job_id)
-    head_plain = f"{tag_plain}   ⚙ {name}"
-    head_markup = f"{tag_markup}   [yellow]⚙[/] [bold yellow]{name}[/]"
+    head_plain = f"{tag_plain} " + cyclecore.tool_line_head(name)
+    head_markup = (f"{tag_markup}   [yellow]⚙[/] [bold yellow]{_esc(name)}[/]"
+                   + cyclecore.TOOL_DETAIL_SEP)
     if detail:
-        _emit_markup(f"{head_plain}: {detail}", f"{head_markup}: {detail}")
+        _emit_markup(head_plain + detail, head_markup + _esc(detail))
     else:
-        _emit_markup(head_plain, head_markup)
+        cut = len(cyclecore.TOOL_DETAIL_SEP)
+        _emit_markup(head_plain[:-cut], head_markup[:-cut])
 
 
 # --- one provider round-trip for one file --------------------------------------
@@ -231,7 +258,8 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
-                diagnostics.append(_short(line))
+                # Printed indented under a head of its own if the job fails.
+                diagnostics.append(_short(line, _job_line_limit(job_id, "  ")))
                 continue  # non-JSON CLI diagnostics — skip in compact mode
             if not isinstance(ev, dict):
                 continue  # valid JSON can still be a diagnostic, not an event
@@ -243,11 +271,15 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     for text in str(item.get("text") or "").splitlines():
                         emit_job(job_id, f"💬 {text}")
                 elif et == "item.started" and item_type == "command_execution":
-                    emit_job(job_id, "💻 " + _short(
-                        undouble_backslashes(str(item.get("command", ""))), 160))
+                    head = "💻 "
+                    emit_job(job_id, head + _short(
+                        undouble_backslashes(str(item.get("command", ""))),
+                        _job_line_limit(job_id, head)))
                 elif et == "item.completed" and item_type == "command_execution":
-                    emit_job(job_id, f"📤 exit {item.get('exit_code', '')}: " + _short(
-                        undouble_backslashes(str(item.get("command", ""))), 140))
+                    head = f"📤 exit {item.get('exit_code', '')}: "
+                    emit_job(job_id, head + _short(
+                        undouble_backslashes(str(item.get("command", ""))),
+                        _job_line_limit(job_id, head)))
                 elif et == "item.completed" and item_type == "file_change":
                     changes = item.get("changes") or []
                     paths = [str(change.get("path")) for change in changes
@@ -263,14 +295,18 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                                  f"output {usage.get('output_tokens', 0)}")
                 elif et in ("error", "turn.failed"):
                     provider_failed = True
+                    error = ev.get("message") or ev.get("error") or ev
                     emit_job(job_id,
-                             f"⚠ {_short(ev.get('message') or ev.get('error') or ev)}",
+                             "⚠ " + _short(error, _job_line_limit(job_id, "⚠ ")),
                              "bold red")
             elif et == "assistant":
                 for block in ev.get("message", {}).get("content", []):
                     if block.get("type") == "tool_use":
                         name = block.get("name", "?")
-                        detail = _describe_tool(name, block.get("input", {}) or {})
+                        detail = _describe_tool(
+                            name, block.get("input", {}) or {},
+                            _job_line_limit(job_id,
+                                            cyclecore.tool_line_head(name)))
                         emit_tool(job_id, name, detail)
             elif et == "user":
                 # Only surface *failed* tool results; successes would just be
@@ -289,7 +325,8 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                                 c.get("text", "") for c in content
                                 if isinstance(c, dict)
                             )
-                        emit_job(job_id, f"  ✗ {_short(content, 160)}", "red")
+                        emit_job(job_id, "  ✗ " + _short(
+                            content, _job_line_limit(job_id, "  ✗ ")), "red")
             elif et == "rate_limit_event":
                 # The run's own rate-limit verdict (see cyclecore.RateLimitEvent).
                 # Surfaced, not acted on: with N workers the pause belongs to the
