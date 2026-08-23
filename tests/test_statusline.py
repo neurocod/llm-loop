@@ -1,9 +1,16 @@
 """Tests for the pinned status line.
 
 Everything here exercises the PURE renderer (rows -> strings) or the controller
-driven by synthetic events. Nothing asserts on raw escape sequences: the byte
-level is the terminal's business and differs per emulator, while the rows are
-what a human actually reads.
+driven by synthetic events.
+
+Row CONTENT is asserted as text: that is what a human reads, and how a row gets
+painted differs per emulator. Escapes are asserted as BYTES only where the bytes
+are themselves the observable — the title escape and the DECSTBM reset (a
+terminal either accepts them or does not, and there is nothing above them to
+look at), the top row the region reserves (the geometry arithmetic), and whether
+any ESC at all reaches the mirror log (it must not). The title escape is spelled
+out literally rather than built from `tio.TITLE_SET`, because an expectation
+built from the constant mutates along with it and pins nothing.
 """
 
 import io
@@ -758,7 +765,12 @@ def test_the_title_is_written_on_change_only_and_given_back_on_exit(monkeypatch)
     app = sl.StatusApp(terminal=tio.terminal_for(stream),
                        input_source=tio.NullInputSource(), refresh=60)
 
-    escape = tio.TITLE_SET.format("⟳ iter 4/9 · garlic.md")
+    # Spelled out rather than built from `tio.TITLE_SET`, which would mutate
+    # along with the constant and leave its VALUE pinned by nothing: OSC 0 (title
+    # AND icon/tab name in one escape) terminated by BEL (which every emulator
+    # this runs under accepts, where some older ones refuse ST). Those bytes are
+    # the whole feature; the reasoning for them lives above the constant.
+    escape = "\x1b]0;⟳ iter 4/9 · garlic.md\x07"
     with app:
         app.update(iteration=4, max_iterations=9, phase="running")
         app.job(1).start(item="garlic.md", model="opus", now=NOW)
@@ -768,7 +780,8 @@ def test_the_title_is_written_on_change_only_and_given_back_on_exit(monkeypatch)
         assert "\x1b]0;" not in stream.getvalue()[mark:]   # so: no second write
         assert stream.getvalue().count(escape) == 1
 
-    assert tio.TITLE_RESET in stream.getvalue()  # the window gets its name back
+    # The empty title, which is the documented way back to the profile's own.
+    assert "\x1b]0;\x07" in stream.getvalue()   # the window gets its name back
 
     # A worker still finishing past a parallel Ctrl+C, or the quota refresher
     # whose join timed out: both paint after the teardown, and a name written

@@ -733,3 +733,65 @@ def test_a_missing_exit_code_does_not_shrink_the_line(monkeypatch, plain_lines):
     line, = plain_lines
     assert "exit" not in line
     assert textwidth.cell_width(line) == fits
+
+
+# --- the other copy of the same line: the one with the colour in it -----------
+#
+# `LineWriter` builds every line twice — the plain copy the mirror log records
+# and the markup copy the screen renders. Everything above reads the plain one,
+# so the styling was pinned by nothing at all: deleting the style wrapper from
+# `line`, the gear and name tags from `tool` and the mark tag from `mark` left
+# the suite green while every verdict, error and tool call went out grey.
+#
+# These read the markup copy THROUGH rich rather than matching tags in it. What
+# a pin owes the reader here is that the text arrives styled and that the styling
+# lands on the right piece of the line — not how the tag was spelled, which a
+# rewrite is free to change without breaking anything a human sees.
+
+
+@pytest.fixture
+def line_pairs(monkeypatch):
+    """Both copies of every rendered line, as `(plain, markup)` pairs."""
+    pairs = []
+    monkeypatch.setattr(cyclecore, "print_markup",
+                        lambda plain, markup: pairs.append((plain, markup)))
+    return pairs
+
+
+def _style_over(markup, part):
+    """The rich style covering `part` of the rendered line; "" when unstyled."""
+    rich_markup = pytest.importorskip("rich.markup")
+    text = rich_markup.render(markup)
+    start = text.plain.index(part)
+    end = start + len(part)
+    return " ".join(str(span.style) for span in text.spans
+                    if span.start <= start and end <= span.end)
+
+
+def test_a_styled_line_reaches_the_screen_in_its_style(line_pairs):
+    """Worker verdicts, the bold-red error lines and the stop/pause notices are
+    all this one shape carrying a style."""
+    cyclecore.LINES.line("run stopped: stop file", style="bold red")
+
+    plain, markup = line_pairs[0]
+    assert plain == "run stopped: stop file"        # the log copy stays plain
+    assert _style_over(markup, plain) == "bold red"
+
+
+def test_a_tool_line_keeps_its_coloured_glyph_and_bold_name(line_pairs):
+    cyclecore.LINES.tool("Bash", "$ pytest -q")
+
+    _, markup = line_pairs[0]
+    assert _style_over(markup, "⚙")                  # the glyph is coloured
+    assert "bold" in _style_over(markup, "Bash")     # the name is picked out
+    assert _style_over(markup, "$ pytest -q") == ""  # the detail is not
+
+
+def test_a_mark_line_styles_the_glyph_and_not_the_body(line_pairs):
+    """The ✓/✗ is the outcome, so it carries the colour; the body beside it is a
+    command and its output, which a style would only make harder to read."""
+    cyclecore.LINES.mark("✗", "red", "exit 1: pytest -q")
+
+    _, markup = line_pairs[0]
+    assert _style_over(markup, "✗") == "red"
+    assert _style_over(markup, "exit 1: pytest -q") == ""
