@@ -189,6 +189,17 @@ def emit_job(job_id: int, plain: str, style: Optional[str] = None) -> None:
     _emit_markup(f"{tag_plain} {plain}", f"{tag_markup} {body_markup}")
 
 
+def emit_fitted(job_id: int, head: str, text, style: Optional[str] = None) -> None:
+    """A worker's line: `head`, then as much of `text` as the row leaves beside it.
+
+    The head is named once and used twice from here — measured, then printed.
+    Spelled out at the call site instead, the two copies drift the moment one of
+    them gains a glyph, and the line overflows by exactly the difference without
+    anything failing; every compact line in `run_job` had that shape.
+    """
+    emit_job(job_id, head + _short(text, _job_line_limit(job_id, head)), style)
+
+
 def emit_note(job_id: int, note: str) -> None:
     """An operator note attributed to a worker — this runner's `print_note`.
 
@@ -273,15 +284,13 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     for text in str(item.get("text") or "").splitlines():
                         emit_job(job_id, f"💬 {text}")
                 elif et == "item.started" and item_type == "command_execution":
-                    head = "💻 "
-                    emit_job(job_id, head + _short(
-                        undouble_backslashes(str(item.get("command", ""))),
-                        _job_line_limit(job_id, head)))
+                    emit_fitted(job_id, "💻 ", undouble_backslashes(
+                        str(item.get("command", ""))))
                 elif et == "item.completed" and item_type == "command_execution":
-                    head = f"📤 exit {item.get('exit_code', '')}: "
-                    emit_job(job_id, head + _short(
-                        undouble_backslashes(str(item.get("command", ""))),
-                        _job_line_limit(job_id, head)))
+                    emit_fitted(job_id,
+                                f"📤 exit {item.get('exit_code', '')}: ",
+                                undouble_backslashes(
+                                    str(item.get("command", ""))))
                 elif et == "item.completed" and item_type == "file_change":
                     changes = item.get("changes") or []
                     paths = [str(change.get("path")) for change in changes
@@ -298,9 +307,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                 elif et in ("error", "turn.failed"):
                     provider_failed = True
                     error = ev.get("message") or ev.get("error") or ev
-                    emit_job(job_id,
-                             "⚠ " + _short(error, _job_line_limit(job_id, "⚠ ")),
-                             "bold red")
+                    emit_fitted(job_id, "⚠ ", error, "bold red")
             elif et == "assistant":
                 for block in ev.get("message", {}).get("content", []):
                     if block.get("type") == "tool_use":
@@ -327,8 +334,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                                 c.get("text", "") for c in content
                                 if isinstance(c, dict)
                             )
-                        emit_job(job_id, "  ✗ " + _short(
-                            content, _job_line_limit(job_id, "  ✗ ")), "red")
+                        emit_fitted(job_id, "  ✗ ", content, "red")
             elif et == "rate_limit_event":
                 # The run's own rate-limit verdict (see cyclecore.RateLimitEvent).
                 # Surfaced, not acted on: with N workers the pause belongs to the

@@ -1031,6 +1031,11 @@ def undouble_backslashes(text: str) -> str:
     return _BACKSLASH_RUN_RE.sub(lambda m: "\\" * (len(m.group(0)) // 2), text)
 
 
+# What a Bash tool call's detail puts in front of the command, so the line reads
+# as the shell prompt it is.
+BASH_DETAIL_HEAD = "$ "
+
+
 def _describe_tool(name: str, ti: dict, limit: Optional[int] = None) -> str:
     """Short human-readable description of a tool call and its arguments.
 
@@ -1049,10 +1054,14 @@ def _describe_tool(name: str, ti: dict, limit: Optional[int] = None) -> str:
     if limit is None:
         limit = line_limit()
     if name == "Bash":
-        # The "$ " below is part of the line too, so the command gets what is
-        # left after it rather than the whole budget.
+        # This head is part of the line too, so the command gets what is left
+        # after it rather than the whole budget. Subtracted from the same value
+        # that is printed: a literal 2 beside a literal "$ " is a number nothing
+        # ties to the string it measures. `len` because it is ASCII — a glyph
+        # here would have to be counted in cells (`statusline.cell_width`).
         command = undouble_backslashes(str(ti.get("command", "")))
-        return f"$ {_short(command, limit - 2)}"
+        return BASH_DETAIL_HEAD + _short(command,
+                                         limit - len(BASH_DETAIL_HEAD))
     if name in ("Read", "Edit", "Write", "NotebookEdit"):
         return _short(ti.get("file_path", ti.get("notebook_path", "")) or "",
                       limit)
@@ -1362,6 +1371,29 @@ def print_tool(name: str, detail: str = "") -> None:
         print_markup(head_plain[:-cut], head_markup[:-cut])
 
 
+def mark_line_head(mark: str) -> str:
+    """Everything an outcome line prints in FRONT of its body.
+
+    The `mark` is a ✓/✗ standing for what a step returned, indented under the
+    tool call it belongs to. Same reason as `tool_line_head`: the head is both
+    measured (`line_limit(mark_line_head(mark))`) and printed, and the two
+    spellings drift silently — the printed line then overflows the row by the
+    difference, which is what the width measurement exists to prevent.
+    """
+    return f"    {mark} "
+
+
+def print_mark_line(mark: str, style: str, body: str) -> None:
+    """An outcome line: the ✓/✗ in `style`, then the (plain) body beside it.
+
+    Both providers report an outcome this way — a Claude tool_result and a codex
+    command_execution completion — and they differ only in what they put in the
+    body, so the glyph, the indent and the escaping are decided once here.
+    """
+    print_markup(f"{mark_line_head(mark)}{body}",
+                 f"    [{style}]{mark}[/] {_esc(body)}")
+
+
 # Streaming print state: the single content-block index text is currently flowing
 # into (assistant replies stream one text block at a time), plus its live renderer.
 _active_text_index = None
@@ -1519,11 +1551,9 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
                 )
             is_err = block.get("is_error")
             mark = "✗" if is_err else "✓"
-            line = _short(content, line_limit(f"    {mark} "))
+            line = _short(content, line_limit(mark_line_head(mark)))
             if line:
-                color = "red" if is_err else "green"
-                print_markup(f"    {mark} {line}",
-                             f"    [{color}]{mark}[/] {_esc(line)}")
+                print_mark_line(mark, "red" if is_err else "green", line)
         return
 
     if et == "result":
@@ -1583,14 +1613,13 @@ def _render_codex_event(ev: dict) -> None:
         code_head = f"exit {exit_code}: " if exit_code is not None else ""
         separator = " — " if _collapse(item.get("aggregated_output", "")) else ""
         command, output = _fit_two(
-            line_limit(f"    {mark} {code_head}{separator}"),
+            line_limit(f"{mark_line_head(mark)}{code_head}{separator}"),
             undouble_backslashes(str(item.get("command", ""))),
             item.get("aggregated_output", ""))
         detail = f"{code_head}{command}"
         if output:
             detail += f"{separator}{output}"
-        style = "green" if exit_code in (None, 0) else "red"
-        print_markup(f"    {mark} {detail}", f"    [{style}]{mark}[/] {_esc(detail)}")
+        print_mark_line(mark, "green" if exit_code in (None, 0) else "red", detail)
         return
 
     if event_type == "item.completed" and item_type == "file_change":
@@ -1615,7 +1644,8 @@ def _render_codex_event(ev: dict) -> None:
 
     if event_type in ("error", "turn.failed"):
         error = ev.get("message") or ev.get("error") or item.get("error") or ev
-        print_error(f"  ⚠ result: {_short(error, line_limit('  ⚠ result: '))}")
+        head = "  ⚠ result: "
+        print_error(head + _short(error, line_limit(head)))
 
 
 def run_agent_streaming(cmd: list, provider: str, raw: bool,
