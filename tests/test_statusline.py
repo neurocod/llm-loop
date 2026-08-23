@@ -1089,7 +1089,7 @@ def test_fit_truncates_with_an_ellipsis():
 
 
 # Every expectation below is a LITERAL. Restating the constant under test
-# (`== sl.LINE_RIGHT_MARGIN`, `== sl.MIN_LINE_COLUMNS`) made three of these pins
+# (`== sl.LINE_RIGHT_MARGIN`, `== sl.LEGACY_LINE_COLUMNS`) made three of these pins
 # survive a mutation of the very number they were named after — measured, with
 # try_patch --expect-fail.
 
