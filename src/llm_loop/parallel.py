@@ -533,22 +533,24 @@ class Shared:
             self.stop_owner = None
             return True
 
-    def latch_stop(self, source, app=None) -> bool:
+    def latch_stop(self, source, app=None, announce=None) -> bool:
         """End the run on a stop request, for good. True for the worker that did it.
 
         Returning True exactly once is what keeps the announcement (and the
         lifecycle latch) single when every worker sees the request at the same
-        time. Only a stop FILE is latched for removal at application exit — a
-        key request never touched the disk.
+        time — which is why the whole tail runs INSIDE the lock rather than
+        being handed back to the winner: `cyclecore.commit_stop` latches the
+        sentinel for cleanup, writes the line and names the reason, and this is
+        the one place that decides there is a winner at all. Both runners get
+        that tail from there, so a new stop channel is one edit, not two.
+
+        Lock order is shared.lock -> the emit lock behind `announce`, and only
+        that way round: nothing on the output path claims this lock back.
         """
         with self.lock:
             if self.stop.is_set():
                 return False
-            if source is cyclecore.StopSource.FILE:
-                cyclecore.mark_stop_file_detected(cyclecore.stop_file_for(app))
-                self.stop_reason = RunStopReason.STOP_FILE
-            else:
-                self.stop_reason = RunStopReason.STOP_KEY
+            self.stop_reason = cyclecore.commit_stop(app, source, announce)
             self.claims_closed.set()
             self.stop.set()
             return True
@@ -626,19 +628,12 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
         # pass reopens the claims.
         if not cyclecore.confirm_stop_request(app):
             return False
-    # NOT `pending`: what may still be cancelled and what must be cleaned up are
-    # different questions once the run is committed to stopping — a sentinel on
-    # disk is consumed by whichever run stops on it. See cyclecore.latched_stop.
-    pending = cyclecore.latched_stop(app) or pending
-    if shared.latch_stop(pending, app):
-        if pending is cyclecore.StopSource.FILE:
-            # The outermost application lifecycle removes the sentinel only after
-            # all workers and wrapper-level cleanup have finished.
-            out.line("stop file detected — stopping; kept until "
-                     "application exit.", "bold red")
-        else:
-            out.line("stop requested with the s key — stopping this run "
-                     "(no stop file written).", "bold red")
+    # The tail — re-reading the channel to act on, latching the sentinel for
+    # cleanup, the line, the reason — is `cyclecore.commit_stop`, reached under
+    # the lock that picks the one worker who runs it. `pending` goes along as the
+    # fallback for a sentinel that vanished in between.
+    if shared.latch_stop(pending, app,
+                         lambda text: out.line(text, "bold red")):
         app.update(phase="stopping")
     return True
 

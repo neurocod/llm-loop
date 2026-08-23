@@ -429,7 +429,16 @@ def test_parallel_stop_file_is_reported_once_by_competing_workers(
         app_name="pytest-stop-parallel")
 
     assert result.reason == cyclecore.RunStopReason.STOP_FILE
-    assert capsys.readouterr().out.lower().count("stop file detected") == 1
+    # The WHOLE sentence, and it is the one the sequential runner prints too
+    # (both tails are cyclecore.commit_stop). Counting a short fragment is how
+    # the two copies drifted into two wordings without a test noticing.
+    # Whitespace is collapsed first because a job row goes through rich, which
+    # wraps it at the console width - measured: this sentence lands on two rows
+    # at 80 columns, exactly as the "no new files will be claimed" line beside
+    # it already did.
+    out = " ".join(capsys.readouterr().out.split())
+    assert out.count("Stop file detected — stopping; it remains in place "
+                     "until the application exits.") == 1
 
 
 # -- asking a run that is parked on the usage wall to stop -----------------------

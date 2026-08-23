@@ -299,6 +299,43 @@ def latched_stop(app=None) -> Optional[StopSource]:
     return pending_stop(app)
 
 
+def commit_stop(app=None, source: Optional[StopSource] = None,
+                announce=None) -> RunStopReason:
+    """Act on a stop a run has decided to obey: latch, announce, name the reason.
+
+    The tail of the decision, shared by both runners. Its head already was —
+    `pending_stop`, `latched_stop`, `confirm_stop_request` — while this half was
+    written twice, and the copies had drifted into two wordings for one event.
+    That drift is the cheap symptom: what it costs is that a new stop channel,
+    or a change to what a stop consumes and cleans up, is two edits in two
+    modules with nothing to catch the missed one (both halves are Python in one
+    process, so there is no mirror gate to fail).
+
+    NOT `pending_stop`, and not the caller's `source` either: what may still be
+    cancelled and what must be cleaned up are different questions once the run
+    is committed to stopping, so the channel is re-read through `latched_stop`
+    here. `source` is only the fallback for the sentinel that vanished between
+    the caller's decision and this call — without it a file-stop would be
+    reported, and cleaned up, as a key press.
+
+    `announce` takes the line (default: print). A parallel worker passes its own
+    job-row writer; only the wording is shared, which is the point.
+    """
+    latched = latched_stop(app) or source
+    say = announce or print
+    if latched is StopSource.FILE:
+        # Only a stop FILE is latched for removal at application exit — a key
+        # request never touched the disk. The outermost lifecycle removes the
+        # sentinel only after every worker and all wrapper-level cleanup is done.
+        mark_stop_file_detected(stop_file_for(app))
+        say("Stop file detected — stopping; it remains in place until "
+            "the application exits.")
+        return RunStopReason.STOP_FILE
+    say("Stop requested with the s key — stopping this run "
+        "(no stop file written; other runs are unaffected).")
+    return RunStopReason.STOP_KEY
+
+
 # How long an interactive run counts down before it acts on a stop request. The
 # status line's `s` key both sets and clears the request, so a mis-press must be
 # undoable — but a runner that ended a millisecond later would make "press s
@@ -2084,18 +2121,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                           "Left in place (a dry run never consumes it).")
                     stop_file_noted = True
             elif pending is not None and confirm_stop_request(app):
-                # NOT `pending`: what may still be cancelled and what must be
-                # cleaned up are different questions once the run is committed to
-                # stopping. See latched_stop.
-                if latched_stop(app) is StopSource.FILE:
-                    mark_stop_file_detected(stop_file_for(app))
-                    print("Stop file detected — stopping; it remains in place until "
-                          "the application exits.")
-                    stop_reason = RunStopReason.STOP_FILE
-                else:
-                    print("Stop requested with the s key — stopping this run "
-                          "(no stop file written; other runs are unaffected).")
-                    stop_reason = RunStopReason.STOP_KEY
+                stop_reason = commit_stop(app, pending)
                 app.update(phase="stopping")
                 break
             # Cancelled inside the interactive grace — carry on with no trace.
