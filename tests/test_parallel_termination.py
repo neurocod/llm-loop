@@ -431,12 +431,23 @@ def test_a_dying_job_does_not_leave_the_provider_running(tmp_path, monkeypatch):
     monkeypatch.setattr(parallel, "print_markup", console_that_dies)
 
     driver = _MemDriver(["products/only.md"])
-    assert _run_and_wait(driver, _args(str(tmp_path), jobs=1),
-                         timeout=HANG_TIMEOUT_S), \
-        "the worker died holding a claim and run_parallel never returned"
-    assert children, "the fake provider was never started — the pin proved nothing"
-    assert not _outlived_the_run(children[0]), \
-        "run_job unwound past a live provider child: orphaned, not reaped"
+    # Every exit from here kills what was started, including the assertion
+    # failures: this pin's fixture is a real process that lives for two minutes,
+    # and a FAILING pin that also leaked it would spend those two minutes
+    # competing with the rest of the suite for the console it complains about.
+    try:
+        assert _run_and_wait(driver, _args(str(tmp_path), jobs=1),
+                             timeout=HANG_TIMEOUT_S), \
+            "the worker died holding a claim and run_parallel never returned"
+        assert children, \
+            "the fake provider was never started — the pin proved nothing"
+        assert not _outlived_the_run(children[0]), \
+            "run_job unwound past a live provider child: orphaned, not reaped"
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=REAP_WAIT_S)
 
 
 def test_max_runs_closes_claims_without_cancelling_in_flight_work(

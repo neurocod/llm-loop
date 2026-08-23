@@ -108,10 +108,29 @@ class _Sink:
                 for line in self.text.splitlines() if line.strip()]
 
 
+class _ClosableLines:
+    """A line source that can also be closed, as a real `Popen.stdout` can.
+
+    A bare iterator was enough while nothing but the render loop touched the
+    stream; `run_job` now closes it on the way out (`_reap_agent_process`), so a
+    fake without `close` fails where a real process would not.
+    """
+
+    def __init__(self, lines):
+        self._lines = iter(lines)
+        self.closed = False
+
+    def __iter__(self):
+        return self._lines
+
+    def close(self):
+        self.closed = True
+
+
 class _FakeProc:
     def __init__(self, stdout=(), stdin=None, returncode=0):
         self.stdin = stdin
-        self.stdout = iter(stdout)
+        self.stdout = _ClosableLines(stdout)
         self._returncode = returncode
 
     def wait(self):

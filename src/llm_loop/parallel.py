@@ -198,16 +198,16 @@ def emit_note(lines: compactline.LineWriter, note: str) -> None:
 
 # --- one provider round-trip for one file --------------------------------------
 
-# How long a provider child gets to end on its own before it is killed outright.
-# It is asked first because it may be mid-write to its own session store, and the
-# bound is what keeps the reaping from becoming a second hang inside the guard
-# that exists to end the first one: this runs on a thread that is ALREADY dying,
-# so nothing above it is left to notice a wait that never returns.
+# How long a provider child gets after being told to end before it is killed
+# outright, and the ceiling on the `taskkill` call itself. The bound is what
+# keeps the reaping from becoming a second hang inside the guard that exists to
+# end the first one: this runs on a thread that is ALREADY dying, so nothing
+# above it is left to notice a wait that never returns.
 REAP_GRACE_S = 2.0
 
 
 def _ask_agent_process_to_end(proc) -> None:
-    """Aim the signal at the provider CLI, not at the shim standing in front of it.
+    """Aim the ending at the provider CLI, not at the shim standing in front of it.
 
     On Windows the handle we hold is usually `cmd.exe`: `runtime_argv` resolves
     the provider to an npm `.cmd` shim and CreateProcess runs a batch file
@@ -217,12 +217,26 @@ def _ask_agent_process_to_end(proc) -> None:
     symptom being fixed, so the Windows branch has to reach the tree
     (`taskkill /T`). On POSIX an npm bin is the executable itself (a shebang
     script), so the handle IS the provider and SIGTERM lands where it is aimed.
+
+    ASYMMETRY WORTH KNOWING, because the two halves do NOT offer the same deal:
+    POSIX gets a real request — SIGTERM, which a CLI can catch and use to close
+    its session store — and only then, after `REAP_GRACE_S`, the kill. Windows
+    gets no such step, because there is nothing to ask WITH: `taskkill` without
+    `/F` posts WM_CLOSE, which a windowless console process never receives, so
+    the polite spelling would do nothing at all and the child would be killed
+    two seconds later regardless. `/F` is therefore not impatience — it is the
+    only thing that ends the tree there, and the cost (a session store torn
+    mid-write) is charged on Windows whichever spelling is used.
     """
     if os.name == "nt":
         try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=REAP_GRACE_S)
-            return
+            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                  capture_output=True, timeout=REAP_GRACE_S)
+            if done.returncode == 0:
+                return
+            # Non-zero means the tree was NOT ended (no such pid, access
+            # denied): fall through rather than return, or the caller's wait
+            # would be a two-second pause on the way to the same `kill`.
         except (OSError, subprocess.SubprocessError):
             pass  # no taskkill, or it hung — fall back to the handle we hold
     try:
@@ -247,24 +261,35 @@ def _reap_agent_process(proc) -> None:
     the damage. Now the run ends cleanly and the orphan is all that is left of
     it.
 
-    Safe on the healthy path (`poll()` answers, so this is a no-op) and bounded
-    on every other: asked to end, then killed if it will not.
+    Safe on a child that has already exited (only the pipe is closed) and
+    bounded on every other path: told to end, then killed if it will not be.
+
+    NOTHING HERE MAY RAISE. It runs from `run_job`'s `finally`, so an exception
+    escaping this function REPLACES the one being unwound — the `BrokenPipeError`
+    that the whole seam exists to survive would reach the worker as a
+    `PermissionError` from the reaper, and the guard in `worker` would report the
+    wrong cause for a dead thread.
     """
-    if proc.poll() is not None:
-        return
-    _ask_agent_process_to_end(proc)
-    # Before the wait, not after: a child blocked writing into a pipe nobody
-    # will read again cannot act on the signal it was just sent, and the read
-    # end is a descriptor this worker would otherwise leak until GC.
+    # Before the poll, not after it: the read end is a descriptor this worker
+    # would otherwise leak until GC even on the common path (an exception raised
+    # while printing the LAST lines, after the CLI has already exited), and a
+    # child blocked writing into a pipe nobody will read again cannot act on
+    # anything it is told until that pipe is gone.
     if proc.stdout is not None:
         try:
             proc.stdout.close()
         except OSError:
             pass
+    if proc.poll() is not None:
+        return
+    _ask_agent_process_to_end(proc)
     try:
         proc.wait(timeout=REAP_GRACE_S)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            proc.kill()
+        except OSError:
+            pass  # gone between the wait and here — `wait` below collects it
         try:
             proc.wait(timeout=REAP_GRACE_S)
         except subprocess.TimeoutExpired:

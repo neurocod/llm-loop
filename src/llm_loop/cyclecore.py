@@ -77,7 +77,6 @@ from .console import (
     _render_markdown_block,
     print_done,
     print_error,
-    print_markup,
     print_note,
     print_percents,
 )
@@ -1558,7 +1557,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # ending: which item it was on when it stopped existing.
             exitlog.note(phase=f"iteration {iteration} — {state_label}",
                          iterations=iteration, completed=completed)
-            print_markup(
+            # Through the module, unlike the line helpers above: this is the one
+            # printed line the run must be able to READ BACK (`report_costs`
+            # parses "=== Iteration 1 ===" as a run boundary), and the pins that
+            # capture printed lines replace `console.print_markup`. A binding of
+            # our own here would be a third address none of them reaches, so the
+            # header would sail past every one of them uncaptured.
+            console.print_markup(
                 f"\n=== Iteration {iteration} === [{state_label} · {model_label}]",
                 f"\n[bold cyan]=== Iteration {iteration} ===[/] "
                 f"[dim]\\[{state_label} · {model_label}][/]",
