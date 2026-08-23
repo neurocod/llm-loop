@@ -177,21 +177,32 @@ credentials — useful on a CI box with no interactive login.
 ```
 src/
   llm_loop/
-    cyclecore.py   engine: parse_args, run_loop, the Driver protocol,
-                   git-push policy, mirror log, stream-json rendering
-    providers.py   Claude/Codex executable flags and argv construction
-    usage.py       UsageSource: query / cache / parse the account's quota figures
-    limits.py      LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
-    drivers.py     StateFileDriver (state machine) and ListFileDriver (work queue)
-    operator.py    notes typed at the console, on their way to the running agent
-    parallel.py    run_parallel: N concurrent LLM workers over a list file
-    exitlog.py     why a run ended — including the endings it cannot report itself
+    cyclecore.py     engine: parse_args, run_loop, the Driver protocol,
+                     git-push policy, mirror log, stream-json rendering
+    providers.py     Claude/Codex executable flags and argv construction
+    drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)
+    parallel.py      run_parallel: N concurrent LLM workers over a list file
+    operator.py      notes typed at the console, on their way to the running agent
+    usage.py         UsageSource: query / cache / parse the account's quota figures
+    codex_usage.py   the same figures for Codex, over its own app-server protocol
+    limits.py        LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
+    statusline.py    the status area pinned under a run: its rows, and the keys
+    termio.py        the terminal underneath: reserved region, window title, keys
+    textwidth.py     how wide terminal text is, and how much a line may hold
+    compactline.py   the one-event-one-line shapes both runners print
+    cmdline.py       the command line that would reproduce this run
+    notifications.py opt-in settings and completion sounds for unattended runs
+    exitlog.py       why a run ended — including the endings it cannot report itself
 examples/
   runCycle.py            state-machine wrapper
   runFileList.py         per-file work-queue wrapper
   runFileListParallel.py parallel work-queue wrapper
 ideas/                   study material, never shipped — see ideas/README.md
 ```
+
+One line per module, and every module has one: the map is worth its upkeep only
+while it is complete — a module missing from it is a module nobody browsing the
+package knows to open. A new module gets its line here, saying what it owns.
 
 The package sits under `src/` for one reason, and it is the reason to keep it
 there: a host project puts that directory on `sys.path`, so whatever sits

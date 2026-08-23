@@ -37,11 +37,14 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# `rich` is a test dependency only, and stays out of `dependencies` above: the
-# engine never imports it. It is here because one test renders a job tag
-# through rich's markup parser to prove the tag survives it, and without the
-# package installed that test silently skips - which in CI means it would
-# never run at all.
+# `rich` stays out of `dependencies` above because nothing here needs it to run:
+# the three modules that import it (cyclecore for the console and live view,
+# compactline for markup escaping, textwidth for cell measurement) each do so
+# behind an ImportError fallback, so an adopter who vendors the package gets
+# plain uncoloured output rather than a missing dependency. It is a test extra
+# because one test renders a job tag through rich's markup parser to prove the
+# tag survives it, and without the package installed that test silently skips -
+# which in CI means it would never run at all.
 test = ["pytest>=7", "rich"]
 
 [project.urls]

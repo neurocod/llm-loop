@@ -6,7 +6,7 @@ one (`parallel`). It imports neither: everything a line's bytes depend on is
 here or below.
 
 These shapes existed twice, once with a `[job k] ` tag in front and the write
-taken under an output lock, so `parallel` reached across for five of
+taken under an output lock, so `parallel` reached across for six of
 `cyclecore`'s rendering symbols (half of them private) and every new line shape
 had to be written on both sides. Both differences are parameters of
 `LineWriter` — the tag is a pair of prefixes, the lock lives inside the emit
