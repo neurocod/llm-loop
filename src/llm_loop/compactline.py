@@ -218,7 +218,7 @@ class LineWriter:
     """The compact line shapes, aimed at one sink and carrying one tag.
 
     `emit(plain, markup)` takes the two copies of a finished line: the plain one
-    for the mirror log, the markup one for the screen. `cyclecore` owns one of
+    for the mirror log, the markup one for the screen. `console` owns one of
     these with no tag over `print_markup`; `parallel` builds one per worker,
     tagged `[job k] ` and emitting under the output lock, so the lines of N
     workers cannot interleave mid-line. Everything else about a line — where the
@@ -226,7 +226,7 @@ class LineWriter:
     both sides and is decided here.
 
     Pass an emit that LOOKS ITS SINK UP rather than one bound to it. The width
-    and markup pins replace `cyclecore.print_markup` / `parallel.print_markup`
+    and markup pins replace `console.print_markup` / `parallel.print_markup`
     to read the plain copy of every line; a writer holding the original function
     would print past them and leave the pins green while they watched a function
     nothing calls.

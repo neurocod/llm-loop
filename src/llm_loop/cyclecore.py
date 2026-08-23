@@ -2,9 +2,12 @@
 cyclecore.py - reusable engine behind autonomous Claude/Codex CLI loops.
 
 This module holds everything that is *not* specific to one particular task:
-command-line parsing, the rotating mirror log, the git-push policy, the whole
-token-usage/session-window machinery, stream-json rendering, and the generic
-`run_loop()` that ties it together. What is asked of a run from OUTSIDE it —
+command-line parsing, the git-push policy, the whole token-usage/session-window
+machinery, stream-json rendering, and the generic `run_loop()` that ties it
+together. What the run PRINTS is `console` — with the rotating mirror log, which
+is the second copy of every printed line and therefore belongs to the printer;
+what `--cost` reads back OUT of that log is still here, because the lines it
+parses are emitted here. What is asked of a run from OUTSIDE it —
 the `s` key and the `stop` sentinel, the `p` key's hold, and the reason a
 runner reports on the way out — is `stopchannel`, a module of its own, because
 the parallel runner and a host wrapper speak that vocabulary too and neither
@@ -49,20 +52,40 @@ guessed from error counts, in two layers:
 
 import argparse
 import json
-import logging
 import os
 import re
 import subprocess
 import sys
-import threading
 import time
-from datetime import datetime
 from enum import Enum
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Union
 
-from . import compactline, exitlog, operator, providers, stopchannel, textwidth
+from . import compactline, console, exitlog, operator, providers, stopchannel, textwidth
+# What the run PRINTS, and the mirror log that is the second copy of it, are
+# `console` (see its header for why those are one module). The line helpers are
+# imported by name because this module calls them on nearly every path; the
+# log's own names are reached through the module instead — `LOG_DIR`, the
+# handler and the tee are configured and replaced, and a second binding here
+# would be a second address for a test or a wrapper to miss.
+from .console import (
+    LINES,
+    _fmt_clock,
+    _fmt_left,
+    _fmt_moment,
+    _log_plain,
+    _MarkdownStream,
+    _real_stream,
+    _render_markdown_block,
+    markup_percents,
+    percent_style,
+    print_done,
+    print_error,
+    print_markup,
+    print_note,
+    print_percents,
+    print_styled,
+)
 # The vocabulary of stopping and pausing is `stopchannel`, its own module,
 # because both runners and a host wrapper speak it and none of them should have
 # to import the sequential runner to do so.
@@ -157,16 +180,19 @@ def set_project_root(path: Optional[str]) -> str:
     read back, so a stop channel never has to import a runner. Both directions
     of that handover are here: this call, and the one under the definition
     above, which is what gives a launch before any --project-dir the same
-    answer both modules would have computed for themselves.
+    answer both modules would have computed for themselves. The mirror log's
+    file name is the same handover for the same reason (`console`).
     """
     global PROJECT_DIR
     if path:
         PROJECT_DIR = os.path.abspath(path)
         stopchannel.set_stop_root(PROJECT_DIR)
+        console.set_log_project(PROJECT_DIR)
     return PROJECT_DIR
 
 
 stopchannel.set_stop_root(PROJECT_DIR)
+console.set_log_project(PROJECT_DIR)
 
 
 def project_dir() -> str:
@@ -201,32 +227,6 @@ def find_project_root(start: Optional[str] = None) -> Optional[str]:
             return None
         path = parent
 
-# A copy of everything printed to the screen is mirrored, line by line, to a
-# rotating log file under the user's home dir (NOT the project tree) so cycle
-# runs leave a durable record without cluttering the repo. The project folder
-# name and the launching app name are baked into the file name so several
-# projects/entry points write to separate logs instead of fighting over one file.
-LOG_DIR = Path.home() / ".runCycle" / "logs"
-
-# Rotation policy for the mirror log. Module-level constants rather than numbers
-# inside the handler setup, so anything reporting how full the log is measures it
-# against the very limit that rotates it instead of restating the figure.
-LOG_MAX_BYTES = 25 * 1024 * 1024
-# Deep enough that a burst of output cannot rotate an interesting segment off
-# the end of the chain before anyone reads it: at 3 backups a single preview run
-# displaced the failure a live run was recording, and it was gone for good.
-LOG_BACKUP_COUNT = 5
-
-
-def log_file_path(app_name: str = "runCycle") -> Path:
-    """Path of the rotating mirror log for a given entry point.
-
-    The project folder name and `app_name` are both baked in, so e.g.
-    runCycle.py and runTranslate.py launched from the same project still write
-    to separate logs (runCycle-<project>.log vs runTranslate-<project>.log).
-    """
-    return LOG_DIR / f"{app_name}-{os.path.basename(PROJECT_DIR)}.log"
-
 
 # Per-run cost accounting parsed straight back out of the mirror log: every run's
 # first iteration logs a "=== Iteration 1 ===" header (see run_loop) and every
@@ -257,7 +257,7 @@ def report_costs(app_name: str = "runCycle",
     the one case app_name cannot reach, since rotation renames files out from
     under log_file_path.
     """
-    path = Path(path) if path else log_file_path(app_name)
+    path = Path(path) if path else console.log_file_path(app_name)
     # Always name the log we are reading, so an empty report is unambiguous
     # (right file, no data) rather than looking like a silent failure.
     print(f"Reading mirror log: {path}")
@@ -307,119 +307,11 @@ def report_costs(app_name: str = "runCycle",
         size = os.path.getsize(path)
     except OSError:
         size = 0
-    pct = size / LOG_MAX_BYTES * 100 if LOG_MAX_BYTES else 0.0
-    print(f"LOG: {size / 1024 / 1024:.2f} / {LOG_MAX_BYTES / 1024 / 1024:.0f} MB "
+    limit = console.LOG_MAX_BYTES
+    pct = size / limit * 100 if limit else 0.0
+    print(f"LOG: {size / 1024 / 1024:.2f} / {limit / 1024 / 1024:.0f} MB "
           f"({pct:.1f}% full, rotates at 100%)")
     print(f"     {path}")
-
-
-# The app-specific logger that owns the mirror-log file handler, set by
-# _setup_file_logging. `_log_plain` (the Rich path) must target *this* logger:
-# the handler lives on "runCycle.<app_name>" (which does not propagate), so
-# logging to a bare "runCycle" would silently drop the message. Kept in a module
-# global because the Rich print helpers have no reference to the configured logger.
-_FILE_LOGGER: Optional[logging.Logger] = None
-
-
-# How long a handler waits before retrying a rotation that failed. Long enough
-# that a wedged rename is attempted once a minute rather than once per line.
-ROLLOVER_RETRY_SECONDS = 60.0
-
-
-class _MirrorLogHandler(RotatingFileHandler):
-    """A rotating handler that survives another process holding the same log.
-
-    Running two loops side by side is normal here (a sequential run, a parallel
-    run, the grow-kit pass), and same-named runs share one mirror log. On Windows
-    a rename fails while another process has the file open, and the stock handler
-    reports that through `logging.raiseExceptions`, i.e. by printing to
-    `sys.stderr` — which is the `_TeeToLog` mirror, which logs the line, which
-    fails again: an unbounded recursion that ends the run with a RecursionError
-    over a *log file*. Measured, not theorised: two runs colliding on a 25 MB
-    rollover killed the second one outright.
-
-    So a failed rotation is not an error here. We keep appending to the current
-    file (briefly past the size cap, which the next successful rotation trims)
-    and try again later.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._retry_rollover_at = 0.0
-
-    def doRollover(self) -> None:
-        if time.time() < self._retry_rollover_at:
-            return  # a recent attempt failed; the other holder still has it
-        try:
-            super().doRollover()
-        except OSError:
-            self._retry_rollover_at = time.time() + ROLLOVER_RETRY_SECONDS
-
-    def handleError(self, record) -> None:
-        """Swallow. The default writes the traceback to `sys.stderr`, which is
-        the tee — see the class docstring for why that cannot be allowed."""
-
-
-def _setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
-    """Configure the rotating file logger at log_file_path(app_name)."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger(f"runCycle.{app_name}")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    if not logger.handlers:  # avoid duplicate handlers if called twice
-        handler = _MirrorLogHandler(
-            log_file_path(app_name), maxBytes=LOG_MAX_BYTES,
-            backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
-        )
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-        )
-        logger.addHandler(handler)
-    global _FILE_LOGGER
-    _FILE_LOGGER = logger
-    return logger
-
-
-class _TeeToLog:
-    """Wrap a console stream so everything printed is also captured into the file
-    logger, one record per line.
-
-    Partial writes (streaming tokens emitted with ``end=""``) are buffered until a
-    newline, so the file holds clean, complete lines while the screen keeps showing
-    live token-by-token output.
-    """
-
-    # Set while this thread is inside a logging call, so anything the logging
-    # machinery itself prints goes to the screen only. Without it a handler that
-    # reports a failure through stderr feeds its own report back into the logger
-    # that just failed, and the run dies of recursion (see _MirrorLogHandler).
-    _in_logging = threading.local()
-
-    def __init__(self, stream, logger: logging.Logger):
-        self._stream = stream
-        self._logger = logger
-        self._buf = ""
-
-    def write(self, text: str) -> int:
-        self._stream.write(text)
-        if getattr(self._in_logging, "active", False):
-            return len(text)
-        self._buf += text
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            self._in_logging.active = True
-            try:
-                self._logger.info(line)
-            finally:
-                self._in_logging.active = False
-        return len(text)
-
-    def flush(self) -> None:
-        self._stream.flush()
-
-    def __getattr__(self, name):
-        # Delegate everything else (encoding, isatty, fileno, ...) to the stream.
-        return getattr(self._stream, name)
 
 
 class ConsumedByWrapperAction(argparse.Action):
@@ -673,227 +565,6 @@ def build_claude_argv(command: ClaudeCommand) -> list:
     return build_agent_argv(command, "claude")
 
 
-# Optional pretty Markdown rendering of the assistant's streamed text via Rich.
-# The model emits its answer as Markdown; with Rich installed we render it live
-# (bold, headings, lists, code fences, tables) instead of dumping the raw
-# `**...**` source to the screen. Without Rich the script falls back to plain
-# token streaming, so it keeps working unchanged (just `pip install rich` to get
-# the formatting).
-try:
-    from rich.console import Console as _RichConsole
-    from rich.live import Live as _RichLive
-    from rich.markdown import Markdown as _RichMarkdown
-    _RICH_AVAILABLE = True
-except ImportError:
-    _RICH_AVAILABLE = False
-
-
-def _real_stream():
-    """The underlying console stream, unwrapping the line-logging tee.
-
-    Rich's Live repaints the frame many times a second using cursor-movement
-    escape codes that must not end up in the file log, so its output goes
-    straight to the real terminal rather than through `_TeeToLog`.
-    """
-    out = sys.stdout
-    return getattr(out, "_stream", out)
-
-
-def _log_plain(text: str) -> None:
-    """Mirror a finished Markdown block to the file log as clean plain text.
-
-    Used on the Rich path, where the live frames bypass the tee — we still want
-    the assistant's words in the log, just without the ANSI/redraw noise.
-
-    Targets the app-specific logger configured by _setup_file_logging (which owns
-    the file handler and does not propagate); falling back to a bare "runCycle"
-    logger only if logging was never set up (e.g. in tests). Using the wrong
-    logger name here silently drops every Rich-path line — including the
-    "=== Iteration N ===" headers and "· done (… c, $…)" cost lines that
-    report_costs parses — leaving --cost to report 0 sessions.
-    """
-    logger = _FILE_LOGGER or logging.getLogger("runCycle")
-    for line in text.splitlines():
-        logger.info(line)
-
-
-class _MarkdownStream:
-    """Render one assistant text block as live-updating Markdown.
-
-    The model streams Markdown token by token; we accumulate it and let Rich
-    re-render the whole block inside a `Live` region on each delta, so formatting
-    appears in realtime. When Rich is unavailable we degrade to the original
-    behaviour: print a `💬` header and stream the raw tokens inline.
-    """
-
-    def __init__(self):
-        self._buf = ""
-        self._live = None
-        self._console = None
-
-    def start(self) -> None:
-        self._buf = ""
-        if _RICH_AVAILABLE:
-            self._console = _RichConsole(file=_real_stream())
-            self._console.print("\n[dim]  💬[/dim]")
-            self._live = _RichLive(
-                _RichMarkdown(""),
-                console=self._console,
-                refresh_per_second=12,
-                vertical_overflow="visible",
-                # Nothing else prints during a text block, so we don't need Rich
-                # to hijack stdout/stderr (which would fight with _TeeToLog).
-                redirect_stdout=False,
-                redirect_stderr=False,
-            )
-            self._live.start()
-        else:
-            print("\n  💬 ", end="", flush=True)
-
-    def feed(self, text: str) -> None:
-        self._buf += text
-        if self._live is not None:
-            self._live.update(_RichMarkdown(self._buf))
-        else:
-            print(text, end="", flush=True)
-
-    def stop(self) -> None:
-        if self._live is not None:
-            self._live.update(_RichMarkdown(self._buf))
-            self._live.stop()
-            self._live = None
-            self._console = None
-            # Guarantee the next output (tool calls, etc.) starts on a fresh line,
-            # regardless of how Live left the cursor on this terminal.
-            print(file=_real_stream())
-            if self._buf.strip():
-                _log_plain(self._buf)
-        else:
-            print(flush=True)  # finish the inline line in fallback mode
-        self._buf = ""
-
-
-def _render_markdown_block(text: str) -> None:
-    """Print a complete Markdown string formatted (Rich) or plain (fallback).
-
-    Used for non-streaming assistant text (when --include-partial-messages is off
-    we never see deltas, only the final block).
-    """
-    text = text.strip()
-    if not text:
-        return
-    if _RICH_AVAILABLE:
-        console = _RichConsole(file=_real_stream())
-        console.print("[dim]  💬[/dim]")
-        console.print(_RichMarkdown(text))
-        _log_plain(text)
-    else:
-        print(f"\n  💬 {text}")
-
-
-def print_markup(plain: str, markup: str) -> None:
-    """Print a status line from hand-written Rich markup: styled on screen, plain
-    in the log. The low-level core of the print_* family — use `print_styled`
-    (text + a style name) for uniform lines and call this directly only when a
-    line needs different styles per segment (e.g. a coloured glyph + plain text).
-
-    With Rich available the `markup` string (Rich console markup: colours, bold,
-    italic, underline) is rendered straight to the real terminal, while a clean
-    `plain` copy is mirrored to the file log — so colour/redraw escapes never end
-    up in the log. Without Rich it degrades to a plain `print` (screen + log via
-    the tee). Note: terminals can't switch *font family*; only colour and the
-    bold/italic/underline attributes are available.
-    """
-    if _RICH_AVAILABLE:
-        _RichConsole(file=_real_stream()).print(markup)
-        _log_plain(plain)
-    else:
-        print(plain)
-
-
-# This runner's compact lines: no job tag, straight to the console. The sink is
-# a lambda rather than `print_markup` itself so that the name is resolved per
-# line — the width pins replace it to read the plain copy of what was printed,
-# and a captured function would sail past them (see `compactline.LineWriter`).
-LINES = compactline.LineWriter(lambda plain, markup: print_markup(plain, markup))
-
-
-def print_styled(text: str, style: str) -> None:
-    """Print a whole line in one Rich style, routed through `print_markup`.
-
-    The single-style sibling of `print_markup`: callers pass plain `text` plus a
-    Rich style (`"green"`, `"bold red"`, …); the plain copy goes to the log and
-    the styled copy to the screen. Markup metacharacters in `text` are escaped,
-    so a stray '[' is shown literally instead of being read as a tag. For lines
-    that need *different* styles per segment (a coloured glyph next to plain
-    text), call `print_markup` directly with hand-written markup.
-    """
-    print_markup(text, f"[{style}]{compactline.esc(text)}[/]")
-
-
-# Colour scale for the usage percentages (session/week quotas, and the ceilings
-# they are judged against): comfortable below GREEN_BELOW, alarming above
-# RED_ABOVE, watch-it in between. Both bounds are exclusive, so exactly 60% and
-# exactly 90% read as the middle band.
-PERCENT_GREEN_BELOW = 60.0
-PERCENT_RED_ABOVE = 90.0
-PERCENT_STYLES = ("green", "yellow", "bold red")  # low, middle, high
-
-# "44%", "7.5 %" — the figure plus its sign, as it appears in a printed line.
-_PERCENT_IN_TEXT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
-
-
-def percent_style(value: float) -> str:
-    """The palette entry for one percentage — see PERCENT_GREEN_BELOW/RED_ABOVE."""
-    if value < PERCENT_GREEN_BELOW:
-        return PERCENT_STYLES[0]
-    if value > PERCENT_RED_ABOVE:
-        return PERCENT_STYLES[2]
-    return PERCENT_STYLES[1]
-
-
-def markup_percents(text: str) -> str:
-    """Rich markup for `text` with every percentage coloured by percent_style.
-
-    Colouring the *rendered line* rather than each figure at its format site is
-    what keeps one scale across lines that are assembled in several places (a
-    rule's own `describe()`, the usage/ceiling line, the usage-report summary
-    lines) — and what lets a line quoted from elsewhere be coloured at all. The
-    non-percentage parts are escaped, so a '[' in a label stays literal.
-    """
-    out = []
-    last = 0
-    for m in _PERCENT_IN_TEXT_RE.finditer(text):
-        out.append(compactline.esc(text[last:m.start()]))
-        value = float(m.group(0).rstrip("% \t"))
-        out.append(f"[{percent_style(value)}]{m.group(0)}[/]")
-        last = m.end()
-    out.append(compactline.esc(text[last:]))
-    return "".join(out)
-
-
-def print_percents(text: str) -> None:
-    """Print a line whose percentages are colour-coded on screen (plain in the
-    log). A no-op difference from `print` when Rich is unavailable.
-
-    Flushed, because these lines include the once-a-minute countdown printed
-    while a run is paused on a limit — the one place output has to appear as it
-    is written rather than when a buffer happens to fill.
-    """
-    print_markup(text, markup_percents(text))
-    sys.stdout.flush()
-
-
-# Named single-style specialisations, each delegating to print_styled. Centralise
-# the loop's palette here so a colour is changed in one place, not at every call.
-def print_done(text: str) -> None:
-    print_styled(text, "green")
-
-
-def print_error(text: str) -> None:
-    print_styled(text, "bold red")
-
-
 def report_undelivered_notes(mailbox) -> None:
     """Say so when the run ends holding notes nobody ever saw.
 
@@ -912,19 +583,6 @@ def report_undelivered_notes(mailbox) -> None:
                 f"note(s) — there was no next iteration to carry them:")
     for note in notes:
         print_error(f"      {note}")
-
-
-def print_note(text: str) -> None:
-    """An operator note, at the point in the stream where the agent received it.
-
-    Printed rather than merely shown on the status row because the status row is
-    transient and the mirror log is the run's record: an agent that changes
-    course mid-iteration is unexplainable later unless the sentence that made it
-    do so sits in the log next to the turn it landed in.
-    """
-    print_markup(f"  ✉ operator note: {text}",
-                 f"  [magenta]✉[/] [bold magenta]operator note:[/] "
-                 f"{compactline.esc(text)}")
 
 
 # Streaming print state: the single content-block index text is currently flowing
@@ -1259,38 +917,6 @@ def run_claude_streaming(cmd: list, raw: bool, partial: bool,
     """
     return run_agent_streaming(cmd, "claude", raw, partial, prompt=prompt,
                                mailbox=mailbox)
-
-
-def _fmt_clock(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-
-
-def _fmt_left(seconds: float) -> str:
-    """"4d3h" / "3h24m" / "24m" — a duration in the two largest units that matter.
-
-    The zero-valued smaller unit is dropped ("3h", not "3h0m"), and anything under
-    a minute reads "<1m" rather than "0m", so a countdown never looks like it is
-    already over. Two units is the point: a weekly window has days left, and
-    "4320 min" is not a quantity anyone reads.
-    """
-    total = max(0, int(seconds))
-    days, rest = divmod(total, 86400)
-    hours, rest = divmod(rest, 3600)
-    minutes = rest // 60
-    if days:
-        return f"{days}d{hours}h" if hours else f"{days}d"
-    if hours:
-        return f"{hours}h{minutes}m" if minutes else f"{hours}h"
-    return f"{minutes}m" if minutes else "<1m"
-
-
-def _fmt_moment(ts: float) -> str:
-    """Like _fmt_clock, but names the day too once the moment is far enough away
-    that a bare clock reading would be ambiguous — a weekly quota resets days out,
-    and "12:59:59" alone reads as "in a few hours"."""
-    if ts - time.time() < 18 * 3600:
-        return _fmt_clock(ts)
-    return datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
 
 
 def _count_down_to(target_ts: float, should_stop=None) -> bool:
@@ -1656,21 +1282,22 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # explain rotated off the end). Said on screen so the missing log is visible
     # rather than mysterious.
     if setup_logging and not dry_run:
-        logger = _setup_file_logging(app_name)
-        sys.stdout = _TeeToLog(sys.stdout, logger)
-        sys.stderr = _TeeToLog(sys.stderr, logger)
+        logger = console._setup_file_logging(app_name)
+        sys.stdout = console._TeeToLog(sys.stdout, logger)
+        sys.stderr = console._TeeToLog(sys.stderr, logger)
     if not dry_run:
         # After the tee, so the report of a run that vanished lands in the very
         # log whose abrupt end it explains. Idempotent per process: the periodic
         # wrapper calls this runner repeatedly and keeps one record.
-        exitlog.begin(app_name, LOG_DIR, os.path.basename(PROJECT_DIR))
+        exitlog.begin(app_name, console.LOG_DIR, os.path.basename(PROJECT_DIR))
     print(f"  · project root: {PROJECT_DIR}")
     if dry_run:
-        print(f"  · dry run: nothing is mirrored to {log_file_path(app_name)}")
+        print(f"  · dry run: nothing is mirrored to "
+              f"{console.log_file_path(app_name)}")
     else:
-        print(f"  · logging to {log_file_path(app_name)}")
+        print(f"  · logging to {console.log_file_path(app_name)}")
     print(f"  · provider: {spec.display_name}")
-    if not _RICH_AVAILABLE:
+    if not console._RICH_AVAILABLE:
         print("  · Markdown rendering is off (the 'rich' library is missing). "
               "Enable it with:")
         print(f"      {sys.executable} -m pip install rich")

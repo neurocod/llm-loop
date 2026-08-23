@@ -178,7 +178,9 @@ credentials — useful on a CI box with no interactive login.
 src/
   llm_loop/
     cyclecore.py     engine: parse_args, run_loop, the Driver protocol,
-                     git-push policy, mirror log, stream-json rendering
+                     git-push policy, stream-json rendering
+    console.py       what a run prints, and the rotating mirror log that is the
+                     second copy of every line of it
     stopchannel.py   how a run is asked to stop or hold, and what it reports
     providers.py     Claude/Codex executable flags and argv construction
     drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)

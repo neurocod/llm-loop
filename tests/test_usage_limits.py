@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from llm_loop import cyclecore, usage
+from llm_loop import console, cyclecore, usage
 from llm_loop.cyclecore import ClaudeCommand, Driver, RateLimitEvent
 from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
 
@@ -187,7 +187,7 @@ def test_a_failed_query_is_not_cached(monkeypatch):
     (-5, "<1m"),
 ])
 def test_time_left_reads_as_a_quantity(seconds, expected):
-    assert cyclecore._fmt_left(seconds) == expected
+    assert console._fmt_left(seconds) == expected
 
 
 def test_the_status_line_says_how_long_the_window_has_left(capsys):

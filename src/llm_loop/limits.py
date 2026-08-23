@@ -40,8 +40,8 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from .cyclecore import (CLAUDE_SESSION_DURATION, _fmt_clock, _fmt_left,
-                        print_percents)
+from .console import _fmt_clock, _fmt_left, print_percents
+from .cyclecore import CLAUDE_SESSION_DURATION
 from .stopchannel import sleep_unless
 from .usage import QUOTA_BY_FIELD, Usage, UsageReading
 

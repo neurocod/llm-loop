@@ -59,7 +59,6 @@ from .cyclecore import (
     build_claude_argv,
     find_project_root,
     last_rate_limit_event,
-    log_file_path,
     parse_args,
     parse_duration,
     project_dir,
@@ -69,6 +68,10 @@ from .cyclecore import (
     run_agent_streaming,
     set_project_root,
 )
+# Same story as the stop vocabulary below: the terminal front end and the mirror
+# log it writes moved out of cyclecore into `console`, and the front door is
+# unchanged on purpose — an embedder asks the PACKAGE where its log is.
+from .console import log_file_path
 # The stop/pause vocabulary moved out of cyclecore into its own module; the
 # front door is unchanged on purpose, since an embedder asks the PACKAGE for
 # `pending_stop`, not the module that used to hold it.

@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-from llm_loop import cyclecore, stopchannel, textwidth
+from llm_loop import console, cyclecore, stopchannel, textwidth
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
@@ -1157,37 +1157,33 @@ class _CollectingHandler(logging.Handler):
 
 
 def test_a_default_terminal_targets_the_real_stream_not_the_tee(monkeypatch):
-    from llm_loop import cyclecore
+    screen = _FakeStream(True)
+    monkeypatch.setattr(console, "_real_stream", lambda: screen)
 
-    console = _FakeStream(True)
-    monkeypatch.setattr(cyclecore, "_real_stream", lambda: console)
-
-    assert tio.Terminal()._stream is console
+    assert tio.Terminal()._stream is screen
 
 
 def test_the_pinned_rows_never_reach_the_mirror_log(monkeypatch):
     """The feature's #1 non-negotiable: cursor bytes in the log corrupt the run
     record `--cost` parses, and every other test injects its own stream."""
-    from llm_loop import cyclecore
-
-    console = _FakeStream(True)
+    screen = _FakeStream(True)
     logged = []
     logger = logging.getLogger("pytest-statusline-tee")
     logger.handlers = [_CollectingHandler(logged)]
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    monkeypatch.setattr(sys, "stdout", cyclecore._TeeToLog(console, logger))
+    monkeypatch.setattr(sys, "stdout", console._TeeToLog(screen, logger))
     monkeypatch.setattr(tio, "_enable_windows_vt", lambda s: True)
     monkeypatch.setattr(tio.shutil, "get_terminal_size",
                         lambda fallback=(0, 0): os.terminal_size((100, 30)))
 
     app = sl.StatusApp(input_source=tio.NullInputSource(), refresh=60)
-    assert app.terminal._stream is console      # the tee was unwrapped
+    assert app.terminal._stream is screen       # the tee was unwrapped
     with app:
         app.update(iteration=7, phase="running")
         print("ordinary output")                # still goes through the tee
 
-    assert "\x1b" in console.getvalue() and "iter 7" in console.getvalue()
+    assert "\x1b" in screen.getvalue() and "iter 7" in screen.getvalue()
     assert logged == ["ordinary output"]
     assert all("\x1b" not in line for line in logged)
 

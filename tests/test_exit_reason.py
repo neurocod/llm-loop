@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from llm_loop import cyclecore, exitlog
+from llm_loop import console, cyclecore, exitlog
 from llm_loop.cyclecore import ClaudeCommand, Driver
 
 
@@ -54,7 +54,7 @@ def _seq_args(project_dir):
 @pytest.fixture(autouse=True)
 def _isolated_record(tmp_path, monkeypatch):
     """Every test gets its own log dir and its own fresh record."""
-    monkeypatch.setattr(cyclecore, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(console, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(exitlog, "_record", None)
     root = cyclecore.project_dir()
     streams = sys.stdout, sys.stderr
@@ -76,7 +76,7 @@ def test_a_clean_run_names_its_ending_in_the_log(tmp_path):
     _run_once(tmp_path)
     exitlog.finish()
 
-    written = cyclecore.log_file_path("pytest-exit").read_text(
+    written = console.log_file_path("pytest-exit").read_text(
         encoding="utf-8", errors="replace")
     assert "=== run ended: no more work in the queue" in written
 
@@ -95,7 +95,7 @@ def test_a_finished_run_leaves_no_record_behind(tmp_path):
 def test_a_record_whose_owner_is_gone_is_reported_and_cleared(
         tmp_path, monkeypatch, capsys):
     """The whole point: the kill that logs nothing is named by the NEXT run."""
-    logs = cyclecore.LOG_DIR
+    logs = console.LOG_DIR
     logs.mkdir(parents=True, exist_ok=True)
     dead = exitlog.record_path(logs, "pytest-exit", "proj", 424242)
     dead.write_text(json.dumps({
@@ -121,7 +121,7 @@ def test_a_record_whose_owner_still_runs_is_left_alone(
         tmp_path, monkeypatch, capsys):
     """Two runs of one wrapper is routine here. Reporting a live sibling as a
     corpse — and deleting its record — would break the report for real kills."""
-    logs = cyclecore.LOG_DIR
+    logs = console.LOG_DIR
     logs.mkdir(parents=True, exist_ok=True)
     live = exitlog.record_path(logs, "pytest-exit", "proj", 424242)
     live.write_text(json.dumps({"pid": 424242, "started": 1000.0}),

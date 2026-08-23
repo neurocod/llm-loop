@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from llm_loop import cyclecore, parallel
+from llm_loop import console, cyclecore, parallel
 from llm_loop.cyclecore import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
@@ -29,7 +29,7 @@ def _restore_streams():
 
 
 def _handler(tmp_path, **kwargs):
-    handler = cyclecore._MirrorLogHandler(
+    handler = console._MirrorLogHandler(
         tmp_path / "mirror.log", maxBytes=64, backupCount=2,
         encoding="utf-8", **kwargs)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -99,7 +99,7 @@ def test_a_logging_failure_never_recurses_through_the_tee(tmp_path):
 
     handler = Exploding()
     logger = _logger("runCycle.test-recursion", handler)
-    sys.stderr = cyclecore._TeeToLog(sys.stderr, logger)
+    sys.stderr = console._TeeToLog(sys.stderr, logger)
 
     print("something the loop printed", file=sys.stderr)
 
@@ -109,7 +109,7 @@ def test_a_logging_failure_never_recurses_through_the_tee(tmp_path):
 def test_the_tee_still_logs_normally_after_a_guarded_call(tmp_path):
     handler = _handler(tmp_path)
     logger = _logger("runCycle.test-normal", handler)
-    sys.stdout = cyclecore._TeeToLog(sys.stdout, logger)
+    sys.stdout = console._TeeToLog(sys.stdout, logger)
 
     print("first")
     print("second")
@@ -209,7 +209,7 @@ def _par_args(project_dir, *, dry_run, max_runs=None):
 def log_dir(tmp_path, monkeypatch):
     """Point the mirror log at the test's own directory, never the user's."""
     logs = tmp_path / "logs"
-    monkeypatch.setattr(cyclecore, "LOG_DIR", logs)
+    monkeypatch.setattr(console, "LOG_DIR", logs)
     yield logs
 
 
@@ -235,7 +235,7 @@ def test_a_parallel_dry_run_writes_nothing_to_the_shared_log(
                           _par_args(str(tmp_path), dry_run=True),
                           app_name=app_name)
 
-    assert not cyclecore.log_file_path(app_name).exists()
+    assert not console.log_file_path(app_name).exists()
     out = capsys.readouterr().out
     # Visible, not mysterious: the preview names the log it is staying out of.
     assert "dry run: nothing is mirrored" in out
@@ -248,7 +248,7 @@ def test_a_sequential_dry_run_writes_nothing_to_the_shared_log(
     cyclecore.run_loop(_OneShotDriver(), _seq_args(str(tmp_path), dry_run=True),
                        app_name=app_name)
 
-    assert not cyclecore.log_file_path(app_name).exists()
+    assert not console.log_file_path(app_name).exists()
     out = capsys.readouterr().out
     assert "dry run: nothing is mirrored" in out
     # The header --cost parses is printed by a dry run too; keeping it out of
@@ -263,11 +263,29 @@ def test_a_real_run_still_mirrors_to_the_shared_log(tmp_path, log_dir):
         cyclecore.run_loop(_NoWorkDriver(),
                            _seq_args(str(tmp_path), dry_run=False),
                            app_name=app_name, wait_on_start=False)
-        written = cyclecore.log_file_path(app_name).read_text(
+        written = console.log_file_path(app_name).read_text(
             encoding="utf-8", errors="replace")
     finally:
         _drop_logger(app_name)
     assert "logging to" in written
+
+
+def test_a_projects_log_is_named_after_that_project(tmp_path, log_dir):
+    """Two projects must not end up writing to one log — the folder name in the
+    file name is the whole of what keeps them apart.
+
+    Pinned because the name is now HANDED to the printer (`console`) instead of
+    read out of the runner: `set_project_root` tells it, and a handover that
+    silently stopped happening would leave every project logging under whatever
+    directory the process happened to start in. Measured: with the assignment in
+    `set_log_project` removed, nothing else in this suite goes red.
+    """
+    project = tmp_path / "some-project"
+    project.mkdir()
+    cyclecore.set_project_root(str(project))
+
+    assert console.log_file_path("pytest-named").name == \
+        "pytest-named-some-project.log"
 
 
 def test_an_uncapped_parallel_dry_run_caps_its_listing(tmp_path, log_dir, capsys):

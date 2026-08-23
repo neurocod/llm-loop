@@ -15,7 +15,7 @@ Two halves, and they are not the same question:
     codes on Windows) into one symbolic `Key`, so nothing above this module
     learns which platform it is on.
 
-The one thing it imports from the package is `cyclecore._real_stream`, and for
+The one thing it imports from the package is `console._real_stream`, and for
 the reason stated there: `sys.stdout` is the mirror-log tee, and cursor-movement
 bytes in the log corrupt the run record `--cost` parses.
 """
@@ -27,7 +27,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from . import cyclecore
+from . import console
 
 __all__ = [
     "CSI_KEYS",
@@ -103,7 +103,7 @@ class Terminal:
     """
 
     def __init__(self, stream=None):
-        self._stream = stream if stream is not None else cyclecore._real_stream()
+        self._stream = stream if stream is not None else console._real_stream()
         self._lock = threading.Lock()
         self._rows = 0
         self._size = (0, 0)
@@ -268,7 +268,7 @@ def terminal_for(stream=None, *, enabled: bool = True) -> Terminal:
     """A real Terminal when pinning rows is safe here, else a NullTerminal."""
     if not enabled or os.environ.get(ENV_FLAG) == "0":
         return NullTerminal()
-    stream = stream if stream is not None else cyclecore._real_stream()
+    stream = stream if stream is not None else console._real_stream()
     try:
         if not stream.isatty():
             return NullTerminal()

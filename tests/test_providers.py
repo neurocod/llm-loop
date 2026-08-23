@@ -6,8 +6,8 @@ import sys
 
 import pytest
 
-from llm_loop import (codex_usage, compactline, cyclecore, limits, parallel,
-                      providers, textwidth)
+from llm_loop import (codex_usage, compactline, console, cyclecore, limits,
+                      parallel, providers, textwidth)
 from llm_loop.cyclecore import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
@@ -531,7 +531,7 @@ def plain_lines(monkeypatch):
     def record(plain, _markup):
         lines.append(plain)
 
-    monkeypatch.setattr(cyclecore, "print_markup", record)
+    monkeypatch.setattr(console, "print_markup", record)
     monkeypatch.setattr(parallel, "print_markup", record)   # imported by name
     return lines
 
@@ -638,7 +638,7 @@ def test_a_printer_coerces_a_detail_that_is_not_a_string(plain_lines):
     """Both printers take whatever their caller has. Joined with `+`, a number
     raised TypeError from inside the renderer — which ends the sequential run,
     and in a worker escapes the thread while it still holds a claimed item."""
-    cyclecore.LINES.tool("Read", 123)
+    console.LINES.tool("Read", 123)
     parallel.job_lines(4).tool("Read", 123)
 
     assert plain_lines == ["  ⚙ Read: 123", "[job 4]   ⚙ Read: 123"]
@@ -760,7 +760,7 @@ def test_a_missing_exit_code_does_not_shrink_the_line(monkeypatch, plain_lines):
 def line_pairs(monkeypatch):
     """Both copies of every rendered line, as `(plain, markup)` pairs."""
     pairs = []
-    monkeypatch.setattr(cyclecore, "print_markup",
+    monkeypatch.setattr(console, "print_markup",
                         lambda plain, markup: pairs.append((plain, markup)))
     return pairs
 
@@ -778,7 +778,7 @@ def _style_over(markup, part):
 def test_a_styled_line_reaches_the_screen_in_its_style(line_pairs):
     """Worker verdicts, the bold-red error lines and the stop/pause notices are
     all this one shape carrying a style."""
-    cyclecore.LINES.line("run stopped: stop file", style="bold red")
+    console.LINES.line("run stopped: stop file", style="bold red")
 
     plain, markup = line_pairs[0]
     assert plain == "run stopped: stop file"        # the log copy stays plain
@@ -786,7 +786,7 @@ def test_a_styled_line_reaches_the_screen_in_its_style(line_pairs):
 
 
 def test_a_tool_line_keeps_its_coloured_glyph_and_bold_name(line_pairs):
-    cyclecore.LINES.tool("Bash", "$ pytest -q")
+    console.LINES.tool("Bash", "$ pytest -q")
 
     _, markup = line_pairs[0]
     assert _style_over(markup, "⚙")                  # the glyph is coloured
@@ -797,7 +797,7 @@ def test_a_tool_line_keeps_its_coloured_glyph_and_bold_name(line_pairs):
 def test_a_mark_line_styles_the_glyph_and_not_the_body(line_pairs):
     """The ✓/✗ is the outcome, so it carries the colour; the body beside it is a
     command and its output, which a style would only make harder to read."""
-    cyclecore.LINES.mark("✗", "red", "exit 1: pytest -q")
+    console.LINES.mark("✗", "red", "exit 1: pytest -q")
 
     _, markup = line_pairs[0]
     assert _style_over(markup, "✗") == "red"

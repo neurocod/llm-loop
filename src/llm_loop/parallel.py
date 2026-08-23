@@ -37,6 +37,7 @@ import time
 from typing import Callable, Optional
 
 from . import compactline
+from . import console
 from . import cyclecore
 from . import exitlog
 from . import limits
@@ -45,6 +46,7 @@ from . import providers
 from . import statusline
 from . import stopchannel
 from . import textwidth
+from .console import print_markup
 from .cyclecore import (
     AgentCommand,
     GitPushPolicy,
@@ -52,7 +54,6 @@ from .cyclecore import (
     git_push,
     git_unpushed_count,
     maybe_git_push,
-    print_markup,
     set_project_root,
 )
 from .stopchannel import RunResult, RunStopReason
@@ -189,7 +190,7 @@ def emit_note(lines: compactline.LineWriter, note: str) -> None:
     announced twice (when it rides a prompt, and when the CLI replays one that
     went in live) and the two must not drift into looking like different things.
     Here rather than on the writer because the sequential runner's note is not
-    the same line with a tag added: `cyclecore.print_note` colours the glyph and
+    the same line with a tag added: `console.print_note` colours the glyph and
     the label separately, so there is no one shape for the two to share yet.
     """
     lines.line(f"✉ operator note: {note}", "magenta")
@@ -1016,20 +1017,20 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # a preview, not a run, and stays out of the shared record entirely: see the
     # same branch in cyclecore.run_loop for the incident behind it.
     if setup_logging and not args.dry_run:
-        logger = cyclecore._setup_file_logging(app_name)
-        sys.stdout = cyclecore._TeeToLog(sys.stdout, logger)
-        sys.stderr = cyclecore._TeeToLog(sys.stderr, logger)
+        logger = console._setup_file_logging(app_name)
+        sys.stdout = console._TeeToLog(sys.stdout, logger)
+        sys.stderr = console._TeeToLog(sys.stderr, logger)
     if not args.dry_run:
         # See the same call in cyclecore.run_loop: after the tee, so a vanished
         # run's report lands in the log whose abrupt end it explains.
-        exitlog.begin(app_name, cyclecore.LOG_DIR,
+        exitlog.begin(app_name, console.LOG_DIR,
                       os.path.basename(cyclecore.project_dir()))
     print(f"  · project root: {cyclecore.project_dir()}")
     if args.dry_run:
         print("  · dry run: nothing is mirrored to "
-              f"{cyclecore.log_file_path(app_name)}")
+              f"{console.log_file_path(app_name)}")
     else:
-        print(f"  · logging to {cyclecore.log_file_path(app_name)}")
+        print(f"  · logging to {console.log_file_path(app_name)}")
     print(f"  · provider: {spec.display_name}")
     print(f"  · jobs: {jobs}  ·  git push policy: {git_push_policy.value}")
 

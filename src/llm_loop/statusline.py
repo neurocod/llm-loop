@@ -19,7 +19,7 @@ both this and `cyclecore` sit on top of; neither is the terminal, which is
 Two things are load-bearing and easy to get wrong:
 
   * nothing here writes an escape or reads a key: it all goes through `termio`,
-    whose bytes reach ``cyclecore._real_stream()`` rather than ``sys.stdout``,
+    whose bytes reach ``console._real_stream()`` rather than ``sys.stdout``,
     the ``_TeeToLog`` mirror (see there).
   * anything that fails here disables the status line (a `termio.NullTerminal`
     takes over) and the run continues. A cosmetic feature must never be able to
@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import cmdline, cyclecore, stopchannel, termio, textwidth
+from . import cmdline, console, cyclecore, stopchannel, termio, textwidth
 
 __all__ = [
     "Action",
@@ -246,7 +246,7 @@ def colorize(line: str) -> str:
     """Colour a rendered row: percentages on the usage scale, the git-push value
     green, chrome muted.
 
-    Reuses `cyclecore.percent_style` so the pinned rows and the scrolling log
+    Reuses `console.percent_style` so the pinned rows and the scrolling log
     lines agree about what "alarming" looks like. Adding the codes here rather
     than in the Rows keeps the truncation arithmetic counting characters instead
     of escape bytes — and keeps the rows readable as plain strings in tests.
@@ -279,7 +279,7 @@ def colorize(line: str) -> str:
     for match in _STYLED_RE.finditer(line):
         token = match.group(0)
         if match.lastgroup == "mode":
-            style = _SGR.get(cyclecore.PERCENT_STYLES[0], "")
+            style = _SGR.get(console.PERCENT_STYLES[0], "")
         elif match.lastgroup == "percent":
             # Only what stands between this figure and its own field's reading —
             # never text from the field before the pipe, which would make a
@@ -289,9 +289,9 @@ def colorize(line: str) -> str:
                 # Policy half of the field: the reading's colour, or green when
                 # the provider had no reading to give.
                 style = (reading_style if reading_style is not None
-                         else _SGR.get(cyclecore.PERCENT_STYLES[0], ""))
+                         else _SGR.get(console.PERCENT_STYLES[0], ""))
             else:
-                style = _SGR.get(cyclecore.percent_style(
+                style = _SGR.get(console.percent_style(
                     float(token.rstrip("% \t"))), "")
                 reading_style, reading_end = style, match.end()
         else:
@@ -688,7 +688,7 @@ class QuotaSegment(Segment):
             # that stops being reported is visible instead of invisible.
             provider = f"{row.label} n/a"
         else:
-            left = (cyclecore._fmt_left(
+            left = (console._fmt_left(
                 row.reset_ts - (time.time() if now is None else now))
                 if row.reset_ts else "")
             provider = f"{row.label} {row.percent:.0f}%" + (f" ({left})" if left else "")
