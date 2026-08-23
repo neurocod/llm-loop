@@ -927,8 +927,15 @@ def build_claude_argv(command: ClaudeCommand) -> list:
 
 
 def line_limit(prefix: str = "") -> int:
-    """Characters of variable text that still fit on one line of this terminal,
-    once `prefix` — the fixed head the caller prints in front of it — is there.
+    """Terminal columns left for variable text on one line, once `prefix` — the
+    fixed head the caller prints in front of it — is there.
+
+    Columns, not characters: `_short` spends this budget in cells too, so a
+    command echoing CJK or emoji is cut where it stops fitting rather than at
+    the same character count and twice the width. And it is a budget, not a
+    promise to fit — on a terminal narrower than `statusline.LEGACY_LINE_COLUMNS`
+    the answer deliberately exceeds the row, so the line wraps instead of
+    recording less than the fixed figures it replaced.
 
     The single source of every compact renderer's truncation width, on both
     sides of the fence: the sequential stream renderer here and the per-worker
@@ -944,17 +951,57 @@ def line_limit(prefix: str = "") -> int:
     return statusline.line_budget(prefix)
 
 
-def _short(text: str, limit: Optional[int] = None) -> str:
-    """Single-line truncated version of text for compact output.
+def _collapse(text) -> str:
+    """One line's worth of `text`: every run of whitespace becomes one space.
+
+    Split from `_short` because the two-field split needs to MEASURE a value
+    before deciding how much of it to keep, and measuring the raw text would
+    count newlines and indentation that are never printed.
+    """
+    return " ".join(str(text).split())
+
+
+def _short(text, limit: Optional[int] = None) -> str:
+    """Single-line version of `text`, cut to `limit` terminal COLUMNS.
 
     `limit` defaults to a bare terminal line (`line_limit()`); a caller that
     prints a head in front of the result passes `line_limit(that_head)` so the
-    two together fill the width instead of overflowing it.
+    two together fill the width instead of overflowing it. The cut is delegated
+    to `statusline.fit`, which counts cells: cutting by characters here while
+    the budget was measured in columns is how a command echoing CJK produced a
+    299-character line 580 columns wide.
     """
-    if limit is None:
-        limit = line_limit()
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    from . import statusline  # lazy: statusline imports cyclecore
+    return statusline.fit(_collapse(text),
+                          line_limit() if limit is None else limit)
+
+
+def _fit_two(budget: int, first, second) -> tuple:
+    """Cut two variable fields of ONE line to share its `budget`.
+
+    Both fit — both are kept whole. Only one is oversized — it takes what the
+    other leaves, so a short output never strands half a row of blank next to a
+    command that was cut to make room for it. Both oversized — half each,
+    because the two fields answer different questions (what ran, and why it
+    failed) and a line showing only one of them answers half of it.
+
+    That last case is the one place this records less than the fixed 160+160 it
+    replaced (100 each at the floor). The alternative is the line those figures
+    actually produced: 320 characters wrapped across three rows whatever the
+    terminal.
+    """
+    from . import statusline  # lazy: statusline imports cyclecore
+    first, second = _collapse(first), _collapse(second)
+    wide_first = statusline.cell_width(first)
+    wide_second = statusline.cell_width(second)
+    if wide_first + wide_second <= budget:
+        return first, second
+    half = budget // 2
+    if wide_first <= half:
+        return first, statusline.fit(second, budget - wide_first)
+    if wide_second <= half:
+        return statusline.fit(first, budget - wide_second), second
+    return statusline.fit(first, half), statusline.fit(second, budget - half)
 
 
 _BACKSLASH_RUN_RE = re.compile(r"\\+")
@@ -991,6 +1038,13 @@ def _describe_tool(name: str, ti: dict, limit: Optional[int] = None) -> str:
     line is printed as `<indent>⚙ <name>: <this>`, so only the caller knows how
     wide the head in front of it is (parallel mode adds a `[job k]` tag). Left
     out, the description is cut to a bare terminal line.
+
+    Every branch that echoes a JSON value goes through `_short`, and not only
+    for the width: these values come out of a provider's JSON, so a `file_path`
+    that arrives as a number or a list used to be returned as-is and reach
+    `print_tool`, whose f-string coerced it. A path is exactly as unbounded as a
+    command — a Grep pattern once printed a 517-column line — and one call fixes
+    both. (`TodoWrite` echoes a count rather than a value, so it needs neither.)
     """
     if limit is None:
         limit = line_limit()
@@ -1000,14 +1054,15 @@ def _describe_tool(name: str, ti: dict, limit: Optional[int] = None) -> str:
         command = undouble_backslashes(str(ti.get("command", "")))
         return f"$ {_short(command, limit - 2)}"
     if name in ("Read", "Edit", "Write", "NotebookEdit"):
-        return ti.get("file_path", ti.get("notebook_path", ""))
+        return _short(ti.get("file_path", ti.get("notebook_path", "")) or "",
+                      limit)
     if name in ("Glob", "Grep"):
         loc = f" in {ti['path']}" if ti.get("path") else ""
-        return f"{ti.get('pattern', '')}{loc}"
+        return _short(f"{ti.get('pattern', '')}{loc}", limit)
     if name == "Skill":
-        return ti.get("skill", "")
+        return _short(ti.get("skill", "") or "", limit)
     if name == "Task" or name == "Agent":
-        return _short(ti.get("description", ti.get("prompt", "")), limit)
+        return _short(ti.get("description", ti.get("prompt", "")) or "", limit)
     if name == "TodoWrite":
         todos = ti.get("todos", [])
         return f"{len(todos)} items"
@@ -1297,7 +1352,11 @@ def print_tool(name: str, detail: str = "") -> None:
     head_plain = tool_line_head(name)
     head_markup = f"  [yellow]⚙[/] [bold yellow]{_esc(name)}[/]{TOOL_DETAIL_SEP}"
     if detail:
-        print_markup(head_plain + detail, head_markup + _esc(detail))
+        # Joined by f-string, not `+`: a detail is whatever a provider's JSON
+        # put in the field, and a `+` against a number raises where the printed
+        # line used to say `123`. It escapes the stream renderer and ends the
+        # run — see `_describe_tool`, which is why one can no longer arrive.
+        print_markup(f"{head_plain}{detail}", f"{head_markup}{_esc(detail)}")
     else:
         cut = len(TOOL_DETAIL_SEP)
         print_markup(head_plain[:-cut], head_markup[:-cut])
@@ -1517,18 +1576,19 @@ def _render_codex_event(ev: dict) -> None:
     if event_type == "item.completed" and item_type == "command_execution":
         exit_code = item.get("exit_code")
         mark = "✓" if exit_code in (None, 0) else "✗"
-        # Two variable fields on one line, so the command is capped at half of
-        # what the line has left and lends the rest of its half to the output —
-        # the field that says WHY a command failed, and the one a short command
-        # would otherwise leave no room for.
-        budget = line_limit(f"    {mark} exit {exit_code}:  — ")
-        command = _short(undouble_backslashes(str(item.get("command", ""))),
-                         budget // 2)
-        output = _short(item.get("aggregated_output", ""),
-                        max(1, budget - len(command)))
-        detail = f"exit {exit_code}: {command}" if exit_code is not None else command
+        # The head is measured from what this line will actually print: there is
+        # no "exit N: " when the provider reported no code, and no " — " when
+        # there is no output to put after it. Measuring both unconditionally
+        # left the line eleven columns short of the width it had been given.
+        code_head = f"exit {exit_code}: " if exit_code is not None else ""
+        separator = " — " if _collapse(item.get("aggregated_output", "")) else ""
+        command, output = _fit_two(
+            line_limit(f"    {mark} {code_head}{separator}"),
+            undouble_backslashes(str(item.get("command", ""))),
+            item.get("aggregated_output", ""))
+        detail = f"{code_head}{command}"
         if output:
-            detail += f" — {output}"
+            detail += f"{separator}{output}"
         style = "green" if exit_code in (None, 0) else "red"
         print_markup(f"    {mark} {detail}", f"    [{style}]{mark}[/] {_esc(detail)}")
         return

@@ -266,19 +266,22 @@ def format_elapsed(seconds: Optional[float]) -> str:
     return f"{minutes}m{secs:02d}s"
 
 
-# What one scrolling line may use when there is no terminal to ask (output
-# redirected to a file or a pipe: `get_terminal_size` then answers with its own
-# 80-column guess, which is not a screen and would cut for nobody). Generous,
-# because in that case the only reader is the mirror log, where a cut cannot be
-# undone.
-UNKNOWN_TERMINAL_COLUMNS = 200
-# Under this a compact line is left to wrap rather than cut any further. The
-# screen is not the only reader of these lines — the same text is mirrored to
-# the log, where the cut cannot be undone — and a narrow window is exactly when
-# a run is being watched rather than read. Set near what the fixed limits used
-# to keep, so a small terminal loses nothing it used to record; wrapping there
-# is not new either, since 140-200 characters never fit on one row anyway.
-MIN_LINE_COLUMNS = 100
+# The widest of the fixed limits this measurement replaced (a Claude tool call's
+# 200 characters). It serves twice, because both uses answer the same question —
+# what a line may hold when the screen is not the constraint:
+#
+#  * no terminal at all (redirected to a file or a pipe, where the mirror log is
+#    the only reader and a cut cannot be undone), rather than the 80-column guess
+#    `get_terminal_size` hands out there;
+#  * the FLOOR under any real width. Screen and log get the same text, so cutting
+#    to a narrow window would shrink what the run recorded — and wrapping is what
+#    140-200 characters always did on such a window anyway. So a terminal below
+#    this wraps exactly as it did before, and only a wider one gains: nothing
+#    records less than the fixed figures kept.
+#
+# The one line that can still record less is codex's command-plus-output pair,
+# which has two variable fields to fit in one budget (see `_fit_two`).
+LEGACY_LINE_COLUMNS = 200
 # The last cell of a row is not ours to fill: a terminal that auto-wraps on it
 # turns an exactly-full line into two rows, and rich's own console is one column
 # narrower than the terminal on the legacy Windows console (`legacy_windows` in
@@ -286,7 +289,7 @@ MIN_LINE_COLUMNS = 100
 LINE_RIGHT_MARGIN = 1
 
 
-def terminal_columns(fallback: int = UNKNOWN_TERMINAL_COLUMNS) -> int:
+def terminal_columns(fallback: int = LEGACY_LINE_COLUMNS) -> int:
     """The terminal's real width in columns, or `fallback` when there is none.
 
     `shutil.get_terminal_size` reads $COLUMNS first and the real console second,
@@ -302,8 +305,7 @@ def terminal_columns(fallback: int = UNKNOWN_TERMINAL_COLUMNS) -> int:
     return columns if columns > 0 else fallback
 
 
-def line_budget(prefix: str = "", *,
-                fallback: int = UNKNOWN_TERMINAL_COLUMNS) -> int:
+def line_budget(prefix: str = "") -> int:
     """Columns left on one scrolling line for its variable part, after `prefix`.
 
     For the ORDINARY output above the pinned region, where a line that does not
@@ -316,13 +318,18 @@ def line_budget(prefix: str = "", *,
     defect — a number that was never the screen's — so the fixed figures were
     replaced by this measurement.
 
+    Not below `LEGACY_LINE_COLUMNS`, which is why this is a budget rather than a
+    promise to fit: on a narrow terminal the caller is told it may write more
+    than one row holds, deliberately (see the constant).
+
     `prefix` is the fixed head the caller is about to print in front of the
     variable part (indent, glyph, job tag, tool name), measured in cells so the
-    double-width glyphs in it count for the two columns they occupy.
+    double-width glyphs in it count for the two columns they occupy — as is the
+    text the answer sizes (`cyclecore._short` cuts by cells too, or a command
+    echoing CJK would overflow by one column per character).
     """
-    return max(MIN_LINE_COLUMNS,
-               terminal_columns(fallback) - cell_width(prefix)
-               - LINE_RIGHT_MARGIN)
+    return max(LEGACY_LINE_COLUMNS,
+               terminal_columns(0) - cell_width(prefix) - LINE_RIGHT_MARGIN)
 
 
 def screen_width(default: int = 100, maximum: int = 120) -> int:

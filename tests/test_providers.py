@@ -435,6 +435,10 @@ def test_a_reported_provider_error_is_not_repeated_as_a_tail(monkeypatch, capsys
 
 def test_the_kept_tail_is_bounded_and_truncated(monkeypatch, capsys):
     """A chatty CLI must not be able to grow a worker's memory."""
+    # The width is pinned, because the tail is _short-ened to the terminal: run
+    # in a 500-column window this same assertion failed, which is the test
+    # depending on the developer's terminal rather than on the code.
+    _terminal(monkeypatch, 200)
     noise = "".join(f"line {i} {'x' * 400}\n" for i in range(50))
     _codex_job(monkeypatch, noise, returncode=1)
 
@@ -521,10 +525,14 @@ def plain_lines(monkeypatch):
 
 
 def _terminal(monkeypatch, columns):
-    """Pretend the terminal is `columns` wide; return what one line may fill."""
+    """Pretend the terminal is `columns` wide; return what one line may fill.
+
+    Only meaningful above `LEGACY_LINE_COLUMNS`, below which a line is allowed
+    to wrap rather than record less (see the narrow-terminal test).
+    """
     monkeypatch.setattr(statusline.shutil, "get_terminal_size",
-                        lambda fallback=(0, 0): os.terminal_size((columns, 30)))
-    return columns - statusline.LINE_RIGHT_MARGIN
+                        lambda fallback=(80, 24): os.terminal_size((columns, 30)))
+    return columns - 1          # the column left for the terminal to wrap on
 
 
 def _bash_tool_use(command):
@@ -597,4 +605,126 @@ def test_a_narrow_terminal_still_records_what_the_old_limits_did(
     cyclecore._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
 
     line, = plain_lines
-    assert statusline.cell_width(line) > statusline.MIN_LINE_COLUMNS
+    assert len(line) >= 200         # the old fixed figure, wrapped as it was
+
+
+def test_a_wide_glyph_body_is_cut_by_cells_not_characters(
+        monkeypatch, plain_lines):
+    """The budget is columns; spending it in characters put a 299-character
+    line 580 columns wide on the screen."""
+    pytest.importorskip("rich.cells")
+    fits = _terminal(monkeypatch, 300)
+
+    cyclecore._render_claude_event(_bash_tool_use("漢" * 500), True)
+
+    line, = plain_lines
+    assert statusline.cell_width(line) == fits
+    assert len(line) < 200          # half as many characters as columns
+
+
+def test_a_printer_coerces_a_detail_that_is_not_a_string(plain_lines):
+    """Both printers take whatever their caller has. Joined with `+`, a number
+    raised TypeError from inside the renderer — which ends the sequential run,
+    and in a worker escapes the thread while it still holds a claimed item."""
+    cyclecore.print_tool("Read", 123)
+    parallel.emit_tool(4, "Read", 123)
+
+    assert plain_lines == ["  ⚙ Read: 123", "[job 4]   ⚙ Read: 123"]
+
+
+@pytest.mark.parametrize("name,tool_input,expected", [
+    ("Read", {"file_path": 123}, "  ⚙ Read: 123"),
+    ("Skill", {"skill": ["deploy"]}, "  ⚙ Skill: ['deploy']"),
+    ("Grep", {"pattern": 7}, "  ⚙ Grep: 7"),
+    ("Write", {"file_path": None}, "  ⚙ Write"),      # nothing to say, no ': '
+])
+def test_a_tool_input_that_is_not_a_string_still_prints(
+        monkeypatch, plain_lines, name, tool_input, expected):
+    """End to end over the same values, since these are whatever the provider's
+    JSON held — `null` included, which used to print the word None."""
+    _terminal(monkeypatch, 300)
+
+    cyclecore._render_claude_event({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": name, "input": tool_input}]}}, True)
+
+    assert plain_lines == [expected]
+
+
+@pytest.mark.parametrize("name,tool_input", [
+    ("Read", {"file_path": "p" * 5000}),
+    ("Write", {"notebook_path": "n" * 5000}),
+    ("Grep", {"pattern": "p" * 5000, "path": "products"}),
+    ("Skill", {"skill": "s" * 5000}),
+    ("Task", {"description": "d" * 5000}),
+    ("WebFetch", {"url": "u" * 5000}),
+])
+def test_every_tool_argument_is_cut_like_a_long_command(
+        monkeypatch, plain_lines, name, tool_input):
+    """Only Bash and Task were bounded; a Grep pattern printed a 517-cell line
+    and a path is exactly as unbounded as a command."""
+    fits = _terminal(monkeypatch, 300)
+
+    cyclecore._render_claude_event({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": name, "input": tool_input}]}}, True)
+
+    line, = plain_lines
+    assert statusline.cell_width(line) == fits
+
+
+# --- the codex line that carries TWO variable fields --------------------------
+#
+# `✗ exit 1: <command> — <output>` has to fit both in one budget. Capping the
+# command at half of it and giving the output the rest left half the row blank
+# whenever there was no output — the very defect the width change is about.
+
+def _codex_completed(command, output="", exit_code=1):
+    item = {"type": "command_execution", "command": command,
+            "aggregated_output": output}
+    if exit_code is not None:
+        item["exit_code"] = exit_code
+    return {"type": "item.completed", "item": item}
+
+
+def test_a_command_with_no_output_gets_the_whole_line(monkeypatch, plain_lines):
+    fits = _terminal(monkeypatch, 300)
+
+    cyclecore._render_codex_event(_codex_completed(LONG_COMMAND))
+
+    line, = plain_lines
+    assert statusline.cell_width(line) == fits
+
+
+def test_a_short_output_lends_its_room_to_the_command(monkeypatch, plain_lines):
+    fits = _terminal(monkeypatch, 300)
+
+    cyclecore._render_codex_event(_codex_completed(LONG_COMMAND, "not found"))
+
+    line, = plain_lines
+    assert statusline.cell_width(line) == fits
+    assert line.endswith(" — not found")     # kept whole, and the command took
+    assert "…" in line                       # the rest of the row
+
+
+def test_two_long_fields_share_the_line_evenly(monkeypatch, plain_lines):
+    fits = _terminal(monkeypatch, 300)
+
+    cyclecore._render_codex_event(
+        _codex_completed(LONG_COMMAND, "y" * 500))
+
+    line, = plain_lines
+    command, output = line.split(" — ")
+    assert statusline.cell_width(line) == fits
+    assert command.endswith("…") and output.endswith("…")   # both were cut
+    assert abs(len(command) - len(output)) < 30             # ...about evenly
+
+
+def test_a_missing_exit_code_does_not_shrink_the_line(monkeypatch, plain_lines):
+    """The head is measured from what is printed: no code, no `exit N: `."""
+    fits = _terminal(monkeypatch, 300)
+
+    cyclecore._render_codex_event(_codex_completed(LONG_COMMAND,
+                                                   exit_code=None))
+
+    line, = plain_lines
+    assert "exit" not in line
+    assert statusline.cell_width(line) == fits

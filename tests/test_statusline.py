@@ -1088,43 +1088,60 @@ def test_fit_truncates_with_an_ellipsis():
 # pinned in test_providers.py.
 
 
+# Every expectation below is a LITERAL. Restating the constant under test
+# (`== sl.LINE_RIGHT_MARGIN`, `== sl.MIN_LINE_COLUMNS`) made three of these pins
+# survive a mutation of the very number they were named after — measured, with
+# try_patch --expect-fail.
+
+
 def _columns(monkeypatch, columns):
-    """Pretend the terminal is `columns` wide (0 = there is no terminal)."""
-    monkeypatch.setattr(sl.shutil, "get_terminal_size",
-                        lambda fallback=(0, 0): os.terminal_size((columns, 30)))
+    """Pretend the terminal is `columns` wide; 0 = there is no terminal.
+
+    The fake honours the `fallback` it is handed, as shutil does — a fake that
+    ignores it hides which fallback the caller asked for, and that argument is
+    the whole of "no terminal means the legacy width, not shutil's 80".
+    """
+    def fake_size(fallback=(80, 24)):
+        return os.terminal_size((columns, 30) if columns else fallback)
+
+    monkeypatch.setattr(sl.shutil, "get_terminal_size", fake_size)
 
 
 def test_the_budget_is_the_terminal_minus_the_prefix(monkeypatch):
     _columns(monkeypatch, 240)
 
     assert sl.terminal_columns() == 240
-    assert sl.line_budget() == 240 - sl.LINE_RIGHT_MARGIN
-    assert sl.line_budget("[job 7] ") == 240 - 8 - sl.LINE_RIGHT_MARGIN
+    assert sl.line_budget() == 239               # one column left unwritten
+    assert sl.line_budget("[job 7] ") == 231     # ...and the head's eight
 
 
 def test_a_prefix_is_measured_in_cells_not_characters(monkeypatch):
     """The heads are full of double-width glyphs; `len` would under-count them
     by one column each and the line would wrap by exactly that much."""
     pytest.importorskip("rich.cells")
-    _columns(monkeypatch, 200)
+    _columns(monkeypatch, 400)
 
     assert sl.cell_width("💻 ") == 3            # two cells plus the space
-    assert sl.line_budget("💻 ") == sl.line_budget("xx ")
+    assert sl.line_budget("💻 ") == 396
 
 
-def test_no_terminal_falls_back_wide_rather_than_to_eighty(monkeypatch):
+def test_no_terminal_hands_back_the_fallback_rather_than_eighty(monkeypatch):
     """Redirected to a file or a pipe there is no screen to fit, and the only
     reader left is the mirror log — where a cut cannot be undone."""
     _columns(monkeypatch, 0)
 
-    assert sl.terminal_columns() == sl.UNKNOWN_TERMINAL_COLUMNS
-    assert sl.line_budget() == sl.UNKNOWN_TERMINAL_COLUMNS - sl.LINE_RIGHT_MARGIN
+    assert sl.terminal_columns(fallback=7) == 7   # shutil's own 80 never shows
+    assert sl.terminal_columns() == 200           # the legacy line width
+    assert sl.line_budget("[job 7] ") == 200      # floored, not 191
 
 
-def test_a_narrow_terminal_wraps_instead_of_cutting_to_nothing(monkeypatch):
+def test_a_narrow_terminal_wraps_rather_than_record_less(monkeypatch):
+    """Screen and mirror log get the same text, so cutting to a small window
+    would shrink the run's record; 200 is what the fixed limits used to keep."""
     _columns(monkeypatch, 30)
 
-    assert sl.line_budget("[job 12]   ⚙ NotebookEdit: ") == sl.MIN_LINE_COLUMNS
+    assert sl.line_budget("[job 12]   ⚙ NotebookEdit: ") == 200
+    assert sl.LEGACY_LINE_COLUMNS == 200          # the figure it replaced
 
 
 def test_format_prompt_block_heads_the_prompt_and_keeps_it_verbatim():

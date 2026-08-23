@@ -212,7 +212,9 @@ def emit_tool(job_id: int, name: str, detail: str) -> None:
     head_markup = (f"{tag_markup}   [yellow]⚙[/] [bold yellow]{_esc(name)}[/]"
                    + cyclecore.TOOL_DETAIL_SEP)
     if detail:
-        _emit_markup(head_plain + detail, head_markup + _esc(detail))
+        # f-string, not `+`: see the same join in `cyclecore.print_tool` — here
+        # the TypeError would escape a worker thread holding a claimed item.
+        _emit_markup(f"{head_plain}{detail}", f"{head_markup}{_esc(detail)}")
     else:
         cut = len(cyclecore.TOOL_DETAIL_SEP)
         _emit_markup(head_plain[:-cut], head_markup[:-cut])

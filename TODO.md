@@ -151,6 +151,18 @@ worth its churn on its own; each has a trigger that makes it cheap.
   copies of a driver that must stay behaviourally identical for the parallel
   tests to mean the same thing. Trigger: the next test file that needs a fourth.
 
+## Known gaps
+
+- **Two tests read a rich-wrapped capture, so a narrow terminal fails them.**
+  `test_operator_messages.py::test_a_note_the_run_never_delivered_is_reported`
+  and `test_usage_limits.py::test_a_reading_without_a_reset_time_still_prints`
+  assert on a whole sentence in `capsys` output, but `print_error` /
+  `print_percents` hand their line to a rich Console, which word-wraps it at the
+  console width — and rich reads `$COLUMNS`. Both pass at 80+ columns and fail
+  under `COLUMNS=40`. Pre-existing, unrelated to what those tests are about; the
+  fix is to assert on the plain copy handed to `print_markup` (as the width
+  tests in `test_providers.py` do) rather than on the rendered capture.
+
 ## Deferred (revisit later — not now, but worth keeping on the radar)
 
 - **Setup wizard** (frankbria `ralph-enable`) — interactive bootstrap that
