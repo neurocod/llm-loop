@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-from llm_loop import cyclecore, textwidth
+from llm_loop import cyclecore, stopchannel, textwidth
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
@@ -135,7 +135,7 @@ def test_an_empty_model_reads_as_cli_default():
 
 
 def test_stop_pending_marker_appears_only_while_pending():
-    key = cyclecore.StopSource.KEY.value
+    key = stopchannel.StopSource.KEY.value
     assert "STOP pending" not in sl.render_rows(
         sequential_status(), 200, now=NOW)[1]
     pending = sl.render_rows(sequential_status(stop_pending=key), 200,
@@ -154,7 +154,7 @@ def test_stop_pending_marker_appears_only_while_pending():
 def test_a_stop_file_marker_does_not_offer_a_cancel_the_key_cannot_do():
     """`s` withdraws only its own request, so the row must not promise otherwise."""
     row = sl.render_rows(
-        sequential_status(stop_pending=cyclecore.StopSource.FILE.value),
+        sequential_status(stop_pending=stopchannel.StopSource.FILE.value),
         200, now=NOW)[1]
 
     assert "STOP pending — stop file present" in row
@@ -363,7 +363,7 @@ def test_stop_key_requests_a_stop_and_pressing_it_again_cancels(tmp_path):
 
     app.handle_event(tio.Key("s"))
     assert app.stop_requested_here is True
-    assert app.status.stop_pending == cyclecore.StopSource.KEY.value
+    assert app.status.stop_pending == stopchannel.StopSource.KEY.value
     assert "cancel stop" in app.render(width=200, now=NOW)[-2]
 
     app.handle_event(tio.Key("s"))
@@ -376,15 +376,15 @@ def test_the_stop_key_writes_no_sentinel_so_a_neighbouring_run_keeps_going(
     """Why the key is a flag and not the file: several loops share one project
     root, and a file stops every one of them."""
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
     one = sl.StatusApp(enabled=False, stop_file=str(sentinel))
     two = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
     one.handle_event(tio.Key("s"))
 
     assert not sentinel.exists(), "the key press left a cross-process sentinel"
-    assert cyclecore.pending_stop(one) is cyclecore.StopSource.KEY
-    assert cyclecore.pending_stop(two) is None
+    assert stopchannel.pending_stop(one) is stopchannel.StopSource.KEY
+    assert stopchannel.pending_stop(two) is None
 
 
 def test_the_sentinel_a_run_watches_is_the_one_its_row_reports(tmp_path):
@@ -392,13 +392,13 @@ def test_the_sentinel_a_run_watches_is_the_one_its_row_reports(tmp_path):
     project root's file while the row talks about another one."""
     sentinel = tmp_path / "elsewhere-stop"
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
-    assert cyclecore.stop_file_for(app) == str(sentinel)
-    assert cyclecore.pending_stop(app) is None
+    assert stopchannel.stop_file_for(app) == str(sentinel)
+    assert stopchannel.pending_stop(app) is None
 
     sentinel.write_text("", encoding="utf-8")
 
-    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
-    assert cyclecore.latched_stop(app) is cyclecore.StopSource.FILE
+    assert stopchannel.pending_stop(app) is stopchannel.StopSource.FILE
+    assert stopchannel.latched_stop(app) is stopchannel.StopSource.FILE
 
 
 def test_what_may_be_cancelled_and_what_must_be_consumed_are_different(
@@ -408,37 +408,37 @@ def test_what_may_be_cancelled_and_what_must_be_consumed_are_different(
     still take it back), but the FILE is what a run stopping now must consume —
     both runners latch on `latched_stop` for exactly this case."""
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
     app.handle_event(tio.Key("s"))
     sentinel.write_text("", encoding="utf-8")
 
-    assert cyclecore.pending_stop(app) is cyclecore.StopSource.KEY
-    assert cyclecore.latched_stop(app) is cyclecore.StopSource.FILE
+    assert stopchannel.pending_stop(app) is stopchannel.StopSource.KEY
+    assert stopchannel.latched_stop(app) is stopchannel.StopSource.FILE
 
 
 def test_the_stop_file_remains_the_cross_process_channel(tmp_path, monkeypatch):
     """The fallback the key deliberately does not use: a file stops every run
     watching the root, and `s` neither writes nor withdraws it."""
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
     sentinel.write_text("", encoding="utf-8")           # another run's `touch stop`
 
-    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
+    assert stopchannel.pending_stop(app) is stopchannel.StopSource.FILE
     # `s` is offered as "stop", not "cancel stop": this request is not ours.
     assert app.action_for("s").help_text(app) == "stop"
 
     app.handle_event(tio.Key("s"))                       # …and then pressed twice
     app.handle_event(tio.Key("s"))
     assert sentinel.exists(), "the s key removed somebody else's stop file"
-    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
+    assert stopchannel.pending_stop(app) is stopchannel.StopSource.FILE
 
 
 def test_stop_file_defaults_to_the_engine_sentinel(monkeypatch):
     from llm_loop import cyclecore
 
-    monkeypatch.setattr(cyclecore, "STOP_FILE", "/somewhere/stop")
+    monkeypatch.setattr(stopchannel, "STOP_FILE", "/somewhere/stop")
 
     assert sl.StatusApp(enabled=False).stop_file == "/somewhere/stop"
 
@@ -451,12 +451,12 @@ def test_pause_key_holds_the_run_and_pressing_it_again_resumes():
 
     app.handle_event(tio.Key("p"))
     assert app.paused is True and app.status.paused is True
-    assert cyclecore.pause_requested(app) is True
+    assert stopchannel.pause_requested(app) is True
     assert "p resume" in app.render(width=200, now=NOW)[-2]
 
     app.handle_event(tio.Key("p"))
     assert app.paused is False and app.status.paused is False
-    assert cyclecore.pause_requested(app) is False
+    assert stopchannel.pause_requested(app) is False
     assert "p pause" in app.render(width=200, now=NOW)[-2]
 
 
@@ -466,22 +466,22 @@ def test_pausing_writes_nothing_to_disk_and_leaves_the_stop_channels_alone(
     """A pause is one run's own, like `s` — and it is not a stop: a run holding
     on `p` must not report a stop pending to anything that asks."""
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
     app.handle_event(tio.Key("p"))
 
     assert not sentinel.exists()
-    assert cyclecore.pending_stop(app) is None
+    assert stopchannel.pending_stop(app) is None
     assert app.stop_requested_here is False
 
 
 def test_a_run_with_no_status_line_is_never_paused():
     """Piped output, CI, --no-statusline: nobody can press the key, and both
     runners must not have to ask whether there is a status line at all."""
-    assert cyclecore.pause_requested(None) is False
-    assert cyclecore.pause_requested(sl.StatusApp(enabled=False)) is False
-    assert cyclecore.wait_while_paused(None) == 0.0
+    assert stopchannel.pause_requested(None) is False
+    assert stopchannel.pause_requested(sl.StatusApp(enabled=False)) is False
+    assert stopchannel.wait_while_paused(None) == 0.0
 
 
 class _PausedApp:
@@ -515,7 +515,7 @@ class _PausedApp:
 def test_the_hold_lasts_exactly_as_long_as_the_key_is_up():
     app = _PausedApp(polls=3)
 
-    held = cyclecore.wait_while_paused(app, poll=0.01)
+    held = stopchannel.wait_while_paused(app, poll=0.01)
 
     assert held > 0.0
     assert app.polls == 4          # three "still paused", then the release
@@ -524,11 +524,11 @@ def test_the_hold_lasts_exactly_as_long_as_the_key_is_up():
 def test_a_stop_pressed_during_the_hold_releases_it_at_once(monkeypatch, tmp_path):
     """The hold has no timer, so `s` must be answered by it and not only by
     whatever the run does next — and the decision stays with the loop head."""
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(tmp_path / "stop"))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(tmp_path / "stop"))
     app = _PausedApp(polls=1000, stop_after=2)
 
-    held = cyclecore.wait_while_paused(
-        app, should_stop=lambda: cyclecore.pending_stop(app) is not None,
+    held = stopchannel.wait_while_paused(
+        app, should_stop=lambda: stopchannel.pending_stop(app) is not None,
         poll=0.01)
 
     assert held > 0.0
@@ -536,7 +536,7 @@ def test_a_stop_pressed_during_the_hold_releases_it_at_once(monkeypatch, tmp_pat
     assert app.paused is True      # …and the pause itself is untouched
 
 
-# --- the cancel grace (cyclecore.confirm_stop_request) -------------------------
+# --- the cancel grace (stopchannel.confirm_stop_request) -------------------------
 
 
 class _FakeApp:
@@ -563,11 +563,11 @@ class _FakeApp:
 def test_a_stop_request_cancelled_inside_the_grace_leaves_no_trace(monkeypatch, tmp_path):
     from llm_loop import cyclecore
 
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(tmp_path / "stop"))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(tmp_path / "stop"))
     app = _FakeApp()
     app._on_note = lambda: setattr(app, "stop_requested_here", False)  # `s` again
 
-    assert cyclecore.confirm_stop_request(app, grace=5.0, poll=0.01) is False
+    assert stopchannel.confirm_stop_request(app, grace=5.0, poll=0.01) is False
     assert app.fields["phase"] == "idle" and app.fields["stop_pending"] == ""
     assert "stop cancelled" in app.notes[-1]
     assert "press s to cancel" in app.notes[0]
@@ -578,7 +578,7 @@ def test_a_stop_file_arriving_mid_grace_outlives_the_cancel(monkeypatch, tmp_pat
     from llm_loop import cyclecore
 
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
     app = _FakeApp()
 
     def cancel_but_a_file_appears():
@@ -587,16 +587,16 @@ def test_a_stop_file_arriving_mid_grace_outlives_the_cancel(monkeypatch, tmp_pat
 
     app._on_note = cancel_but_a_file_appears
 
-    assert cyclecore.confirm_stop_request(app, grace=0.2, poll=0.01) is True
+    assert stopchannel.confirm_stop_request(app, grace=0.2, poll=0.01) is True
 
 
 def test_a_stop_request_still_pending_after_the_grace_stops_the_run(monkeypatch, tmp_path):
     from llm_loop import cyclecore
 
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(tmp_path / "stop"))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(tmp_path / "stop"))
     app = _FakeApp()
 
-    assert cyclecore.confirm_stop_request(app, grace=0.05, poll=0.01) is True
+    assert stopchannel.confirm_stop_request(app, grace=0.05, poll=0.01) is True
     assert app.fields["phase"] == "stopping"
 
 
@@ -606,11 +606,11 @@ def test_a_non_interactive_run_stops_without_any_grace(monkeypatch, tmp_path):
 
     sentinel = tmp_path / "stop"
     sentinel.write_text("", encoding="utf-8")
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
     started = time.monotonic()
 
-    assert cyclecore.confirm_stop_request(None, grace=60) is True
-    assert cyclecore.confirm_stop_request(
+    assert stopchannel.confirm_stop_request(None, grace=60) is True
+    assert stopchannel.confirm_stop_request(
         sl.StatusApp(enabled=False), grace=60) is True
     assert time.monotonic() - started < 1.0
 
@@ -621,11 +621,11 @@ def test_a_stop_this_run_did_not_request_stops_it_at_once(monkeypatch, tmp_path)
 
     sentinel = tmp_path / "stop"
     sentinel.write_text("", encoding="utf-8")
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
     external = _FakeApp(requested_here=False)   # requested by somebody else
     started = time.monotonic()
 
-    assert cyclecore.confirm_stop_request(external, grace=1.0, poll=0.01) is True
+    assert stopchannel.confirm_stop_request(external, grace=1.0, poll=0.01) is True
     assert time.monotonic() - started < 0.5
     assert external.notes == []             # no countdown was ever announced
 
@@ -635,21 +635,21 @@ def test_the_stop_key_is_what_marks_the_request_as_ours(tmp_path, monkeypatch):
     from llm_loop import cyclecore
 
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
     assert app.stop_requested_here is False
     sentinel.write_text("", encoding="utf-8")       # an external `touch stop`
     assert app.stop_requested_here is False
-    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
+    assert stopchannel.pending_stop(app) is stopchannel.StopSource.FILE
 
     app.handle_event(tio.Key("s"))                   # ours, on top of theirs
     assert app.stop_requested_here is True
-    assert cyclecore.pending_stop(app) is cyclecore.StopSource.KEY
+    assert stopchannel.pending_stop(app) is stopchannel.StopSource.KEY
 
     app.handle_event(tio.Key("s"))                   # withdrawn — theirs remains
     assert app.stop_requested_here is False
-    assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
+    assert stopchannel.pending_stop(app) is stopchannel.StopSource.FILE
 
 
 # --- disabled / no-TTY paths ---------------------------------------------------
@@ -1484,7 +1484,7 @@ def test_a_paused_loop_holds_before_it_asks_the_driver_for_work(monkeypatch,
         seen.append(driver.calls)
         return 2 <= len(seen) <= 4      # up for three reads, then released
 
-    monkeypatch.setattr(cyclecore, "pause_requested",
+    monkeypatch.setattr(stopchannel, "pause_requested",
                         pressed_after_the_first_iteration)
 
     app, _source = _run_with_status(monkeypatch, tmp_path, driver, max=2)
@@ -1516,7 +1516,7 @@ def test_a_pause_pressed_at_the_usage_gate_holds_the_next_iteration(monkeypatch,
             key["up"] = False         # as if `p` were pressed a second time
         return key["up"]
 
-    monkeypatch.setattr(cyclecore, "pause_requested", fake_pause_requested)
+    monkeypatch.setattr(stopchannel, "pause_requested", fake_pause_requested)
 
     class _PressesPAtTheGate:
         """A policy that never holds, but is where the key gets pressed."""

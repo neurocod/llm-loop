@@ -42,12 +42,11 @@ from . import limits
 from . import operator
 from . import providers
 from . import statusline
+from . import stopchannel
 from . import textwidth
 from .cyclecore import (
     AgentCommand,
     GitPushPolicy,
-    RunResult,
-    RunStopReason,
     build_agent_argv,
     git_push,
     git_unpushed_count,
@@ -55,6 +54,7 @@ from .cyclecore import (
     print_markup,
     set_project_root,
 )
+from .stopchannel import RunResult, RunStopReason
 from .providers import (note_channel, provider_spec, set_live_messages,
                         start_agent_process, usage_source_for)
 from .drivers import ListFileDriver
@@ -477,7 +477,7 @@ class Shared:
         the checks around them), which is three places that have to agree about
         a question with two sources.
         """
-        return self.stop.is_set() or cyclecore.pending_stop(app) is not None
+        return self.stop.is_set() or stopchannel.pending_stop(app) is not None
 
     def finish(self, line: str, ok: bool) -> tuple:
         """Record an item's outcome: strike it on success, or count/park a fail.
@@ -539,7 +539,7 @@ class Shared:
         Returning True exactly once is what keeps the announcement (and the
         lifecycle latch) single when every worker sees the request at the same
         time — which is why the tail runs here rather than being handed back to
-        the winner: `cyclecore.commit_stop` latches the sentinel for cleanup and
+        the winner: `stopchannel.commit_stop` latches the sentinel for cleanup and
         names the reason, and this is the one place that decides there is a
         winner at all. Both runners get that tail from there, so a new stop
         channel is one edit, not two.
@@ -550,7 +550,7 @@ class Shared:
           * order, because a write that raises must not take the latch with it.
             Announcing first left `stop_reason` unset and `stop` clear when the
             console refused the line, and the run reported NO_WORK for a stop
-            FILE it had obeyed (see `cyclecore.commit_stop`);
+            FILE it had obeyed (see `stopchannel.commit_stop`);
           * outside, because `shared.lock` is also the lock every other worker
             needs to claim, finish or release a file, and a console that blocks
             would hold all of them for as long as the write is stuck.
@@ -563,7 +563,7 @@ class Shared:
         with self.lock:
             if self.stop.is_set():
                 return False
-            self.stop_reason, announcement = cyclecore.commit_stop(app, source)
+            self.stop_reason, announcement = stopchannel.commit_stop(app, source)
             self.claims_closed.set()
             self.stop.set()
         (announce or print)(announcement)
@@ -611,12 +611,12 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
         as the user can see a job row moving;
       * a stop file — latch it and end the run.
 
-    The grace is interactive-only, exactly as in `cyclecore.confirm_stop_request`:
+    The grace is interactive-only, exactly as in `stopchannel.confirm_stop_request`:
     a stop file (a script's `touch stop`, another run) has nobody sitting here to
     press `s` again, so it must stop the run as promptly as it always did.
     """
     out = job_lines(job_id)
-    pending = cyclecore.pending_stop(app)
+    pending = stopchannel.pending_stop(app)
     if pending is None:
         if shared.reopen_claims():
             out.line("stop request withdrawn — claiming files again.", "cyan")
@@ -624,7 +624,7 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
         return False
 
     owner, first = shared.request_stop(job_id)
-    if pending is cyclecore.StopSource.KEY:
+    if pending is stopchannel.StopSource.KEY:
         if first:
             app.update(phase="stopping")
             out.line("stop requested — no new files will be claimed; "
@@ -634,16 +634,16 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
         # withdrawn. `stop.wait` rather than sleep so the latch releases this
         # worker at once instead of after the poll interval.
         if not owner or shared.busy():
-            shared.stop.wait(cyclecore.STOP_RECHECK_SECONDS)
+            shared.stop.wait(stopchannel.STOP_RECHECK_SECONDS)
             return False
         # Nothing left in flight: the same countdown the sequential loop holds
         # at its iteration boundary, so both runners define "the user really
         # meant it" identically. False => the request went away, and the next
         # pass reopens the claims.
-        if not cyclecore.confirm_stop_request(app):
+        if not stopchannel.confirm_stop_request(app):
             return False
     # The tail — re-reading the channel to act on, latching the sentinel for
-    # cleanup, the reason, the line — is `cyclecore.commit_stop`, reached under
+    # cleanup, the reason, the line — is `stopchannel.commit_stop`, reached under
     # the lock that picks the one worker who runs it (which is also the lock the
     # line is written after, not under). `pending` goes along as the fallback for
     # a sentinel that vanished in between.
@@ -687,13 +687,13 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # back: as in the sequential loop, what pauses is the START of work.
         # `shared.stop.wait` rather than sleep, so a latched stop releases this
         # worker at once, and the loop head above is what acts on it.
-        if cyclecore.pause_requested(app):
+        if stopchannel.pause_requested(app):
             if shared.exhausted():
                 break       # nothing left to hold back — see Shared.exhausted
             if shared.note_pause(True):
                 out.line(f"{statusline.PAUSE_GLYPH} paused — no new "
                          "files will be claimed; press p to resume.", "yellow")
-            shared.stop.wait(cyclecore.STOP_RECHECK_SECONDS)
+            shared.stop.wait(stopchannel.STOP_RECHECK_SECONDS)
             continue
         if shared.note_pause(False):
             out.line("▶ pause released — claiming files again.", "cyan")
@@ -745,7 +745,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # A max-items boundary only closes new claims, so already-claimed work
         # deliberately continues past all of this.
         try:
-            while (cyclecore.pending_stop(app) is not None
+            while (stopchannel.pending_stop(app) is not None
                    and not shared.stop.is_set()):
                 # The one place that decides what a request means — the key keeps
                 # its cancel grace, a stop file does not. Read its verdict off
@@ -822,7 +822,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             out.line(f"✗ {command.label} (exit {rc}){suffix}{tail}", "bold red")
 
 
-@cyclecore.stop_file_lifecycle()
+@stopchannel.stop_file_lifecycle()
 def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                  app_name: str = "parallel", *, setup_logging: bool = True,
                  wait_on_start: bool = True, progress=None) -> RunResult:
@@ -896,7 +896,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # workers below are what detect it, and they never start here). Reported so
     # the preview says why a real run would not start yet.
     if args.dry_run:
-        if os.path.exists(cyclecore.STOP_FILE):
+        if os.path.exists(stopchannel.STOP_FILE):
             print("  · stop file present — a real run would wait here until it "
                   "went away. Left in place (a dry run never consumes it).")
         would_run = (len(pending_now) if args.max is None
@@ -937,7 +937,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # waited out here, on the main thread, before any worker starts — otherwise
     # the first worker would claim it and stop the run before it did anything.
     if wait_on_start:
-        cyclecore.wait_for_stop_file_clear()
+        stopchannel.wait_for_stop_file_clear()
 
     # Usage gate: a shared UsageSource (query/cache) plus the Driver's LimitPolicy
     # (which quotas to gate on). --ignore-usage turns both off.
@@ -1095,6 +1095,6 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     reason = shared.stop_reason or RunStopReason.NO_WORK
     # See run_loop's matching call: the closing line belongs to the process, so
     # the reason is recorded here and printed by exitlog on the way out.
-    exitlog.set_reason(cyclecore.STOP_REASON_TEXT.get(reason, reason.value),
+    exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
                        iterations=shared.claimed, completed=shared.done)
     return RunResult(reason, shared.claimed, shared.done, remaining)

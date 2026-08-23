@@ -15,7 +15,7 @@ covered, since either entry point could regress independently.
 
 The status line's `s` key is the other half of the story and is deliberately NOT
 this file: it sets an in-process flag, so one of several loops sharing a project
-root can be stopped on its own (see cyclecore.StopSource).
+root can be stopped on its own (see stopchannel.StopSource).
 """
 
 import os
@@ -27,7 +27,7 @@ from typing import Optional
 
 import pytest
 
-from llm_loop import cyclecore, parallel, statusline
+from llm_loop import cyclecore, parallel, statusline, stopchannel
 from llm_loop.cyclecore import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 from llm_loop.limits import LimitPolicy, SessionLimit
@@ -225,7 +225,7 @@ def test_dry_run_leaves_the_stop_file(tmp_path, capsys):
 
 def test_real_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch, capsys):
     """A new launch leaves another run's pending stop request alone."""
-    monkeypatch.setattr(cyclecore, "STOP_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(stopchannel, "STOP_POLL_SECONDS", 0.01)
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
     stop = _stop_file(tmp_path)
@@ -267,12 +267,12 @@ def test_sequential_stop_file_lives_until_outer_application_exit(
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
 
-    with cyclecore.stop_file_lifecycle():
+    with stopchannel.stop_file_lifecycle():
         result = cyclecore.run_loop(
             _StopAfterOneDriver(stop),
             _seq_args(str(tmp_path), dry_run=False),
             app_name="pytest-stop")
-        assert result.reason == cyclecore.RunStopReason.STOP_FILE
+        assert result.reason == stopchannel.RunStopReason.STOP_FILE
         assert stop.exists(), "runner removed the mutex before application cleanup"
 
     assert not stop.exists(), "application exit left the stop mutex behind"
@@ -289,12 +289,12 @@ def test_the_s_key_stops_the_sequential_run_without_writing_a_sentinel(
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
     captured = _capture_disabled_app(monkeypatch)
 
-    with cyclecore.stop_file_lifecycle():
+    with stopchannel.stop_file_lifecycle():
         result = cyclecore.run_loop(_PressStopAfterOneDriver(captured),
                                     _seq_args(str(tmp_path), dry_run=False),
                                     app_name="pytest-stop")
 
-    assert result.reason == cyclecore.RunStopReason.STOP_KEY
+    assert result.reason == stopchannel.RunStopReason.STOP_KEY
     assert result.completed == 1, "the key press did not stop at the boundary"
     assert not (tmp_path / "stop").exists(), "the s key wrote a stop file"
 
@@ -314,13 +314,13 @@ def test_a_sentinel_present_at_stop_time_is_consumed_even_if_s_was_pressed(
     stop = tmp_path / "stop"
     captured = _capture_disabled_app(monkeypatch)
 
-    with cyclecore.stop_file_lifecycle():
+    with stopchannel.stop_file_lifecycle():
         result = cyclecore.run_loop(
             _PressStopAfterOneDriver(captured, also_touch=stop),
             _seq_args(str(tmp_path), dry_run=False), app_name="pytest-stop")
         assert stop.exists(), "consumed before the application finished cleanup"
 
-    assert result.reason == cyclecore.RunStopReason.STOP_FILE
+    assert result.reason == stopchannel.RunStopReason.STOP_FILE
     assert not stop.exists(), "the sentinel outlived the run it stopped"
 
 
@@ -341,7 +341,7 @@ def test_parallel_dry_run_leaves_the_stop_file(tmp_path, capsys):
 def test_parallel_launch_waits_for_an_existing_stop_file(tmp_path, monkeypatch, capsys):
     """A parallel launch also waits rather than stealing a pending stop."""
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
-    monkeypatch.setattr(cyclecore, "STOP_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(stopchannel, "STOP_POLL_SECONDS", 0.01)
     stop = _stop_file(tmp_path)
     done = threading.Event()
 
@@ -382,11 +382,11 @@ def test_parallel_stop_file_lives_until_outer_application_exit(
     args = _par_args(str(tmp_path), dry_run=False)
     args.jobs = 1
 
-    with cyclecore.stop_file_lifecycle():
+    with stopchannel.stop_file_lifecycle():
         result = parallel.run_parallel(
             _MemListDriver(["products/a.md", "products/b.md"]), args,
             app_name="pytest-stop-parallel")
-        assert result.reason == cyclecore.RunStopReason.STOP_FILE
+        assert result.reason == stopchannel.RunStopReason.STOP_FILE
         assert stop.exists(), "workers removed the mutex before application cleanup"
 
     assert not stop.exists(), "application exit left the stop mutex behind"
@@ -429,7 +429,7 @@ class _WorkersMeetAtTheSentinel:
 
     `os.path.exists` is patched through `parallel.os`, which is the `os` module
     itself, so the interception also covers the read that matters
-    (`cyclecore.pending_stop`, in the other module). Everything else is passed
+    (`stopchannel.pending_stop`, in the other module). Everything else is passed
     straight through, and only threads named `job*` are ever held.
     """
 
@@ -475,9 +475,9 @@ def test_parallel_stop_file_is_reported_once_by_competing_workers(
         _MemListDriver([f"products/{i}.md" for i in range(8)]), args,
         app_name="pytest-stop-parallel")
 
-    assert result.reason == cyclecore.RunStopReason.STOP_FILE
+    assert result.reason == stopchannel.RunStopReason.STOP_FILE
     # The WHOLE sentence, and it is the one the sequential runner prints too
-    # (both tails are cyclecore.commit_stop). Counting a short fragment is how
+    # (both tails are stopchannel.commit_stop). Counting a short fragment is how
     # the two copies drifted into two wordings without a test noticing.
     # Whitespace is collapsed first because a job row goes through rich, which
     # wraps it at the console width - measured: this sentence lands on two rows
@@ -529,11 +529,11 @@ def test_parallel_stop_file_latches_even_when_the_console_write_fails(
     args = _par_args(str(tmp_path), dry_run=False)
     args.jobs = 4
 
-    with cyclecore.stop_file_lifecycle():
+    with stopchannel.stop_file_lifecycle():
         result = parallel.run_parallel(
             _MemListDriver([f"products/{i}.md" for i in range(8)]), args,
             app_name="pytest-stop-parallel")
-        assert result.reason == cyclecore.RunStopReason.STOP_FILE, (
+        assert result.reason == stopchannel.RunStopReason.STOP_FILE, (
             "a failed write to the console changed why the run ended")
         assert stop.exists(), "workers removed the mutex before application cleanup"
 
@@ -584,12 +584,12 @@ def test_a_worker_that_dies_announcing_a_stop_hands_its_claim_back(
     args = _par_args(str(tmp_path), dry_run=False)
     args.jobs = 1
 
-    with cyclecore.stop_file_lifecycle():
+    with stopchannel.stop_file_lifecycle():
         result = parallel.run_parallel(driver, args,
                                        app_name="pytest-stop-parallel")
 
     assert len(refusals) == 1, "the announcement was never even attempted"
-    assert result.reason == cyclecore.RunStopReason.STOP_FILE
+    assert result.reason == stopchannel.RunStopReason.STOP_FILE
     assert result.completed == 0, "no worker ran a file — nothing may be completed"
     assert result.attempted == 0, (
         f"the dead worker's claim was counted: {result.attempted} attempted, "
@@ -687,7 +687,7 @@ def test_the_s_key_ends_a_sequential_run_parked_on_the_usage_limit(
     captured["app"].request_stop()
 
     held.wait_for_exit("the s key was ignored while the run sat on the limit")
-    assert held.result.reason == cyclecore.RunStopReason.STOP_KEY
+    assert held.result.reason == stopchannel.RunStopReason.STOP_KEY
     assert not (tmp_path / "stop").exists(), "the s key wrote a stop file"
 
 
@@ -712,7 +712,7 @@ def test_the_s_key_ends_a_parallel_fleet_parked_on_the_usage_limit(
     captured["app"].request_stop()
 
     held.wait_for_exit("the s key was ignored while the fleet sat on the limit")
-    assert held.result.reason == cyclecore.RunStopReason.STOP_KEY
+    assert held.result.reason == stopchannel.RunStopReason.STOP_KEY
     # Nothing ran, so nothing may be struck: a file claimed and handed back is
     # still pending work for the next run.
     assert driver.pending_lines() == ["products/a.md", "products/b.md"]
@@ -735,7 +735,7 @@ def test_cancelling_the_stop_keeps_the_file_a_parked_worker_had_claimed(
                             ran.append(cmd.label), (0, 0.0, 0.01))[1])
     monkeypatch.setattr(parallel, "usage_source_for",
                         lambda provider: _PeggedSource())
-    monkeypatch.setattr(cyclecore, "confirm_stop_request", cancel_it)
+    monkeypatch.setattr(stopchannel, "confirm_stop_request", cancel_it)
     captured = _capture_disabled_app(monkeypatch)
     driver = _MemListDriver(["products/a.md", "products/b.md"])
     driver.limit_policy = LimitPolicy([SessionLimit(80)])
@@ -769,7 +769,7 @@ def test_a_withdrawn_request_does_not_reset_the_consecutive_error_brake(
         return 1
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", always_fails)
-    monkeypatch.setattr(cyclecore, "confirm_stop_request", cancel_it)
+    monkeypatch.setattr(stopchannel, "confirm_stop_request", cancel_it)
     captured = _capture_disabled_app(monkeypatch)
 
     with pytest.raises(SystemExit):
@@ -804,6 +804,6 @@ def test_stop_file_path_follows_the_project_root(tmp_path):
     previous = cyclecore.project_dir()
     try:
         cyclecore.set_project_root(str(tmp_path))
-        assert cyclecore.STOP_FILE == os.path.join(str(tmp_path), "stop")
+        assert stopchannel.STOP_FILE == os.path.join(str(tmp_path), "stop")
     finally:
         cyclecore.set_project_root(previous)

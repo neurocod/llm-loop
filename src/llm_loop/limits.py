@@ -41,7 +41,8 @@ from datetime import datetime
 from typing import Optional
 
 from .cyclecore import (CLAUDE_SESSION_DURATION, _fmt_clock, _fmt_left,
-                        print_percents, sleep_unless)
+                        print_percents)
+from .stopchannel import sleep_unless
 from .usage import QUOTA_BY_FIELD, Usage, UsageReading
 
 # Default ceilings for the ready-made rules (all overridable per instance).
@@ -276,7 +277,7 @@ class LimitPolicy:
         when the *session* window actually reset, so callers can reset their
         per-session bookkeeping; otherwise it is returned unchanged.
 
-        `should_stop` is the caller's stop channels (see cyclecore.sleep_unless).
+        `should_stop` is the caller's stop channels (see stopchannel.sleep_unless).
         The pause here is the longest hold in the engine — hours, with every
         worker parked in it — so it must be abandonable: the caller re-reads its
         own stop state after this returns and decides what to do about it.

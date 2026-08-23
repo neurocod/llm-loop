@@ -18,7 +18,7 @@ import os
 import sys
 import threading
 
-from llm_loop import cyclecore, parallel
+from llm_loop import cyclecore, parallel, stopchannel
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 from llm_loop.drivers import ListFileDriver
@@ -261,7 +261,7 @@ def test_cancelling_the_stop_reopens_claims_while_a_job_runs(tmp_path, monkeypat
         cyclecore.set_project_root(previous)
 
     assert driver.pending_lines() == [], "claims never reopened"
-    assert result["value"].reason is not cyclecore.RunStopReason.STOP_FILE
+    assert result["value"].reason is not stopchannel.RunStopReason.STOP_FILE
     assert result["value"].completed == 2
     assert not (tmp_path / "stop").exists()
 
@@ -271,7 +271,7 @@ def test_an_interactive_stop_left_alone_ends_the_run(tmp_path, monkeypatch):
     finished, nothing new claimed — and no sentinel anywhere, so a second run in
     the same root is untouched by this one's `s`."""
     made = _live_statusline(monkeypatch, {})
-    monkeypatch.setattr(cyclecore, "STOP_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(stopchannel, "STOP_GRACE_SECONDS", 0.05)
     driver = _MemDriver(["products/a.md", "products/b.md"])
     in_flight = threading.Event()
     release = threading.Event()
@@ -285,7 +285,7 @@ def test_an_interactive_stop_left_alone_ends_the_run(tmp_path, monkeypatch):
     monkeypatch.setattr(parallel, "run_job", block_the_first_job)
     previous = cyclecore.project_dir()
     try:
-        with cyclecore.stop_file_lifecycle():
+        with stopchannel.stop_file_lifecycle():
             done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=1))
             assert in_flight.wait(5)
             made["app"].request_stop()
@@ -297,7 +297,7 @@ def test_an_interactive_stop_left_alone_ends_the_run(tmp_path, monkeypatch):
         release.set()
         cyclecore.set_project_root(previous)
 
-    assert result["value"].reason is cyclecore.RunStopReason.STOP_KEY
+    assert result["value"].reason is stopchannel.RunStopReason.STOP_KEY
     assert driver.pending_lines() == ["products/b.md"]   # nothing new claimed
 
 
@@ -323,7 +323,7 @@ def test_a_sentinel_this_run_did_not_write_is_not_reopenable(tmp_path, monkeypat
     monkeypatch.setattr(parallel, "run_job", block_the_first_job)
     previous = cyclecore.project_dir()
     try:
-        with cyclecore.stop_file_lifecycle():
+        with stopchannel.stop_file_lifecycle():
             done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=2))
             assert in_flight.wait(5)
             (tmp_path / "stop").write_text("", encoding="utf-8")   # not the `s` key
@@ -337,7 +337,7 @@ def test_a_sentinel_this_run_did_not_write_is_not_reopenable(tmp_path, monkeypat
         cyclecore.set_project_root(previous)
 
     assert made["app"].enabled is False   # released with the run, but it WAS live
-    assert result["value"].reason is cyclecore.RunStopReason.STOP_FILE
+    assert result["value"].reason is stopchannel.RunStopReason.STOP_FILE
     assert driver.pending_lines() == ["products/b.md"]   # nothing new claimed
 
 
@@ -354,7 +354,7 @@ def test_a_max_items_stop_is_never_reopened():
     shared.request_stop(1)
     assert shared.reopen_claims()
     assert shared.claim() is None
-    assert shared.stop_reason is cyclecore.RunStopReason.LIMIT_REACHED
+    assert shared.stop_reason is stopchannel.RunStopReason.LIMIT_REACHED
 
 
 def test_only_one_worker_owns_the_pending_request():

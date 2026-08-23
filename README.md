@@ -179,6 +179,7 @@ src/
   llm_loop/
     cyclecore.py     engine: parse_args, run_loop, the Driver protocol,
                      git-push policy, mirror log, stream-json rendering
+    stopchannel.py   how a run is asked to stop or hold, and what it reports
     providers.py     Claude/Codex executable flags and argv construction
     drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)
     parallel.py      run_parallel: N concurrent LLM workers over a list file

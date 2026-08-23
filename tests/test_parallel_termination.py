@@ -13,7 +13,7 @@ import os
 import threading
 import time
 
-from llm_loop import parallel
+from llm_loop import parallel, stopchannel
 from llm_loop.drivers import ListFileDriver
 
 
@@ -122,8 +122,6 @@ def test_a_paused_fleet_claims_nothing_until_it_is_let_go(tmp_path, monkeypatch)
     the hold — where a stop latched meanwhile releases it — and the point of the
     key is that it costs the run nothing.
     """
-    from llm_loop import cyclecore
-
     paused = threading.Event()
     paused.set()
     started = threading.Event()
@@ -133,7 +131,7 @@ def test_a_paused_fleet_claims_nothing_until_it_is_let_go(tmp_path, monkeypatch)
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", watched_job)
-    monkeypatch.setattr(cyclecore, "pause_requested",
+    monkeypatch.setattr(stopchannel, "pause_requested",
                         lambda app=None: paused.is_set())
     driver = _MemDriver(["products/a.md", "products/b.md"])
     done = threading.Event()
@@ -161,8 +159,6 @@ def test_a_paused_fleet_still_ends_when_the_queue_drains(tmp_path, monkeypatch):
     claim — so a fleet that waited for a boundary that will never come never set
     `stop`, and run_parallel's join() never returned. `p` hung the whole run.
     """
-    from llm_loop import cyclecore
-
     paused = threading.Event()
 
     def pause_while_it_runs(job_id, command, mailbox=None):
@@ -170,7 +166,7 @@ def test_a_paused_fleet_still_ends_when_the_queue_drains(tmp_path, monkeypatch):
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", pause_while_it_runs)
-    monkeypatch.setattr(cyclecore, "pause_requested",
+    monkeypatch.setattr(stopchannel, "pause_requested",
                         lambda app=None: paused.is_set())
     driver = _MemDriver(["products/only.md"])
 
@@ -183,8 +179,6 @@ def test_a_paused_fleet_still_ends_when_the_queue_drains(tmp_path, monkeypatch):
 def test_a_paused_fleet_still_ends_at_the_item_cap(tmp_path, monkeypatch):
     """The other half: --max-runs is knowable without asking the queue, and the
     sequential loop already ends on it rather than holding — so must this one."""
-    from llm_loop import cyclecore
-
     paused = threading.Event()
 
     def pause_while_it_runs(job_id, command, mailbox=None):
@@ -192,7 +186,7 @@ def test_a_paused_fleet_still_ends_at_the_item_cap(tmp_path, monkeypatch):
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", pause_while_it_runs)
-    monkeypatch.setattr(cyclecore, "pause_requested",
+    monkeypatch.setattr(stopchannel, "pause_requested",
                         lambda app=None: paused.is_set())
     driver = _MemDriver(["products/a.md", "products/b.md"])
 

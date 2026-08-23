@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import cmdline, cyclecore, termio, textwidth
+from . import cmdline, cyclecore, stopchannel, termio, textwidth
 
 __all__ = [
     "Action",
@@ -410,7 +410,7 @@ class LoopStatus:
     phase: str = "idle"                      # idle|running|paused|waiting|stopping
     quotas: List[Tuple] = field(default_factory=list)
     script_limits: List[Tuple[str, str]] = field(default_factory=list)
-    # "" when nothing is pending, else the cyclecore.StopSource value that is
+    # "" when nothing is pending, else the stopchannel.StopSource value that is
     # asking for the stop. The SOURCE, not a bool, because the two read
     # differently on the row: only a `s` request can be taken back from here.
     stop_pending: str = ""
@@ -754,7 +754,7 @@ class StopSegment(Segment):
         glyph = "" if PHASE_GLYPHS.get(status.phase) == STOP_GLYPH \
             else f"{STOP_GLYPH} "
         tail = ("press s to cancel"
-                if status.stop_pending == cyclecore.StopSource.KEY.value
+                if status.stop_pending == stopchannel.StopSource.KEY.value
                 else "stop file present")
         return f"{glyph}STOP pending — {tail}"
 
@@ -1764,7 +1764,7 @@ class StatusApp:
         self._atexit_registered = False
         self._signal_handlers: List[Tuple[int, object]] = []
         # The `p` key's flag: what the RUNNERS read (through
-        # cyclecore.pause_requested), while the row reads `status.paused`. Two
+        # stopchannel.pause_requested), while the row reads `status.paused`. Two
         # spellings of one fact, moved together by request_pause/resume, and
         # under no lock unlike `_requested_stop`: nothing else writes either of
         # them, a bool read is atomic, and a reader one poll interval behind
@@ -1956,18 +1956,18 @@ class StatusApp:
 
     @property
     def stop_file(self) -> str:
-        # Read late: --project-dir moves cyclecore.STOP_FILE after import.
-        return self._stop_file or cyclecore.STOP_FILE
+        # Read late: --project-dir moves stopchannel.STOP_FILE after import.
+        return self._stop_file or stopchannel.STOP_FILE
 
     @property
     def stop_requested_here(self) -> bool:
         """True while THIS run's `s` key is asking it to stop.
 
-        In-process by design (see `cyclecore.StopSource`): it addresses the one
+        In-process by design (see `stopchannel.StopSource`): it addresses the one
         run whose terminal the key was typed into, so concurrent loops sharing a
         project root can be stopped one at a time.
 
-        `cyclecore.confirm_stop_request`'s cancel grace hangs off this rather
+        `stopchannel.confirm_stop_request`'s cancel grace hangs off this rather
         than off `enabled`: a stop file written by somebody else (a script's
         `touch stop`, another run) must halt this run as promptly as it always
         did — nobody is sitting at this terminal waiting to press `s` again.
@@ -1980,7 +1980,7 @@ class StatusApp:
         sentinel to clean up, and the loop next door keeps running."""
         with self._stop_lock:
             self._requested_stop = True
-            self.status.update(stop_pending=cyclecore.StopSource.KEY.value)
+            self.status.update(stop_pending=stopchannel.StopSource.KEY.value)
         self.note("stop requested — this run halts at the next iteration "
                   "boundary (other runs are unaffected)")
 
@@ -1999,7 +1999,7 @@ class StatusApp:
         Says nothing about what the loop is doing RIGHT NOW: the flag can be
         raised mid-iteration, and that iteration still finishes. What it
         promises is that no new one starts while it is up — see
-        `cyclecore.wait_while_paused`, which is where both runners honour it.
+        `stopchannel.wait_while_paused`, which is where both runners honour it.
         """
         return self._paused
 
@@ -2019,7 +2019,7 @@ class StatusApp:
     def _sentinel_pending(self) -> str:
         """The stop-file half of `stop_pending` (call under `_stop_lock`)."""
         try:
-            return (cyclecore.StopSource.FILE.value
+            return (stopchannel.StopSource.FILE.value
                     if os.path.exists(self.stop_file) else "")
         except OSError:
             return ""
@@ -2151,7 +2151,7 @@ class StatusApp:
                     # anyone does to the file. Under the same lock as the key
                     # press so the flag and the row cannot disagree.
                     with self._stop_lock:
-                        pending = (cyclecore.StopSource.KEY.value
+                        pending = (stopchannel.StopSource.KEY.value
                                    if self._requested_stop
                                    else self._sentinel_pending())
                         if pending != self.status.stop_pending:

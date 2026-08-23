@@ -46,6 +46,7 @@ __version__ = "0.1.0"
 
 from . import cmdline
 from . import exitlog
+from . import stopchannel
 from .cyclecore import (
     AgentCommand,
     ClaudeCommand,
@@ -54,29 +55,34 @@ from .cyclecore import (
     GitPushPolicy,
     LoopStop,
     RateLimitEvent,
-    REQUESTED_STOP_REASONS,
-    RunResult,
-    RunStopReason,
-    StopSource,
     build_agent_argv,
     build_claude_argv,
-    commit_stop,
-    confirm_stop_request,
     find_project_root,
     last_rate_limit_event,
-    latched_stop,
     log_file_path,
     parse_args,
     parse_duration,
-    pause_requested,
-    pending_stop,
     project_dir,
-    stop_file_for,
     rate_limit_event_from,
     report_costs,
     run_loop,
     run_agent_streaming,
     set_project_root,
+)
+# The stop/pause vocabulary moved out of cyclecore into its own module; the
+# front door is unchanged on purpose, since an embedder asks the PACKAGE for
+# `pending_stop`, not the module that used to hold it.
+from .stopchannel import (
+    REQUESTED_STOP_REASONS,
+    RunResult,
+    RunStopReason,
+    StopSource,
+    commit_stop,
+    confirm_stop_request,
+    latched_stop,
+    pause_requested,
+    pending_stop,
+    stop_file_for,
     wait_while_paused,
 )
 from .providers import (
@@ -201,6 +207,7 @@ __all__ = [
     "set_project_root",
     "settings_path",
     "stop_file_for",
+    "stopchannel",
     "usage_source_for",
     "wait_while_paused",
 ]
