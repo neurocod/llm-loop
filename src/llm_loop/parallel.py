@@ -1154,7 +1154,17 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         for line in sorted(shared.failed):
             print(f"      {os.path.basename(line.strip())}")
     cyclecore.report_undelivered_notes(mailbox)
-    reason = shared.stop_reason or RunStopReason.NO_WORK
+    # `stop_reason` unset means no worker ever reached a verdict about the run:
+    # every one of the endings — the cap, the drained queue, a latched stop —
+    # writes it before a worker can leave. So the threads did not run out of
+    # work, they died holding it (see Shared.abandon), and NO_WORK would tell
+    # the reader the opposite of what happened. A queue that ends with lines
+    # parked in `failed` is NOT this case: `_exhausted` latched NO_WORK there.
+    reason = shared.stop_reason
+    if reason is None:
+        reason = RunStopReason.WORKERS_DIED
+        print(f"  ⚠ every worker thread ended before the queue drained; "
+              f"{remaining} file(s) left unclaimed.")
     # See run_loop's matching call: the closing line belongs to the process, so
     # the reason is recorded here and printed by exitlog on the way out.
     exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),

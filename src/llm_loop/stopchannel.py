@@ -41,6 +41,12 @@ class RunStopReason(Enum):
     NO_WORK = "no_work"
     DRIVER_STOP = "driver_stop"
     DRY_RUN = "dry_run"
+    # Only the parallel runner can reach this one, and only since its workers
+    # started handing their claims back as they die (Shared.abandon): a run whose
+    # whole fleet died ends with nobody having observed the queue drain, and
+    # calling that NO_WORK would tell the reader the opposite of what happened —
+    # there is work left, there is just nobody to do it.
+    WORKERS_DIED = "workers_died"
 
 
 class StopSource(Enum):
@@ -81,6 +87,7 @@ STOP_REASON_TEXT = {
     RunStopReason.NO_WORK: "no more work in the queue",
     RunStopReason.DRIVER_STOP: "the driver stopped the run",
     RunStopReason.DRY_RUN: "dry run finished",
+    RunStopReason.WORKERS_DIED: "every worker died before the queue drained",
 }
 
 # The reasons that mean "a human asked this INVOCATION to stop", as opposed to

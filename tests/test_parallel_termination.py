@@ -23,6 +23,7 @@ import pytest
 
 from llm_loop import parallel, stopchannel
 from llm_loop.drivers import ListFileDriver
+from llm_loop.stopchannel import RunStopReason
 
 
 class _MemDriver(ListFileDriver):
@@ -299,6 +300,11 @@ def test_a_worker_dying_mid_turn_does_not_hang_the_run(tmp_path, monkeypatch):
     # line at zero attempts — retried for ever, one dead worker at a time.
     assert result.attempted == 5, \
         f"a started-then-crashed turn was not counted: {result}"
+    # And the run says so. Nobody reached a verdict here — every ending writes
+    # `stop_reason` before its worker can leave — so reporting NO_WORK would
+    # claim the queue drained while a file is still sitting in it.
+    assert result.reason is RunStopReason.WORKERS_DIED, \
+        f"a fleet that died reported the wrong reason: {result}"
 
 
 @_EXPECTED_THREAD_DEATH
