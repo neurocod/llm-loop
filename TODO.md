@@ -105,6 +105,18 @@ The run never terminates and its `join()` never returns. Found while changing
 and the suite hung instead of failing. Fix: wrap the body, `shared.release(line)`
 on an unexpected exception, and treat it as a failed attempt.
 
+### [P3] A `p` pause does not survive a wrapper's batch boundary
+
+Each runner call builds its own `StatusApp`, so `_paused` dies with it — the
+same trap `s` has (and works around by returning a `RunResult.reason` the
+wrapper acts on, see `REQUESTED_STOP_REASONS`). A wrapper that slices one
+invocation into several runner calls — the host project's
+`runGenerateModels.py -p`, which calls `run_parallel` once per batch — therefore
+starts the next batch unpaused, silently, after the user held the run. Nothing
+carries the flag across: `InvocationProgress` is the seam for invocation-wide
+state, but it holds figures, not requests. Not reachable from `runCycle.py`
+(one call per process), which is why it is here rather than fixed.
+
 ### [P3] Nothing ties `FLAG_ALIASES` to the parsers it mirrors
 `cmdline.FLAG_ALIASES` is hand-kept in step with `cyclecore.parse_args`,
 `parallel.parse_args` and the host wrapper's own flags — its comment says so and

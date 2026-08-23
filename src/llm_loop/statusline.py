@@ -91,6 +91,7 @@ __all__ = [
     "fit_tail",
     "format_elapsed",
     "format_prompt_block",
+    "pause_state",
     "push_quotas",
     "quota_rows",
     "render_rows",
@@ -670,17 +671,37 @@ class Segment:
         raise NotImplementedError
 
 
+def pause_state(status: LoopStatus) -> str:
+    """"" | "pausing" | "paused" — a pause request weighed against what is running.
+
+    The distinction is a SAFETY one, not a nicety. The reason to hold a run is
+    to touch what it works on, and a request made mid-iteration does not stop
+    that iteration — it finishes. A row that said PAUSED from the keypress
+    therefore invited exactly the race the key exists to prevent: the note
+    explaining it expires after NOTE_TTL, the marker does not, and the person
+    who walked back to the terminal reads "PAUSED" over a running agent.
+
+    So PAUSED means the run is actually standing still, and until then the row
+    says PAUSING. Derived from the Jobs rather than kept as a second flag: they
+    already know what is in flight, in both runners, and a flag would be one
+    more thing for a hold to keep in step.
+    """
+    if not status.paused:
+        return ""
+    return "pausing" if any(job.running for job in status.jobs) else "paused"
+
+
 class IterationSegment(Segment):
     """"⟳ iter 12/40 rand" — phase glyph, counter, optional cap and order marker.
 
-    A pause outranks the phase: the phase describes the ITERATION (running,
-    waiting on the gate, idle between two), and while `p` is up there is no next
-    iteration to describe. Reading it off the flag also means neither runner has
-    to set a phase for the hold and then guess what to set it back to.
+    A run that is actually held outranks the phase: the phase describes the
+    ITERATION (running, waiting on the gate, idle between two), and there is no
+    next iteration to describe. Reading it off the state also means neither
+    runner has to set a phase for the hold and then guess what to set it back to.
     """
 
     def text(self, status, now=None):
-        glyph = (PAUSE_GLYPH if status.paused
+        glyph = (PAUSE_GLYPH if pause_state(status) == "paused"
                  else PHASE_GLYPHS.get(status.phase, "·"))
         text = f"{glyph} iter {status.iteration}"
         if status.max_iterations is not None:
@@ -795,18 +816,25 @@ class ScriptLimitSegment(Segment):
 
 
 class PauseSegment(Segment):
-    """The paused marker — "PAUSED — press p to resume".
+    """The pause marker — "PAUSING …" while an iteration finishes, then "PAUSED".
 
     Carries no glyph of its own: `IterationSegment` already opens the row with
-    ⏸ whenever this field is shown. What it adds is the half the glyph cannot
+    ⏸ once the run is actually held. What it adds is the half the glyph cannot
     say — that the run is standing still because somebody asked it to, and not
     because it is waiting out a rate-limit window, which wears the same glyph.
+
+    Why the two wordings differ by more than a tense: PAUSING is the state in
+    which the files are NOT safe to touch (see `pause_state`), so it says what
+    is being waited for rather than offering the resume key.
     """
 
+    WORDING = {
+        "pausing": "PAUSING — the iteration in flight finishes first",
+        "paused": "PAUSED — press p to resume",
+    }
+
     def text(self, status, now=None):
-        if not status.paused:
-            return None
-        return "PAUSED — press p to resume"
+        return self.WORDING.get(pause_state(status))
 
 
 class StopSegment(Segment):
@@ -969,8 +997,11 @@ class Layout:
         # touching this file.
         segments += [QuotaSegment(i) for i in range(len(status.quotas))]
         segments += [ScriptLimitSegment(i) for i in range(len(status.script_limits))]
-        segments.append(PauseSegment())
+        # Stop last but one, pause last: `fit` cuts the row from the END, so on a
+        # narrow terminal holding both requests the pause marker is the one that
+        # goes — a stop is the louder of the two, and the only one on a clock.
         segments.append(StopSegment())
+        segments.append(PauseSegment())
         return SegmentRow(segments)
 
     def rows(self, status: LoopStatus) -> List[Row]:
@@ -2319,10 +2350,14 @@ class StatusApp:
         self._stop_lock = threading.Lock()
         self._atexit_registered = False
         self._signal_handlers: List[Tuple[int, object]] = []
-        # The `p` key's flag. Written by the input thread, read by the loop's —
-        # a plain bool, like `_requested_stop`, and unlike it under no lock: it
-        # pairs with no second state (the row reads `status.paused`, which
-        # LoopStatus already guards), so there is nothing here to keep in step.
+        # The `p` key's flag: what the RUNNERS read (through
+        # cyclecore.pause_requested), while the row reads `status.paused`. Two
+        # spellings of one fact, moved together by request_pause/resume, and
+        # under no lock unlike `_requested_stop`: nothing else writes either of
+        # them, a bool read is atomic, and a reader one poll interval behind
+        # simply holds a quarter-second longer. The lock on the stop flag is
+        # there for a different reason — the sentinel poll re-derives
+        # `stop_pending` from the file and the flag TOGETHER.
         self._paused = False
         if default_actions:
             self.register_action(StopAction())

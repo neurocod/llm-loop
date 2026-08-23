@@ -492,22 +492,30 @@ forever.
 
 `p` pauses the loop and `p` again resumes it. The iteration in flight is never
 interrupted — it finishes its one state transition, and the next one does not
-begin; the pinned row shows `⏸ … PAUSED — press p to resume` for as long as the
-hold lasts. In a parallel run the same key stops new files being claimed, and
-whatever is already running finishes.
+begin. That gap is the point: nothing the loop reads (a state file, a task list,
+the tree itself) is being written while it holds, so it can be edited, and the
+next iteration is what reads the edit. In a parallel run the same key stops new
+files being claimed, and whatever is already running finishes.
 
-The hold sits where it does on purpose: after the `--max-runs` check, so a run
-with no iteration left to hold back ends instead of standing paused for a
-boundary that will never come, and before the driver is asked for the next unit
-of work, which is the whole point of the key. While it holds, the files the loop
-reads — a state file, a task list, the tree itself — are nobody's to race, so
-they can be edited and the next iteration reads the edit.
+**Read the row, not the keypress**, because the two are not the same moment:
+
+```
+ ⟳ iter 12/40 | … | PAUSING — the iteration in flight finishes first
+ ⏸ iter 12/40 | … | PAUSED — press p to resume
+```
+
+Only the second line means the run is standing still and the files are yours.
+(`pause_state` in `statusline.py` is the whole rule.)
 
 Held, a run still answers everything else: `s` ends the hold and stops the run
 (with its usual cancel countdown), the `stop` file does the same, and `m` queues
 a note that rides the next iteration's prompt. Like `s`, `p` is in-process and
 writes nothing to disk — it holds the run whose terminal it was typed into, and
 the ones next door work on.
+
+What a hold does **not** do is keep a finished run alive: a sequential run that
+has reached `--max-runs`, and a parallel one whose queue drained or hit its item
+cap, end instead of waiting for a boundary that will never come.
 
 ## Talking to the running agent (`m`)
 

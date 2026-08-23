@@ -152,17 +152,31 @@ def test_a_stop_file_marker_does_not_offer_a_cancel_the_key_cannot_do():
     assert "press s to cancel" not in row
 
 
-def test_the_paused_marker_appears_only_while_paused():
-    assert "PAUSED" not in sl.render_rows(sequential_status(), 200, now=NOW)[1]
+def test_the_pause_marker_appears_only_while_paused():
+    assert "PAUS" not in sl.render_rows(sequential_status(), 200, now=NOW)[1]
 
     row = sl.render_rows(sequential_status(paused=True), 200, now=NOW)[1]
 
-    assert "PAUSED — press p to resume" in row
-    # The glyph outranks the phase: the run says "running" right up to the
-    # boundary it will hold at, and a row that opened with ⟳ would deny the
-    # marker next to it.
-    assert row.lstrip().startswith(sl.PAUSE_GLYPH)
-    assert row.count(sl.PAUSE_GLYPH) == 1
+    assert "PAUSING — the iteration in flight finishes first" in row
+
+
+def test_a_request_made_mid_iteration_does_not_yet_read_as_held():
+    """The safety line of the whole feature: the files are touchable only once
+    the run is standing still, and the row must not say so a moment early — the
+    note explaining it expires, the marker does not."""
+    running = sequential_status(paused=True)            # the fixture job is busy
+    held = sequential_status(paused=True)
+    held.jobs[0].finish()
+
+    running_row = sl.render_rows(running, 200, now=NOW)[1]
+    held_row = sl.render_rows(held, 200, now=NOW)[1]
+
+    assert "PAUSING" in running_row and "PAUSED" not in running_row
+    assert running_row.lstrip().startswith("⟳")         # still running, and says so
+    assert "PAUSED — press p to resume" in held_row
+    # Held, the glyph outranks the phase — one ⏸, at the head of the row.
+    assert held_row.lstrip().startswith(sl.PAUSE_GLYPH)
+    assert held_row.count(sl.PAUSE_GLYPH) == 1
 
 
 def test_a_rate_limit_hold_wears_the_glyph_without_claiming_to_be_the_p_key():
@@ -1472,6 +1486,70 @@ def test_a_paused_loop_holds_before_it_asks_the_driver_for_work(monkeypatch,
     assert seen[1:4] == [1, 1, 1]
     assert driver.calls == 2
     assert app.status.iteration == 2
+
+
+def test_a_pause_pressed_at_the_usage_gate_holds_the_next_iteration(monkeypatch,
+                                                                    tmp_path):
+    """The gate is the longest hold in the engine — hours with nothing moving —
+    so it is exactly where somebody reaches for `p`. The gate does not watch the
+    pause, so the loop head has to re-read it: without that the window opened
+    and a full iteration started under a row that already said PAUSED."""
+    from llm_loop import cyclecore
+    from llm_loop.cyclecore import AgentCommand, Driver
+
+    key = {"up": False, "reads": 0}
+
+    def fake_pause_requested(app=None):
+        if not key["up"]:
+            return False
+        key["reads"] += 1
+        if key["reads"] > 3:
+            key["up"] = False         # as if `p` were pressed a second time
+        return key["up"]
+
+    monkeypatch.setattr(cyclecore, "pause_requested", fake_pause_requested)
+
+    class _PressesPAtTheGate:
+        """A policy that never holds, but is where the key gets pressed."""
+
+        rules = ()
+        reached = False
+
+        def describe(self):
+            return "never holds"
+
+        def log_snapshot(self, *a, **k):
+            pass
+
+        def rule_for(self, quota):
+            return None
+
+        def check_and_wait(self, source, session_start, note="",
+                           cache_value=True, should_stop=None):
+            self.reached = True
+            key["up"] = True
+            return False, session_start
+
+    asked_while_paused = []
+
+    class _OneItem(Driver):
+        calls = 0
+
+        def next_command(self):
+            asked_while_paused.append(key["up"])
+            self.calls += 1
+            return (AgentCommand("do the thing", "", "item-1")
+                    if self.calls == 1 else None)
+
+    driver = _OneItem()
+    policy = _PressesPAtTheGate()
+    driver.limit_policy = policy
+
+    _app, _source = _run_with_status(monkeypatch, tmp_path, driver, max=None)
+
+    assert policy.reached, "the gate was never entered — the test proved nothing"
+    assert asked_while_paused == [False, False]
+    assert key["up"] is False and driver.calls == 2
 
 
 def _counts_down(total):

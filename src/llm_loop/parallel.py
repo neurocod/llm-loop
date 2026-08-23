@@ -369,6 +369,48 @@ class Shared:
         # announce one keypress eight times.
         self.paused_noted = False
 
+    def _pending(self) -> list:
+        """Lines nobody holds and nobody gave up on (call under `lock`)."""
+        return [ln for ln in self.driver.pending_lines()
+                if ln not in self.in_progress and ln not in self.failed]
+
+    def _exhausted(self, pending: list) -> bool:
+        """Has this run run out of work to give? (call under `lock`)
+
+        The two ways it ends of its own accord — the item cap, and a queue that
+        drained with nobody still working — latched here rather than inside
+        `claim`, because a worker that is NOT claiming has to be able to ask.
+        See `exhausted`, and the pause hold in `worker` that uses it.
+
+        A queue that is merely empty right now is not exhausted: the rest is in
+        flight elsewhere, and the caller backs off and retries.
+        """
+        if self.claims_closed.is_set():
+            return True
+        if self.max_items is not None and self.claimed >= self.max_items:
+            self.stop_reason = RunStopReason.LIMIT_REACHED
+            self.claims_closed.set()
+            return True
+        if not pending and not self.in_progress:
+            self.stop_reason = RunStopReason.NO_WORK
+            self.claims_closed.set()
+            self.stop.set()
+            return True
+        return False
+
+    def exhausted(self) -> bool:
+        """True once this run has no work left to give, latching why.
+
+        Asked by a worker held on `p`: a pause is about not STARTING work, and a
+        run with none left has no start to hold back — while a fleet that waits
+        for one anyway never sets `stop`, so `run_parallel`'s join() never
+        returns and the whole run hangs on a key that was only meant to slow it
+        down. It is the same reading `claim` acts on, from the same lock, so the
+        two cannot come to different verdicts about the run being over.
+        """
+        with self.lock:
+            return self._exhausted(self._pending())
+
     def claim(self) -> Optional[str]:
         """Reserve the next pending list line, or signal why there is none.
 
@@ -378,22 +420,13 @@ class Shared:
         stop sentinel; `stop` cancels claims held at a usage gate.
         """
         with self.lock:
-            if self.claims_closed.is_set() or self.stop_requested.is_set():
+            if self.stop_requested.is_set():
                 return None
-            if self.max_items is not None and self.claimed >= self.max_items:
-                self.stop_reason = RunStopReason.LIMIT_REACHED
-                self.claims_closed.set()
+            pending = self._pending()
+            if self._exhausted(pending):
                 return None
-            pending = [ln for ln in self.driver.pending_lines()
-                       if ln not in self.in_progress
-                       and ln not in self.failed]
             if not pending:
-                # Drained only if no one else is still working; otherwise back off.
-                if not self.in_progress:
-                    self.stop_reason = RunStopReason.NO_WORK
-                    self.claims_closed.set()
-                    self.stop.set()
-                return None
+                return None   # busy: others hold the rest — the caller backs off
             # The driver decides the order (random by default, list order when
             # it sets pick_order = "list"); we are already under the lock, which
             # is the thread-safety pick() is documented to expect.
@@ -641,6 +674,8 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # `shared.stop.wait` rather than sleep, so a latched stop releases this
         # worker at once, and the loop head above is what acts on it.
         if cyclecore.pause_requested(app):
+            if shared.exhausted():
+                break       # nothing left to hold back — see Shared.exhausted
             if shared.note_pause(True):
                 emit_job(job_id, f"{statusline.PAUSE_GLYPH} paused — no new "
                          "files will be claimed; press p to resume.", "yellow")

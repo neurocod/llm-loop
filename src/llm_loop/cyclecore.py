@@ -2087,6 +2087,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
     iteration = 0
     completed = 0
+    paused_since = 0.0            # start of the pause being held (0.0 = none)
     stop_reason = RunStopReason.NO_WORK
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     dry_run_prompt_shown = False  # dry-run: show job 1's prompt once, not per pass
@@ -2176,17 +2177,28 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # tree are all quiet while it holds, so an edit made now is what the
             # next iteration reads.
             if pause_requested(app):
-                print(f"\n  {statusline.PAUSE_GLYPH} Paused — press p to resume, "
-                      f"s to stop, m to queue a note for the next iteration.")
-                exitlog.note(phase="paused (p key)", iterations=iteration,
-                             completed=completed)
-                held = wait_while_paused(app, should_stop=stop_pending)
-                print(f"  ▶ Pause released after "
-                      f"{statusline.format_elapsed(held)}.")
+                if not paused_since:
+                    # Announced once per pause, not once per pass: a stop
+                    # requested and then withdrawn inside the hold sends the
+                    # loop back through here, and that is the same pause.
+                    paused_since = time.time()
+                    print(f"\n  {statusline.PAUSE_GLYPH} Paused — press p to "
+                          f"resume, s to stop, m to queue a note for the next "
+                          f"iteration.")
+                    exitlog.note(phase="paused (p key)", iterations=iteration,
+                                 completed=completed)
+                wait_while_paused(app, should_stop=stop_pending)
                 # Back to the head rather than on: a stop pressed during the hold
                 # is the head's to act on (with its cancel grace), and the caps
                 # and quotas are re-read there.
                 continue
+            if paused_since:
+                # Only here, where the loop is actually going on to work: a hold
+                # the stop channels ended never reaches this line, and "pause
+                # released" is not what happened to a run that is stopping.
+                print(f"  ▶ Pause released after "
+                      f"{statusline.format_elapsed(time.time() - paused_since)}.")
+                paused_since = 0.0
 
             # Proactive limit check: read the real Current-session usage from the
             # account and pause cleanly between iterations if it is already at/over
@@ -2202,11 +2214,18 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 app.update(phase="idle")
                 if paused:
                     consecutive_errors = 0  # fresh window — start counting errors anew
-                if stop_pending():
-                    # Asked to stop while parked on the limit. Back to the loop
-                    # head, which owns the decision (a key press still gets its
-                    # cancel grace, a stop file still ends the run at once) —
-                    # deciding it here would be a second, divergent copy of it.
+                if stop_pending() or pause_requested(app):
+                    # Asked to stop or to hold while parked on the limit. Back to
+                    # the loop head, which owns both decisions (a key press still
+                    # gets its cancel grace, a stop file still ends the run at
+                    # once) — deciding here would be a second, divergent copy.
+                    #
+                    # The pause half is not symmetry: the gate is the longest
+                    # hold in the engine, so it is exactly where somebody watching
+                    # a run that is doing nothing reaches for `p`. Without this
+                    # re-read the flag was set, the gate did not watch it, and the
+                    # window opening started a full iteration under a row that
+                    # already said PAUSED.
                     continue
 
             # Ask the driver what to do next. None => no more work (stop cleanly);
