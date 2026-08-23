@@ -58,7 +58,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Union
 
-from . import exitlog, operator, providers, textwidth
+from . import compactline, exitlog, operator, providers, textwidth
 from .providers import (
     build_agent_argv as provider_argv,
     note_channel,
@@ -853,8 +853,8 @@ def git_push() -> bool:
     if proc.returncode == 0:
         print_done("  · git push: done.")
         return True
-    head = f"  · git push failed (exit {proc.returncode}): "
-    print_error(head + _short(proc.stdout or "", textwidth.line_budget(head)))
+    LINES.fitted(f"  · git push failed (exit {proc.returncode}): ",
+                 proc.stdout or "", "bold red")
     return False
 
 
@@ -926,136 +926,6 @@ def build_claude_argv(command: ClaudeCommand) -> list:
     return build_agent_argv(command, "claude")
 
 
-def _collapse(text) -> str:
-    """One line's worth of `text`: every run of whitespace becomes one space.
-
-    Split from `_short` because the two-field split needs to MEASURE a value
-    before deciding how much of it to keep, and measuring the raw text would
-    count newlines and indentation that are never printed.
-    """
-    return " ".join(str(text).split())
-
-
-def _short(text, limit: Optional[int] = None) -> str:
-    """Single-line version of `text`, cut to `limit` terminal COLUMNS.
-
-    `limit` defaults to a bare terminal line (`textwidth.line_budget()`); a
-    caller that prints a head in front of the result passes
-    `textwidth.line_budget(that_head)` so the two together fill the width
-    instead of overflowing it. The cut is delegated to `textwidth.fit`, which
-    counts cells: cutting by characters here while the budget was measured in
-    columns is how a command echoing CJK produced a 299-character line 580
-    columns wide.
-    """
-    return textwidth.fit(_collapse(text),
-                         textwidth.line_budget() if limit is None else limit)
-
-
-def _fit_two(budget: int, first, second) -> tuple:
-    """Cut two variable fields of ONE line to share its `budget`.
-
-    Both fit — both are kept whole. Only one is oversized — it takes what the
-    other leaves, so a short output never strands half a row of blank next to a
-    command that was cut to make room for it. Both oversized — half each,
-    because the two fields answer different questions (what ran, and why it
-    failed) and a line showing only one of them answers half of it.
-
-    That last case is the one place this records less than the fixed 160+160 it
-    replaced (100 each at the floor). The alternative is the line those figures
-    actually produced: 320 characters wrapped across three rows whatever the
-    terminal.
-    """
-    first, second = _collapse(first), _collapse(second)
-    wide_first = textwidth.cell_width(first)
-    wide_second = textwidth.cell_width(second)
-    if wide_first + wide_second <= budget:
-        return first, second
-    half = budget // 2
-    if wide_first <= half:
-        return first, textwidth.fit(second, budget - wide_first)
-    if wide_second <= half:
-        return textwidth.fit(first, budget - wide_second), second
-    return textwidth.fit(first, half), textwidth.fit(second, budget - half)
-
-
-_BACKSLASH_RUN_RE = re.compile(r"\\+")
-
-
-def undouble_backslashes(text: str) -> str:
-    r"""Halve uniformly doubled backslashes in a command line, for display only.
-
-    Codex reports the command it ran with every backslash doubled — its own
-    escaping, not JSON's (json.loads already removed one level, and the quotes
-    in the same value arrive unescaped) — so a Windows path reaches the screen
-    and the log as C:\\WINDOWS\\... and cannot be copied without hand-editing.
-
-    Halving is the exact inverse only while EVERY run of consecutive backslashes
-    has even length: a UNC \\server\share arrives as four and halves back to its
-    correct two. A single odd run means the string was never uniformly doubled,
-    so it is returned untouched — showing a raw string beats corrupting one.
-    That is why this is not `text.replace("\\\\", "\\")`, which would eat the
-    UNC pair and mangle half-escaped strings.
-
-    Apply it to values that are definitionally command lines, before _short, so
-    truncation counts the characters the reader actually sees.
-    """
-    runs = _BACKSLASH_RUN_RE.findall(text)
-    if not runs or any(len(run) % 2 for run in runs):
-        return text
-    return _BACKSLASH_RUN_RE.sub(lambda m: "\\" * (len(m.group(0)) // 2), text)
-
-
-# What a Bash tool call's detail puts in front of the command, so the line reads
-# as the shell prompt it is.
-BASH_DETAIL_HEAD = "$ "
-
-
-def _describe_tool(name: str, ti: dict, limit: Optional[int] = None) -> str:
-    """Short human-readable description of a tool call and its arguments.
-
-    `limit` is what the caller's own line leaves for this text — the tool-call
-    line is printed as `<indent>⚙ <name>: <this>`, so only the caller knows how
-    wide the head in front of it is (parallel mode adds a `[job k]` tag). Left
-    out, the description is cut to a bare terminal line.
-
-    Every branch that echoes a JSON value goes through `_short`, and not only
-    for the width: these values come out of a provider's JSON, so a `file_path`
-    that arrives as a number or a list used to be returned as-is and reach
-    `print_tool`, whose f-string coerced it. A path is exactly as unbounded as a
-    command — a Grep pattern once printed a 517-column line — and one call fixes
-    both. (`TodoWrite` echoes a count rather than a value, so it needs neither.)
-    """
-    if limit is None:
-        limit = textwidth.line_budget()
-    if name == "Bash":
-        # This head is part of the line too, so the command gets what is left
-        # after it rather than the whole budget. Subtracted from the same value
-        # that is printed: a literal 2 beside a literal "$ " is a number nothing
-        # ties to the string it measures. `len` because it is ASCII — a glyph
-        # here would have to be counted in cells (`textwidth.cell_width`).
-        command = undouble_backslashes(str(ti.get("command", "")))
-        return BASH_DETAIL_HEAD + _short(command,
-                                         limit - len(BASH_DETAIL_HEAD))
-    if name in ("Read", "Edit", "Write", "NotebookEdit"):
-        return _short(ti.get("file_path", ti.get("notebook_path", "")) or "",
-                      limit)
-    if name in ("Glob", "Grep"):
-        loc = f" in {ti['path']}" if ti.get("path") else ""
-        return _short(f"{ti.get('pattern', '')}{loc}", limit)
-    if name == "Skill":
-        return _short(ti.get("skill", "") or "", limit)
-    if name == "Task" or name == "Agent":
-        return _short(ti.get("description", ti.get("prompt", "")) or "", limit)
-    if name == "TodoWrite":
-        todos = ti.get("todos", [])
-        return f"{len(todos)} items"
-    # fallback: the first meaningful field
-    for key in ("url", "query", "description", "prompt"):
-        if ti.get(key):
-            return _short(ti[key], limit)
-    return _short(json.dumps(ti, ensure_ascii=False), limit) if ti else ""
-
-
 # Optional pretty Markdown rendering of the assistant's streamed text via Rich.
 # The model emits its answer as Markdown; with Rich installed we render it live
 # (bold, headings, lists, code fences, tables) instead of dumping the raw
@@ -1066,16 +936,9 @@ try:
     from rich.console import Console as _RichConsole
     from rich.live import Live as _RichLive
     from rich.markdown import Markdown as _RichMarkdown
-    from rich.markup import escape as _rich_escape
     _RICH_AVAILABLE = True
 except ImportError:
     _RICH_AVAILABLE = False
-
-
-def _esc(text: str) -> str:
-    """Escape Rich markup metacharacters in dynamic text (e.g. a Bash command or
-    a file path containing '['). No-op when Rich is unavailable."""
-    return _rich_escape(str(text)) if _RICH_AVAILABLE else str(text)
 
 
 def _real_stream():
@@ -1201,6 +1064,13 @@ def print_markup(plain: str, markup: str) -> None:
         print(plain)
 
 
+# This runner's compact lines: no job tag, straight to the console. The sink is
+# a lambda rather than `print_markup` itself so that the name is resolved per
+# line — the width pins replace it to read the plain copy of what was printed,
+# and a captured function would sail past them (see `compactline.LineWriter`).
+LINES = compactline.LineWriter(lambda plain, markup: print_markup(plain, markup))
+
+
 def print_styled(text: str, style: str) -> None:
     """Print a whole line in one Rich style, routed through `print_markup`.
 
@@ -1211,7 +1081,7 @@ def print_styled(text: str, style: str) -> None:
     that need *different* styles per segment (a coloured glyph next to plain
     text), call `print_markup` directly with hand-written markup.
     """
-    print_markup(text, f"[{style}]{_esc(text)}[/]")
+    print_markup(text, f"[{style}]{compactline.esc(text)}[/]")
 
 
 # Colour scale for the usage percentages (session/week quotas, and the ceilings
@@ -1247,11 +1117,11 @@ def markup_percents(text: str) -> str:
     out = []
     last = 0
     for m in _PERCENT_IN_TEXT_RE.finditer(text):
-        out.append(_esc(text[last:m.start()]))
+        out.append(compactline.esc(text[last:m.start()]))
         value = float(m.group(0).rstrip("% \t"))
         out.append(f"[{percent_style(value)}]{m.group(0)}[/]")
         last = m.end()
-    out.append(_esc(text[last:]))
+    out.append(compactline.esc(text[last:]))
     return "".join(out)
 
 
@@ -1306,66 +1176,8 @@ def print_note(text: str) -> None:
     do so sits in the log next to the turn it landed in.
     """
     print_markup(f"  ✉ operator note: {text}",
-                 f"  [magenta]✉[/] [bold magenta]operator note:[/] {_esc(text)}")
-
-
-# What stands between a tool-call line's head and its detail. Named because two
-# places need it as a value rather than as a literal: the width arithmetic
-# (`tool_line_head`) counts it, and the printer drops it when there is no detail.
-TOOL_DETAIL_SEP = ": "
-
-
-def tool_line_head(name: str) -> str:
-    """Everything a tool-call line prints in FRONT of its detail.
-
-    Exists for the width arithmetic: `textwidth.line_budget(tool_line_head(name))`
-    is how much of the detail fits beside it. Kept here, next to the printer, so a
-    head measured somewhere else cannot drift from the head printed; parallel mode
-    prepends its own `[job k] ` tag to both (see `parallel.emit_tool`).
-    """
-    return f"  ⚙ {name}{TOOL_DETAIL_SEP}"
-
-
-def print_tool(name: str, detail: str = "") -> None:
-    """A tool-call line: a yellow gear glyph and the bold-yellow tool name,
-    followed by the (plain, possibly empty) detail. Multi-segment, so it builds
-    markup and calls `print_markup` rather than print_styled; the shared head is
-    written once instead of being repeated across the with/without-detail forms.
-    """
-    head_plain = tool_line_head(name)
-    head_markup = f"  [yellow]⚙[/] [bold yellow]{_esc(name)}[/]{TOOL_DETAIL_SEP}"
-    if detail:
-        # Joined by f-string, not `+`: a detail is whatever a provider's JSON
-        # put in the field, and a `+` against a number raises where the printed
-        # line used to say `123`. It escapes the stream renderer and ends the
-        # run — see `_describe_tool`, which is why one can no longer arrive.
-        print_markup(f"{head_plain}{detail}", f"{head_markup}{_esc(detail)}")
-    else:
-        cut = len(TOOL_DETAIL_SEP)
-        print_markup(head_plain[:-cut], head_markup[:-cut])
-
-
-def mark_line_head(mark: str) -> str:
-    """Everything an outcome line prints in FRONT of its body.
-
-    The `mark` is a ✓/✗ standing for what a step returned, indented under the
-    tool call it belongs to. Same reason as `tool_line_head`: the head is both
-    measured (`textwidth.line_budget(mark_line_head(mark))`) and printed, and the
-    two spellings drift silently — the printed line then overflows the row by the
-    difference, which is what the width measurement exists to prevent.
-    """
-    return f"    {mark} "
-
-
-def print_mark_line(mark: str, style: str, body: str) -> None:
-    """An outcome line: the ✓/✗ in `style`, then the (plain) body beside it.
-
-    Both providers report an outcome this way — a Claude tool_result and a codex
-    command_execution completion — and they differ only in what they put in the
-    body, so the glyph, the indent and the escaping are decided once here.
-    """
-    print_markup(f"{mark_line_head(mark)}{body}",
-                 f"    [{style}]{mark}[/] {_esc(body)}")
+                 f"  [magenta]✉[/] [bold magenta]operator note:[/] "
+                 f"{compactline.esc(text)}")
 
 
 # Streaming print state: the single content-block index text is currently flowing
@@ -1503,10 +1315,8 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
                     continue  # already printed streaming from the deltas
                 _render_markdown_block(block.get("text", ""))
             elif bt == "tool_use":
-                name = block.get("name", "?")
-                detail = _describe_tool(name, block.get("input", {}) or {},
-                                        textwidth.line_budget(tool_line_head(name)))
-                print_tool(name, detail)
+                LINES.tool_use(block.get("name", "?"),
+                               block.get("input", {}) or {})
         return
 
     if et == "user":
@@ -1525,9 +1335,10 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
                 )
             is_err = block.get("is_error")
             mark = "✗" if is_err else "✓"
-            line = _short(content, textwidth.line_budget(mark_line_head(mark)))
+            line = compactline.short(
+                content, LINES.budget(compactline.mark_line_head(mark)))
             if line:
-                print_mark_line(mark, "red" if is_err else "green", line)
+                LINES.mark(mark, "red" if is_err else "green", line)
         return
 
     if et == "result":
@@ -1572,9 +1383,10 @@ def _render_codex_event(ev: dict) -> None:
         return
 
     if event_type == "item.started" and item_type == "command_execution":
-        command = _short(undouble_backslashes(str(item.get("command", ""))),
-                         textwidth.line_budget(tool_line_head("Bash")))
-        print_tool("Bash", command)
+        command = compactline.short(
+            compactline.undouble_backslashes(str(item.get("command", ""))),
+            LINES.budget(compactline.tool_line_head("Bash")))
+        LINES.tool("Bash", command)
         return
 
     if event_type == "item.completed" and item_type == "command_execution":
@@ -1585,22 +1397,24 @@ def _render_codex_event(ev: dict) -> None:
         # there is no output to put after it. Measuring both unconditionally
         # left the line eleven columns short of the width it had been given.
         code_head = f"exit {exit_code}: " if exit_code is not None else ""
-        separator = " — " if _collapse(item.get("aggregated_output", "")) else ""
-        command, output = _fit_two(
-            textwidth.line_budget(f"{mark_line_head(mark)}{code_head}{separator}"),
-            undouble_backslashes(str(item.get("command", ""))),
+        separator = (" — " if compactline.collapse(
+            item.get("aggregated_output", "")) else "")
+        command, output = compactline.fit_two(
+            LINES.budget(f"{compactline.mark_line_head(mark)}"
+                         f"{code_head}{separator}"),
+            compactline.undouble_backslashes(str(item.get("command", ""))),
             item.get("aggregated_output", ""))
         detail = f"{code_head}{command}"
         if output:
             detail += f"{separator}{output}"
-        print_mark_line(mark, "green" if exit_code in (None, 0) else "red", detail)
+        LINES.mark(mark, "green" if exit_code in (None, 0) else "red", detail)
         return
 
     if event_type == "item.completed" and item_type == "file_change":
         changes = item.get("changes") or []
         paths = [str(change.get("path")) for change in changes
                  if isinstance(change, dict) and change.get("path")]
-        print_tool("Edit", ", ".join(paths) or "file changes applied")
+        LINES.tool("Edit", ", ".join(paths) or "file changes applied")
         return
 
     if event_type == "turn.completed":
@@ -1618,8 +1432,7 @@ def _render_codex_event(ev: dict) -> None:
 
     if event_type in ("error", "turn.failed"):
         error = ev.get("message") or ev.get("error") or item.get("error") or ev
-        head = "  ⚠ result: "
-        print_error(head + _short(error, textwidth.line_budget(head)))
+        LINES.fitted("  ⚠ result: ", error, "bold red")
 
 
 def run_agent_streaming(cmd: list, provider: str, raw: bool,

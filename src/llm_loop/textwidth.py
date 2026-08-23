@@ -106,7 +106,7 @@ def pad(text: str, width: int) -> str:
 #    records less than the fixed figures kept.
 #
 # The one line that can still record less is codex's command-plus-output pair,
-# which has two variable fields to fit in one budget (see `cyclecore._fit_two`).
+# which has two variable fields to fit in one budget (see `compactline.fit_two`).
 LEGACY_LINE_COLUMNS = 200
 # The last cell of a row is not ours to fill: a terminal that auto-wraps on it
 # turns an exactly-full line into two rows, and rich's own console is one column
@@ -155,7 +155,7 @@ def line_budget(prefix: str = "") -> int:
     `prefix` is the fixed head the caller is about to print in front of the
     variable part (indent, glyph, job tag, tool name), measured in cells so the
     double-width glyphs in it count for the two columns they occupy — as is the
-    text the answer sizes (`cyclecore._short` cuts by cells too, or a command
+    text the answer sizes (`compactline.short` cuts by cells too, or a command
     echoing CJK would overflow by one column per character). So pass the prefix
     itself, never its `len`.
     """

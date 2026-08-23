@@ -6,8 +6,8 @@ import sys
 
 import pytest
 
-from llm_loop import (codex_usage, cyclecore, limits, parallel, providers,
-                      textwidth)
+from llm_loop import (codex_usage, compactline, cyclecore, limits, parallel,
+                      providers, textwidth)
 from llm_loop.cyclecore import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
@@ -279,11 +279,11 @@ def test_parallel_job_tag_remains_visible_in_rich_markup():
     assert rich_markup.render(markup).plain == plain
 
 
-@pytest.mark.parametrize("emit,args", [
-    (parallel.emit_job, (3, "$ grep '[job 3]' *.md")),
-    (parallel.emit_tool, (3, "Grep", "[job 3] in products")),
+@pytest.mark.parametrize("shape,args", [
+    ("line", ("$ grep '[job 3]' *.md",)),
+    ("tool", ("Grep", "[job 3] in products")),
 ])
-def test_a_bracket_in_a_worker_line_reaches_the_screen(monkeypatch, emit, args):
+def test_a_bracket_in_a_worker_line_reaches_the_screen(monkeypatch, shape, args):
     """rich reads '[' as the start of a style tag and drops what follows it
     without complaining, so the screen quietly lost text the log still had."""
     rich_markup = pytest.importorskip("rich.markup")
@@ -291,7 +291,7 @@ def test_a_bracket_in_a_worker_line_reaches_the_screen(monkeypatch, emit, args):
     monkeypatch.setattr(parallel, "print_markup",
                         lambda plain, markup: printed.append((plain, markup)))
 
-    emit(*args)
+    getattr(parallel.job_lines(3), shape)(*args)
 
     plain, markup = printed[0]
     assert "[job 3]" in plain                     # twice: the tag and the text
@@ -435,7 +435,7 @@ def test_a_reported_provider_error_is_not_repeated_as_a_tail(monkeypatch, capsys
 
 def test_the_kept_tail_is_bounded_and_truncated(monkeypatch, capsys):
     """A chatty CLI must not be able to grow a worker's memory."""
-    # The width is pinned, because the tail is _short-ened to the terminal: run
+    # The width is pinned, because the tail is cut to the terminal: run
     # in a 500-column window this same assertion failed, which is the test
     # depending on the developer's terminal rather than on the code.
     _terminal(monkeypatch, 200)
@@ -446,7 +446,7 @@ def test_the_kept_tail_is_bounded_and_truncated(monkeypatch, capsys):
     kept = [ln for ln in out.splitlines() if "line " in ln]
     assert len(kept) == parallel.FAILURE_TAIL_LINES
     assert "line 49" in out and "line 44" not in out   # the LAST few lines
-    assert all(len(ln) < 300 for ln in kept)           # each one _short-ened
+    assert all(len(ln) < 300 for ln in kept)           # each one cut to the row
 
 
 # --- command lines are shown the way they can be copied ------------------------
@@ -455,23 +455,23 @@ def test_the_kept_tail_is_bounded_and_truncated(monkeypatch, capsys):
 # reached the screen as C:\\WINDOWS\\... and had to be hand-edited after copying.
 
 def test_a_doubled_windows_path_is_halved_for_display():
-    assert cyclecore.undouble_backslashes(
+    assert compactline.undouble_backslashes(
         r"powershell.exe -Command 'D:\\g\\3d-research\\x'"
     ) == r"powershell.exe -Command 'D:\g\3d-research\x'"
 
 
 def test_a_doubled_unc_path_keeps_its_leading_pair():
-    assert cyclecore.undouble_backslashes(
+    assert compactline.undouble_backslashes(
         r"dir \\\\server\\share") == r"dir \\server\share"
 
 
 def test_a_string_with_an_odd_run_is_left_completely_alone():
     raw = r"grep 'a\b' \\host\c"      # runs of 1, 2, 1: not uniformly doubled
-    assert cyclecore.undouble_backslashes(raw) == raw
+    assert compactline.undouble_backslashes(raw) == raw
 
 
 def test_a_string_without_backslashes_is_untouched():
-    assert cyclecore.undouble_backslashes("pytest -q") == "pytest -q"
+    assert compactline.undouble_backslashes("pytest -q") == "pytest -q"
 
 
 def test_both_renderers_use_the_helper_on_command_execution(monkeypatch, capsys):
@@ -488,7 +488,7 @@ def test_both_renderers_use_the_helper_on_command_execution(monkeypatch, capsys)
 
 
 def test_the_claude_bash_tool_line_uses_the_helper():
-    assert cyclecore._describe_tool("Bash", {"command": r"type C:\\a\\b.txt"}) \
+    assert compactline.describe_tool("Bash", {"command": r"type C:\\a\\b.txt"}) \
         == r"$ type C:\a\b.txt"
 
 
@@ -513,6 +513,11 @@ def plain_lines(monkeypatch):
     Collected here rather than from capsys because with rich installed the
     styled copy is wrapped at rich's own console width (80 when stdout is not a
     terminal), so the capture would show that wrapping instead of our cut.
+
+    Both renderers reach their sink through a `compactline.LineWriter` that
+    resolves this name per line, which is what makes patching it here work at
+    all — a writer built around the function object would print past the capture
+    and leave every assertion below reading an empty list.
     """
     lines = []
 
@@ -626,8 +631,8 @@ def test_a_printer_coerces_a_detail_that_is_not_a_string(plain_lines):
     """Both printers take whatever their caller has. Joined with `+`, a number
     raised TypeError from inside the renderer — which ends the sequential run,
     and in a worker escapes the thread while it still holds a claimed item."""
-    cyclecore.print_tool("Read", 123)
-    parallel.emit_tool(4, "Read", 123)
+    cyclecore.LINES.tool("Read", 123)
+    parallel.job_lines(4).tool("Read", 123)
 
     assert plain_lines == ["  ⚙ Read: 123", "[job 4]   ⚙ Read: 123"]
 

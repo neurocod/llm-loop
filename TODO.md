@@ -153,25 +153,12 @@ worth its churn on its own; each has a trigger that makes it cheap.
   copies of a driver that must stay behaviourally identical for the parallel
   tests to mean the same thing. Trigger: the next test file that needs a fourth.
 
-Two more from the structural pass over the line-width commits (8cb0cb8,
-9009a52, 629edab). The small half of that pass — a compact line's head named
-once where it is both measured and printed — is done (749d6e2); these are what
-was left because they cross module boundaries.
+One more from the structural pass over the line-width commits (8cb0cb8,
+9009a52, 629edab). The rest of that pass is done: a compact line's head named
+once where it is both measured and printed (749d6e2), the width primitives put
+under the renderers instead of above them (080bdd5), and the line shapes
+themselves given their own module, `compactline.py`.
 
-- **The compact renderer exists twice, once with a job tag in front.**
-  `parallel` imports `_describe_tool`, `_esc` and `_short` from `cyclecore` and
-  reaches for `cyclecore.tool_line_head` and `.TOOL_DETAIL_SEP` — five rendering
-  symbols, half of them private, and the set grows with every line
-  shape. Both files hold the same shapes: a head plus a body fitted to what the
-  head leaves, a tool line assembled from `tool_line_head` and chopped by
-  `len(TOOL_DETAIL_SEP)` when there is no detail (five near-identical lines in
-  `print_tool` and `emit_tool`), a plain/markup pair per line. The only
-  differences are the `[job k] ` tag on the front of every head and the emit
-  lock. The cost is measured: all three width commits had to touch both files
-  for every change, and the review commit fixed the same `+`-join TypeError in
-  both printers. Trigger: a third sink (log-only or TUI), or the next line shape
-  that has to exist on both sides — then the head/fit/plain-markup trio becomes
-  its own module, parameterised by the tag prefix and the emit function.
 - **Two fake terminals in the tests, and still no `conftest.py`.**
   `test_providers._terminal` and `test_textwidth._columns` both patch
   `shutil.get_terminal_size`, with deliberately different contracts (one returns

@@ -35,6 +35,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+from . import compactline
 from . import cyclecore
 from . import exitlog
 from . import limits
@@ -53,10 +54,6 @@ from .cyclecore import (
     maybe_git_push,
     print_markup,
     set_project_root,
-    undouble_backslashes,
-    _describe_tool,
-    _esc,
-    _short,
 )
 from .providers import (note_channel, provider_spec, set_live_messages,
                         start_agent_process, usage_source_for)
@@ -156,6 +153,11 @@ def parse_args(argv=None, *, prog: str = "parallel",
 # --- output helpers: every emit goes through the shared lock --------------------
 
 def _emit_markup(plain: str, markup: str) -> None:
+    """The sink under every worker's line: one whole line written at a time.
+
+    Reads `print_markup` off this module per call rather than closing over it —
+    which is what lets the pins replace it (see `compactline.LineWriter`).
+    """
     with _emit_lock:
         print_markup(plain, markup)
 
@@ -165,71 +167,31 @@ def _job_tag(job_id: int) -> tuple:
     return f"[job {job_id}]", f"[cyan]\\[job {job_id}][/]"
 
 
-def _job_line_limit(job_id: int, head: str = "") -> int:
-    """`textwidth.line_budget` for a worker's line, tag included.
+def job_lines(job_id: int) -> compactline.LineWriter:
+    """The compact line shapes, tagged for one worker and emitted under the lock.
 
-    Every line here is printed as `[job k] <head><variable part>`, and the tag
-    is as much of the line's furniture as the glyph after it — a worker whose
-    text was cut to the bare terminal width would overflow by exactly the tag.
-    """
-    return textwidth.line_budget(f"{_job_tag(job_id)[0]} {head}")
-
-
-def emit_job(job_id: int, plain: str, style: Optional[str] = None) -> None:
-    """One compact line attributed to a worker (styled on screen, plain in log).
-
-    The body is escaped on its way into the markup: these lines carry commands,
-    paths and error text, and rich reads a '[' in them as the start of a style
-    tag. It does not complain — `[job 3]` inside a Grep pattern simply vanishes
-    from the screen while the log copy still has it.
+    The whole difference between this runner's output and the sequential one:
+    every line carries `[job k] ` and every write is serialised. Both are given
+    to `compactline.LineWriter` here, so the shapes themselves — a tool call, a
+    head plus what the row leaves beside it, an outcome — exist once for both
+    runners, and the tag counts against the width of each of them.
     """
     tag_plain, tag_markup = _job_tag(job_id)
-    body_markup = _esc(plain)
-    if style:
-        body_markup = f"[{style}]{body_markup}[/]"
-    _emit_markup(f"{tag_plain} {plain}", f"{tag_markup} {body_markup}")
+    return compactline.LineWriter(_emit_markup, f"{tag_plain} ",
+                                  f"{tag_markup} ")
 
 
-def emit_fitted(job_id: int, head: str, text, style: Optional[str] = None) -> None:
-    """A worker's line: `head`, then as much of `text` as the row leaves beside it.
-
-    The head is named once and used twice from here — measured, then printed.
-    Spelled out at the call site instead, the two copies drift the moment one of
-    them gains a glyph, and the line overflows by exactly the difference without
-    anything failing; every compact line in `run_job` had that shape.
-    """
-    emit_job(job_id, head + _short(text, _job_line_limit(job_id, head)), style)
-
-
-def emit_note(job_id: int, note: str) -> None:
+def emit_note(lines: compactline.LineWriter, note: str) -> None:
     """An operator note attributed to a worker — this runner's `print_note`.
 
     One place for the glyph, the colour and the label, because a note is
     announced twice (when it rides a prompt, and when the CLI replays one that
     went in live) and the two must not drift into looking like different things.
+    Here rather than on the writer because the sequential runner's note is not
+    the same line with a tag added: `cyclecore.print_note` colours the glyph and
+    the label separately, so there is no one shape for the two to share yet.
     """
-    emit_job(job_id, f"✉ operator note: {note}", "magenta")
-
-
-def emit_tool(job_id: int, name: str, detail: str) -> None:
-    """A tool-call line for a worker: '[job k]   ⚙ Write: path'.
-
-    The plain head comes from `cyclecore.tool_line_head`, the same one the
-    sequential renderer prints and the same one `_job_line_limit` measures to
-    size the detail — three places that have to agree about the width of one
-    prefix, so only one of them owns it.
-    """
-    tag_plain, tag_markup = _job_tag(job_id)
-    head_plain = f"{tag_plain} " + cyclecore.tool_line_head(name)
-    head_markup = (f"{tag_markup}   [yellow]⚙[/] [bold yellow]{_esc(name)}[/]"
-                   + cyclecore.TOOL_DETAIL_SEP)
-    if detail:
-        # f-string, not `+`: see the same join in `cyclecore.print_tool` — here
-        # the TypeError would escape a worker thread holding a claimed item.
-        _emit_markup(f"{head_plain}{detail}", f"{head_markup}{_esc(detail)}")
-    else:
-        cut = len(cyclecore.TOOL_DETAIL_SEP)
-        _emit_markup(head_plain[:-cut], head_markup[:-cut])
+    lines.line(f"✉ operator note: {note}", "magenta")
 
 
 # --- one provider round-trip for one file --------------------------------------
@@ -245,6 +207,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     `mailbox` is passed only by a single-worker run (see run_parallel); it lends
     the console this turn's stdin, exactly as the sequential runner does.
     """
+    out = job_lines(job_id)
     provider = command.provider or "claude"
     spec = provider_spec(provider)
     argv = build_agent_argv(command, provider)
@@ -252,7 +215,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
         proc = start_agent_process(
             argv, provider, command.prompt, cyclecore.project_dir())
     except FileNotFoundError:
-        emit_job(job_id, f"executable {spec.executable!r} not found on PATH.", "bold red")
+        out.line(f"executable {spec.executable!r} not found on PATH.", "bold red")
         return 2, None, None
 
     cost_usd = None
@@ -273,7 +236,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 # Printed indented under a head of its own if the job fails.
-                diagnostics.append(_short(line, _job_line_limit(job_id, "  ")))
+                diagnostics.append(compactline.short(line, out.budget("  ")))
                 continue  # non-JSON CLI diagnostics — skip in compact mode
             if not isinstance(ev, dict):
                 continue  # valid JSON can still be a diagnostic, not an event
@@ -283,41 +246,35 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                 item_type = item.get("type")
                 if et == "item.completed" and item_type == "agent_message":
                     for text in str(item.get("text") or "").splitlines():
-                        emit_job(job_id, f"💬 {text}")
+                        out.line(f"💬 {text}")
                 elif et == "item.started" and item_type == "command_execution":
-                    emit_fitted(job_id, "💻 ", undouble_backslashes(
+                    out.fitted("💻 ", compactline.undouble_backslashes(
                         str(item.get("command", ""))))
                 elif et == "item.completed" and item_type == "command_execution":
-                    emit_fitted(job_id,
-                                f"📤 exit {item.get('exit_code', '')}: ",
-                                undouble_backslashes(
-                                    str(item.get("command", ""))))
+                    out.fitted(f"📤 exit {item.get('exit_code', '')}: ",
+                               compactline.undouble_backslashes(
+                                   str(item.get("command", ""))))
                 elif et == "item.completed" and item_type == "file_change":
                     changes = item.get("changes") or []
                     paths = [str(change.get("path")) for change in changes
                              if isinstance(change, dict) and change.get("path")]
-                    emit_job(job_id,
-                             f"🛠️ {', '.join(paths) or 'file changes applied'}")
+                    out.line(f"🛠️ {', '.join(paths) or 'file changes applied'}")
                 elif et == "turn.completed":
                     usage = ev.get("usage") or {}
                     if usage:
-                        emit_job(job_id, "tokens: "
+                        out.line("tokens: "
                                  f"input {usage.get('input_tokens', 0)}, "
                                  f"cached {usage.get('cached_input_tokens', 0)}, "
                                  f"output {usage.get('output_tokens', 0)}")
                 elif et in ("error", "turn.failed"):
                     provider_failed = True
                     error = ev.get("message") or ev.get("error") or ev
-                    emit_fitted(job_id, "⚠ ", error, "bold red")
+                    out.fitted("⚠ ", error, "bold red")
             elif et == "assistant":
                 for block in ev.get("message", {}).get("content", []):
                     if block.get("type") == "tool_use":
-                        name = block.get("name", "?")
-                        detail = _describe_tool(
-                            name, block.get("input", {}) or {},
-                            _job_line_limit(job_id,
-                                            cyclecore.tool_line_head(name)))
-                        emit_tool(job_id, name, detail)
+                        out.tool_use(block.get("name", "?"),
+                                     block.get("input", {}) or {})
             elif et == "user":
                 # Only surface *failed* tool results; successes would just be
                 # noise at high concurrency. An operator note replayed back to us
@@ -327,7 +284,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     if block.get("type") == "text" and mailbox is not None:
                         note = mailbox.claim_echo(block.get("text", ""))
                         if note is not None:
-                            emit_note(job_id, note)
+                            emit_note(out, note)
                     if block.get("type") == "tool_result" and block.get("is_error"):
                         content = block.get("content", "")
                         if isinstance(content, list):
@@ -335,7 +292,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                                 c.get("text", "") for c in content
                                 if isinstance(c, dict)
                             )
-                        emit_fitted(job_id, "  ✗ ", content, "red")
+                        out.fitted("  ✗ ", content, "red")
             elif et == "rate_limit_event":
                 # The run's own rate-limit verdict (see cyclecore.RateLimitEvent).
                 # Surfaced, not acted on: with N workers the pause belongs to the
@@ -343,7 +300,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                 # percentage when the next worker checks in.
                 rl = cyclecore.rate_limit_event_from(ev)
                 if rl is not None and rl.status != "allowed":
-                    emit_job(job_id, f"⚠ rate limit: {rl.describe()}", "bold red")
+                    out.line(f"⚠ rate limit: {rl.describe()}", "bold red")
             elif et == "result":
                 # Before the figures: once the turn has reported, the console
                 # must not be able to write into a session that is closing.
@@ -369,9 +326,9 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # explanation is exactly what must never print bare again. Emitted here, so
     # the lines sit immediately above the worker's ✗ verdict for this job.
     if returncode != 0 and not provider_failed and diagnostics:
-        emit_job(job_id, f"provider output before exit {returncode}:", "red")
+        out.line(f"provider output before exit {returncode}:", "red")
         for text in diagnostics:
-            emit_job(job_id, f"  {text}", "red")
+            out.line(f"  {text}", "red")
     return returncode, cost_usd, duration_s
 
 
@@ -642,11 +599,11 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
     a stop file (a script's `touch stop`, another run) has nobody sitting here to
     press `s` again, so it must stop the run as promptly as it always did.
     """
+    out = job_lines(job_id)
     pending = cyclecore.pending_stop(app)
     if pending is None:
         if shared.reopen_claims():
-            emit_job(job_id, "stop request withdrawn — claiming files again.",
-                     "cyan")
+            out.line("stop request withdrawn — claiming files again.", "cyan")
             app.update(phase="running")
         return False
 
@@ -654,7 +611,7 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
     if pending is cyclecore.StopSource.KEY:
         if first:
             app.update(phase="stopping")
-            emit_job(job_id, "stop requested — no new files will be claimed; "
+            out.line("stop requested — no new files will be claimed; "
                      "press s again to cancel while a job is still running.",
                      "yellow")
         # Held, not ended, while the owner decides: the request may yet be
@@ -677,10 +634,10 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
         if pending is cyclecore.StopSource.FILE:
             # The outermost application lifecycle removes the sentinel only after
             # all workers and wrapper-level cleanup have finished.
-            emit_job(job_id, "stop file detected — stopping; kept until "
+            out.line("stop file detected — stopping; kept until "
                      "application exit.", "bold red")
         else:
-            emit_job(job_id, "stop requested with the s key — stopping this run "
+            out.line("stop requested with the s key — stopping this run "
                      "(no stop file written).", "bold red")
         app.update(phase="stopping")
     return True
@@ -705,6 +662,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
     progress = (progress if progress is not None
                 else statusline.InvocationProgress())
     job = app.job(job_id)
+    out = job_lines(job_id)
     while not shared.stop.is_set():
         if apply_stop_request(job_id, shared, app):
             break
@@ -723,12 +681,12 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             if shared.exhausted():
                 break       # nothing left to hold back — see Shared.exhausted
             if shared.note_pause(True):
-                emit_job(job_id, f"{statusline.PAUSE_GLYPH} paused — no new "
+                out.line(f"{statusline.PAUSE_GLYPH} paused — no new "
                          "files will be claimed; press p to resume.", "yellow")
             shared.stop.wait(cyclecore.STOP_RECHECK_SECONDS)
             continue
         if shared.note_pause(False):
-            emit_job(job_id, "▶ pause released — claiming files again.", "cyan")
+            out.line("▶ pause released — claiming files again.", "cyan")
 
         # Claim work FIRST, before the session-limit gate. The gate can block for a
         # long time when the budget is spent, and its wait loop does not watch the
@@ -801,7 +759,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             if notes:
                 command = command._replace(prompt=spliced)
                 for note in notes:
-                    emit_note(job_id, note)
+                    emit_note(out, note)
         # The same three calls the sequential loop makes on its single Job: the
         # Job clock times THIS file, the run clock (latched once) times the run.
         # This is the display's half of `shared.start_turn(line)` above — the row
@@ -812,7 +770,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         job.start(item=command.label, model=command.model,
                   prompt=command.prompt, now=started_at)
         app.update(phase="running")
-        emit_job(job_id, f"▶ {command.label}", "bold cyan")
+        out.line(f"▶ {command.label}", "bold cyan")
         rc, cost_usd, dur = run_job(job_id, command, mailbox)
         job.finish()
         ok = rc == 0
@@ -830,14 +788,12 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             bits.append(f"${cost_usd:.4f}")
         suffix = f" ({', '.join(bits)})" if bits else ""
         if ok:
-            emit_job(job_id,
-                     f"✓ {command.label}{suffix}  "
+            out.line(f"✓ {command.label}{suffix}  "
                      f"[{done_total} done this run, {remaining} left]", "green")
         else:
             parked = line in shared.failed
             tail = " — parked after repeated failures" if parked else " — will retry"
-            emit_job(job_id, f"✗ {command.label} (exit {rc}){suffix}{tail}",
-                     "bold red")
+            out.line(f"✗ {command.label} (exit {rc}){suffix}{tail}", "bold red")
 
 
 @cyclecore.stop_file_lifecycle()
