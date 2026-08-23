@@ -838,9 +838,6 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             app.update(phase="running")
             out.line(f"▶ {command.label}", "bold cyan")
             rc, cost_usd, dur = run_job(job_id, command, mailbox)
-            job.finish()
-            ok = rc == 0
-            done_total, remaining = shared.finish(line, ok)
         except BaseException:
             # Hand the claim back (see `Shared.abandon` for which way and why),
             # then let the exception go on ending the thread it was always going
@@ -856,6 +853,16 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                 # status line that threw here must not take the claim with it.
                 job.finish()
             raise
+        # Recording the outcome is deliberately OUTSIDE the guard, and it is the
+        # one place that does it: were it inside, a `finish` that raised half-way
+        # (its `strike`/`pending_total` are file I/O on a real driver) would be
+        # followed by the guard's `abandon` calling `finish` a second time, and
+        # the line would be both struck and counted as a failed attempt. It needs
+        # no guard: `finish` discards `in_progress` first thing under the lock,
+        # so whatever happens after that, the run can still read as drained.
+        job.finish()
+        ok = rc == 0
+        done_total, remaining = shared.finish(line, ok)
         # The summary counter moves on COMPLETION, not on the claim: a claimed
         # file is in flight, and counting it as progress would report N jobs'
         # worth of work that nothing has finished yet.

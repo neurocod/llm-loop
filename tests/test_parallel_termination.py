@@ -73,18 +73,34 @@ def _run_and_wait(driver, args, timeout=10.0, result_box=None):
     done = threading.Event()
 
     def go():
+        outcome = None
         try:
             outcome = parallel.run_parallel(driver, args,
                                             app_name="pytest-parallel")
-            if result_box is not None:
-                result_box.append(outcome)
         except SystemExit:
             pass
+        except BaseException as exc:
+            # Recorded, not merely raised on a doomed thread: the pins that read
+            # `result_box` silence the thread-death warning (they kill workers on
+            # purpose), so a run_parallel that blew up would reach the test as a
+            # bare IndexError with its cause nowhere on screen. See `_result`.
+            outcome = exc
         finally:
+            if result_box is not None and outcome is not None:
+                result_box.append(outcome)
             done.set()
 
     threading.Thread(target=go, daemon=True).start()
     return done.wait(timeout)
+
+
+def _result(result_box):
+    """The RunResult out of `_run_and_wait`'s box, or say what happened instead."""
+    assert result_box, "run_parallel returned nothing and raised nothing"
+    outcome = result_box[0]
+    assert not isinstance(outcome, BaseException), \
+        f"run_parallel itself raised: {outcome!r}"
+    return outcome
 
 
 def test_drain_terminates_with_more_workers_than_files(tmp_path, monkeypatch):
@@ -276,7 +292,7 @@ def test_a_worker_dying_mid_turn_does_not_hang_the_run(tmp_path, monkeypatch):
         "a worker died holding a claim and run_parallel never returned"
     assert driver.pending_lines() == [poison], \
         "the healthy files did not all get struck"
-    result = box[0]
+    result = _result(box)
     assert result.completed == 3
     # Two workers, each killed once by the poison file, plus the three healthy
     # claims. A claim released instead of failed would leave this at 3 and the
@@ -325,8 +341,9 @@ def test_a_worker_dying_in_the_usage_gate_gives_the_file_back(
     assert len(calls) >= 2, "the second worker never reached the gate"
     assert driver.pending_lines() == [], \
         "the released file was not picked up and finished by another worker"
-    assert box[0].attempted == 1, \
-        f"the abandoned claim's --max reservation was not undone: {box[0]}"
+    result = _result(box)
+    assert result.attempted == 1, \
+        f"the abandoned claim's --max reservation was not undone: {result}"
 
 
 def test_max_runs_closes_claims_without_cancelling_in_flight_work(
