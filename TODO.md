@@ -133,10 +133,12 @@ was added, and would have been just as green if it had not been).
 Three findings from the structural pass over the operator-note commits. None is
 worth its churn on its own; each has a trigger that makes it cheap.
 
-- **`statusline.py`, lines ~894–1290 are a separable front end.** `Terminal`,
-  `NullTerminal`, `terminal_for`, the `InputEvent` family, `decode_escape`,
-  `InputSource`, `TerminalInput`, `_EscapeDecoder` — ~400 lines that reference
-  `LoopStatus`, `Row` and `Segment` exactly zero times. Trigger: a second front
+- **`statusline.py`'s `# --- terminal` and `# --- input` sections are a
+  separable front end.** `Terminal`, `NullTerminal`, `terminal_for`, the
+  `InputEvent` family, `decode_escape`, `InputSource`, `TerminalInput`,
+  `_EscapeDecoder` — ~490 lines that reference `LoopStatus`, `Row` and `Segment`
+  exactly zero times. (Named by section rather than by line number: the numbers
+  went stale twice already.) Trigger: a second front
   end, or a platform that needs its own reader. Not before — the operator-note
   change touched three regions of this file at once, and under any split that
   would have been a three-file change with two new import edges.
@@ -151,27 +153,15 @@ worth its churn on its own; each has a trigger that makes it cheap.
   copies of a driver that must stay behaviourally identical for the parallel
   tests to mean the same thing. Trigger: the next test file that needs a fourth.
 
-Three more from the structural pass over the line-width commits (8cb0cb8,
+Two more from the structural pass over the line-width commits (8cb0cb8,
 9009a52, 629edab). The small half of that pass — a compact line's head named
 once where it is both measured and printed — is done (749d6e2); these are what
 was left because they cross module boundaries.
 
-- **The text-width primitives live above the code that needs them.**
-  `cell_width`, `fit`, `fit_tail`, `terminal_columns`, `line_budget`,
-  `LEGACY_LINE_COLUMNS` and `LINE_RIGHT_MARGIN` are in `statusline.py`, which
-  imports `cyclecore` at module level (`_MODE_VALUE_PATTERN` is built from
-  `cyclecore.GIT_PUSH_SETTING`). So the direction the renderers need is the one
-  that closes a cycle: `cyclecore` reaches them through four function-local
-  `from . import statusline` and republishes one as `line_limit`. The cost is
-  paid in names — one measurement documented twice, as `line_limit` and as
-  `line_budget` — and in a `__all__` that advertises terminal-text helpers as
-  part of a status line. Trigger: the `statusline.py` front-end split above.
-  `Terminal` needs `fit` and `cell_width` too, so the primitives move down with
-  it into a module both halves import, and the lazy imports go with the cycle.
 - **The compact renderer exists twice, once with a job tag in front.**
   `parallel` imports `_describe_tool`, `_esc` and `_short` from `cyclecore` and
-  reaches for `cyclecore.tool_line_head`, `.TOOL_DETAIL_SEP` and `.line_limit` —
-  six rendering symbols, half of them private, and the set grows with every line
+  reaches for `cyclecore.tool_line_head` and `.TOOL_DETAIL_SEP` — five rendering
+  symbols, half of them private, and the set grows with every line
   shape. Both files hold the same shapes: a head plus a body fitted to what the
   head leaves, a tool line assembled from `tool_line_head` and chopped by
   `len(TOOL_DETAIL_SEP)` when there is no detail (five near-identical lines in
@@ -183,7 +173,7 @@ was left because they cross module boundaries.
   that has to exist on both sides — then the head/fit/plain-markup trio becomes
   its own module, parameterised by the tag prefix and the emit function.
 - **Two fake terminals in the tests, and still no `conftest.py`.**
-  `test_providers._terminal` and `test_statusline._columns` both patch
+  `test_providers._terminal` and `test_textwidth._columns` both patch
   `shutil.get_terminal_size`, with deliberately different contracts (one returns
   the width a line may fill and ignores the fallback; the other honours the
   fallback, which is the whole point of the no-terminal pins). Cheap while the

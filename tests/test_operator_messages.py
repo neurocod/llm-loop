@@ -20,7 +20,7 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, operator, parallel, providers
+from llm_loop import cyclecore, operator, parallel, providers, textwidth
 from llm_loop import statusline as sl
 from llm_loop.cyclecore import AgentCommand, Driver
 from llm_loop.providers import build_agent_argv, start_agent_process
@@ -581,7 +581,7 @@ def test_the_prompt_row_shows_the_end_of_a_long_line(tmp_path):
 
     row = app.render(width=40)[-1]
 
-    assert sl.cell_width(row) <= 40
+    assert textwidth.cell_width(row) <= 40
     assert row.startswith(" ✉ …")
     assert row.endswith("码" + sl.MessagePromptRow.caret)
 
@@ -681,7 +681,7 @@ def test_the_cursor_stays_visible_in_a_line_wider_than_the_row(tmp_path):
 
     row = app.render(width=40)[-1]
 
-    assert sl.cell_width(row) <= 40
+    assert textwidth.cell_width(row) <= 40
     assert sl.MessagePromptRow.caret in row
     assert row.startswith(" ✉ …") and row.endswith("…")
 
@@ -735,12 +735,6 @@ def test_the_legend_counts_what_is_still_waiting(tmp_path):
     mailbox.submit("two")
 
     assert dict(app.legend_entries())["m"] == "message (2 queued)"
-
-
-def test_fit_tail_keeps_the_end_and_marks_the_cut():
-    assert sl.fit_tail("abcdef", 10) == "abcdef"
-    assert sl.fit_tail("abcdef", 4) == "…def"
-    assert sl.fit_tail("abcdef", 0) == ""
 
 
 # --- the parallel runner: one worker, one recipient -----------------------------

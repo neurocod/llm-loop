@@ -22,7 +22,9 @@ keywords = ["claude", "codex", "llm", "agent", "cli", "automation", "loop"]
 requires-python = ">=3.9"
 
 # Deliberately empty, and worth keeping that way: the engine runs on the
-# standard library alone. Every import across the eleven modules is stdlib.
+# standard library alone: every import across the package is stdlib. Stated
+# without a module count on purpose — the count goes stale the next time one is
+# split out, while the property it was attached to does not.
 dependencies = []
 
 classifiers = [

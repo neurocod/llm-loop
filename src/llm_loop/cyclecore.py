@@ -58,7 +58,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Union
 
-from . import exitlog, operator, providers
+from . import exitlog, operator, providers, textwidth
 from .providers import (
     build_agent_argv as provider_argv,
     note_channel,
@@ -854,7 +854,7 @@ def git_push() -> bool:
         print_done("  · git push: done.")
         return True
     head = f"  · git push failed (exit {proc.returncode}): "
-    print_error(head + _short(proc.stdout or "", line_limit(head)))
+    print_error(head + _short(proc.stdout or "", textwidth.line_budget(head)))
     return False
 
 
@@ -926,31 +926,6 @@ def build_claude_argv(command: ClaudeCommand) -> list:
     return build_agent_argv(command, "claude")
 
 
-def line_limit(prefix: str = "") -> int:
-    """Terminal columns left for variable text on one line, once `prefix` — the
-    fixed head the caller prints in front of it — is there.
-
-    Columns, not characters: `_short` spends this budget in cells too, so a
-    command echoing CJK or emoji is cut where it stops fitting rather than at
-    the same character count and twice the width. And it is a budget, not a
-    promise to fit — on a terminal narrower than `statusline.LEGACY_LINE_COLUMNS`
-    the answer deliberately exceeds the row, so the line wraps instead of
-    recording less than the fixed figures it replaced.
-
-    The single source of every compact renderer's truncation width, on both
-    sides of the fence: the sequential stream renderer here and the per-worker
-    lines in `parallel`. Both used to carry their own fixed figures (200 for a
-    Claude tool call, 160 or 140 for the same field coming from codex), so how
-    much of a command reached the screen depended on the provider rather than on
-    the screen. See `statusline.line_budget` for what is measured and why.
-
-    Pass the prefix, not its length: it is measured in terminal cells, and these
-    heads are full of double-width glyphs (⚙, 💻, 📤) that `len` counts as one.
-    """
-    from . import statusline  # lazy: statusline imports cyclecore
-    return statusline.line_budget(prefix)
-
-
 def _collapse(text) -> str:
     """One line's worth of `text`: every run of whitespace becomes one space.
 
@@ -964,16 +939,16 @@ def _collapse(text) -> str:
 def _short(text, limit: Optional[int] = None) -> str:
     """Single-line version of `text`, cut to `limit` terminal COLUMNS.
 
-    `limit` defaults to a bare terminal line (`line_limit()`); a caller that
-    prints a head in front of the result passes `line_limit(that_head)` so the
-    two together fill the width instead of overflowing it. The cut is delegated
-    to `statusline.fit`, which counts cells: cutting by characters here while
-    the budget was measured in columns is how a command echoing CJK produced a
-    299-character line 580 columns wide.
+    `limit` defaults to a bare terminal line (`textwidth.line_budget()`); a
+    caller that prints a head in front of the result passes
+    `textwidth.line_budget(that_head)` so the two together fill the width
+    instead of overflowing it. The cut is delegated to `textwidth.fit`, which
+    counts cells: cutting by characters here while the budget was measured in
+    columns is how a command echoing CJK produced a 299-character line 580
+    columns wide.
     """
-    from . import statusline  # lazy: statusline imports cyclecore
-    return statusline.fit(_collapse(text),
-                          line_limit() if limit is None else limit)
+    return textwidth.fit(_collapse(text),
+                         textwidth.line_budget() if limit is None else limit)
 
 
 def _fit_two(budget: int, first, second) -> tuple:
@@ -990,18 +965,17 @@ def _fit_two(budget: int, first, second) -> tuple:
     actually produced: 320 characters wrapped across three rows whatever the
     terminal.
     """
-    from . import statusline  # lazy: statusline imports cyclecore
     first, second = _collapse(first), _collapse(second)
-    wide_first = statusline.cell_width(first)
-    wide_second = statusline.cell_width(second)
+    wide_first = textwidth.cell_width(first)
+    wide_second = textwidth.cell_width(second)
     if wide_first + wide_second <= budget:
         return first, second
     half = budget // 2
     if wide_first <= half:
-        return first, statusline.fit(second, budget - wide_first)
+        return first, textwidth.fit(second, budget - wide_first)
     if wide_second <= half:
-        return statusline.fit(first, budget - wide_second), second
-    return statusline.fit(first, half), statusline.fit(second, budget - half)
+        return textwidth.fit(first, budget - wide_second), second
+    return textwidth.fit(first, half), textwidth.fit(second, budget - half)
 
 
 _BACKSLASH_RUN_RE = re.compile(r"\\+")
@@ -1052,13 +1026,13 @@ def _describe_tool(name: str, ti: dict, limit: Optional[int] = None) -> str:
     both. (`TodoWrite` echoes a count rather than a value, so it needs neither.)
     """
     if limit is None:
-        limit = line_limit()
+        limit = textwidth.line_budget()
     if name == "Bash":
         # This head is part of the line too, so the command gets what is left
         # after it rather than the whole budget. Subtracted from the same value
         # that is printed: a literal 2 beside a literal "$ " is a number nothing
         # ties to the string it measures. `len` because it is ASCII — a glyph
-        # here would have to be counted in cells (`statusline.cell_width`).
+        # here would have to be counted in cells (`textwidth.cell_width`).
         command = undouble_backslashes(str(ti.get("command", "")))
         return BASH_DETAIL_HEAD + _short(command,
                                          limit - len(BASH_DETAIL_HEAD))
@@ -1344,9 +1318,9 @@ TOOL_DETAIL_SEP = ": "
 def tool_line_head(name: str) -> str:
     """Everything a tool-call line prints in FRONT of its detail.
 
-    Exists for the width arithmetic: `line_limit(tool_line_head(name))` is how
-    much of the detail fits beside it. Kept here, next to the printer, so a head
-    measured somewhere else cannot drift from the head printed; parallel mode
+    Exists for the width arithmetic: `textwidth.line_budget(tool_line_head(name))`
+    is how much of the detail fits beside it. Kept here, next to the printer, so a
+    head measured somewhere else cannot drift from the head printed; parallel mode
     prepends its own `[job k] ` tag to both (see `parallel.emit_tool`).
     """
     return f"  ⚙ {name}{TOOL_DETAIL_SEP}"
@@ -1376,8 +1350,8 @@ def mark_line_head(mark: str) -> str:
 
     The `mark` is a ✓/✗ standing for what a step returned, indented under the
     tool call it belongs to. Same reason as `tool_line_head`: the head is both
-    measured (`line_limit(mark_line_head(mark))`) and printed, and the two
-    spellings drift silently — the printed line then overflows the row by the
+    measured (`textwidth.line_budget(mark_line_head(mark))`) and printed, and the
+    two spellings drift silently — the printed line then overflows the row by the
     difference, which is what the width measurement exists to prevent.
     """
     return f"    {mark} "
@@ -1531,7 +1505,7 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
             elif bt == "tool_use":
                 name = block.get("name", "?")
                 detail = _describe_tool(name, block.get("input", {}) or {},
-                                        line_limit(tool_line_head(name)))
+                                        textwidth.line_budget(tool_line_head(name)))
                 print_tool(name, detail)
         return
 
@@ -1551,7 +1525,7 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
                 )
             is_err = block.get("is_error")
             mark = "✗" if is_err else "✓"
-            line = _short(content, line_limit(mark_line_head(mark)))
+            line = _short(content, textwidth.line_budget(mark_line_head(mark)))
             if line:
                 print_mark_line(mark, "red" if is_err else "green", line)
         return
@@ -1599,7 +1573,7 @@ def _render_codex_event(ev: dict) -> None:
 
     if event_type == "item.started" and item_type == "command_execution":
         command = _short(undouble_backslashes(str(item.get("command", ""))),
-                         line_limit(tool_line_head("Bash")))
+                         textwidth.line_budget(tool_line_head("Bash")))
         print_tool("Bash", command)
         return
 
@@ -1613,7 +1587,7 @@ def _render_codex_event(ev: dict) -> None:
         code_head = f"exit {exit_code}: " if exit_code is not None else ""
         separator = " — " if _collapse(item.get("aggregated_output", "")) else ""
         command, output = _fit_two(
-            line_limit(f"{mark_line_head(mark)}{code_head}{separator}"),
+            textwidth.line_budget(f"{mark_line_head(mark)}{code_head}{separator}"),
             undouble_backslashes(str(item.get("command", ""))),
             item.get("aggregated_output", ""))
         detail = f"{code_head}{command}"
@@ -1645,7 +1619,7 @@ def _render_codex_event(ev: dict) -> None:
     if event_type in ("error", "turn.failed"):
         error = ev.get("message") or ev.get("error") or item.get("error") or ev
         head = "  ⚠ result: "
-        print_error(head + _short(error, line_limit(head)))
+        print_error(head + _short(error, textwidth.line_budget(head)))
 
 
 def run_agent_streaming(cmd: list, provider: str, raw: bool,
@@ -2453,7 +2427,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     dry_run_prompt_shown = True
                     print(statusline.format_prompt_block(
                         job_id=1, label=state_label, prompt=command.prompt,
-                        width=statusline.screen_width()))
+                        width=textwidth.screen_width()))
                 # looping forever in dry-run is pointless — nothing is actually done,
                 # so the driver would keep handing back the same first unit of work.
                 if run_settings.max_runs is None:

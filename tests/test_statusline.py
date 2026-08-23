@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from llm_loop import cyclecore, statusline as sl
+from llm_loop import cyclecore, textwidth, statusline as sl
 
 
 NOW = 1_700_000_000.0
@@ -97,7 +97,7 @@ def test_rows_never_exceed_the_terminal_width():
     for width in (40, 60, 100):
         rows = sl.render_rows(sequential_status(), width, now=NOW)
         for line in rows:
-            assert sl.cell_width(line) <= width
+            assert textwidth.cell_width(line) <= width
             assert "\n" not in line        # exactly one terminal line per row
     assert "…" in sl.render_rows(sequential_status(), 40, now=NOW)[1]
 
@@ -257,7 +257,7 @@ def test_the_rule_row_opens_the_area_and_spans_the_width():
         rule = sl.render_rows(sequential_status(), width, now=NOW)[0]
 
         assert rule == sl.RULE_CHAR * width       # plain chars: no colour needed
-        assert sl.cell_width(rule) == width
+        assert textwidth.cell_width(rule) == width
 
 
 def test_values_inside_a_row_are_separated_by_the_chrome_pipe():
@@ -1074,76 +1074,6 @@ def test_format_elapsed(seconds, expected):
     assert sl.format_elapsed(seconds) == expected
 
 
-def test_fit_truncates_with_an_ellipsis():
-    assert sl.fit("abcdef", 10) == "abcdef"
-    assert sl.fit("abcdef", 4) == "abc…"
-    assert sl.fit("abcdef", 0) == ""
-
-
-# --- how wide one scrolling line may be ---------------------------------------
-#
-# The compact renderers used to cut their variable field at 140, 160 or 200
-# characters depending on the call site and the provider. `line_budget` replaces
-# all three with the terminal's own width; what the renderers do with it is
-# pinned in test_providers.py.
-
-
-# Every expectation below is a LITERAL. Restating the constant under test
-# (`== sl.LINE_RIGHT_MARGIN`, `== sl.LEGACY_LINE_COLUMNS`) made three of these pins
-# survive a mutation of the very number they were named after — measured, with
-# try_patch --expect-fail.
-
-
-def _columns(monkeypatch, columns):
-    """Pretend the terminal is `columns` wide; 0 = there is no terminal.
-
-    The fake honours the `fallback` it is handed, as shutil does — a fake that
-    ignores it hides which fallback the caller asked for, and that argument is
-    the whole of "no terminal means the legacy width, not shutil's 80".
-    """
-    def fake_size(fallback=(80, 24)):
-        return os.terminal_size((columns, 30) if columns else fallback)
-
-    monkeypatch.setattr(sl.shutil, "get_terminal_size", fake_size)
-
-
-def test_the_budget_is_the_terminal_minus_the_prefix(monkeypatch):
-    _columns(monkeypatch, 240)
-
-    assert sl.terminal_columns() == 240
-    assert sl.line_budget() == 239               # one column left unwritten
-    assert sl.line_budget("[job 7] ") == 231     # ...and the head's eight
-
-
-def test_a_prefix_is_measured_in_cells_not_characters(monkeypatch):
-    """The heads are full of double-width glyphs; `len` would under-count them
-    by one column each and the line would wrap by exactly that much."""
-    pytest.importorskip("rich.cells")
-    _columns(monkeypatch, 400)
-
-    assert sl.cell_width("💻 ") == 3            # two cells plus the space
-    assert sl.line_budget("💻 ") == 396
-
-
-def test_no_terminal_hands_back_the_fallback_rather_than_eighty(monkeypatch):
-    """Redirected to a file or a pipe there is no screen to fit, and the only
-    reader left is the mirror log — where a cut cannot be undone."""
-    _columns(monkeypatch, 0)
-
-    assert sl.terminal_columns(fallback=7) == 7   # shutil's own 80 never shows
-    assert sl.terminal_columns() == 200           # the legacy line width
-    assert sl.line_budget("[job 7] ") == 200      # floored, not 191
-
-
-def test_a_narrow_terminal_wraps_rather_than_record_less(monkeypatch):
-    """Screen and mirror log get the same text, so cutting to a small window
-    would shrink the run's record; 200 is what the fixed limits used to keep."""
-    _columns(monkeypatch, 30)
-
-    assert sl.line_budget("[job 12]   ⚙ NotebookEdit: ") == 200
-    assert sl.LEGACY_LINE_COLUMNS == 200          # the figure it replaced
-
-
 def test_format_prompt_block_heads_the_prompt_and_keeps_it_verbatim():
     block = sl.format_prompt_block(job_id=2, label="garlic.md",
                                    prompt="line one\nline two\n", width=60)
@@ -1151,7 +1081,7 @@ def test_format_prompt_block_heads_the_prompt_and_keeps_it_verbatim():
         block.split("\n")[-1]
 
     assert "job 2" in head and "garlic.md" in head and "18 chars" in head
-    assert sl.cell_width(head) == 60 and foot == "─" * 60
+    assert textwidth.cell_width(head) == 60 and foot == "─" * 60
     assert body == ["line one", "line two"]   # verbatim: still pasteable
 
 

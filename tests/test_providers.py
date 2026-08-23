@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from llm_loop import (codex_usage, cyclecore, limits, parallel, providers,
-                      statusline)
+                      textwidth)
 from llm_loop.cyclecore import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
@@ -499,8 +499,8 @@ def test_the_claude_bash_tool_line_uses_the_helper():
 # codex. How much of a command reached the screen therefore depended on the
 # provider rather than on the screen — a wide terminal showed a halved command
 # beside a third of a blank row, a narrow one wrapped anyway. All of them now
-# ask `statusline.line_budget`, whose own arithmetic is pinned in
-# test_statusline.py; what follows is that the renderers use it, prefix
+# ask `textwidth.line_budget`, whose own arithmetic is pinned in
+# test_textwidth.py; what follows is that the renderers use it, prefix
 # included.
 
 LONG_COMMAND = "echo " + "x" * 500
@@ -530,7 +530,7 @@ def _terminal(monkeypatch, columns):
     Only meaningful above `LEGACY_LINE_COLUMNS`, below which a line is allowed
     to wrap rather than record less (see the narrow-terminal test).
     """
-    monkeypatch.setattr(statusline.shutil, "get_terminal_size",
+    monkeypatch.setattr(textwidth.shutil, "get_terminal_size",
                         lambda fallback=(80, 24): os.terminal_size((columns, 30)))
     return columns - 1          # the column left for the terminal to wrap on
 
@@ -548,7 +548,7 @@ def test_a_tool_line_is_cut_to_the_terminal_not_to_two_hundred(
 
     line, = plain_lines
     assert line.endswith("…")                        # it was cut
-    assert statusline.cell_width(line) == fits       # ...to the terminal
+    assert textwidth.cell_width(line) == fits       # ...to the terminal
     assert len(line) > 200                           # ...not to the old figure
 
 
@@ -562,8 +562,8 @@ def test_the_same_command_is_cut_the_same_from_either_provider(
         "type": "command_execution", "command": LONG_COMMAND}})
 
     claude_line, codex_line = plain_lines
-    assert statusline.cell_width(claude_line) == fits
-    assert statusline.cell_width(codex_line) == fits
+    assert textwidth.cell_width(claude_line) == fits
+    assert textwidth.cell_width(codex_line) == fits
 
 
 def test_a_worker_line_leaves_room_for_its_job_tag(monkeypatch, plain_lines):
@@ -577,7 +577,7 @@ def test_a_worker_line_leaves_room_for_its_job_tag(monkeypatch, plain_lines):
 
     line, = plain_lines
     assert line.startswith("[job 4] ")
-    assert statusline.cell_width(line) == fits
+    assert textwidth.cell_width(line) == fits
 
 
 def test_a_worker_tool_line_leaves_room_for_its_job_tag(
@@ -593,7 +593,7 @@ def test_a_worker_tool_line_leaves_room_for_its_job_tag(
 
     line, = plain_lines
     assert line.startswith("[job 4]   ⚙ Bash: $ ")
-    assert statusline.cell_width(line) == fits
+    assert textwidth.cell_width(line) == fits
 
 
 def test_a_narrow_terminal_still_records_what_the_old_limits_did(
@@ -618,7 +618,7 @@ def test_a_wide_glyph_body_is_cut_by_cells_not_characters(
     cyclecore._render_claude_event(_bash_tool_use("漢" * 500), True)
 
     line, = plain_lines
-    assert statusline.cell_width(line) == fits
+    assert textwidth.cell_width(line) == fits
     assert len(line) < 200          # half as many characters as columns
 
 
@@ -668,7 +668,7 @@ def test_every_tool_argument_is_cut_like_a_long_command(
         {"type": "tool_use", "name": name, "input": tool_input}]}}, True)
 
     line, = plain_lines
-    assert statusline.cell_width(line) == fits
+    assert textwidth.cell_width(line) == fits
 
 
 # --- the codex line that carries TWO variable fields --------------------------
@@ -691,7 +691,7 @@ def test_a_command_with_no_output_gets_the_whole_line(monkeypatch, plain_lines):
     cyclecore._render_codex_event(_codex_completed(LONG_COMMAND))
 
     line, = plain_lines
-    assert statusline.cell_width(line) == fits
+    assert textwidth.cell_width(line) == fits
 
 
 def test_a_short_output_lends_its_room_to_the_command(monkeypatch, plain_lines):
@@ -700,7 +700,7 @@ def test_a_short_output_lends_its_room_to_the_command(monkeypatch, plain_lines):
     cyclecore._render_codex_event(_codex_completed(LONG_COMMAND, "not found"))
 
     line, = plain_lines
-    assert statusline.cell_width(line) == fits
+    assert textwidth.cell_width(line) == fits
     assert line.endswith(" — not found")     # kept whole, and the command took
     assert "…" in line                       # the rest of the row
 
@@ -713,7 +713,7 @@ def test_two_long_fields_share_the_line_evenly(monkeypatch, plain_lines):
 
     line, = plain_lines
     command, output = line.split(" — ")
-    assert statusline.cell_width(line) == fits
+    assert textwidth.cell_width(line) == fits
     assert command.endswith("…") and output.endswith("…")   # both were cut
     assert abs(len(command) - len(output)) < 30             # ...about evenly
 
@@ -727,4 +727,4 @@ def test_a_missing_exit_code_does_not_shrink_the_line(monkeypatch, plain_lines):
 
     line, = plain_lines
     assert "exit" not in line
-    assert statusline.cell_width(line) == fits
+    assert textwidth.cell_width(line) == fits

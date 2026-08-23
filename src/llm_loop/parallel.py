@@ -41,6 +41,7 @@ from . import limits
 from . import operator
 from . import providers
 from . import statusline
+from . import textwidth
 from .cyclecore import (
     AgentCommand,
     GitPushPolicy,
@@ -165,13 +166,13 @@ def _job_tag(job_id: int) -> tuple:
 
 
 def _job_line_limit(job_id: int, head: str = "") -> int:
-    """`cyclecore.line_limit` for a worker's line, tag included.
+    """`textwidth.line_budget` for a worker's line, tag included.
 
     Every line here is printed as `[job k] <head><variable part>`, and the tag
     is as much of the line's furniture as the glyph after it — a worker whose
     text was cut to the bare terminal width would overflow by exactly the tag.
     """
-    return cyclecore.line_limit(f"{_job_tag(job_id)[0]} {head}")
+    return textwidth.line_budget(f"{_job_tag(job_id)[0]} {head}")
 
 
 def emit_job(job_id: int, plain: str, style: Optional[str] = None) -> None:
@@ -947,7 +948,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             # through the one formatter every prompt view shares.
             print(statusline.format_prompt_block(
                 job_id=1, label=first_command.label, prompt=first_command.prompt,
-                width=statusline.screen_width()))
+                width=textwidth.screen_width()))
         return RunResult(RunStopReason.DRY_RUN, remaining=len(pending_now))
 
     # Same as the sequential runner: a stop request pending from another run is
