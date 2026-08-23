@@ -187,6 +187,25 @@ def _await_output(capsys, needle: str, timeout: float = 10.0) -> str:
         time.sleep(0.01)
 
 
+def _capture_disabled_app(monkeypatch) -> dict:
+    """Capture the run's StatusApp, screenless (pytest has no terminal).
+
+    Disabled is what the `s` key needs here anyway: the flag it sets is
+    in-process, and a screenless app skips the cancel countdown, which is only
+    offered to somebody who can see the row it counts down on.
+    """
+    captured = {}
+    real_app_class = statusline.StatusApp
+
+    def _app(**kwargs):
+        kwargs["enabled"] = False
+        captured["app"] = real_app_class(**kwargs)
+        return captured["app"]
+
+    monkeypatch.setattr(statusline, "StatusApp", _app)
+    return captured
+
+
 # -- sequential runner ---------------------------------------------------------
 
 def test_dry_run_leaves_the_stop_file(tmp_path, capsys):
@@ -268,15 +287,7 @@ def test_the_s_key_stops_the_sequential_run_without_writing_a_sentinel(
     the same root sees no sentinel, and this one still ends on the request."""
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
-    captured = {}
-    real_app_class = statusline.StatusApp
-
-    def _app(**kwargs):
-        kwargs["enabled"] = False   # no terminal in pytest; the flag is the point
-        captured["app"] = real_app_class(**kwargs)
-        return captured["app"]
-
-    monkeypatch.setattr(statusline, "StatusApp", _app)
+    captured = _capture_disabled_app(monkeypatch)
 
     with cyclecore.stop_file_lifecycle():
         result = cyclecore.run_loop(_PressStopAfterOneDriver(captured),
@@ -301,15 +312,7 @@ def test_a_sentinel_present_at_stop_time_is_consumed_even_if_s_was_pressed(
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
     stop = tmp_path / "stop"
-    captured = {}
-    real_app_class = statusline.StatusApp
-
-    def _app(**kwargs):
-        kwargs["enabled"] = False
-        captured["app"] = real_app_class(**kwargs)
-        return captured["app"]
-
-    monkeypatch.setattr(statusline, "StatusApp", _app)
+    captured = _capture_disabled_app(monkeypatch)
 
     with cyclecore.stop_file_lifecycle():
         result = cyclecore.run_loop(
@@ -626,25 +629,6 @@ class _NeverEndingDriver(Driver):
 
     def next_command(self):
         return ClaudeCommand("do the thing", "", "the-thing")
-
-
-def _capture_disabled_app(monkeypatch) -> dict:
-    """Capture the run's StatusApp, screenless (pytest has no terminal).
-
-    Disabled is what the `s` key needs here anyway: the flag it sets is
-    in-process, and a screenless app skips the cancel countdown, which is only
-    offered to somebody who can see the row it counts down on.
-    """
-    captured = {}
-    real_app_class = statusline.StatusApp
-
-    def _app(**kwargs):
-        kwargs["enabled"] = False
-        captured["app"] = real_app_class(**kwargs)
-        return captured["app"]
-
-    monkeypatch.setattr(statusline, "StatusApp", _app)
-    return captured
 
 
 def cancel_it(app=None, **kwargs):
