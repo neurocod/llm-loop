@@ -441,6 +441,64 @@ def test_parallel_stop_file_is_reported_once_by_competing_workers(
                      "until the application exits.") == 1
 
 
+# The announcing worker's thread really does die on the refused write — that is
+# the unchanged half of the cost (a `worker` has no try/except, and had none
+# before the two tails were merged either), and pytest reports the dead thread as
+# a warning. Ignored here rather than left to a future `-W error` to turn into a
+# red test about the very thing this test arranges.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_parallel_stop_file_latches_even_when_the_console_write_fails(
+    tmp_path, monkeypatch
+):
+    """A refused announcement costs the line, never the reason.
+
+    The stop tail runs on the one worker that won the latch, and its console
+    write can fail for reasons that have nothing to do with the run: a closed
+    pipe (`llm-loop … | head`), a code page that cannot spell the em dash, rich
+    itself. Written before the transition, that exception unwinds the winner
+    with nothing latched — no reason, no `stop` event — the remaining workers
+    find the run still going and die on the same line in turn, and `run_parallel`
+    falls back to `shared.stop_reason or NO_WORK`. A run that obeyed a stop FILE
+    then reports that it simply ran out of work: the sentinel is consumed, the
+    exit log names the wrong cause, and a wrapper reading the reason to decide
+    whether to start the next phase starts it.
+
+    So the pin is on the REASON, not on the output — the whole point is that the
+    output failed. `print_markup` is where a real console write lands
+    (`_emit_markup` re-reads it per call for exactly this kind of pin).
+    """
+    stop = tmp_path / "stop"
+    calls = 0
+    real_print_markup = parallel.print_markup
+
+    def stop_after_first_job(job_id, command, mailbox=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            stop.write_text("", encoding="utf-8")
+        return 0, 0.0, 0.01
+
+    def refuse_the_stop_line(plain, markup):
+        if "Stop file detected" in plain:
+            raise BrokenPipeError("stdout closed under the stop announcement")
+        real_print_markup(plain, markup)
+
+    monkeypatch.setattr(parallel, "run_job", stop_after_first_job)
+    monkeypatch.setattr(parallel, "print_markup", refuse_the_stop_line)
+    args = _par_args(str(tmp_path), dry_run=False)
+    args.jobs = 1
+
+    with cyclecore.stop_file_lifecycle():
+        result = parallel.run_parallel(
+            _MemListDriver(["products/a.md", "products/b.md"]), args,
+            app_name="pytest-stop-parallel")
+        assert result.reason == cyclecore.RunStopReason.STOP_FILE, (
+            "a failed write to the console changed why the run ended")
+        assert stop.exists(), "workers removed the mutex before application cleanup"
+
+    assert not stop.exists(), "application exit left the stop mutex behind"
+
+
 # -- asking a run that is parked on the usage wall to stop -----------------------
 #
 # The pause on the account's budget is the longest hold in the engine: hours,

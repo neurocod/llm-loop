@@ -56,7 +56,7 @@ from datetime import datetime
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Callable, NamedTuple, Optional, Union
+from typing import Callable, NamedTuple, Optional, Tuple, Union
 
 from . import compactline, exitlog, operator, providers, textwidth
 from .providers import (
@@ -299,9 +299,19 @@ def latched_stop(app=None) -> Optional[StopSource]:
     return pending_stop(app)
 
 
-def commit_stop(app=None, source: Optional[StopSource] = None,
-                announce=None) -> RunStopReason:
-    """Act on a stop a run has decided to obey: latch, announce, name the reason.
+# The half of a stop-file announcement that does not depend on what found the
+# sentinel: the run ends, the FILE stays. Apart from the sentences that use it
+# because it is said in three places — both runners' stop tail (`commit_stop`)
+# and the wrapper that looks between periodic phases
+# (runGenerateModels._detect_periodic_stop) — and those copies had already
+# drifted into different spellings of the one promise.
+STOP_FILE_KEPT_CLAUSE = ("stopping; it remains in place until "
+                         "the application exits.")
+
+
+def commit_stop(app, source: StopSource) -> Tuple[RunStopReason, str]:
+    """Act on a stop a run has decided to obey: latch the sentinel, name the
+    reason, and hand back the line to announce — saying it is the caller's job.
 
     The tail of the decision, shared by both runners. Its head already was —
     `pending_stop`, `latched_stop`, `confirm_stop_request` — while this half was
@@ -311,29 +321,50 @@ def commit_stop(app=None, source: Optional[StopSource] = None,
     modules with nothing to catch the missed one (both halves are Python in one
     process, so there is no mirror gate to fail).
 
+    The line is RETURNED, never written here, and that is correctness rather
+    than taste: in the parallel runner this tail runs inside `shared.lock`, on
+    the single worker that won the latch, and a console write fails for reasons
+    that have nothing to do with the run — a closed pipe (`… | head`), a code
+    page that cannot spell the em dash, rich itself. Written from in here, such
+    an exception unwound the winner BEFORE the reason and the `stop` event were
+    set: the other workers found the run unlatched, died on the same write in
+    turn, and a run that obeyed a stop FILE reported NO_WORK on the way out.
+    Everything that decides the outcome therefore finishes before this returns,
+    and nothing on the way to it can fail (see `parallel.Shared.latch_stop`,
+    which is where the ordering is spent, and the pin
+    `test_parallel_stop_file_latches_even_when_the_console_write_fails`).
+
     NOT `pending_stop`, and not the caller's `source` either: what may still be
     cancelled and what must be cleaned up are different questions once the run
     is committed to stopping, so the channel is re-read through `latched_stop`
-    here. `source` is only the fallback for the sentinel that vanished between
-    the caller's decision and this call — without it a file-stop would be
-    reported, and cleaned up, as a key press.
+    here. `source` is the fallback for a sentinel that vanished between the
+    caller's decision and this call, and it has no default on purpose: with both
+    channels silent and nothing named, an unnamed stop would be reported as a
+    key press — silently, and in the one window where the truth is hardest to
+    reconstruct afterwards.
 
-    `announce` takes the line (default: print). A parallel worker passes its own
-    job-row writer; only the wording is shared, which is the point.
+    That vanished-sentinel window resolves to `source`, i.e. to STOP_FILE, with
+    a path that no longer exists marked for exit cleanup. Both halves are
+    deliberate. The run is stopping because of a FILE — nobody pressed `s`, and
+    STOP_KEY would name a human who was never there — and marking a path that is
+    already gone costs nothing, since `stop_file_lifecycle` treats a missing
+    file as done; the opposite mistake, not marking a sentinel that comes back,
+    leaves it for the next launch's `wait_for_stop_file_clear` to wait on
+    forever. The parallel runner has read it this way since it grew a stop file;
+    the sequential one used to answer STOP_KEY here and mark nothing, and that
+    difference ended when the two tails became this one.
     """
     latched = latched_stop(app) or source
-    say = announce or print
     if latched is StopSource.FILE:
         # Only a stop FILE is latched for removal at application exit — a key
         # request never touched the disk. The outermost lifecycle removes the
         # sentinel only after every worker and all wrapper-level cleanup is done.
         mark_stop_file_detected(stop_file_for(app))
-        say("Stop file detected — stopping; it remains in place until "
-            "the application exits.")
-        return RunStopReason.STOP_FILE
-    say("Stop requested with the s key — stopping this run "
-        "(no stop file written; other runs are unaffected).")
-    return RunStopReason.STOP_KEY
+        return (RunStopReason.STOP_FILE,
+                f"Stop file detected — {STOP_FILE_KEPT_CLAUSE}")
+    return (RunStopReason.STOP_KEY,
+            "Stop requested with the s key — stopping this run "
+            "(no stop file written; other runs are unaffected).")
 
 
 # How long an interactive run counts down before it acts on a stop request. The
@@ -2121,7 +2152,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                           "Left in place (a dry run never consumes it).")
                     stop_file_noted = True
             elif pending is not None and confirm_stop_request(app):
-                stop_reason = commit_stop(app, pending)
+                # Reason first, line second — the same order the parallel runner
+                # spends a lock on (see commit_stop): a console that refuses the
+                # line must not cost the run the reason it is stopping for.
+                stop_reason, announcement = commit_stop(app, pending)
+                print(announcement)
                 app.update(phase="stopping")
                 break
             # Cancelled inside the interactive grace — carry on with no trace.

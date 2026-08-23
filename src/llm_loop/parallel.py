@@ -538,22 +538,36 @@ class Shared:
 
         Returning True exactly once is what keeps the announcement (and the
         lifecycle latch) single when every worker sees the request at the same
-        time — which is why the whole tail runs INSIDE the lock rather than
-        being handed back to the winner: `cyclecore.commit_stop` latches the
-        sentinel for cleanup, writes the line and names the reason, and this is
-        the one place that decides there is a winner at all. Both runners get
-        that tail from there, so a new stop channel is one edit, not two.
+        time — which is why the tail runs here rather than being handed back to
+        the winner: `cyclecore.commit_stop` latches the sentinel for cleanup and
+        names the reason, and this is the one place that decides there is a
+        winner at all. Both runners get that tail from there, so a new stop
+        channel is one edit, not two.
 
-        Lock order is shared.lock -> the emit lock behind `announce`, and only
-        that way round: nothing on the output path claims this lock back.
+        The transition finishes INSIDE the lock and the line is written OUTSIDE
+        it, in that order and never the other way round — two separate reasons:
+
+          * order, because a write that raises must not take the latch with it.
+            Announcing first left `stop_reason` unset and `stop` clear when the
+            console refused the line, and the run reported NO_WORK for a stop
+            FILE it had obeyed (see `cyclecore.commit_stop`);
+          * outside, because `shared.lock` is also the lock every other worker
+            needs to claim, finish or release a file, and a console that blocks
+            would hold all of them for as long as the write is stuck.
+
+        What is still taken under `shared.lock` is `commit_stop`'s `os.path.exists`
+        and the stop-file lifecycle lock behind `mark_stop_file_detected` — a
+        stat and a global assignment, both of which have to be the winner's, and
+        neither of which claims `shared.lock` back.
         """
         with self.lock:
             if self.stop.is_set():
                 return False
-            self.stop_reason = cyclecore.commit_stop(app, source, announce)
+            self.stop_reason, announcement = cyclecore.commit_stop(app, source)
             self.claims_closed.set()
             self.stop.set()
-            return True
+        (announce or print)(announcement)
+        return True
 
     def note_pause(self, paused: bool) -> bool:
         """True for the worker that should announce this pause (or its release).
@@ -629,9 +643,10 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
         if not cyclecore.confirm_stop_request(app):
             return False
     # The tail — re-reading the channel to act on, latching the sentinel for
-    # cleanup, the line, the reason — is `cyclecore.commit_stop`, reached under
-    # the lock that picks the one worker who runs it. `pending` goes along as the
-    # fallback for a sentinel that vanished in between.
+    # cleanup, the reason, the line — is `cyclecore.commit_stop`, reached under
+    # the lock that picks the one worker who runs it (which is also the lock the
+    # line is written after, not under). `pending` goes along as the fallback for
+    # a sentinel that vanished in between.
     if shared.latch_stop(pending, app,
                          lambda text: out.line(text, "bold red")):
         app.update(phase="stopping")
