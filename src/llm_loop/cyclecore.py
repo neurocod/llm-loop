@@ -300,11 +300,11 @@ def latched_stop(app=None) -> Optional[StopSource]:
 
 
 # The half of a stop-file announcement that does not depend on what found the
-# sentinel: the run ends, the FILE stays. Apart from the sentences that use it
-# because it is said in three places — both runners' stop tail (`commit_stop`)
-# and the wrapper that looks between periodic phases
-# (runGenerateModels._detect_periodic_stop) — and those copies had already
-# drifted into different spellings of the one promise.
+# sentinel: the run ends, the FILE stays. A constant rather than a literal in
+# each sentence, because that promise is made in three places — both runners'
+# stop tail (`commit_stop`) and the wrapper that looks between periodic phases
+# (runGenerateModels._detect_periodic_stop) — and the copies had already drifted
+# into different spellings of it.
 STOP_FILE_KEPT_CLAUSE = ("stopping; it remains in place until "
                          "the application exits.")
 
@@ -2152,9 +2152,20 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                           "Left in place (a dry run never consumes it).")
                     stop_file_noted = True
             elif pending is not None and confirm_stop_request(app):
-                # Reason first, line second — the same order the parallel runner
-                # spends a lock on (see commit_stop): a console that refuses the
-                # line must not cost the run the reason it is stopping for.
+                # Reason first, line second: `commit_stop` hands the line back
+                # instead of writing it (the order the parallel runner spends a
+                # lock on — see there). What this branch gets out of that order
+                # is narrower than what the fleet gets, and the difference is
+                # worth naming here rather than inheriting the fleet's promise.
+                # A refused write cannot lose the SENTINEL: commit_stop marked it
+                # for cleanup before returning, and `stop_file_lifecycle`'s
+                # finally still removes it while the exception unwinds. It does
+                # lose the REASON: `stop_reason` is a local, nothing around this
+                # loop catches, and a raising print leaves run_loop with no
+                # RunResult at all (exitlog then prints "reason not recorded").
+                # Left that way on purpose — one thread, no other worker to
+                # mislead, so the exception IS this run's ending instead of a
+                # wrong answer about why it ended.
                 stop_reason, announcement = commit_stop(app, pending)
                 print(announcement)
                 app.update(phase="stopping")
