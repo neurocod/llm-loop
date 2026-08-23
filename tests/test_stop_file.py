@@ -389,38 +389,57 @@ def test_parallel_stop_file_lives_until_outer_application_exit(
     assert not stop.exists(), "application exit left the stop mutex behind"
 
 
+class _WorkersMeetAtTheSentinel:
+    """Stage "every worker sees one stop file at the same moment", don't hope for it.
+
+    Both fleet stop-file pins are about an ELECTION, so both need the candidates
+    to be real: a worker that reaches its stop check after the winner has already
+    latched never stands, and a run where that happens to all but one proves
+    nothing about what the losers do. Two barriers arrange it — the jobs finish
+    together, then the FIRST post-sentinel `os.path.exists` of each worker waits
+    for the rest — after which all `jobs` threads are inside the check at once.
+
+    `os.path.exists` is patched through `parallel.os`, which is the `os` module
+    itself, so the interception also covers the read that matters
+    (`cyclecore.pending_stop`, in the other module). Everything else is passed
+    straight through, and only threads named `job*` are ever held.
+    """
+
+    def __init__(self, stop: Path, jobs: int, monkeypatch):
+        self.stop = stop
+        self._created = threading.Event()
+        self._jobs_ready = threading.Barrier(jobs)
+        self._checks_ready = threading.Barrier(jobs)
+        self._checked = set()
+        self._lock = threading.Lock()
+        self._real_exists = os.path.exists
+        monkeypatch.setattr(parallel, "run_job", self.run_job)
+        monkeypatch.setattr(parallel.os.path, "exists", self.exists)
+
+    def run_job(self, job_id, command, mailbox=None):
+        self._jobs_ready.wait(timeout=5)
+        if job_id == 1:
+            self.stop.write_text("", encoding="utf-8")
+            self._created.set()
+        assert self._created.wait(5)
+        return 0, 0.0, 0.01
+
+    def exists(self, path):
+        thread_name = threading.current_thread().name
+        if (path == str(self.stop) and self._created.is_set()
+                and thread_name.startswith("job")):
+            with self._lock:
+                first = thread_name not in self._checked
+                self._checked.add(thread_name)
+            if first:
+                self._checks_ready.wait(timeout=5)
+        return self._real_exists(path)
+
+
 def test_parallel_stop_file_is_reported_once_by_competing_workers(
     tmp_path, monkeypatch, capsys
 ):
-    stop = tmp_path / "stop"
-    stop_created = threading.Event()
-    jobs_ready = threading.Barrier(4)
-    checks_ready = threading.Barrier(4)
-    checked_threads = set()
-    checked_lock = threading.Lock()
-    real_exists = os.path.exists
-
-    def finish_jobs_together(job_id, command, mailbox=None):
-        jobs_ready.wait(timeout=5)
-        if job_id == 1:
-            stop.write_text("", encoding="utf-8")
-            stop_created.set()
-        assert stop_created.wait(5)
-        return 0, 0.0, 0.01
-
-    def coordinate_first_worker_checks(path):
-        thread_name = threading.current_thread().name
-        if (path == str(stop) and stop_created.is_set()
-                and thread_name.startswith("job")):
-            with checked_lock:
-                first = thread_name not in checked_threads
-                checked_threads.add(thread_name)
-            if first:
-                checks_ready.wait(timeout=5)
-        return real_exists(path)
-
-    monkeypatch.setattr(parallel, "run_job", finish_jobs_together)
-    monkeypatch.setattr(parallel.os.path, "exists", coordinate_first_worker_checks)
+    _WorkersMeetAtTheSentinel(tmp_path / "stop", 4, monkeypatch)
     args = _par_args(str(tmp_path), dry_run=False)
     args.jobs = 4
 
@@ -466,37 +485,46 @@ def test_parallel_stop_file_latches_even_when_the_console_write_fails(
     So the pin is on the REASON, not on the output — the whole point is that the
     output failed. `print_markup` is where a real console write lands
     (`_emit_markup` re-reads it per call for exactly this kind of pin).
+
+    Run with a FLEET, on the same staging as the neighbouring election pin. The
+    reason assertion bites at `jobs = 1` too (measured: restoring the
+    winner-election order fails it there as well, NO_WORK == STOP_FILE) — but the
+    half of the story that COSTS the reason is the OTHER workers finding the run
+    unlatched and dying on the same line in turn, and one worker has no others
+    for that to happen to. Four of them, all inside the stop check together, do;
+    and the refusal counter is what states the outcome for them: exactly one
+    thread may ever reach the write, however many stood in the election.
     """
     stop = tmp_path / "stop"
-    calls = 0
+    _WorkersMeetAtTheSentinel(stop, 4, monkeypatch)
+    refusals = 0
+    counter_lock = threading.Lock()
     real_print_markup = parallel.print_markup
 
-    def stop_after_first_job(job_id, command, mailbox=None):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            stop.write_text("", encoding="utf-8")
-        return 0, 0.0, 0.01
-
     def refuse_the_stop_line(plain, markup):
+        nonlocal refusals
         if "Stop file detected" in plain:
+            with counter_lock:
+                refusals += 1
             raise BrokenPipeError("stdout closed under the stop announcement")
         real_print_markup(plain, markup)
 
-    monkeypatch.setattr(parallel, "run_job", stop_after_first_job)
     monkeypatch.setattr(parallel, "print_markup", refuse_the_stop_line)
     args = _par_args(str(tmp_path), dry_run=False)
-    args.jobs = 1
+    args.jobs = 4
 
     with cyclecore.stop_file_lifecycle():
         result = parallel.run_parallel(
-            _MemListDriver(["products/a.md", "products/b.md"]), args,
+            _MemListDriver([f"products/{i}.md" for i in range(8)]), args,
             app_name="pytest-stop-parallel")
         assert result.reason == cyclecore.RunStopReason.STOP_FILE, (
             "a failed write to the console changed why the run ended")
         assert stop.exists(), "workers removed the mutex before application cleanup"
 
     assert not stop.exists(), "application exit left the stop mutex behind"
+    assert refusals == 1, (
+        f"{refusals} workers reached the stop line — the losers are supposed to "
+        "find the run already latched and leave without announcing anything")
 
 
 # -- asking a run that is parked on the usage wall to stop -----------------------
