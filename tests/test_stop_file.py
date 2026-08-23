@@ -389,6 +389,31 @@ def test_parallel_stop_file_lives_until_outer_application_exit(
     assert not stop.exists(), "application exit left the stop mutex behind"
 
 
+def _refuse_the_stop_announcement(monkeypatch) -> list:
+    """Make the console refuse the stop line; returns the list of attempts.
+
+    The failure is not the run's and never was: a closed pipe (`llm-loop … |
+    head`), a code page that cannot spell the em dash, rich itself. It is staged
+    on `print_markup` because that is where a real console write lands, and
+    `_emit_markup` re-reads the name per call for exactly this kind of pin.
+    Every other line still goes through untouched, so a test that gets no
+    attempt at all learns that from the empty list rather than from silence.
+    """
+    attempts = []
+    lock = threading.Lock()
+    real_print_markup = parallel.print_markup
+
+    def refuse(plain, markup):
+        if "Stop file detected" in plain:
+            with lock:
+                attempts.append(plain)
+            raise BrokenPipeError("stdout closed under the stop announcement")
+        real_print_markup(plain, markup)
+
+    monkeypatch.setattr(parallel, "print_markup", refuse)
+    return attempts
+
+
 class _WorkersMeetAtTheSentinel:
     """Stage "every worker sees one stop file at the same moment", don't hope for it.
 
@@ -497,19 +522,7 @@ def test_parallel_stop_file_latches_even_when_the_console_write_fails(
     """
     stop = tmp_path / "stop"
     _WorkersMeetAtTheSentinel(stop, 4, monkeypatch)
-    refusals = 0
-    counter_lock = threading.Lock()
-    real_print_markup = parallel.print_markup
-
-    def refuse_the_stop_line(plain, markup):
-        nonlocal refusals
-        if "Stop file detected" in plain:
-            with counter_lock:
-                refusals += 1
-            raise BrokenPipeError("stdout closed under the stop announcement")
-        real_print_markup(plain, markup)
-
-    monkeypatch.setattr(parallel, "print_markup", refuse_the_stop_line)
+    refusals = _refuse_the_stop_announcement(monkeypatch)
     args = _par_args(str(tmp_path), dry_run=False)
     args.jobs = 4
 
@@ -522,9 +535,64 @@ def test_parallel_stop_file_latches_even_when_the_console_write_fails(
         assert stop.exists(), "workers removed the mutex before application cleanup"
 
     assert not stop.exists(), "application exit left the stop mutex behind"
-    assert refusals == 1, (
-        f"{refusals} workers reached the stop line — the losers are supposed to "
-        "find the run already latched and leave without announcing anything")
+    assert len(refusals) == 1, (
+        f"{len(refusals)} workers reached the stop line — the losers are "
+        "supposed to find the run already latched and leave without announcing "
+        "anything")
+
+
+# Same dead announcing thread as above, and the same warning to ignore.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_worker_that_dies_announcing_a_stop_hands_its_claim_back(
+    tmp_path, monkeypatch
+):
+    """The winner may be holding a file when the write refuses it.
+
+    The stop check the fleet pin above stages runs at the loop head, where a
+    worker holds nothing. The other one does not: a sentinel that appears
+    between `Shared.claim` and the hold loop right after it parks the worker
+    there WITH a claim, and that worker can be the one that wins the latch and
+    dies on the announcement. Every ordinary way out of that hold releases the
+    line; an exception used to be the way that did not, and `claimed` counts a
+    file no worker ever started — `RunResult.attempted` and the exit log's
+    `iterations` both overstate the run by one.
+
+    So the pin is on the COUNT, not on the queue: nothing was ever struck, so
+    the file itself was never in danger (asserted anyway, since a fix that
+    rescued the claim by finishing it would satisfy the count).
+    """
+    stop = tmp_path / "stop"
+    real_claim = parallel.Shared.claim
+    refusals = _refuse_the_stop_announcement(monkeypatch)
+
+    def sentinel_appears_under_the_claim(self):
+        line = real_claim(self)
+        if line is not None and not stop.exists():
+            # The window: the claim is made, the hold loop has not read the
+            # channel yet. Written from here rather than from `run_job` because
+            # a stop noticed at the loop head never reaches the hold at all.
+            stop.write_text("", encoding="utf-8")
+        return line
+
+    monkeypatch.setattr(parallel.Shared, "claim", sentinel_appears_under_the_claim)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
+    driver = _MemListDriver(["products/a.md", "products/b.md"])
+    args = _par_args(str(tmp_path), dry_run=False)
+    args.jobs = 1
+
+    with cyclecore.stop_file_lifecycle():
+        result = parallel.run_parallel(driver, args,
+                                       app_name="pytest-stop-parallel")
+
+    assert len(refusals) == 1, "the announcement was never even attempted"
+    assert result.reason == cyclecore.RunStopReason.STOP_FILE
+    assert result.completed == 0, "no worker ran a file — nothing may be completed"
+    assert result.attempted == 0, (
+        f"the dead worker's claim was counted: {result.attempted} attempted, "
+        "though it never started the file it was holding")
+    assert driver.pending_lines() == ["products/a.md", "products/b.md"], (
+        "a claim handed back on the way out must leave the file pending")
 
 
 # -- asking a run that is parked on the usage wall to stop -----------------------

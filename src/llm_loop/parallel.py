@@ -744,12 +744,28 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # busy (no turn is running), so the verdict is not waiting on it either.
         # A max-items boundary only closes new claims, so already-claimed work
         # deliberately continues past all of this.
-        while cyclecore.pending_stop(app) is not None and not shared.stop.is_set():
-            # The one place that decides what a request means — the key keeps
-            # its cancel grace, a stop file does not. Read its verdict off
-            # `shared.stop` rather than its return value: the loop has to end on
-            # a stop latched by ANY worker, not only on this call's answer.
-            apply_stop_request(job_id, shared, app)
+        try:
+            while (cyclecore.pending_stop(app) is not None
+                   and not shared.stop.is_set()):
+                # The one place that decides what a request means — the key keeps
+                # its cancel grace, a stop file does not. Read its verdict off
+                # `shared.stop` rather than its return value: the loop has to end
+                # on a stop latched by ANY worker, not only on this call's answer.
+                apply_stop_request(job_id, shared, app)
+        except BaseException:
+            # This is the ONE hold that can raise with a claim in hand, and the
+            # thing that raises is the stop announcement: the worker parked here
+            # may be the one that wins the latch, and its console write can fail
+            # for reasons that have nothing to do with the run (see
+            # `Shared.latch_stop`). Falling out of `worker` without this leaves
+            # the line in `in_progress` and `claimed` one too high, so the run
+            # reports one more file attempted than any worker ever started — in
+            # `RunResult.attempted` and in the exit log's `iterations`. The file
+            # itself was never at risk (nothing struck it), which is why this is
+            # a release rather than a rescue: hand the claim back, let the
+            # exception go on ending the thread it was always going to end.
+            shared.release(line)
+            raise
         if shared.stop.is_set():
             shared.release(line)
             break
