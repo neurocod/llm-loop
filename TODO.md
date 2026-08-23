@@ -130,18 +130,9 @@ was added, and would have been just as green if it had not been).
 
 ## Structure worth doing when something takes you there anyway
 
-Three findings from the structural pass over the operator-note commits. None is
+Two findings from the structural pass over the operator-note commits. Neither is
 worth its churn on its own; each has a trigger that makes it cheap.
 
-- **`statusline.py`'s `# --- terminal` and `# --- input` sections are a
-  separable front end.** `Terminal`, `NullTerminal`, `terminal_for`, the
-  `InputEvent` family, `decode_escape`, `InputSource`, `TerminalInput`,
-  `_EscapeDecoder` — ~490 lines that reference `LoopStatus`, `Row` and `Segment`
-  exactly zero times. (Named by section rather than by line number: the numbers
-  went stale twice already.) Trigger: a second front
-  end, or a platform that needs its own reader. Not before — the operator-note
-  change touched three regions of this file at once, and under any split that
-  would have been a three-file change with two new import edges.
 - **`operator.py` vs `providers.py` could be split by ownership** — providers
   owns the pipe (open, wire format, channel, close), operator owns the policy
   (framing, queue, receipts). Today `user_message_line` (a stream-json fact)

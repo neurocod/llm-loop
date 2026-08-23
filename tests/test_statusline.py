@@ -15,7 +15,9 @@ import time
 
 import pytest
 
-from llm_loop import cyclecore, textwidth, statusline as sl
+from llm_loop import cyclecore, textwidth
+from llm_loop import statusline as sl
+from llm_loop import termio as tio
 
 
 NOW = 1_700_000_000.0
@@ -299,7 +301,7 @@ def test_key_legend_row_is_built_from_registered_actions():
 
     assert legend.strip() == "keys: x do the thing"
 
-    app.handle_event(sl.Key("x"))
+    app.handle_event(tio.Key("x"))
     assert action.runs == 1
 
 
@@ -326,13 +328,13 @@ def test_an_unavailable_action_leaves_the_legend():
     app.register_action(Hidden())
 
     assert app.render(width=200, now=NOW)[-2].strip() == ""
-    app.handle_event(sl.Key("z"))   # dispatch must not reach it either
+    app.handle_event(tio.Key("z"))   # dispatch must not reach it either
 
 
 def test_help_key_writes_the_full_key_list_into_the_note_row():
     app = sl.StatusApp(enabled=False)
 
-    app.handle_event(sl.Key("?"))
+    app.handle_event(tio.Key("?"))
 
     assert "s stop" in app.status.note and "h/? help" in app.status.note
 
@@ -340,7 +342,7 @@ def test_help_key_writes_the_full_key_list_into_the_note_row():
 def test_an_unknown_key_points_at_the_help_key():
     app = sl.StatusApp(enabled=False)
 
-    app.handle_event(sl.Key("q"))
+    app.handle_event(tio.Key("q"))
 
     assert "press h for help" in app.status.note
 
@@ -352,12 +354,12 @@ def test_stop_key_requests_a_stop_and_pressing_it_again_cancels(tmp_path):
     sentinel = tmp_path / "stop"
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
-    app.handle_event(sl.Key("s"))
+    app.handle_event(tio.Key("s"))
     assert app.stop_requested_here is True
     assert app.status.stop_pending == cyclecore.StopSource.KEY.value
     assert "cancel stop" in app.render(width=200, now=NOW)[-2]
 
-    app.handle_event(sl.Key("s"))
+    app.handle_event(tio.Key("s"))
     assert app.stop_requested_here is False and app.status.stop_pending == ""
 
 
@@ -371,7 +373,7 @@ def test_the_stop_key_writes_no_sentinel_so_a_neighbouring_run_keeps_going(
     one = sl.StatusApp(enabled=False, stop_file=str(sentinel))
     two = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
-    one.handle_event(sl.Key("s"))
+    one.handle_event(tio.Key("s"))
 
     assert not sentinel.exists(), "the key press left a cross-process sentinel"
     assert cyclecore.pending_stop(one) is cyclecore.StopSource.KEY
@@ -401,7 +403,7 @@ def test_what_may_be_cancelled_and_what_must_be_consumed_are_different(
     sentinel = tmp_path / "stop"
     monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
-    app.handle_event(sl.Key("s"))
+    app.handle_event(tio.Key("s"))
     sentinel.write_text("", encoding="utf-8")
 
     assert cyclecore.pending_stop(app) is cyclecore.StopSource.KEY
@@ -420,8 +422,8 @@ def test_the_stop_file_remains_the_cross_process_channel(tmp_path, monkeypatch):
     # `s` is offered as "stop", not "cancel stop": this request is not ours.
     assert app.action_for("s").help_text(app) == "stop"
 
-    app.handle_event(sl.Key("s"))                       # …and then pressed twice
-    app.handle_event(sl.Key("s"))
+    app.handle_event(tio.Key("s"))                       # …and then pressed twice
+    app.handle_event(tio.Key("s"))
     assert sentinel.exists(), "the s key removed somebody else's stop file"
     assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
 
@@ -440,12 +442,12 @@ def test_stop_file_defaults_to_the_engine_sentinel(monkeypatch):
 def test_pause_key_holds_the_run_and_pressing_it_again_resumes():
     app = sl.StatusApp(enabled=False)
 
-    app.handle_event(sl.Key("p"))
+    app.handle_event(tio.Key("p"))
     assert app.paused is True and app.status.paused is True
     assert cyclecore.pause_requested(app) is True
     assert "p resume" in app.render(width=200, now=NOW)[-2]
 
-    app.handle_event(sl.Key("p"))
+    app.handle_event(tio.Key("p"))
     assert app.paused is False and app.status.paused is False
     assert cyclecore.pause_requested(app) is False
     assert "p pause" in app.render(width=200, now=NOW)[-2]
@@ -460,7 +462,7 @@ def test_pausing_writes_nothing_to_disk_and_leaves_the_stop_channels_alone(
     monkeypatch.setattr(cyclecore, "STOP_FILE", str(sentinel))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
-    app.handle_event(sl.Key("p"))
+    app.handle_event(tio.Key("p"))
 
     assert not sentinel.exists()
     assert cyclecore.pending_stop(app) is None
@@ -634,11 +636,11 @@ def test_the_stop_key_is_what_marks_the_request_as_ours(tmp_path, monkeypatch):
     assert app.stop_requested_here is False
     assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
 
-    app.handle_event(sl.Key("s"))                   # ours, on top of theirs
+    app.handle_event(tio.Key("s"))                   # ours, on top of theirs
     assert app.stop_requested_here is True
     assert cyclecore.pending_stop(app) is cyclecore.StopSource.KEY
 
-    app.handle_event(sl.Key("s"))                   # withdrawn — theirs remains
+    app.handle_event(tio.Key("s"))                   # withdrawn — theirs remains
     assert app.stop_requested_here is False
     assert cyclecore.pending_stop(app) is cyclecore.StopSource.FILE
 
@@ -656,18 +658,18 @@ class _FakeStream(io.StringIO):
 
 
 def test_a_non_tty_stream_gets_a_null_terminal():
-    assert isinstance(sl.terminal_for(_FakeStream(False)), sl.NullTerminal)
+    assert isinstance(tio.terminal_for(_FakeStream(False)), tio.NullTerminal)
 
 
 def test_the_env_flag_disables_the_status_line(monkeypatch):
-    monkeypatch.setenv(sl.ENV_FLAG, "0")
+    monkeypatch.setenv(tio.ENV_FLAG, "0")
 
-    assert isinstance(sl.terminal_for(_FakeStream(True)), sl.NullTerminal)
+    assert isinstance(tio.terminal_for(_FakeStream(True)), tio.NullTerminal)
 
 
 def test_a_disabled_app_writes_nothing_and_still_serves_its_api():
     stream = _FakeStream(True)   # a real TTY: only `enabled=False` disables us
-    app = sl.StatusApp(terminal=sl.terminal_for(stream, enabled=False))
+    app = sl.StatusApp(terminal=tio.terminal_for(stream, enabled=False))
 
     with app:
         app.update(iteration=3, phase="running")
@@ -683,11 +685,11 @@ def test_a_disabled_app_writes_nothing_and_still_serves_its_api():
 def test_a_pinned_terminal_writes_its_rows_to_the_real_stream(monkeypatch):
     """The bytes are the terminal's business; that the ROWS land is ours."""
     stream = _FakeStream(True)
-    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
-    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+    monkeypatch.setattr(tio, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(tio.shutil, "get_terminal_size",
                         lambda fallback=(0, 0): os.terminal_size((100, 30)))
-    app = sl.StatusApp(terminal=sl.terminal_for(stream),
-                       input_source=sl.NullInputSource(), refresh=60)
+    app = sl.StatusApp(terminal=tio.terminal_for(stream),
+                       input_source=tio.NullInputSource(), refresh=60)
 
     with app:
         assert app.enabled is True
@@ -699,7 +701,7 @@ def test_a_pinned_terminal_writes_its_rows_to_the_real_stream(monkeypatch):
 
 def test_start_is_a_no_op_when_the_terminal_cannot_reserve(monkeypatch):
     """Any failure swaps in the Null terminal — the run must not care."""
-    class Refusing(sl.Terminal):
+    class Refusing(tio.Terminal):
         def __init__(self):
             super().__init__(stream=_FakeStream(True))
 
@@ -710,7 +712,7 @@ def test_start_is_a_no_op_when_the_terminal_cannot_reserve(monkeypatch):
     with app:
         app.update(phase="running")
 
-    assert isinstance(app.terminal, sl.NullTerminal)
+    assert isinstance(app.terminal, tio.NullTerminal)
 
 
 # --- window/tab title ----------------------------------------------------------
@@ -750,13 +752,13 @@ def test_control_characters_never_reach_the_title():
 
 def test_the_title_is_written_on_change_only_and_given_back_on_exit(monkeypatch):
     stream = _FakeStream(True)
-    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
-    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+    monkeypatch.setattr(tio, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(tio.shutil, "get_terminal_size",
                         lambda fallback=(0, 0): os.terminal_size((100, 30)))
-    app = sl.StatusApp(terminal=sl.terminal_for(stream),
-                       input_source=sl.NullInputSource(), refresh=60)
+    app = sl.StatusApp(terminal=tio.terminal_for(stream),
+                       input_source=tio.NullInputSource(), refresh=60)
 
-    escape = sl.TITLE_SET.format("⟳ iter 4/9 · garlic.md")
+    escape = tio.TITLE_SET.format("⟳ iter 4/9 · garlic.md")
     with app:
         app.update(iteration=4, max_iterations=9, phase="running")
         app.job(1).start(item="garlic.md", model="opus", now=NOW)
@@ -766,7 +768,7 @@ def test_the_title_is_written_on_change_only_and_given_back_on_exit(monkeypatch)
         assert "\x1b]0;" not in stream.getvalue()[mark:]   # so: no second write
         assert stream.getvalue().count(escape) == 1
 
-    assert sl.TITLE_RESET in stream.getvalue()  # the window gets its name back
+    assert tio.TITLE_RESET in stream.getvalue()  # the window gets its name back
 
     # A worker still finishing past a parallel Ctrl+C, or the quota refresher
     # whose join timed out: both paint after the teardown, and a name written
@@ -785,13 +787,13 @@ def test_the_window_keeps_its_name_when_something_else_takes_it(monkeypatch):
     run — we already wrote ours, as far as we know.
     """
     stream = _FakeStream(True)
-    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
-    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+    monkeypatch.setattr(tio, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(tio.shutil, "get_terminal_size",
                         lambda fallback=(0, 0): os.terminal_size((100, 30)))
-    app = sl.StatusApp(terminal=sl.terminal_for(stream),
-                       input_source=sl.NullInputSource(), refresh=0.01)
+    app = sl.StatusApp(terminal=tio.terminal_for(stream),
+                       input_source=tio.NullInputSource(), refresh=0.01)
 
-    escape = sl.TITLE_SET.format("⟳ iter 4/9 · garlic.md")
+    escape = tio.TITLE_SET.format("⟳ iter 4/9 · garlic.md")
     with app:
         app.update(iteration=4, max_iterations=9, phase="running")
         app.job(1).start(item="garlic.md", model="opus", now=NOW)
@@ -810,11 +812,11 @@ def test_disabling_mid_paint_cannot_leave_a_name_on_the_window(monkeypatch):
     may release that very terminal in between (a resize the screen cannot fit,
     any painting error). The released terminal has to refuse the write."""
     stream = _FakeStream(True)
-    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
-    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+    monkeypatch.setattr(tio, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(tio.shutil, "get_terminal_size",
                         lambda fallback=(0, 0): os.terminal_size((100, 30)))
-    terminal = sl.terminal_for(stream)
-    app = sl.StatusApp(terminal=terminal, input_source=sl.NullInputSource(),
+    terminal = tio.terminal_for(stream)
+    app = sl.StatusApp(terminal=terminal, input_source=tio.NullInputSource(),
                        refresh=60)
 
     with app:
@@ -1147,7 +1149,7 @@ def test_a_default_terminal_targets_the_real_stream_not_the_tee(monkeypatch):
     console = _FakeStream(True)
     monkeypatch.setattr(cyclecore, "_real_stream", lambda: console)
 
-    assert sl.Terminal()._stream is console
+    assert tio.Terminal()._stream is console
 
 
 def test_the_pinned_rows_never_reach_the_mirror_log(monkeypatch):
@@ -1162,11 +1164,11 @@ def test_the_pinned_rows_never_reach_the_mirror_log(monkeypatch):
     logger.setLevel(logging.INFO)
     logger.propagate = False
     monkeypatch.setattr(sys, "stdout", cyclecore._TeeToLog(console, logger))
-    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
-    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+    monkeypatch.setattr(tio, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(tio.shutil, "get_terminal_size",
                         lambda fallback=(0, 0): os.terminal_size((100, 30)))
 
-    app = sl.StatusApp(input_source=sl.NullInputSource(), refresh=60)
+    app = sl.StatusApp(input_source=tio.NullInputSource(), refresh=60)
     assert app.terminal._stream is console      # the tee was unwrapped
     with app:
         app.update(iteration=7, phase="running")
@@ -1186,11 +1188,11 @@ def test_every_way_out_releases_the_region(monkeypatch, blow_up):
     """Disabling is not enough — the region has to be reset on the way out, or
     the shell keeps scrolling inside it after the process is gone."""
     stream = _FakeStream(True)
-    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
-    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+    monkeypatch.setattr(tio, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(tio.shutil, "get_terminal_size",
                         lambda fallback=(0, 0): os.terminal_size((100, 30)))
-    app = sl.StatusApp(terminal=sl.terminal_for(stream),
-                       input_source=sl.NullInputSource(), refresh=60)
+    app = sl.StatusApp(terminal=tio.terminal_for(stream),
+                       input_source=tio.NullInputSource(), refresh=60)
 
     with pytest.raises(type(blow_up)):
         with app:
@@ -1208,8 +1210,8 @@ def test_a_signal_restores_the_terminal_and_still_lets_the_kill_through():
     import signal
 
     stream = _FakeStream(True)
-    app = sl.StatusApp(terminal=sl.Terminal(stream),
-                       input_source=sl.NullInputSource(), refresh=60)
+    app = sl.StatusApp(terminal=tio.Terminal(stream),
+                       input_source=tio.NullInputSource(), refresh=60)
     chained = []
     previous = signal.signal(signal.SIGTERM, lambda *args: chained.append(args))
     try:
@@ -1229,18 +1231,18 @@ def test_a_resize_the_region_cannot_satisfy_stops_painting(monkeypatch):
     left the rows being painted at the OLD coordinates."""
     stream = _FakeStream(True)
     size = [(100, 30)]
-    monkeypatch.setattr(sl, "_enable_windows_vt", lambda s: True)
-    monkeypatch.setattr(sl.shutil, "get_terminal_size",
+    monkeypatch.setattr(tio, "_enable_windows_vt", lambda s: True)
+    monkeypatch.setattr(tio.shutil, "get_terminal_size",
                         lambda fallback=(0, 0): os.terminal_size(size[0]))
-    app = sl.StatusApp(terminal=sl.terminal_for(stream),
-                       input_source=sl.NullInputSource(), refresh=60)
+    app = sl.StatusApp(terminal=tio.terminal_for(stream),
+                       input_source=tio.NullInputSource(), refresh=60)
 
     with app:
         assert app.enabled is True
         assert "\x1b[27;1H" in stream.getvalue()     # 5 rows at the 30-line size
         size[0] = (100, 6)                           # no room for the region now
         mark = len(stream.getvalue())
-        app.handle_event(sl.Resize(100, 6))
+        app.handle_event(tio.Resize(100, 6))
         app.update(iteration=99)
 
         assert app.enabled is False
@@ -1289,7 +1291,7 @@ def test_concurrent_job_updates_never_tear_a_snapshot():
 # --- the loop's wiring: live caps, primed quotas, no forced polls ---------------
 
 
-class _LiveTerminal(sl.Terminal):
+class _LiveTerminal(tio.Terminal):
     """Active from reserve() on, with no screen behind it.
 
     What these tests are about happens on either side of start() (push_quotas is
@@ -1358,7 +1360,7 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
     def _app(**kwargs):
         kwargs.pop("enabled", None)
         app = real_app_class(terminal=_LiveTerminal(),
-                             input_source=sl.NullInputSource(), refresh=60,
+                             input_source=tio.NullInputSource(), refresh=60,
                              **kwargs)
         made["app"] = app
         if on_app is not None:
@@ -1701,7 +1703,7 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
     def _app(**kwargs):
         kwargs.pop("enabled", None)
         app = real_app_class(terminal=_LiveTerminal(),
-                             input_source=sl.NullInputSource(), refresh=60,
+                             input_source=tio.NullInputSource(), refresh=60,
                              **kwargs)
         made.append(app)
         return app
@@ -1754,7 +1756,7 @@ def test_a_background_quota_poll_notes_its_failure_instead_of_printing(capsys):
             raise RuntimeError("no figures")     # quota_rows swallows this
 
     app = sl.StatusApp(terminal=_LiveTerminal(),
-                       input_source=sl.NullInputSource(), refresh=60)
+                       input_source=tio.NullInputSource(), refresh=60)
     with app:
         refresher = sl.QuotaRefresher(app, _NoisySource(), interval=0.01)
         refresher.start()
@@ -1782,56 +1784,3 @@ def test_capture_only_diverts_the_thread_that_asked_for_it(capsys):
     assert "".join(chunks) == "mine\n"
     assert capsys.readouterr().out == "from another thread\n"
     assert not isinstance(sys.stdout, sl._ThreadScopedCapture)   # uninstalled
-
-
-def test_escape_decoder_names_the_special_keys_on_both_platforms():
-    posix = sl._EscapeDecoder(scan_codes=False)
-
-    assert [e.char for e in posix.feed("s")] == ["s"]
-    assert posix.feed("\x1b") == [] and posix.feed("[") == []
-    assert [e.char for e in posix.feed("A")] == ["up"]
-    assert posix.feed("\x1b") == []
-    assert [e.char for e in posix.flush()] == ["\x1b"]     # a bare Esc
-
-    windows = sl._EscapeDecoder(scan_codes=True)
-    assert windows.feed("\xe0") == []
-    assert [e.char for e in windows.feed("K")] == ["left"]
-
-
-def test_the_word_wise_arrows_are_named_on_both_platforms():
-    """Ctrl+Left/Right: two unrelated spellings, one symbolic key, so the line
-    editor never learns which platform it is on."""
-    posix = sl._EscapeDecoder(scan_codes=False)
-    for char in "\x1b[1;5":
-        assert posix.feed(char) == []
-    assert [e.char for e in posix.feed("D")] == ["wordleft"]
-
-    windows = sl._EscapeDecoder(scan_codes=True)
-    assert windows.feed("\xe0") == []
-    assert [e.char for e in windows.feed("t")] == ["wordright"]
-    # …and the same letter without the lead byte is still just a letter.
-    assert [e.char for e in windows.feed("t")] == ["t"]
-
-
-def test_the_decoder_rejoins_a_utf16_surrogate_pair():
-    """msvcrt hands over code UNITS: an emoji in a pasted line arrives as two
-    lone surrogates, each unprintable on its own and therefore dropped."""
-    windows = sl._EscapeDecoder(scan_codes=True)
-
-    assert windows.feed("\ud83d") == []
-    assert [e.char for e in windows.feed("\ude80")] == ["🚀"]
-
-    # A half pair that never completes is not a keypress, and must not glue
-    # itself to whatever is typed next.
-    windows.feed("\ud83d")
-    assert windows.flush() == []
-    assert [e.char for e in windows.feed("a")] == ["a"]
-
-
-def test_escape_decoder_drops_sequences_nothing_understands():
-    decoder = sl._EscapeDecoder(scan_codes=False)
-
-    for char in "\x1b[200~":                 # bracketed paste: not a keypress
-        events = decoder.feed(char)
-
-    assert events == []

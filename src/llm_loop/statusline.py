@@ -12,27 +12,28 @@ have to own that stream, and `rich.live.Live` is already taken by the streaming
 Markdown renderer - only one may be active at a time, and `redirect_stdout`
 would bypass the mirror-log tee and silently empty `--cost`. Measuring and
 cutting text is not this module's business at all: it asks `textwidth`, the leaf
-both this and `cyclecore` sit on top of.
+both this and `cyclecore` sit on top of; neither is the terminal, which is
+`termio`'s — the rows below decide WHAT is said, `termio.Terminal` writes it and
+`termio.TerminalInput` brings the keys back.
 
 Two things are load-bearing and easy to get wrong:
 
-  * every escape goes to ``cyclecore._real_stream()``. ``sys.stdout`` is the
-    ``_TeeToLog`` mirror, and cursor-movement bytes in the log corrupt the run
-    record that ``--cost`` parses.
-  * anything that fails here disables the status line (a `NullTerminal` takes
-    over) and the run continues. A cosmetic feature must never be able to stop
-    an eight-hour loop.
+  * nothing here writes an escape or reads a key: it all goes through `termio`,
+    whose bytes reach ``cyclecore._real_stream()`` rather than ``sys.stdout``,
+    the ``_TeeToLog`` mirror (see there).
+  * anything that fails here disables the status line (a `termio.NullTerminal`
+    takes over) and the run continues. A cosmetic feature must never be able to
+    stop an eight-hour loop.
 
 The object model is deliberately wider than wave 1 needs: `Segment`, `Row`,
-`Mode`, `Action`, `Setting` and `InputEvent` all exist so later features land by
-ADDING a subclass and registering it - never by editing a dispatch chain, adding
-a boolean to `LoopStatus`, or hard-coding a key into the legend.
+`Mode`, `Action`, `Setting` and `termio.InputEvent` all exist so later features
+land by ADDING a subclass and registering it - never by editing a dispatch
+chain, adding a boolean to `LoopStatus`, or hard-coding a key into the legend.
 """
 
 import atexit
 import os
 import re
-import shutil
 import sys
 import threading
 import time
@@ -40,19 +41,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import cmdline, cyclecore, textwidth
+from . import cmdline, cyclecore, termio, textwidth
 
 __all__ = [
     "Action",
     "ElapsedSegment",
     "HelpAction",
-    "InputEvent",
-    "InputSource",
     "IterationSegment",
     "Job",
     "JobCountSegment",
     "JobRow",
-    "Key",
     "KeyLegendRow",
     "LabelSegment",
     "Layout",
@@ -61,11 +59,8 @@ __all__ = [
     "MessageMode",
     "MessagePromptRow",
     "Mode",
-    "Mouse",
     "NoteRow",
     "NormalMode",
-    "NullInputSource",
-    "NullTerminal",
     "NumberSetting",
     "PauseAction",
     "PauseSegment",
@@ -74,7 +69,6 @@ __all__ = [
     "QuotaRefresher",
     "QuotaRow",
     "QuotaSegment",
-    "Resize",
     "Row",
     "RuleRow",
     "ScriptLimitSegment",
@@ -85,8 +79,6 @@ __all__ = [
     "StatusApp",
     "StopAction",
     "StopSegment",
-    "Terminal",
-    "TerminalInput",
     "colorize",
     "format_elapsed",
     "format_prompt_block",
@@ -95,18 +87,8 @@ __all__ = [
     "quota_rows",
     "render_rows",
     "running_items",
-    "terminal_for",
     "title_text",
 ]
-
-# Environment kill switch, honoured next to --no-statusline so a hostile terminal
-# can be worked around without editing any command line.
-ENV_FLAG = "LLM_LOOP_STATUSLINE"
-
-# Below these the reserved region would eat the visible scrollback, so we simply
-# do not pin anything.
-MIN_COLUMNS = 40
-MIN_LINES = 8
 
 # Repaint cadence: fast enough that the elapsed clock ticks like a clock, slow
 # enough to be invisible next to the agent's own output.
@@ -172,17 +154,9 @@ TITLE_SEPARATOR = " · "
 # themselves and at a width we cannot know; cutting here at least puts the '…'
 # where we chose. Generous enough for the counter plus a couple of paths.
 TITLE_MAX = 120
-# OSC 0: sets the window title AND the icon/tab name, so one escape covers both
-# a tab strip and a taskbar button. BEL-terminated rather than ST — every
-# emulator this runs under accepts BEL, some older ones only accept BEL.
-TITLE_SET = "\x1b]0;{}\x07"
-# The empty title is the documented way back: Windows Terminal (and Tabby, and
-# the usual POSIX emulators) fall back to the profile's own title, which is
-# nearer to "as we found it" than any string we could invent.
-TITLE_RESET = TITLE_SET.format("")
-# A control character here would end the escape early and spray the rest of the
-# title into the scrollback as text; an item label is arbitrary text, so it is
-# never trusted to be free of them.
+# A control character here would end the OSC escape early (`termio.TITLE_SET`)
+# and spray the rest of the title into the scrollback as text; an item label is
+# arbitrary text, so it is never trusted to be free of them.
 _TITLE_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -800,8 +774,8 @@ class RuleRow(Row):
     """The full-width rule of underscores that opens the status area.
 
     A Row like every other one on purpose: the reserved region is sized by the
-    row COUNT, so a rule special-cased in the Terminal would put the region one
-    line out of step with what is painted. Rendered as plain characters, dimmed
+    row COUNT, so a rule special-cased in `termio.Terminal` would put the region
+    one line out of step with what is painted. Rendered as plain characters, dimmed
     later by `colorize` — it must survive a terminal that shows no colour, since
     it is the only thing separating the toolbar from the scrolling output.
     """
@@ -946,7 +920,7 @@ def render_rows(status: LoopStatus, width: int, *, now: Optional[float] = None,
     """The pinned area as plain text. Pure: no terminal, no clock of its own.
 
     All rendering lives here (and in the Rows) precisely so it can be tested
-    without a terminal; the Terminal class only moves bytes.
+    without a terminal; `termio.Terminal` only moves bytes.
     """
     layout = layout or Layout()
     snapshot = status.snapshot()
@@ -972,496 +946,6 @@ def title_text(status: LoopStatus, now: Optional[float] = None) -> str:
     parts += running_items(snapshot)
     text = TITLE_SEPARATOR.join(part for part in parts if part)
     return textwidth.fit(_TITLE_UNSAFE_RE.sub(" ", text), TITLE_MAX)
-
-
-# --- terminal ------------------------------------------------------------------
-
-
-def _enable_windows_vt(stream) -> bool:
-    """Turn on ENABLE_VIRTUAL_TERMINAL_PROCESSING; True if escapes will work.
-
-    Rich has usually done this already, but the status line must not depend on
-    rich being installed. A console that refuses simply gets no status line.
-    """
-    if os.name != "nt":
-        return True
-    try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_uint32()
-        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            return False
-        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
-    except Exception:
-        return False
-
-
-class Terminal:
-    """The reserved bottom region: bytes only, no idea what a row means.
-
-    Mechanics: a DECSTBM scroll region shrinks the scrolling area by `rows`, so
-    ordinary output keeps scrolling above untouched. Repaints save/restore the
-    cursor around absolute moves, which is also what heals the rows after rich's
-    Live has been moving the cursor around for a streamed Markdown block.
-    """
-
-    def __init__(self, stream=None):
-        self._stream = stream if stream is not None else cyclecore._real_stream()
-        self._lock = threading.Lock()
-        self._rows = 0
-        self._size = (0, 0)
-        self._title = None    # last title written (None = we never set one)
-        self._released = False  # torn down: writes no more title (see set_title)
-        self.failed = False
-
-    @property
-    def active(self) -> bool:
-        return self._rows > 0 and not self.failed
-
-    def size(self) -> Tuple[int, int]:
-        """(columns, lines) of the terminal right now."""
-        size = shutil.get_terminal_size(fallback=(80, 24))
-        return size.columns, size.lines
-
-    def _write(self, text: str) -> bool:
-        try:
-            self._stream.write(text)
-            self._stream.flush()
-            return True
-        except Exception:
-            # A closed/odd stream must not take the loop down with it.
-            self.failed = True
-            return False
-
-    def reserve(self, rows: int) -> bool:
-        """Pin `rows` lines at the bottom. Safe to call again to resize."""
-        if self.failed or rows <= 0:
-            return False
-        columns, lines = self.size()
-        if columns < MIN_COLUMNS or lines < MIN_LINES or rows >= lines - 1:
-            return False
-        with self._lock:
-            # Pinning rows is a run starting here, so the title ban lifts: a
-            # Terminal that was released and is now reserved again is in use.
-            self._released = False
-            # Scroll only for the rows we are *adding*: re-establishing the
-            # region on every resize must not walk the output up the screen.
-            grown = max(0, rows - self._rows)
-            self._rows = rows
-            self._size = (columns, lines)
-            first = lines - rows + 1
-            return self._write(
-                "\n" * grown
-                + f"\x1b[{first};1H\x1b[0J"        # clear the whole reserved area
-                + f"\x1b[1;{lines - rows}r"        # DECSTBM: shrink the scroll area
-                + f"\x1b[{lines - rows};1H")       # park at the bottom of it
-
-    def set_title(self, text: str, *, reassert: bool = False) -> bool:
-        """Name the window/tab. Repeats are dropped, so this is cheap to call
-        on every repaint — and an emulator that ignores OSC 0 simply swallows a
-        few bytes that never reach the scrollback.
-
-        Not gated on `active`, because a title has no geometry behind it: it is
-        written as soon as the run has something to say, before any region is
-        pinned. It IS refused once `release()` has run, and that is not
-        symmetry for its own sake — nothing would ever clear a name written
-        after the teardown. Two threads reach here after it routinely: a worker
-        still finishing its job past a parallel run's Ctrl+C, and the quota
-        refresher whose 1 s join timed out. Both used to leave the dead run's
-        name on the window for good.
-
-        `reassert` writes even when the text has not changed, and the periodic
-        repaint passes it for the same reason it re-states the scroll region
-        (see `paint`): the name is not ours alone. Anything the run launches can
-        take it — an escape from a provider CLI or a pager, and on Windows a
-        child that calls SetConsoleTitle, which no escape of ours is answering.
-        Without a re-assert the dedupe below then holds the window on somebody
-        else's name for the rest of the run, because as far as we know we
-        already wrote ours.
-        """
-        if self.failed or self._released:
-            return False
-        with self._lock:
-            # Compared UNDER the lock, with the write: two threads painting
-            # different states could otherwise leave the newer text recorded and
-            # the older one on screen, and every later repaint would then skip
-            # the correction as a duplicate.
-            if text == self._title and not reassert:
-                return False
-            self._title = text
-            return self._write(TITLE_SET.format(text))
-
-    def paint(self, lines: Sequence[str], *, reassert: bool = False) -> bool:
-        if not self.active:
-            return False
-        with self._lock:
-            columns, total = self._size
-            first = total - self._rows + 1
-            out = ["\x1b7"]  # save cursor (DECSC) — output above must not move
-            if reassert:
-                # The region is not sticky: an `ESC[r`, an alt-screen switch or a
-                # full reset from anything downstream (a provider CLI, a pager)
-                # un-pins it for good, and every absolute row write below would
-                # then scroll away with the output. Re-stating it costs one short
-                # escape on the periodic repaint; DECSTBM homes the cursor, which
-                # the DECRC at the end undoes.
-                out.append(f"\x1b[1;{total - self._rows}r")
-            for i in range(self._rows):
-                text = lines[i] if i < len(lines) else ""
-                out.append(f"\x1b[{first + i};1H\x1b[2K{text}")
-            out.append("\x1b8")  # restore cursor (DECRC)
-            return self._write("".join(out))
-
-    def release(self) -> None:
-        """Reset the scroll region and the title, clear the rows, leave a clean
-        cursor.
-
-        The title is put back BEFORE the early return: a run that never managed
-        to pin a row may still have named the window, and a finished run whose
-        name still says "iter 7/40" is worse than no name at all.
-        """
-        with self._lock:
-            if self._title is not None:
-                self._title = None
-                self._write(TITLE_RESET)
-            self._released = True
-            if self._rows <= 0:
-                return
-            _columns, total = self._size
-            first = total - self._rows + 1
-            out = ["\x1b7"]
-            for i in range(self._rows):
-                out.append(f"\x1b[{first + i};1H\x1b[2K")
-            out.append("\x1b8")
-            out.append("\x1b[r")             # full-height scroll region again
-            out.append(f"\x1b[{first};1H")   # sit on the first freed line
-            self._rows = 0
-            self._write("".join(out))
-
-
-class NullTerminal(Terminal):
-    """Null Object: chosen when there is no TTY, when disabled, or after any
-    error — so the controller has no `if enabled:` scattered through it."""
-
-    def __init__(self):
-        self._rows = 0
-        self.failed = False
-
-    @property
-    def active(self) -> bool:
-        return False
-
-    def size(self):
-        return (0, 0)
-
-    def reserve(self, rows):
-        return False
-
-    def set_title(self, text, *, reassert=False):
-        return False
-
-    def paint(self, lines, *, reassert=False):
-        return False
-
-    def release(self):
-        return None
-
-
-def terminal_for(stream=None, *, enabled: bool = True) -> Terminal:
-    """A real Terminal when pinning rows is safe here, else a NullTerminal."""
-    if not enabled or os.environ.get(ENV_FLAG) == "0":
-        return NullTerminal()
-    stream = stream if stream is not None else cyclecore._real_stream()
-    try:
-        if not stream.isatty():
-            return NullTerminal()
-    except Exception:
-        return NullTerminal()
-    if not _enable_windows_vt(stream):
-        return NullTerminal()
-    size = shutil.get_terminal_size(fallback=(0, 0))
-    if size.columns < MIN_COLUMNS or size.lines < MIN_LINES:
-        return NullTerminal()
-    return Terminal(stream)
-
-
-# --- input ---------------------------------------------------------------------
-
-
-class InputEvent:
-    """Something the user did. Subclasses carry the payload."""
-
-
-@dataclass
-class Key(InputEvent):
-    char: str
-
-
-@dataclass
-class Mouse(InputEvent):
-    """An SGR mouse report. Produced from wave 4 on; the type exists now so the
-    Mode/Action dispatch already speaks it."""
-
-    button: int
-    x: int
-    y: int
-    pressed: bool = True
-
-
-@dataclass
-class Resize(InputEvent):
-    columns: int
-    lines: int
-
-
-# Named keys. A `Key.char` longer than one character is one of these symbolic
-# names, so a Mode can ask for "left" without knowing whether the terminal spelt
-# it as a CSI sequence (POSIX) or a two-byte scan code (Windows).
-CSI_KEYS = {
-    "A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end",
-    "1~": "home", "3~": "delete", "4~": "end", "5~": "pgup", "6~": "pgdn",
-    "7~": "home", "8~": "end",
-    # Modified arrows: `ESC [ 1 ; <mod> <letter>`, where the modifier is
-    # 1+bitmask (2 shift, 4 alt, 8 ctrl). Ctrl (5) and Alt (3) both mean
-    # word-wise here — which one a terminal actually sends is not the typist's
-    # choice, and no other meaning is on offer in a one-line editor.
-    "1;5C": "wordright", "1;5D": "wordleft",
-    "1;3C": "wordright", "1;3D": "wordleft",
-    "1;5H": "home", "1;5F": "end",
-}
-# msvcrt reports these as a '\x00'/'\xe0' lead byte plus a scan code. The
-# word-wise codes are the console's own (Ctrl+Left 0x73 's', Ctrl+Right 0x74
-# 't', Ctrl+Home 0x77 'w', Ctrl+End 0x75 'u'); the lead byte is what keeps them
-# from colliding with those letters.
-WINDOWS_KEYS = {
-    "H": "up", "P": "down", "K": "left", "M": "right", "G": "home", "O": "end",
-    "I": "pgup", "Q": "pgdn", "S": "delete",
-    "s": "wordleft", "t": "wordright", "w": "home", "u": "end",
-    "\x93": "delete",                       # Ctrl+Delete
-}
-_WINDOWS_LEAD = ("\x00", "\xe0")
-
-
-def decode_escape(sequence: str) -> Optional[InputEvent]:
-    """A CSI sequence -> an InputEvent, or None to drop it.
-
-    The single seam for escape-driven input: wave 4 turns
-    `ESC [ < b ; x ; y M|m` into a Mouse here and nothing else changes. Unknown
-    sequences are dropped rather than delivered as a burst of Keys, which would
-    look to the user like random keypresses.
-    """
-    body = sequence[2:]                       # strip the leading "ESC ["
-    name = CSI_KEYS.get(body)
-    return Key(name) if name else None
-
-
-class InputSource:
-    """Produces InputEvents on a daemon thread."""
-
-    def start(self, handler: Callable[[InputEvent], None]) -> None:
-        raise NotImplementedError
-
-    def stop(self) -> None:
-        raise NotImplementedError
-
-    def restore_tty(self) -> None:
-        """Undo any terminal mode this source set. Nothing to undo by default.
-
-        Separate from `stop()` because it must be callable from a signal handler
-        or from atexit, where the reader thread's own `finally` will never run.
-        """
-        return None
-
-
-class NullInputSource(InputSource):
-    """No TTY (or disabled): yields nothing, so no key is ever read."""
-
-    def start(self, handler):
-        return None
-
-    def stop(self):
-        return None
-
-
-class _EscapeDecoder:
-    """Assembles keystrokes into InputEvents: plain chars, CSI sequences (POSIX)
-    and msvcrt scan codes (Windows), so both platforms deliver the same
-    symbolic `Key("left")` / `Key("pgup")`.
-
-    A bare ESC is only known to be a bare ESC once nothing follows it, hence
-    `flush()` — the reader calls it when its poll times out. Wave 2's edit mode
-    needs Esc to mean cancel, so the distinction is not academic.
-    """
-
-    def __init__(self, scan_codes: bool = os.name == "nt"):
-        # `scan_codes` off on POSIX: there a NUL is a normal (if odd) character,
-        # and treating it as a lead byte would swallow the key after it.
-        self.scan_codes = scan_codes
-        self._buf = ""
-        self._high = ""
-
-    def feed(self, char: str) -> List[InputEvent]:
-        if self._high:
-            char, self._high = self._combine(self._high, char), ""
-            if not char:
-                return []
-        elif "\ud800" <= char <= "\udbff":
-            # msvcrt.getwch() hands over UTF-16 code UNITS, so anything outside
-            # the BMP (an emoji in a pasted line) arrives as two lone surrogates.
-            # Each half is unprintable on its own, so passing them through drops
-            # the character silently — join them here, where the platform quirk
-            # already lives, and every consumer keeps seeing one printable Key.
-            self._high = char
-            return []
-        if self._buf in _WINDOWS_LEAD and self._buf:   # lead byte + scan code
-            name = WINDOWS_KEYS.get(char)
-            self._buf = ""
-            return [Key(name)] if name else []
-        if not self._buf:
-            if self.scan_codes and char in _WINDOWS_LEAD:
-                self._buf = char
-                return []
-            if char == "\x1b":
-                self._buf = char
-                return []
-            return [Key(char)]
-        self._buf += char
-        if len(self._buf) == 2 and char not in "[O":
-            buf, self._buf = self._buf, ""
-            return [Key("\x1b"), Key(buf[1])]
-        if len(self._buf) >= 3 and "@" <= char <= "~":
-            buf, self._buf = self._buf, ""
-            event = decode_escape(buf)
-            return [event] if event is not None else []
-        return []
-
-    @staticmethod
-    def _combine(high: str, low: str) -> str:
-        """One character from a UTF-16 surrogate pair, or "" if it was not one."""
-        try:
-            return (high + low).encode("utf-16", "surrogatepass").decode("utf-16")
-        except UnicodeError:
-            return ""
-
-    def flush(self) -> List[InputEvent]:
-        self._high = ""      # a half pair that never completed is not a keypress
-        if self._buf == "\x1b":
-            self._buf = ""
-            return [Key("\x1b")]
-        return []
-
-
-class TerminalInput(InputSource):
-    """Raw-ish key reader: msvcrt on Windows, termios+select on POSIX.
-
-    cbreak, never raw: ISIG stays on so Ctrl+C keeps behaving exactly as it does
-    today. On Windows msvcrt hands '\\x03' over instead, so it is turned back
-    into a KeyboardInterrupt on the main thread.
-    """
-
-    poll_seconds = 0.05
-
-    def __init__(self, stream=None):
-        self._stream = stream if stream is not None else sys.stdin
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._decoder = _EscapeDecoder()
-        # (fd, saved termios attrs) while the tty is in cbreak, else None.
-        self._tty_state: Optional[Tuple[int, object]] = None
-
-    def usable(self) -> bool:
-        try:
-            return bool(self._stream) and self._stream.isatty()
-        except Exception:
-            return False
-
-    def start(self, handler):
-        if self._thread is not None or not self.usable():
-            return
-        self._stop.clear()
-        target = self._run_windows if os.name == "nt" else self._run_posix
-        self._thread = threading.Thread(target=self._guard, args=(target, handler),
-                                        name="statusline-input", daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        thread, self._thread = self._thread, None
-        if thread is not None:
-            thread.join(timeout=1.0)
-        self.restore_tty()   # the thread normally did it; make sure of it here
-
-    def restore_tty(self):
-        """Take the tty back out of cbreak, from any thread, at most once."""
-        state, self._tty_state = self._tty_state, None
-        if state is None:
-            return
-        fd, saved = state
-        try:
-            import termios
-
-            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        except Exception:
-            pass
-
-    def _guard(self, target, handler):
-        try:
-            target(handler)
-        except Exception:
-            return  # a broken reader costs the keys, never the run
-
-    def _emit(self, handler, char: str) -> None:
-        if char == "\x03":  # Ctrl+C on the Windows path: keep the usual meaning
-            import _thread
-
-            _thread.interrupt_main()
-            return
-        for event in self._decoder.feed(char):
-            handler(event)
-
-    def _run_windows(self, handler):
-        import msvcrt
-
-        while not self._stop.is_set():
-            if msvcrt.kbhit():
-                self._emit(handler, msvcrt.getwch())
-                continue
-            for event in self._decoder.flush():
-                handler(event)
-            self._stop.wait(self.poll_seconds)
-
-    def _run_posix(self, handler):
-        import codecs
-        import select
-        import termios
-        import tty
-
-        fd = self._stream.fileno()
-        saved = termios.tcgetattr(fd)
-        # INCREMENTAL, not a plain .decode() per read: a paste arrives as a byte
-        # stream cut at arbitrary offsets, and a read that ends mid-character
-        # (every non-ASCII one is 2-4 bytes) would decode to U+FFFD and eat the
-        # start of the next character with it. Keeping the decoder across reads
-        # is what makes a pasted Russian sentence survive a chunk boundary.
-        utf8 = codecs.getincrementaldecoder("utf-8")("replace")
-        try:
-            tty.setcbreak(fd)  # cbreak, not raw: ISIG (Ctrl+C) stays enabled
-            # Published so a signal handler / atexit can undo it: this thread is
-            # a daemon, and a signal kills it without running the finally below.
-            self._tty_state = (fd, saved)
-            while not self._stop.is_set():
-                ready, _, _ = select.select([fd], [], [], self.poll_seconds)
-                if not ready:
-                    for event in self._decoder.flush():
-                        handler(event)
-                    continue
-                for char in utf8.decode(os.read(fd, 1024)):
-                    self._emit(handler, char)
-        finally:
-            # Guaranteed restore: a terminal left in cbreak is unusable.
-            self.restore_tty()
 
 
 # --- actions and modes ---------------------------------------------------------
@@ -1571,7 +1055,7 @@ class Mode:
         """
         return None
 
-    def handle(self, event: InputEvent) -> bool:
+    def handle(self, event: termio.InputEvent) -> bool:
         """True when the event was consumed (and must not fall through)."""
         return False
 
@@ -1582,7 +1066,7 @@ class NormalMode(Mode):
     name = "normal"
 
     def handle(self, event):
-        if not isinstance(event, Key):
+        if not isinstance(event, termio.Key):
             return False
         action = self.app.action_for(event.char)
         if action is not None:
@@ -1609,9 +1093,9 @@ class LineEditor:
     themselves; this app already owns both (a reserved region at the bottom of
     the scrollback, its own cbreak reader, its own repaint thread), so a second
     owner would fight it for the cursor rather than add anything. What was
-    actually missing was smaller than the seam: `_EscapeDecoder` has delivered
-    symbolic `Key("left")`/`Key("home")` since wave 1, and the editor simply
-    dropped them.
+    actually missing was smaller than the seam: `termio._EscapeDecoder` has
+    delivered symbolic `Key("left")`/`Key("home")` since wave 1, and the editor
+    simply dropped them.
 
     A key it does not recognise is REFUSED (False) rather than swallowed, so the
     Mode above stays free to give that key a meaning of its own.
@@ -1702,10 +1186,10 @@ class LineEditor:
 
     # --- key dispatch --------------------------------------------------------
 
-    # Symbolic keys (from _EscapeDecoder) and the readline control characters
-    # side by side: the arrows are the discoverable path, the control keys the
-    # fast one — and they are the ONLY path left on a terminal that eats
-    # modified arrows, which many do.
+    # Symbolic keys (from termio._EscapeDecoder) and the readline control
+    # characters side by side: the arrows are the discoverable path, the control
+    # keys the fast one — and they are the ONLY path left on a terminal that
+    # eats modified arrows, which many do.
     ACTIONS = {
         "left": lambda e: e.move(-1),
         "right": lambda e: e.move(1),
@@ -1817,7 +1301,7 @@ class MessageMode(Mode):
                 ("←/→", "move"), ("^W/^U/^K", "erase")]
 
     def handle(self, event):
-        if not isinstance(event, Key):
+        if not isinstance(event, termio.Key):
             return False        # Resize and friends still belong to the app
         char = event.char
         if char in ("\r", "\n"):
@@ -2245,8 +1729,8 @@ class StatusApp:
     """
 
     def __init__(self, *, status: Optional[LoopStatus] = None,
-                 terminal: Optional[Terminal] = None,
-                 input_source: Optional[InputSource] = None,
+                 terminal: Optional[termio.Terminal] = None,
+                 input_source: Optional[termio.InputSource] = None,
                  layout: Optional[Layout] = None,
                  settings: Optional[SettingsRegistry] = None,
                  messages=None,
@@ -2259,7 +1743,7 @@ class StatusApp:
         # (a dry run, several concurrent workers). Registering the key on the
         # same condition keeps the legend from offering what it cannot do.
         self.messages = messages
-        self.terminal = terminal if terminal is not None else terminal_for(
+        self.terminal = terminal if terminal is not None else termio.terminal_for(
             enabled=enabled)
         self.layout = layout or Layout(self.legend_entries)
         self.actions: List[Action] = []
@@ -2322,15 +1806,15 @@ class StatusApp:
         try:
             with self._stop_lock:
                 self.status.update(stop_pending=self._sentinel_pending())
-            if isinstance(self.terminal, NullTerminal):
+            if isinstance(self.terminal, termio.NullTerminal):
                 return self   # disabled: no region to pin, no keys to read
             if not self._reserve(len(self.rows())):
                 self.disable()
                 return self
             self._paint()
             if self._input is None:
-                self._input = (TerminalInput() if self.terminal.active
-                               else NullInputSource())
+                self._input = (termio.TerminalInput() if self.terminal.active
+                               else termio.NullInputSource())
             self._input.start(self.handle_event)
             self._paint_thread = threading.Thread(
                 target=self._repaint_loop, name="statusline-paint", daemon=True)
@@ -2450,7 +1934,7 @@ class StatusApp:
             self.terminal.release()
         except Exception:
             pass
-        self.terminal = NullTerminal()
+        self.terminal = termio.NullTerminal()
 
     # --- state -------------------------------------------------------------
 
@@ -2577,9 +2061,9 @@ class StatusApp:
     def mode(self) -> Mode:
         return self.modes[-1]
 
-    def handle_event(self, event: InputEvent) -> None:
+    def handle_event(self, event: termio.InputEvent) -> None:
         try:
-            if isinstance(event, Resize):
+            if isinstance(event, termio.Resize):
                 # A refused reserve() leaves the OLD geometry in place, so
                 # carrying on would paint absolute rows outside the new screen
                 # with the region set for the old one. Disable instead —
@@ -2613,7 +2097,7 @@ class StatusApp:
 
     def _reserve(self, rows: int) -> bool:
         """True when the region has the requested shape (or there is none to keep)."""
-        if isinstance(self.terminal, NullTerminal):
+        if isinstance(self.terminal, termio.NullTerminal):
             return True
         if self.terminal.reserve(rows):
             self._reserved = rows
@@ -2656,7 +2140,7 @@ class StatusApp:
                 size = self.terminal.size()
                 if size != last_size:
                     last_size = size
-                    self.handle_event(Resize(size[0], size[1]))
+                    self.handle_event(termio.Resize(size[0], size[1]))
                 if self._note_at and time.time() - self._note_at > NOTE_TTL:
                     self._note_at = 0.0
                     self.status.update(note="")
@@ -2672,7 +2156,8 @@ class StatusApp:
                                    else self._sentinel_pending())
                         if pending != self.status.stop_pending:
                             self.status.update(stop_pending=pending)
-                # Re-assert the region on the periodic repaint: see Terminal.paint.
+                # Re-assert the region on the periodic repaint: see
+                # termio.Terminal.paint.
                 self._paint(reassert=True)
             except Exception:
                 self.disable()

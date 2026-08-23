@@ -140,7 +140,7 @@ def line_budget(prefix: str = "") -> int:
 
     For the ORDINARY output above the pinned region, where a line that does not
     fit merely wraps — not for the pinned rows themselves, which are sized by
-    `statusline.Terminal` and must never wrap (see `fit`). The compact renderers
+    `termio.Terminal` and must never wrap (see `fit`). The compact renderers
     used to cut their one variable field at 140, 160 or 200 characters depending
     on the call site and on which provider produced the event; on a 240-column
     terminal that showed a command cut in half with a third of the screen left

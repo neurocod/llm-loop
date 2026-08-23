@@ -22,6 +22,7 @@ import pytest
 
 from llm_loop import cyclecore, operator, parallel, providers, textwidth
 from llm_loop import statusline as sl
+from llm_loop import termio as tio
 from llm_loop.cyclecore import AgentCommand, Driver
 from llm_loop.providers import build_agent_argv, start_agent_process
 
@@ -73,8 +74,8 @@ def _capture_status_app(monkeypatch):
 
     def _build(**kwargs):
         seen["messages"] = kwargs.get("messages")
-        return real_app_class(terminal=sl.NullTerminal(),
-                              input_source=sl.NullInputSource(), refresh=60,
+        return real_app_class(terminal=tio.NullTerminal(),
+                              input_source=tio.NullInputSource(), refresh=60,
                               **{k: v for k, v in kwargs.items()
                                  if k != "enabled"})
 
@@ -473,14 +474,14 @@ def test_the_sequential_status_line_is_given_the_runs_mailbox(tmp_path,
 
 
 def _app(mailbox=None, stop_file=None):
-    return sl.StatusApp(messages=mailbox, terminal=sl.NullTerminal(),
-                        input_source=sl.NullInputSource(), refresh=60,
+    return sl.StatusApp(messages=mailbox, terminal=tio.NullTerminal(),
+                        input_source=tio.NullInputSource(), refresh=60,
                         stop_file=stop_file)
 
 
 def _type(app, text):
     for char in text:
-        app.handle_event(sl.Key(char))
+        app.handle_event(tio.Key(char))
 
 
 def test_the_message_key_is_absent_when_there_is_nobody_to_address():
@@ -495,9 +496,9 @@ def test_typing_a_note_and_sending_it(tmp_path):
     mailbox = operator.Mailbox()
     app = _app(mailbox, stop_file=str(tmp_path / "stop"))
 
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "use the studs")
-    app.handle_event(sl.Key("\r"))
+    app.handle_event(tio.Key("\r"))
 
     assert mailbox.take_queued() == ["use the studs"]
     assert "queued for the next iteration" in app.status.note
@@ -512,7 +513,7 @@ def test_a_pasted_newline_cannot_reach_the_stop_key(tmp_path):
     stop = tmp_path / "stop"
     app = _app(mailbox, stop_file=str(stop))
 
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "check the sizes\r")
     _type(app, "stop after this one")
 
@@ -524,13 +525,13 @@ def test_a_pasted_newline_cannot_reach_the_stop_key(tmp_path):
 def test_escape_clears_before_it_leaves(tmp_path):
     """Alt+key arrives as ESC + key, so a one-step Esc would leak that key."""
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "half a thought")
 
-    app.handle_event(sl.Key("\x1b"))
+    app.handle_event(tio.Key("\x1b"))
     assert app.mode.name == "message" and app.mode.buffer == ""
 
-    app.handle_event(sl.Key("\x1b"))
+    app.handle_event(tio.Key("\x1b"))
     assert app.mode.name == "normal"
 
 
@@ -538,7 +539,7 @@ def test_the_legend_stops_offering_keys_the_editor_has_taken(tmp_path):
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
     assert "s" in dict(app.legend_entries())
 
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
 
     keys = dict(app.legend_entries())
     assert "s" not in keys, "`s` is a letter in here — the legend must not lie"
@@ -551,7 +552,7 @@ def test_the_stop_key_inside_a_note_is_a_letter_not_a_stop(tmp_path):
     stop = tmp_path / "stop"
     app = _app(operator.Mailbox(), stop_file=str(stop))
 
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "stop after this one")
 
     assert not stop.exists()
@@ -562,10 +563,10 @@ def test_backspace_in_both_spellings(tmp_path):
     mailbox = operator.Mailbox()
     app = _app(mailbox, stop_file=str(tmp_path / "stop"))
 
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "abc")
-    app.handle_event(sl.Key("\x08"))      # msvcrt spelling
-    app.handle_event(sl.Key("\x7f"))      # POSIX spelling
+    app.handle_event(tio.Key("\x08"))      # msvcrt spelling
+    app.handle_event(tio.Key("\x7f"))      # POSIX spelling
 
     assert app.mode.buffer == "a"
     assert mailbox.queued_count == 0, "nothing is sent until Enter"
@@ -576,7 +577,7 @@ def test_the_prompt_row_shows_the_end_of_a_long_line(tmp_path):
     for this project, and a row counted in code points would wrap — which pushes
     the reserved region up a line and desynchronises every later repaint."""
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "码" * 100)
 
     row = app.render(width=40)[-1]
@@ -594,11 +595,11 @@ def test_an_unbound_key_is_swallowed_rather_than_dispatched(tmp_path):
     that fell through.
     """
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     hint = app.status.note
 
-    app.handle_event(sl.Key("pgup"))
-    app.handle_event(sl.Key("\x00"))
+    app.handle_event(tio.Key("pgup"))
+    app.handle_event(tio.Key("\x00"))
 
     assert app.mode.name == "message" and app.mode.buffer == ""
     assert app.status.note == hint
@@ -611,18 +612,18 @@ def test_the_cursor_moves_and_typing_lands_where_it_points(tmp_path):
     """The report this fixes: the line was append-only, so a typo three words
     back could only be reached by erasing everything after it."""
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "use the studs")
 
     for _ in range(len("studs")):
-        app.handle_event(sl.Key("left"))
+        app.handle_event(tio.Key("left"))
     _type(app, "big ")
 
     assert app.mode.buffer == "use the big studs"
 
-    app.handle_event(sl.Key("home"))
+    app.handle_event(tio.Key("home"))
     _type(app, "please ")
-    app.handle_event(sl.Key("end"))
+    app.handle_event(tio.Key("end"))
     _type(app, "!")
 
     assert app.mode.buffer == "please use the big studs!"
@@ -630,43 +631,43 @@ def test_the_cursor_moves_and_typing_lands_where_it_points(tmp_path):
 
 def test_backspace_and_delete_work_off_the_cursor(tmp_path):
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "abXcd")
     for _ in range(3):
-        app.handle_event(sl.Key("left"))
+        app.handle_event(tio.Key("left"))
 
-    app.handle_event(sl.Key("delete"))          # forward: eats the X
+    app.handle_event(tio.Key("delete"))          # forward: eats the X
     assert app.mode.buffer == "abcd"
 
-    app.handle_event(sl.Key("\x7f"))            # backward: eats the b
+    app.handle_event(tio.Key("\x7f"))            # backward: eats the b
     assert app.mode.buffer == "acd"
 
 
 def test_word_moves_and_word_erase(tmp_path):
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "measure the second shelf")
 
-    app.handle_event(sl.Key("wordleft"))        # Ctrl+Left, both platforms
-    app.handle_event(sl.Key("\x17"))            # Ctrl+W: erase "second "
+    app.handle_event(tio.Key("wordleft"))        # Ctrl+Left, both platforms
+    app.handle_event(tio.Key("\x17"))            # Ctrl+W: erase "second "
     assert app.mode.buffer == "measure the shelf"
 
-    app.handle_event(sl.Key("wordright"))       # to the end of "shelf"
+    app.handle_event(tio.Key("wordright"))       # to the end of "shelf"
     _type(app, "!")
     assert app.mode.buffer == "measure the shelf!"
 
 
 def test_the_kill_keys_cut_from_the_cursor(tmp_path):
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "keep this drop that")
     for _ in range(len("drop that")):
-        app.handle_event(sl.Key("left"))
+        app.handle_event(tio.Key("left"))
 
-    app.handle_event(sl.Key("\x0b"))            # Ctrl+K
+    app.handle_event(tio.Key("\x0b"))            # Ctrl+K
     assert app.mode.buffer == "keep this "
 
-    app.handle_event(sl.Key("\x15"))            # Ctrl+U
+    app.handle_event(tio.Key("\x15"))            # Ctrl+U
     assert app.mode.buffer == ""
 
 
@@ -674,10 +675,10 @@ def test_the_cursor_stays_visible_in_a_line_wider_than_the_row(tmp_path):
     """A window that only ever showed the tail would scroll the caret off the
     moment the typist went back to fix something."""
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "码" * 100)
     for _ in range(60):
-        app.handle_event(sl.Key("left"))
+        app.handle_event(tio.Key("left"))
 
     row = app.render(width=40)[-1]
 
@@ -691,10 +692,10 @@ def test_sending_resets_the_cursor_with_the_buffer(tmp_path):
     middle of nothing."""
     mailbox = operator.Mailbox()
     app = _app(mailbox, stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "first note")
-    app.handle_event(sl.Key("home"))
-    app.handle_event(sl.Key("\r"))
+    app.handle_event(tio.Key("home"))
+    app.handle_event(tio.Key("\r"))
 
     _type(app, "second")
 
@@ -706,10 +707,10 @@ def test_a_pasted_line_lands_intact_at_the_cursor(tmp_path):
     """Ctrl+V is the terminal's own key: the clipboard arrives as an ordinary
     burst of characters, so paste is insertion — including into the middle."""
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
-    app.handle_event(sl.Key("m"))
+    app.handle_event(tio.Key("m"))
     _type(app, "измерь полку")
     for _ in range(len("полку")):
-        app.handle_event(sl.Key("left"))
+        app.handle_event(tio.Key("left"))
 
     _type(app, "вторую\tсправа ")        # a tab inside the pasted fragment
 

@@ -20,6 +20,7 @@ import threading
 
 from llm_loop import cyclecore, parallel
 from llm_loop import statusline as sl
+from llm_loop import termio as tio
 from llm_loop.drivers import ListFileDriver
 
 
@@ -56,7 +57,7 @@ class _MemDriver(ListFileDriver):
             return False
 
 
-class _LiveTerminal(sl.Terminal):
+class _LiveTerminal(tio.Terminal):
     """Active from reserve() on, with no screen behind it.
 
     The grace is interactive-only (`app.enabled`), so a NullTerminal — which is
@@ -105,9 +106,9 @@ def _live_statusline(monkeypatch, made, *, live=True):
 
     def _app(**kwargs):
         enabled = kwargs.pop("enabled", True)
-        terminal = _LiveTerminal() if (live and enabled) else sl.NullTerminal()
+        terminal = _LiveTerminal() if (live and enabled) else tio.NullTerminal()
         app = real_app_class(terminal=terminal,
-                             input_source=sl.NullInputSource(), refresh=60,
+                             input_source=tio.NullInputSource(), refresh=60,
                              **kwargs)
         made["app"] = app
         made.setdefault("enabled", enabled)
@@ -407,7 +408,7 @@ def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
     def _app(**kwargs):
         kwargs.pop("enabled", None)
         return real_app_class(terminal=_RecordingTerminal(log),
-                              input_source=sl.NullInputSource(), refresh=60,
+                              input_source=tio.NullInputSource(), refresh=60,
                               **kwargs)
 
     monkeypatch.setattr(sl, "StatusApp", _app)
