@@ -52,23 +52,19 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Callable, NamedTuple, Optional, Union
+from typing import Callable, Optional, Union
 
 from . import (compactline, console, exitlog, operator, projectroot, providers,
                stopchannel, textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
 # Driver protocol that produces them — is `agentwork`, for the same reason as the
 # rest of this list: both runners execute that contract and neither owns it.
-# Imported by name because these are the spellings the loop uses on nearly every
-# path, and all six are part of the package's public surface (see __init__).
-from .agentwork import (
-    AgentCommand,
-    ClaudeCommand,
-    Driver,
-    LoopStop,
-    build_agent_argv,
-    build_claude_argv,
-)
+#
+# Three names, not the six that module exports: these are the ones this loop
+# CALLS. The rest of the vocabulary reaches an embedder through `__init__`, which
+# takes all six straight from `agentwork` — so re-importing them here would only
+# create second addresses for names this file never mentions again.
+from .agentwork import Driver, LoopStop, build_agent_argv
 # What the run PRINTS, and the mirror log that is the second copy of it, are
 # `console` (see its header for why those are one module). The line helpers are
 # imported by name because this module calls them on nearly every path; the

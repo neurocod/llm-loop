@@ -191,7 +191,8 @@ src/
     drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)
     parallel.py      run_parallel: N concurrent LLM workers over a list file
     operator.py      notes typed at the console, on their way to the running agent
-    usage.py         UsageSource: query / cache / parse the account's quota figures
+    usage.py         what is known about a quota: the queried figures
+                     (UsageSource) and the verdict the wire streams back
     codex_usage.py   the same figures for Codex, over its own app-server protocol
     limits.py        LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
     statusline.py    the status area pinned under a run: its rows, and the keys
@@ -414,7 +415,7 @@ of a temporary network, CLI, or authentication problem. A failure is therefore
 treated as "no figures" rather than a fatal error. Claude also has a reactive
 backstop: every run streams its own `rate_limit_event` verdict, and a `rejected`
 makes the loop wait out exactly the quota that refused it
-(`cyclecore.RateLimitEvent`). A failed Codex turn forces a fresh app-server
+(`usage.RateLimitEvent`). A failed Codex turn forces a fresh app-server
 reading before the bounded retry path continues.
 
 ## Common options

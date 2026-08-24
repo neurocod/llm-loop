@@ -1185,10 +1185,16 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # inside the run's one push lock, because the join above may have given up
     # on a pusher that is still in `git push`. The lock is HERE and not inside
     # `final_git_push` on purpose: this is the runner with threads, so the
-    # exclusion is its own (see that function's docstring). Note the whole call
-    # is inside, `git_unpushed_count` included: reading the count while the
-    # pusher pushes is how the old spelling could print "nothing to push" about
-    # a repository that was being pushed at that moment.
+    # exclusion is its own (see that function's docstring).
+    #
+    # The whole call is inside, `git_unpushed_count` included, and that is the
+    # deliberate half: reading the count while the pusher pushes is how the old
+    # spelling could print "nothing to push" about a repository that was being
+    # pushed at that moment. The price is paid at exit — a run whose pusher is
+    # mid-push now waits for it (up to `git_push`'s 300 s subprocess timeout)
+    # even when it has nothing of its own to push, where before it printed and
+    # left. Worth it: the alternative is a closing line that can be false, and
+    # the wait only happens when a push really is in flight.
     with push_lock:
         final_git_push(git_push_policy, projectroot.project_dir())
 

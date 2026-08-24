@@ -32,10 +32,11 @@ Pick a usage-limit specialisation with a Driver's `limit_policy` attribute, e.g.
 composite `LimitPolicy([DayNightLimit(), WeeklyLimit(90)])`; unset defaults to a
 day/night session rule for Claude and a session-plus-weekly policy for Codex.
 
-See cyclecore for the engine and the Driver protocol, drivers for the two ready
-made Drivers, parallel for the concurrent list runner, projectroot for the root
-itself, usage/codex_usage for the provider quota query layers, and limits for
-the pausing policy.
+See agentwork for what a unit of work is and the Driver protocol you subclass,
+cyclecore for the sequential engine, drivers for the two ready made Drivers,
+parallel for the concurrent list runner, projectroot for the root itself,
+usage/codex_usage for the provider quota query layers, and limits for the
+pausing policy.
 """
 
 # The single source of truth for the version: pyproject.toml reads it back out
@@ -57,7 +58,7 @@ from .cyclecore import (
     run_loop,
     run_agent_streaming,
 )
-# Same story as the three below: the vocabulary of WORK — what a unit of it is,
+# Same story as the four below: the vocabulary of WORK — what a unit of it is,
 # how it becomes an argv, and the Driver protocol a wrapper subclasses — moved
 # out of cyclecore into `agentwork`, and the front door is unchanged on purpose.
 # A wrapper names the PACKAGE's `Driver`, not the runner it happens to drive;

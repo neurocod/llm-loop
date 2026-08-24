@@ -19,7 +19,6 @@ import os
 import subprocess
 import sys
 import threading
-import time
 
 import pytest
 
@@ -359,11 +358,84 @@ class _OverlapWatchingGit(_FakeGitModule):
 
 # Upper bound on how long a staged push is held if nothing releases it.
 HELD_PUSH_TIMEOUT_S = 10.0
-# How long the stager waits, after the first push starts, before releasing it.
-# It only has to outlast "a worker returns, two joins, the status area closes",
-# all of which are immediate here — and erring long only makes the overlap more
-# certain, never less.
-HANDOVER_S = 0.5
+
+
+class _LockWaitLog:
+    """Every lock acquire in the run that had to WAIT, and who was holding it.
+
+    The one observation the pin below cannot make from outside the runner:
+    whether the main thread was BLOCKED on `push_lock`. Timing cannot answer it
+    — "the exit push ran after the pusher's" looks identical whether it waited
+    or simply arrived late — and arriving late is exactly what a loaded machine
+    produces.
+    """
+
+    def __init__(self):
+        self.waits = []
+        self.main_waited_for_pusher = threading.Event()
+
+    def note(self, waiter: str, holder) -> None:
+        self.waits.append((waiter, holder))
+        if waiter == "MainThread" and holder == "pusher":
+            self.main_waited_for_pusher.set()
+
+
+class _WatchedLock:
+    """A `threading.Lock` that reports a blocking acquire to a `_LockWaitLog`.
+
+    `acquire` first tries non-blocking: succeeding means there was no contention
+    and nothing to report. Only the failing try is a wait, and the owner recorded
+    at the last successful acquire says who it waited for.
+    """
+
+    def __init__(self, real, log: _LockWaitLog):
+        self._real = real
+        self._log = log
+        self._owner = None
+
+    def acquire(self, blocking=True, timeout=-1):
+        if self._real.acquire(blocking=False):
+            self._owner = threading.current_thread().name
+            return True
+        self._log.note(threading.current_thread().name, self._owner)
+        got = self._real.acquire(blocking, timeout)
+        if got:
+            self._owner = threading.current_thread().name
+        return got
+
+    def release(self):
+        self._owner = None
+        self._real.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+class _LockWatchingThreading:
+    """Stands in for `parallel.threading`, handing out `_WatchedLock`s.
+
+    A replacement MODULE for one importer, the same trick `_FakeGitModule` plays
+    on `gitpush.subprocess` and for the same reason: patching `threading.Lock`
+    itself would instrument every lock in the process, including pytest's own.
+    Everything else (`Event`, `Thread`, …) is forwarded untouched.
+
+    `_emit_lock` is not covered — it is built at import time, long before this
+    stands in — which is correct: it is the print lock, not this run's.
+    """
+
+    def __init__(self, real, log: _LockWaitLog):
+        self._real = real
+        self._log = log
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def Lock(self):
+        return _WatchedLock(self._real.Lock(), self._log)
 
 
 def test_the_exit_push_never_runs_beside_the_background_pusher(
@@ -377,12 +449,20 @@ def test_the_exit_push_never_runs_beside_the_background_pusher(
     reachable at all — with the shipped five seconds the pusher always finishes
     first and this pin would be green whatever the exit push did.
 
-    Staged, not raced: the pusher's first push blocks until the stager releases
-    it HANDOVER_S later, by which time the main thread is already at the exit
-    push. Remove the `with push_lock:` around it and `max_live` reads 2.
+    A handshake, not a sleep, and the difference is the whole pin. The pusher's
+    push blocks until the stager releases it, and the stager waits for the main
+    thread to be observed WAITING on the lock the pusher holds. So the overlap is
+    not hoped for on a timer — a first draft slept 0.5 s here, which on a loaded
+    box degrades to a silent vacuous pass, and closing that window (sleep 0) made
+    the missing lock invisible while the test still said PASS.
+
+    Remove the `with push_lock:` around the exit push and `max_live` reads 2.
     """
     fake = _OverlapWatchingGit()
+    waits = _LockWaitLog()
     monkeypatch.setattr(gitpush, "subprocess", fake)
+    monkeypatch.setattr(parallel, "threading",
+                        _LockWatchingThreading(threading, waits))
     monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
     monkeypatch.setattr(parallel, "PUSHER_JOIN_TIMEOUT_S", 0.01)
     monkeypatch.setattr(parallel, "run_job",
@@ -392,8 +472,9 @@ def test_the_exit_push_never_runs_beside_the_background_pusher(
     root = _elsewhere(tmp_path)
 
     def stage_the_handover():
-        if fake.pushed.wait(timeout=PUMP_WAIT_S):
-            time.sleep(HANDOVER_S)
+        # Bounded: if the main thread never waits for the pusher the run must
+        # end and the assertions report it, not hang the suite.
+        waits.main_waited_for_pusher.wait(timeout=PUMP_WAIT_S)
         fake.release.set()
 
     stager = threading.Thread(target=stage_the_handover, name="stager",
@@ -408,7 +489,8 @@ def test_the_exit_push_never_runs_beside_the_background_pusher(
         fake.release.set()
         stager.join(timeout=PUMP_WAIT_S)
 
-    assert fake.max_live >= 1, \
-        "no push happened at all, so nothing about concurrency was measured"
+    assert waits.main_waited_for_pusher.is_set(), (
+        "the exit push never waited for the pusher, so this run measured "
+        f"nothing about their mutual exclusion; lock waits seen: {waits.waits}")
     assert fake.max_live == 1, \
         f"two git pushes were in flight at once: {fake.calls}"

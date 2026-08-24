@@ -1,11 +1,11 @@
 """When a loop pushes what it has committed, and the two git calls that decide.
 
 The policy is the same for both runners and belongs to neither: the sequential
-loop applies it at the top of every iteration and once more on the way out, the
-parallel one from its own timer thread. It lived in `cyclecore` only because
-`git_push` had to print, and printing lived there too — the moment the terminal
-moved to `console`/`termio` the cut became clean, and a module that had to
-import a runner back stopped being one.
+loop applies it at the top of every iteration, the parallel one from its own
+timer thread, and BOTH end with `final_git_push`. It lived in `cyclecore` only
+because `git_push` had to print, and printing lived there too — the moment the
+terminal moved to `console`/`termio` the cut became clean, and a module that had
+to import a runner back stopped being one.
 
 THE REPOSITORY IS A PARAMETER, NOT AN AMBIENT FACT. Every call here takes the
 directory to run git in. The old spelling read the runner's own project-root
