@@ -970,7 +970,65 @@ def test_fleet_report_keeps_a_live_send_blocked_during_shutdown(capsys):
     assert "1 operator note(s) whose live delivery was not" in out
     assert "confirmed:" in out
     assert "job 2: must survive Ctrl+C" in out
-    assert deliveries and not deliveries[0].live
+    assert deliveries and deliveries[0].reported
+    assert mailboxes.queued_count == 0, \
+        "a note already preserved by the report must not be queued afterward"
+
+
+def test_fleet_report_catches_a_submit_before_live_framing(monkeypatch, capsys):
+    started = threading.Event()
+    release = threading.Event()
+    real_frame_live = operator.frame_live
+
+    def blocked_frame(text):
+        started.set()
+        assert release.wait(timeout=5)
+        return real_frame_live(text)
+
+    class _BrokenPipe:
+        def write(self, _text):
+            raise OSError("the write should be skipped after shutdown")
+
+        def flush(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(operator, "frame_live", blocked_frame)
+    mailboxes = operator.MailboxSet([1, 2])
+    mailbox = mailboxes.mailbox(2)
+    operator.AgentChannel(_BrokenPipe(), mailbox)
+    deliveries = []
+    sender = threading.Thread(
+        target=lambda: deliveries.append(mailbox.submit("registered at entry")))
+    sender.start()
+    try:
+        assert started.wait(timeout=2)
+        operator.report_undelivered_notes(mailboxes)
+        out = capsys.readouterr().out
+    finally:
+        release.set()
+        sender.join(timeout=2)
+
+    assert not sender.is_alive()
+    assert "job 2: registered at entry" in out
+    assert deliveries and deliveries[0].reported
+    assert mailboxes.queued_count == 0
+
+
+def test_fleet_report_discloses_receipts_aged_out_of_its_bound(capsys):
+    mailbox = operator.Mailbox()
+    operator.AgentChannel(_Sink(), mailbox)
+
+    for index in range(operator.MAX_AWAITING_ECHO + 3):
+        assert mailbox.submit(f"note {index}").live
+
+    operator.report_undelivered_notes(mailbox)
+    out = capsys.readouterr().out
+
+    assert "tracking for 3 earlier live operator note(s)" in out
+    assert "3 receipt(s) no longer tracked" in out
 
 
 # --- the parallel runner: one mailbox per worker -------------------------------

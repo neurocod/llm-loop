@@ -211,11 +211,15 @@ class Delivery(NamedTuple):
     live: bool          # went straight into the turn in flight
     queued: int         # notes now waiting for the next iteration
     error: str = ""     # why the live attempt failed, when it did
+    reported: bool = False  # shutdown already preserved the note's text
 
     @property
     def message(self) -> str:
         if self.live:
             return "note sent to the agent"
+        if self.reported:
+            return (f"live delivery stopped ({self.error}) - the closing report "
+                    f"preserved the note")
         if self.error:
             return (f"live delivery failed ({self.error}) - queued for the next "
                     f"iteration ({self.queued} waiting)")
@@ -234,9 +238,18 @@ class Mailbox:
         self._lock = threading.Lock()
         self._queued: List[str] = []
         self._channel: Optional[AgentChannel] = None
-        # (what was written, what the human typed) for notes whose replay echo
-        # has not come back yet - see claim_echo.
-        self._awaiting: List[Tuple[str, str]] = []
+        # (what was written, what the human typed, submission identity) for notes
+        # whose replay echo has not come back yet - see claim_echo.
+        self._awaiting: List[Tuple[str, str, object]] = []
+        # Registered at the first locked step of a live submit, before framing,
+        # so the closing report cannot pass through a pre-write gap and miss it.
+        self._sending: Dict[object, str] = {}
+        # Tokens captured by the closing report while their write was blocked.
+        # A later ChannelError must not queue the same already-reported note.
+        self._reported_sends = set()
+        # Receipt matching remains bounded; the closing report makes any
+        # evictions observable instead of pretending its snapshot was complete.
+        self._forgotten_receipts = 0
 
     # --- the runner's side -------------------------------------------------
 
@@ -279,9 +292,10 @@ class Mailbox:
         difference.
         """
         with self._lock:
-            for index, (framed, original) in enumerate(self._awaiting):
+            for index, (framed, original, token) in enumerate(self._awaiting):
                 if framed == replayed:
                     del self._awaiting[index]
+                    self._sending.pop(token, None)
                     return original
             return None
 
@@ -300,56 +314,81 @@ class Mailbox:
         text = (text or "").strip()
         if not text:
             return None
+        token = object()
         with self._lock:
             channel = self._channel
-        if channel is not None:
+            if channel is None:
+                self._queued.append(text)
+                return Delivery(live=False, queued=len(self._queued))
+            self._sending[token] = text
+        try:
             framed = frame_live(text)
+        except BaseException:
+            with self._lock:
+                self._sending.pop(token, None)
+            raise
+        pair = (framed, text, token)
+        with self._lock:
+            if token in self._reported_sends:
+                self._reported_sends.discard(token)
+                self._sending.pop(token, None)
+                return Delivery(live=False, queued=0,
+                                error="run ended before the write",
+                                reported=True)
             # Recorded BEFORE the write, and unrecorded if the write fails. The
             # replay comes back on the RUNNER's thread, which can be inside
             # claim_echo while this one is still between two statements: an echo
             # that arrives before its entry exists matches nothing and is
             # dropped, so the note lands and the log never says so.
+            self._awaiting.append(pair)
+            # Keep the newest: a mailbox this far behind is one whose replays
+            # are not coming back at all. Count what ages out so shutdown states
+            # that its bounded receipt window is incomplete.
+            overflow = max(0, len(self._awaiting) - MAX_AWAITING_ECHO)
+            if overflow:
+                del self._awaiting[:overflow]
+                self._forgotten_receipts += overflow
+        try:
+            channel.send(framed)
+        except ChannelError as exc:
             with self._lock:
-                self._awaiting.append((framed, text))
-                # Keep the newest: a mailbox this far behind is one whose
-                # replays are not coming back at all, and then the entry worth
-                # holding is the one whose note was typed most recently.
-                del self._awaiting[:-MAX_AWAITING_ECHO]
-            try:
-                channel.send(framed)
-            except ChannelError as exc:
-                with self._lock:
-                    if (framed, text) in self._awaiting:
-                        self._awaiting.remove((framed, text))
-                    # Moving a failed live send into the queue is one state
-                    # transition. The end-of-run reporter takes the same lock,
-                    # so it sees the note either awaiting confirmation or queued
-                    # for the next prompt, never in the gap between the two.
+                if pair in self._awaiting:
+                    self._awaiting.remove(pair)
+                self._sending.pop(token, None)
+                reported = token in self._reported_sends
+                self._reported_sends.discard(token)
+                if not reported:
                     self._queued.append(text)
-                    queued = len(self._queued)
-                return Delivery(live=False, queued=queued, error=str(exc))
-            return Delivery(live=True, queued=0)
-        return self._queue(text)
-
-    def _queue(self, text: str, error: str = "") -> Delivery:
+                queued = len(self._queued)
+            return Delivery(live=False, queued=queued, error=str(exc),
+                            reported=reported)
         with self._lock:
-            self._queued.append(text)
-            return Delivery(live=False, queued=len(self._queued), error=error)
+            self._sending.pop(token, None)
+            self._reported_sends.discard(token)
+        return Delivery(live=True, queued=0)
 
-    def take_pending(self) -> Tuple[List[str], List[str]]:
-        """Drain (queued notes, live notes still lacking a provider receipt).
+    def take_pending(self) -> Tuple[List[str], List[str], int]:
+        """Drain queued/unconfirmed notes and the aged-out receipt count.
 
         Used only when the run is ending. A live write can still be blocked on a
         provider pipe after the status input and workers reached their bounded
-        shutdown waits. Remembering `_awaiting` in the same locked snapshot as
-        `_queued` makes such a note visible as unconfirmed instead of letting a
-        later ChannelError queue it after the only closing report has passed.
+        shutdown waits. Snapshotting `_sending` and `_awaiting` under the same
+        lock as `_queued` makes such a note visible as unconfirmed from the first
+        step of submission, and `_reported_sends` keeps a later ChannelError from
+        queuing it after the only closing report has passed.
         """
         with self._lock:
             queued, self._queued = self._queued, []
-            unconfirmed = [original for _framed, original in self._awaiting]
+            unconfirmed = [original for _framed, original, _token
+                           in self._awaiting]
+            awaiting_tokens = {token for _framed, _original, token
+                               in self._awaiting}
+            unconfirmed.extend(text for token, text in self._sending.items()
+                               if token not in awaiting_tokens)
+            self._reported_sends.update(self._sending)
             self._awaiting = []
-            return queued, unconfirmed
+            forgotten, self._forgotten_receipts = self._forgotten_receipts, 0
+            return queued, unconfirmed, forgotten
 
 
 class MailboxSet:
@@ -412,10 +451,14 @@ def report_undelivered_notes(mailbox) -> None:
                else [(None, mailbox)])
     queued = []
     unconfirmed = []
+    forgotten = []
     for job_id, target in targets:
-        target_queued, target_unconfirmed = target.take_pending()
+        target_queued, target_unconfirmed, target_forgotten = (
+            target.take_pending())
         queued.extend((job_id, note) for note in target_queued)
         unconfirmed.extend((job_id, note) for note in target_unconfirmed)
+        if target_forgotten:
+            forgotten.append((job_id, target_forgotten))
 
     if queued:
         print_error(f"\n  ⚠ the run ended holding {len(queued)} undelivered "
@@ -430,3 +473,11 @@ def report_undelivered_notes(mailbox) -> None:
     for job_id, note in unconfirmed:
         target = f"job {job_id}: " if job_id is not None else ""
         print_error(f"      {target}{note}")
+    forgotten_total = sum(count for _job_id, count in forgotten)
+    if forgotten_total:
+        print_error(f"\n  ⚠ replay-receipt tracking for {forgotten_total} "
+                    f"earlier live operator note(s) aged out of its bounded "
+                    f"window before shutdown:")
+    for job_id, count in forgotten:
+        target = f"job {job_id}: " if job_id is not None else ""
+        print_error(f"      {target}{count} receipt(s) no longer tracked")
