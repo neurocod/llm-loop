@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from llm_loop import (codex_usage, compactline, console, cyclecore, limits,
-                      parallel, providers, textwidth)
+                      parallel, providers, streamrender, textwidth)
 from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
@@ -256,9 +256,9 @@ def test_sequential_codex_runner_forwards_prompt_to_stdin_transport(monkeypatch)
         calls.append((argv, provider, prompt, project_dir))
         return _FakeAgentProcess(has_stdin=False)
 
-    monkeypatch.setattr(cyclecore, "start_agent_process", fake_start)
+    monkeypatch.setattr(streamrender, "start_agent_process", fake_start)
 
-    assert cyclecore.run_agent_streaming(
+    assert streamrender.run_agent_streaming(
         ["codex", "exec", "--json", "-"], "codex", False,
         prompt="sequential prompt",
     ) == 0
@@ -310,11 +310,11 @@ def test_a_bracket_in_a_worker_line_reaches_the_screen(monkeypatch, shape, args)
 def test_sequential_runner_treats_non_object_json_as_diagnostic(
         monkeypatch, capsys, line):
     monkeypatch.setattr(
-        cyclecore, "start_agent_process",
+        streamrender, "start_agent_process",
         lambda *args: _FakeAgentProcess(has_stdin=False, stdout=f"{line}\n"),
     )
 
-    assert cyclecore.run_agent_streaming(
+    assert streamrender.run_agent_streaming(
         ["codex", "exec", "--json", "-"], "codex", False,
     ) == 0
     assert capsys.readouterr().out.strip() == line
@@ -407,11 +407,11 @@ def test_a_dying_sequential_turn_does_not_leave_the_provider_running(monkeypatch
         children.append(proc)
         return proc
 
-    monkeypatch.setattr(cyclecore, "start_agent_process", fake_provider)
+    monkeypatch.setattr(streamrender, "start_agent_process", fake_provider)
     monkeypatch.setattr(sys, "stdout", _StdoutThatDies())
 
     with pytest.raises(BrokenPipeError):
-        cyclecore.run_agent_streaming(
+        streamrender.run_agent_streaming(
             ["codex", "exec", "--json", "-"], "codex", False)
 
     assert children, "the fake provider was never started — the pin proved nothing"
@@ -463,15 +463,15 @@ def test_a_failed_prompt_handover_does_not_leave_the_provider_running(monkeypatc
 
 
 def test_codex_events_render_message_commands_and_usage(capsys):
-    cyclecore._render_codex_event({
+    streamrender._render_codex_event({
         "type": "item.started",
         "item": {"type": "command_execution", "command": "pytest -q"},
     })
-    cyclecore._render_codex_event({
+    streamrender._render_codex_event({
         "type": "item.completed",
         "item": {"type": "agent_message", "text": "Finished cleanly."},
     })
-    cyclecore._render_codex_event({
+    streamrender._render_codex_event({
         "type": "turn.completed",
         "usage": {"input_tokens": 12, "cached_input_tokens": 3,
                   "output_tokens": 4},
@@ -616,7 +616,7 @@ def test_a_string_without_backslashes_is_untouched():
 def test_both_renderers_use_the_helper_on_command_execution(monkeypatch, capsys):
     item = {"type": "command_execution", "command": r"cd D:\\g\\loop && ls",
             "exit_code": 0}
-    cyclecore._render_codex_event({"type": "item.completed", "item": item})
+    streamrender._render_codex_event({"type": "item.completed", "item": item})
     _codex_job(monkeypatch,
                json.dumps({"type": "item.completed", "item": item}) + "\n",
                returncode=0)
@@ -688,7 +688,7 @@ def test_a_tool_line_is_cut_to_the_terminal_not_to_two_hundred(
         monkeypatch, plain_lines):
     fits = _terminal(monkeypatch, 300)
 
-    cyclecore._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
+    streamrender._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
 
     line, = plain_lines
     assert line.endswith("…")                        # it was cut
@@ -701,8 +701,8 @@ def test_the_same_command_is_cut_the_same_from_either_provider(
     """200 for claude and 160 for codex was the provider deciding the width."""
     fits = _terminal(monkeypatch, 300)
 
-    cyclecore._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
-    cyclecore._render_codex_event({"type": "item.started", "item": {
+    streamrender._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
+    streamrender._render_codex_event({"type": "item.started", "item": {
         "type": "command_execution", "command": LONG_COMMAND}})
 
     claude_line, codex_line = plain_lines
@@ -746,7 +746,7 @@ def test_a_narrow_terminal_still_records_what_the_old_limits_did(
     wrap them rather than shrink what the run recorded."""
     _terminal(monkeypatch, 40)
 
-    cyclecore._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
+    streamrender._render_claude_event(_bash_tool_use(LONG_COMMAND), True)
 
     line, = plain_lines
     assert len(line) >= 200         # the old fixed figure, wrapped as it was
@@ -759,7 +759,7 @@ def test_a_wide_glyph_body_is_cut_by_cells_not_characters(
     pytest.importorskip("rich.cells")
     fits = _terminal(monkeypatch, 300)
 
-    cyclecore._render_claude_event(_bash_tool_use("漢" * 500), True)
+    streamrender._render_claude_event(_bash_tool_use("漢" * 500), True)
 
     line, = plain_lines
     assert textwidth.cell_width(line) == fits
@@ -788,7 +788,7 @@ def test_a_tool_input_that_is_not_a_string_still_prints(
     JSON held — `null` included, which used to print the word None."""
     _terminal(monkeypatch, 300)
 
-    cyclecore._render_claude_event({"type": "assistant", "message": {"content": [
+    streamrender._render_claude_event({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "name": name, "input": tool_input}]}}, True)
 
     assert plain_lines == [expected]
@@ -808,7 +808,7 @@ def test_every_tool_argument_is_cut_like_a_long_command(
     and a path is exactly as unbounded as a command."""
     fits = _terminal(monkeypatch, 300)
 
-    cyclecore._render_claude_event({"type": "assistant", "message": {"content": [
+    streamrender._render_claude_event({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "name": name, "input": tool_input}]}}, True)
 
     line, = plain_lines
@@ -832,7 +832,7 @@ def _codex_completed(command, output="", exit_code=1):
 def test_a_command_with_no_output_gets_the_whole_line(monkeypatch, plain_lines):
     fits = _terminal(monkeypatch, 300)
 
-    cyclecore._render_codex_event(_codex_completed(LONG_COMMAND))
+    streamrender._render_codex_event(_codex_completed(LONG_COMMAND))
 
     line, = plain_lines
     assert textwidth.cell_width(line) == fits
@@ -841,7 +841,7 @@ def test_a_command_with_no_output_gets_the_whole_line(monkeypatch, plain_lines):
 def test_a_short_output_lends_its_room_to_the_command(monkeypatch, plain_lines):
     fits = _terminal(monkeypatch, 300)
 
-    cyclecore._render_codex_event(_codex_completed(LONG_COMMAND, "not found"))
+    streamrender._render_codex_event(_codex_completed(LONG_COMMAND, "not found"))
 
     line, = plain_lines
     assert textwidth.cell_width(line) == fits
@@ -852,7 +852,7 @@ def test_a_short_output_lends_its_room_to_the_command(monkeypatch, plain_lines):
 def test_two_long_fields_share_the_line_evenly(monkeypatch, plain_lines):
     fits = _terminal(monkeypatch, 300)
 
-    cyclecore._render_codex_event(
+    streamrender._render_codex_event(
         _codex_completed(LONG_COMMAND, "y" * 500))
 
     line, = plain_lines
@@ -866,7 +866,7 @@ def test_a_missing_exit_code_does_not_shrink_the_line(monkeypatch, plain_lines):
     """The head is measured from what is printed: no code, no `exit N: `."""
     fits = _terminal(monkeypatch, 300)
 
-    cyclecore._render_codex_event(_codex_completed(LONG_COMMAND,
+    streamrender._render_codex_event(_codex_completed(LONG_COMMAND,
                                                    exit_code=None))
 
     line, = plain_lines

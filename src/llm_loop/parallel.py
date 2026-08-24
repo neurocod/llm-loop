@@ -54,6 +54,10 @@ from . import statusline
 from . import stopchannel
 from . import textwidth
 from . import usage
+# The words the provider stream is made of, shared with the other renderer:
+# this runner and `streamrender` read the SAME events, and 32 of the literals
+# they read them with used to be spelled in both files (see `wire`).
+from . import wire
 from .agentwork import (
     AgentCommand,
     build_agent_argv,
@@ -228,60 +232,54 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     continue  # non-JSON CLI diagnostics — skip in compact mode
                 if not isinstance(ev, dict):
                     continue  # valid JSON can still be a diagnostic, not an event
-                et = ev.get("type")
+                et = wire.event_type(ev)
                 if provider == "codex":
-                    item = ev.get("item") or {}
-                    item_type = item.get("type")
-                    if et == "item.completed" and item_type == "agent_message":
-                        for text in str(item.get("text") or "").splitlines():
+                    item = wire.codex_item(ev)
+                    item_type = wire.codex_item_type(item)
+                    if et == wire.ITEM_COMPLETED and item_type == wire.AGENT_MESSAGE:
+                        for text in wire.codex_message_text(item).splitlines():
                             out.line(f"💬 {text}")
-                    elif et == "item.started" and item_type == "command_execution":
-                        out.fitted("💻 ", compactline.undouble_backslashes(
-                            str(item.get("command", ""))))
-                    elif et == "item.completed" and item_type == "command_execution":
-                        out.fitted(f"📤 exit {item.get('exit_code', '')}: ",
-                                   compactline.undouble_backslashes(
-                                       str(item.get("command", ""))))
-                    elif et == "item.completed" and item_type == "file_change":
-                        changes = item.get("changes") or []
-                        paths = [str(change.get("path")) for change in changes
-                                 if isinstance(change, dict) and change.get("path")]
+                    elif et == wire.ITEM_STARTED and item_type == wire.COMMAND_EXECUTION:
+                        out.fitted("💻 ", wire.codex_command(item))
+                    elif et == wire.ITEM_COMPLETED and item_type == wire.COMMAND_EXECUTION:
+                        # An empty slot rather than the live renderer's dropped
+                        # prefix, for a command that carried no code — see
+                        # `wire.codex_exit_code` for why the default is asked for
+                        # here rather than decided there.
+                        out.fitted(f"📤 exit {wire.codex_exit_code(item, '')}: ",
+                                   wire.codex_command(item))
+                    elif et == wire.ITEM_COMPLETED and item_type == wire.FILE_CHANGE:
+                        paths = wire.codex_changed_paths(item)
                         out.line(f"🛠️ {', '.join(paths) or 'file changes applied'}")
-                    elif et == "turn.completed":
-                        usage = ev.get("usage") or {}
-                        if usage:
-                            out.line("tokens: "
-                                     f"input {usage.get('input_tokens', 0)}, "
-                                     f"cached {usage.get('cached_input_tokens', 0)}, "
-                                     f"output {usage.get('output_tokens', 0)}")
-                    elif et in ("error", "turn.failed"):
+                    elif et == wire.TURN_COMPLETED:
+                        counts = wire.codex_token_counts(ev)
+                        if counts is not None:
+                            tokens_in, cached, tokens_out = counts
+                            out.line(f"tokens: input {tokens_in}, "
+                                     f"cached {cached}, output {tokens_out}")
+                    elif et in (wire.ERROR, wire.TURN_FAILED):
                         provider_failed = True
-                        error = ev.get("message") or ev.get("error") or ev
-                        out.fitted("⚠ ", error, "bold red")
-                elif et == "assistant":
-                    for block in ev.get("message", {}).get("content", []):
-                        if block.get("type") == "tool_use":
-                            out.tool_use(block.get("name", "?"),
-                                         block.get("input", {}) or {})
-                elif et == "user":
+                        out.fitted("⚠ ", wire.codex_error(ev), "bold red")
+                elif et == wire.ASSISTANT:
+                    for block in wire.message_blocks(ev):
+                        if wire.block_type(block) == wire.BLOCK_TOOL_USE:
+                            out.tool_use(wire.tool_use_name(block),
+                                         wire.tool_use_input(block))
+                elif et == wire.USER:
                     # Only surface *failed* tool results; successes would just be
                     # noise at high concurrency. An operator note replayed back to us
                     # is the exception: it is the receipt for something a human
                     # typed, and it belongs in the log next to the turn it landed in.
-                    for block in ev.get("message", {}).get("content", []):
-                        if block.get("type") == "text" and mailbox is not None:
-                            note = mailbox.claim_echo(block.get("text", ""))
+                    for block in wire.message_blocks(ev):
+                        if (wire.block_type(block) == wire.BLOCK_TEXT
+                                and mailbox is not None):
+                            note = mailbox.claim_echo(wire.block_text(block))
                             if note is not None:
                                 emit_note(out, note)
-                        if block.get("type") == "tool_result" and block.get("is_error"):
-                            content = block.get("content", "")
-                            if isinstance(content, list):
-                                content = " ".join(
-                                    c.get("text", "") for c in content
-                                    if isinstance(c, dict)
-                                )
-                            out.fitted("  ✗ ", content, "red")
-                elif et == "rate_limit_event":
+                        if (wire.block_type(block) == wire.BLOCK_TOOL_RESULT
+                                and wire.tool_result_failed(block)):
+                            out.fitted("  ✗ ", wire.tool_result_text(block), "red")
+                elif et == wire.RATE_LIMIT_EVENT:
                     # The run's own rate-limit verdict (see usage.RateLimitEvent).
                     # Surfaced, not acted on: with N workers the pause belongs to the
                     # shared usage gate, which sees the same wall as a pegged
@@ -294,7 +292,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     rl = usage.rate_limit_event_from(ev)
                     if rl is not None and rl.status != "allowed":
                         out.line(f"⚠ rate limit: {rl.describe()}", "bold red")
-                elif et == "result":
+                elif et == wire.RESULT:
                     # Before the figures: once the turn has reported, the console
                     # must not be able to write into a session that is closing.
                     channel.close()
@@ -304,8 +302,8 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     # `total_cost_usd` is the session's running total (so the last
                     # one is the job's cost), `duration_ms` is that turn's alone (so
                     # they add up).
-                    cost_usd = ev.get("total_cost_usd", cost_usd)
-                    dur = ev.get("duration_ms")
+                    cost_usd = wire.result_cost(ev, cost_usd)
+                    dur = wire.result_duration_ms(ev)
                     if dur is not None:
                         duration_s = (duration_s or 0.0) + dur / 1000
         # Outside the `with`, so the pipe is closed before we wait on the process:

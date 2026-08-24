@@ -2,9 +2,12 @@
 cyclecore.py - reusable engine behind autonomous Claude/Codex CLI loops.
 
 This module holds everything that is *not* specific to one particular task:
-command-line parsing, stream-json rendering with the run's own rate-limit
-verdict picked out of that stream, and the generic `run_loop()` that ties it
-together. Reading a quota and pausing on it are `usage`/`limits`, and when a run
+command-line parsing and the generic `run_loop()` that ties a run together.
+Turning ONE provider stream into what a watcher sees — and the single-stream
+state that goes with it, the run's own rate-limit verdict included — is
+`streamrender`, which this loop calls and does not own; the words that stream is
+made of are `wire`, shared with the parallel runner's renderer.
+Reading a quota and pausing on it are `usage`/`limits`, and when a run
 pushes what it has committed is `gitpush` — both runners apply those and neither
 owns them. What the run PRINTS is `console` — with the rotating mirror log, which
 is the second copy of every printed line and therefore belongs to the printer;
@@ -37,16 +40,15 @@ guessed from error counts, in two layers:
     reading lives in usage.py (UsageSource, an HTTP GET of the usage endpoint)
     and the pausing policy in limits.py (LimitPolicy and the ready-made
     SessionLimit / DayNightLimit / WeeklyLimit rules).
-  * reactive — every Claude run streams its own rate-limit verdict, which this
-    module picks out of the stream it is already parsing and latches for the
+  * reactive — every Claude run streams its own rate-limit verdict, which the
+    renderer picks out of the stream it is already parsing and latches for this
     iteration to read (`usage.RateLimitEvent` says what one is; the latch is
-    here, and the block above `_last_rate_limit_event` says why): a "rejected"
+    `streamrender`'s, and the block above it there says why): a "rejected"
     means the wall was hit, and the loop waits that quota out even if the
     proactive reading was unavailable.
 """
 
 import argparse
-import json
 import os
 import re
 import sys
@@ -60,7 +62,7 @@ from typing import Callable, Optional, Union
 # package's `__init__`, which imports both unconditionally, so they are already
 # in `sys.modules` before this line is reached. The cycle the local import
 # really was for is gone too — neither module imports this one any more.
-from . import (clispec, compactline, console, exitlog, limits, operator,
+from . import (clispec, console, exitlog, limits, operator,
                projectroot, providers, runlifecycle, statusline, stopchannel,
                textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
@@ -79,16 +81,12 @@ from .agentwork import Driver, LoopStop, build_agent_argv
 # handler and the tee are configured and replaced, and a second binding here
 # would be a second address for a test or a wrapper to miss.
 from .console import (
-    LINES,
-    MarkdownStream,
     fmt_clock,
     fmt_left,
     fmt_moment,
-    print_done,
     print_error,
     print_note,
     print_percents,
-    render_markdown_block,
 )
 # The vocabulary of stopping and pausing is `stopchannel`, its own module,
 # because both runners and a host wrapper speak it and none of them should have
@@ -104,13 +102,27 @@ from .console import (
 # freeze it at the launch directory. That constant is gone — the sentinel is
 # `stop_file_path()`, derived on read — and a function imported by name would
 # NOT freeze. Only the second-address argument was ever load-bearing.
-from .providers import (
-    note_channel,
-    prompt_on_stdin,
-    provider_spec,
-    reap_agent_process,
-    start_agent_process,
-    usage_source_for,
+from .providers import prompt_on_stdin, usage_source_for
+# Rendering ONE provider stream into a terminal — starting the CLI, printing its
+# events, and the single-stream state that only makes sense with one run in
+# flight — is `streamrender`, its own module.
+#
+# Imported BY NAME, deliberately, and that is the load-bearing half of this
+# move: 18 pins across six test files replace `cyclecore.run_claude_streaming` /
+# `cyclecore.run_agent_streaming`, and a `from … import` is exactly what keeps
+# those bites landing — the loop below calls the name in THIS module's globals,
+# which is the name a `monkeypatch.setattr(cyclecore, …)` rebinds. Reaching
+# through `streamrender.` instead stops the patch reaching the call, and what
+# runs then is MEASURED rather than feared (2026-08-24, `try_patch` over both
+# spellings with `providers.start_agent_process` guarded so nothing could
+# actually start): every such pin goes red on `SystemExit: 2`, and on a machine
+# where `claude` IS on PATH the test suite launches a real agent instead.
+# `last_rate_limit_event` comes the same way and for the same reason
+# (`tests/test_usage_limits.py` reads it back off this module).
+from .streamrender import (
+    last_rate_limit_event,
+    run_agent_streaming,
+    run_claude_streaming,
 )
 # The git-push policy is `gitpush`, its own module, for the same reason as the
 # two above: both runners apply it and neither owns it. Only the per-iteration
@@ -119,15 +131,11 @@ from .providers import (
 # both runners open and close a run through.
 from .gitpush import maybe_git_push
 # What is known about a quota lives in `usage`, so the limit rules (and the
-# parallel runner) can use it without importing this one: the length of the
-# window a token-limited run waits out, and the vocabulary of the verdict the
-# wire streams back on every request. Only the LATCH holding the last such
-# verdict stays here — see the block above `_last_rate_limit_event` for why.
-from .usage import (
-    CLAUDE_SESSION_DURATION,
-    RateLimitEvent,
-    rate_limit_event_from,
-)
+# parallel runner) can use it without importing this one. Only the length of the
+# window a token-limited run waits out is named here — the verdict's vocabulary
+# is read where the stream is parsed (`streamrender`), and the latch holding the
+# last such verdict lives there too.
+from .usage import CLAUDE_SESSION_DURATION
 
 # The usage-limit policy (which quota to gate on, what ceiling to allow,
 # when to pause) lives in limits.py / usage.py, chosen per project via a Driver's
@@ -152,10 +160,16 @@ except (AttributeError, ValueError):
 
 # Per-run cost accounting parsed straight back out of the mirror log: every run's
 # first iteration logs a "=== Iteration 1 ===" header (see run_loop) and every
-# successful iteration logs a "done (… c, $…)" line (see _render_event's "result"
-# branch). Summing the dollar figures between headers reconstructs per-run spend
-# with no extra bookkeeping. The patterns live here, next to the code that emits
-# both lines, so they can't drift apart. Note "=== Iteration 1 ===" matches only
+# successful iteration logs a "done (… c, $…)" line. Summing the dollar figures
+# between headers reconstructs per-run spend with no extra bookkeeping.
+#
+# Only the FIRST of those two lines is emitted next to its pattern (run_loop,
+# below). The second is `streamrender._render_claude_event`'s "result" branch.
+# Two files, so they CAN drift: this pattern is what a re-worded "done" line has
+# to be checked against. `_render_codex_event` prints "· done (tokens: …)",
+# which this deliberately does not match — codex reports tokens, not dollars, so
+# a codex run has no per-session spend to total up.
+# Note "=== Iteration 1 ===" matches only
 # iteration 1 (the "1 ===" boundary rules out "11", "12", …), so each match is a
 # genuine run boundary.
 _SESSION_RE = re.compile(r"=== Iteration 1 ===")
@@ -317,315 +331,6 @@ def parse_duration(text: str) -> float:
     if not matched:
         raise ValueError(f"cannot parse duration: {text!r}")
     return total
-
-
-# Streaming print state: the single content-block index text is currently flowing
-# into (assistant replies stream one text block at a time), plus its live renderer.
-_active_text_index = None
-_md_stream = MarkdownStream()
-
-# The session cost already reported by earlier `result` events of the process
-# now streaming. Reset by run_agent_streaming; see the result branch for why the
-# figure has to be differenced at all.
-_turn_cost_base = 0.0
-
-
-# --- the free half of the limit machinery: the run's own rate-limit events -----
-#
-# What such an event IS — `RateLimitEvent`, `rate_limit_event_from`, and the
-# labels the CLI gives each quota — is `usage`, next to everything else known
-# about a quota, because the PARALLEL runner parses the same events out of the
-# same stream and had to import this loop to name them.
-#
-# THE LATCH BELOW STAYS HERE, and that is a decision rather than a leftover.
-# `_last_rate_limit_event` answers "the verdict of the run that just finished",
-# which is a question only a caller with ONE run in flight can ask. This
-# renderer is that caller by construction — it already keeps module-global
-# streaming state that no second concurrent stream could share, which is why
-# `parallel.run_job` prints its own compact lines instead of reusing it, and
-# `run_agent_streaming` clears the latch on
-# entry so the answer describes this run and not the previous one. The parallel
-# runner has N streams at once and keeps each job's verdict as a LOCAL in
-# `run_job`, which is the only correct shape there. Moving the latch into a
-# module both runners import would publish an address that cannot be right for
-# one of them — a process-global "the last verdict" is meaningless when ten runs
-# are in flight — so the vocabulary is shared and the latch is not.
-
-# The last verdict seen by run_claude_streaming, cleared when a run starts — so it
-# always describes the run that just finished, never the one before it.
-_last_rate_limit_event = None
-
-
-def last_rate_limit_event() -> Optional[RateLimitEvent]:
-    """The rate-limit verdict of the most recent run_claude_streaming call (None
-    if that run streamed no rate_limit_event)."""
-    return _last_rate_limit_event
-
-
-def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
-    """Print a single stream-json event in the style of interactive mode.
-
-    partial=True — --include-partial-messages is enabled: we print text from the
-    deltas (`stream_event`), and from the final `assistant` we take only the tool
-    calls, so as not to duplicate already-printed text.
-
-    `mailbox` turns the replay of an operator note (`--replay-user-messages`)
-    into a console line. Rendered here rather than where the note was typed
-    because this is the main thread, between two events — the one place a line
-    can be printed without cutting into the live Markdown block — and because
-    the replay is the CLI confirming delivery, not the console assuming it.
-    """
-    et = ev.get("type")
-
-    if et == "system" and ev.get("subtype") == "init":
-        model = ev.get("model", "?")
-        print(f"  · session started (model {model})")
-        return
-
-    if et == "rate_limit_event":
-        global _last_rate_limit_event
-        _last_rate_limit_event = rate_limit_event_from(ev)
-        # "allowed" is the normal case and would be one more line per run; the
-        # two states that mean something get shown.
-        if _last_rate_limit_event.status != "allowed":
-            print_error(f"  ⚠ rate limit: {_last_rate_limit_event.describe()}")
-        return
-
-    # Streaming deltas (Anthropic streaming events, wrapped in stream_event).
-    if et == "stream_event":
-        global _active_text_index
-        inner = ev.get("event", {})
-        it = inner.get("type")
-        if it == "content_block_start":
-            if inner.get("content_block", {}).get("type") == "text":
-                _active_text_index = inner.get("index")
-                _md_stream.start()
-        elif it == "content_block_delta":
-            d = inner.get("delta", {})
-            if d.get("type") == "text_delta" and inner.get("index") == _active_text_index:
-                _md_stream.feed(d.get("text", ""))
-        elif it == "content_block_stop":
-            if inner.get("index") == _active_text_index:
-                _md_stream.stop()  # finalize the Markdown render / line
-                _active_text_index = None
-        return
-
-    if et == "assistant":
-        for block in ev.get("message", {}).get("content", []):
-            bt = block.get("type")
-            if bt == "text":
-                if partial:
-                    continue  # already printed streaming from the deltas
-                render_markdown_block(block.get("text", ""))
-            elif bt == "tool_use":
-                LINES.tool_use(block.get("name", "?"),
-                               block.get("input", {}) or {})
-        return
-
-    if et == "user":
-        for block in ev.get("message", {}).get("content", []):
-            if block.get("type") == "text" and mailbox is not None:
-                note = mailbox.claim_echo(block.get("text", ""))
-                if note is not None:
-                    print_note(note)
-                continue
-            if block.get("type") != "tool_result":
-                continue
-            content = block.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    c.get("text", "") for c in content if isinstance(c, dict)
-                )
-            is_err = block.get("is_error")
-            mark = "✗" if is_err else "✓"
-            line = compactline.short(
-                content, LINES.budget(compactline.mark_line_head(mark)))
-            if line:
-                LINES.mark(mark, "red" if is_err else "green", line)
-        return
-
-    if et == "result":
-        global _turn_cost_base
-        cost = ev.get("total_cost_usd")
-        if cost is not None:
-            # `total_cost_usd` is the SESSION's running total, not this turn's
-            # (measured: two trivial turns in one process reported $0.2015 then
-            # $0.2204, while their durations were 2243 ms and 1991 ms — the
-            # second figure is the first plus $0.019, not a second $0.2). A
-            # process emits more than one `result` whenever a note typed late is
-            # answered as its own turn, and `report_costs` sums these lines, so
-            # each line shows what its turn ADDED.
-            cost, _turn_cost_base = cost - _turn_cost_base, cost
-        dur = ev.get("duration_ms")
-        bits = []
-        if dur is not None:
-            bits.append(f"{dur / 1000:.1f} c")
-        if cost is not None:
-            bits.append(f"${cost:.4f}")
-        suffix = f" ({', '.join(bits)})" if bits else ""
-        if ev.get("subtype") != "success" or ev.get("is_error"):
-            print_error(f"  ⚠ result: {ev.get('subtype', 'error')}{suffix}")
-        else:
-            print_done(f"  · done{suffix}")
-        return
-
-
-def _render_codex_event(ev: dict) -> None:
-    """Render one event from ``codex exec --json``."""
-    event_type = ev.get("type")
-    item = ev.get("item") or {}
-    item_type = item.get("type")
-
-    if event_type == "thread.started":
-        thread_id = ev.get("thread_id") or "?"
-        print(f"  · session started (thread {thread_id})")
-        return
-
-    if event_type == "item.completed" and item_type == "agent_message":
-        render_markdown_block(str(item.get("text") or ""))
-        return
-
-    if event_type == "item.started" and item_type == "command_execution":
-        command = compactline.short(
-            compactline.undouble_backslashes(str(item.get("command", ""))),
-            LINES.budget(compactline.tool_line_head("Bash")))
-        LINES.tool("Bash", command)
-        return
-
-    if event_type == "item.completed" and item_type == "command_execution":
-        exit_code = item.get("exit_code")
-        mark = "✓" if exit_code in (None, 0) else "✗"
-        # The head is measured from what this line will actually print: there is
-        # no "exit N: " when the provider reported no code, and no " — " when
-        # there is no output to put after it. Measuring both unconditionally
-        # left the line eleven columns short of the width it had been given.
-        code_head = f"exit {exit_code}: " if exit_code is not None else ""
-        separator = (" — " if compactline.collapse(
-            item.get("aggregated_output", "")) else "")
-        command, output = compactline.fit_two(
-            LINES.budget(f"{compactline.mark_line_head(mark)}"
-                         f"{code_head}{separator}"),
-            compactline.undouble_backslashes(str(item.get("command", ""))),
-            item.get("aggregated_output", ""))
-        detail = f"{code_head}{command}"
-        if output:
-            detail += f"{separator}{output}"
-        LINES.mark(mark, "green" if exit_code in (None, 0) else "red", detail)
-        return
-
-    if event_type == "item.completed" and item_type == "file_change":
-        changes = item.get("changes") or []
-        paths = [str(change.get("path")) for change in changes
-                 if isinstance(change, dict) and change.get("path")]
-        LINES.tool("Edit", ", ".join(paths) or "file changes applied")
-        return
-
-    if event_type == "turn.completed":
-        usage = ev.get("usage") or {}
-        bits = []
-        if usage:
-            bits.append(f"input {usage.get('input_tokens', 0)}")
-            cached = usage.get("cached_input_tokens", 0)
-            if cached:
-                bits.append(f"cached {cached}")
-            bits.append(f"output {usage.get('output_tokens', 0)}")
-        suffix = f" (tokens: {', '.join(bits)})" if bits else ""
-        print_done(f"  · done{suffix}")
-        return
-
-    if event_type in ("error", "turn.failed"):
-        error = ev.get("message") or ev.get("error") or item.get("error") or ev
-        LINES.fitted("  ⚠ result: ", error, "bold red")
-
-
-def run_agent_streaming(cmd: list, provider: str, raw: bool,
-                        partial: bool = True, prompt: str = "",
-                        mailbox=None) -> int:
-    """Run one provider CLI, parse its JSONL and render progress live.
-
-    Claude's rate-limit verdict, if streamed, is left in
-    ``last_rate_limit_event()``. Codex limits are queried separately through
-    its app-server before and after turns.
-
-    `mailbox` is this run's `operator.Mailbox`: while the turn is in flight it
-    holds the process's stdin, so a note typed at the console reaches the agent
-    mid-iteration. The channel is closed on the turn's `result` event and again
-    in the `finally` — closing stdin is what ends a streaming-input session, so
-    an unclosed pipe is a run that never returns, and the redundancy is
-    deliberate: a crash that swallows `result` must not be able to hang the loop.
-
-    Everything from `start_agent_process` down to `proc.wait()` runs with a
-    child process alive, and `wait()` is the only exit that reaps it: the
-    console write behind each rendered line, `note_channel`'s close and a
-    decoder error on the child's own stream all raise past it. Hence the
-    `finally` — `reap_agent_process` is what ends the CLI, and it is the whole
-    ending: the `except KeyboardInterrupt` below deliberately no longer calls
-    `proc.terminate()` itself, because on Windows that aims at the npm `.cmd`
-    shim and leaves the CLI — a GRANDCHILD — running with the terminal's stdout
-    in hand.
-    """
-    global _last_rate_limit_event, _turn_cost_base
-    _last_rate_limit_event = None
-    _turn_cost_base = 0.0     # a new process starts a new cost total
-    spec = provider_spec(provider)
-    try:
-        proc = start_agent_process(cmd, provider, prompt, projectroot.project_dir())
-    except FileNotFoundError:
-        print(f"Executable {spec.executable!r} not found. "
-              f"Is {spec.display_name} installed and on PATH?")
-        sys.exit(2)
-
-    provider_failed = False
-    try:
-        with note_channel(proc, provider, mailbox) as channel:
-            for line in proc.stdout:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                if raw:
-                    print(line)
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    # non-JSON line (e.g. CLI diagnostics) — print it as is
-                    print(line)
-                    continue
-                if not isinstance(ev, dict):
-                    # A JSON scalar/array is diagnostic output, not a JSONL event.
-                    print(line)
-                    continue
-                if provider == "claude":
-                    # Before rendering, so the console cannot take a note for a
-                    # turn that has already reported its result.
-                    if ev.get("type") == "result":
-                        channel.close()
-                    _render_claude_event(ev, partial, mailbox)
-                else:
-                    _render_codex_event(ev)
-                    provider_failed = provider_failed or ev.get("type") in (
-                        "error", "turn.failed")
-        # Outside the `with`, so the pipe is already closed: waiting on a
-        # process whose stdin is still open is the hang this whole seam exists
-        # to prevent.
-        returncode = proc.wait()
-        return 1 if returncode == 0 and provider_failed else returncode
-    except KeyboardInterrupt:
-        print("\nInterrupted by user (Ctrl+C).")
-        sys.exit(130)
-    finally:
-        reap_agent_process(proc)
-
-
-def run_claude_streaming(cmd: list, raw: bool, partial: bool,
-                         prompt: str = "", mailbox=None) -> int:
-    """Backward-compatible Claude-only wrapper.
-
-    `prompt` is required whenever the live-message transport is on — the argv
-    then carries no task, only flags.
-    """
-    return run_agent_streaming(cmd, "claude", raw, partial, prompt=prompt,
-                               mailbox=mailbox)
 
 
 def _count_down_to(target_ts: float, should_stop=None) -> bool:

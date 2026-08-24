@@ -177,7 +177,11 @@ credentials — useful on a CI box with no interactive login.
 ```
 src/
   llm_loop/
-    cyclecore.py     engine: parse_args, run_loop, stream-json rendering
+    cyclecore.py     engine: parse_args and the sequential run_loop
+    streamrender.py  one provider run rendered live, and the single-stream state
+                     that only a runner with one in flight can hold
+    wire.py          the words the provider stream is made of, so both renderers
+                     read the same event by the same name
     runlifecycle.py  the prologue and epilogue every run has, and the live
                      knobs (RunSettings) both runners read
     agentwork.py     what one unit of work is, and the Driver protocol a

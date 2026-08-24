@@ -20,7 +20,8 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, operator, parallel, providers, textwidth
+from llm_loop import (cyclecore, operator, parallel, providers, streamrender,
+                      textwidth)
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 from llm_loop.agentwork import AgentCommand, Driver
@@ -261,10 +262,10 @@ _RESULT = {"type": "result", "subtype": "success", "total_cost_usd": 0.1}
 
 def _run_streaming(monkeypatch, lines, sink, mailbox):
     monkeypatch.setattr(
-        cyclecore, "start_agent_process",
+        streamrender, "start_agent_process",
         lambda *args: _FakeProc(stdout=lines, stdin=sink))
-    return cyclecore.run_agent_streaming(["claude", "-p"], "claude", False,
-                                         prompt="task", mailbox=mailbox)
+    return streamrender.run_agent_streaming(["claude", "-p"], "claude", False,
+                                            prompt="task", mailbox=mailbox)
 
 
 def test_the_result_event_closes_stdin_before_the_stream_ends(monkeypatch):
@@ -324,10 +325,10 @@ def test_the_pipe_is_closed_even_with_nobody_listening(monkeypatch, runner):
     proc = _FakeProc(stdout=_events(_RESULT), stdin=sink)
 
     if runner == "sequential":
-        monkeypatch.setattr(cyclecore, "start_agent_process",
+        monkeypatch.setattr(streamrender, "start_agent_process",
                             lambda *args: proc)
-        cyclecore.run_agent_streaming(["claude", "-p"], "claude", False,
-                                      prompt="task", mailbox=None)
+        streamrender.run_agent_streaming(["claude", "-p"], "claude", False,
+                                         prompt="task", mailbox=None)
     else:
         monkeypatch.setattr(parallel, "start_agent_process",
                             lambda *args: proc)

@@ -51,6 +51,9 @@ from typing import NamedTuple, Optional
 # exact text is a contract with LimitPolicy.log_snapshot — so the verdict's
 # `describe()` borrows the console's spelling rather than growing a third.
 from .console import fmt_moment
+# One event of the provider stream reaches this module — the rate-limit verdict —
+# and the word the stream calls it by lives with the rest of that vocabulary.
+from . import wire
 
 # The usage endpoint, and the OAuth credentials the CLI stores for its own calls.
 # ANTHROPIC_BASE_URL / CLAUDE_CONFIG_DIR are the CLI's own environment overrides,
@@ -144,7 +147,8 @@ QUOTA_BY_FIELD = {quota.field: quota for quota in QUOTAS}
 # stream it renders, the parallel one out of each worker's stream — so living in
 # either made the other import a loop it does not run. What does NOT live here is
 # the latch remembering the last verdict: that is single-stream state, and it
-# stays with the single-stream renderer, behind `cyclecore.last_rate_limit_event`.
+# stays with the single-stream renderer, behind
+# `streamrender.last_rate_limit_event`.
 
 # Quota id -> the name the CLI itself uses for it in limit messages.
 #
@@ -185,8 +189,13 @@ class RateLimitEvent(NamedTuple):
 
 
 def rate_limit_event_from(ev: dict) -> Optional[RateLimitEvent]:
-    """The RateLimitEvent carried by a stream-json event, or None if it isn't one."""
-    if ev.get("type") != "rate_limit_event":
+    """The RateLimitEvent carried by a stream-json event, or None if it isn't one.
+
+    The envelope's word is `wire`'s (one home for every literal the provider
+    stream is dispatched on); the PAYLOAD's keys are this module's, because what
+    a quota verdict is made of is a fact about a quota.
+    """
+    if wire.event_type(ev) != wire.RATE_LIMIT_EVENT:
         return None
     info = ev.get("rate_limit_info") or {}
     resets = info.get("resetsAt")

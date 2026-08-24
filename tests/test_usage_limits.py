@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from llm_loop import console, cyclecore, providers, usage
+from llm_loop import console, cyclecore, providers, streamrender, usage
 from llm_loop.usage import RateLimitEvent
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
@@ -280,7 +280,7 @@ def _run_with_verdict(tmp_path, monkeypatch, verdict):
                             waits.append(ts))
 
     def fake_run(cmd, raw, partial, prompt="", mailbox=None):
-        cyclecore._last_rate_limit_event = verdict
+        streamrender._last_rate_limit_event = verdict
         return 0
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", fake_run)
@@ -351,7 +351,7 @@ def test_anything_short_of_a_refusal_runs_on(tmp_path, monkeypatch, verdict):
 def test_the_verdict_does_not_outlive_its_run(monkeypatch):
     """run_claude_streaming clears it on entry — otherwise the run after a refusal
     inherits the refusal and parks the loop a second time for nothing."""
-    cyclecore._last_rate_limit_event = RateLimitEvent(
+    streamrender._last_rate_limit_event = RateLimitEvent(
         "rejected", "five_hour", time.time())
 
     def boom(*a, **k):

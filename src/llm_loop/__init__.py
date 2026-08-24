@@ -33,7 +33,9 @@ composite `LimitPolicy([DayNightLimit(), WeeklyLimit(90)])`; unset defaults to a
 day/night session rule for Claude and a session-plus-weekly policy for Codex.
 
 See agentwork for what a unit of work is and the Driver protocol you subclass,
-cyclecore for the sequential engine, drivers for the two ready made Drivers,
+cyclecore for the sequential engine, streamrender for one provider run shown
+live and wire for the words that stream is made of,
+drivers for the two ready made Drivers,
 parallel for the concurrent list runner, projectroot for the root itself,
 usage/codex_usage for the provider quota query layers, and limits for the
 pausing policy.
@@ -51,13 +53,16 @@ from . import exitlog
 from . import stopchannel
 from .cyclecore import (
     ConsumedByWrapperAction,
-    last_rate_limit_event,
     parse_args,
     parse_duration,
     report_costs,
     run_loop,
-    run_agent_streaming,
 )
+# Same story as every move below: rendering one provider stream — and the
+# single-stream latch that goes with it — left cyclecore for `streamrender`, and
+# the front door is unchanged on purpose. An embedder driving its own turn asks
+# the PACKAGE to run one, not whichever module currently prints it.
+from .streamrender import last_rate_limit_event, run_agent_streaming
 # Same story as the four below: the vocabulary of WORK — what a unit of it is,
 # how it becomes an argv, and the Driver protocol a wrapper subclasses — moved
 # out of cyclecore into `agentwork`, and the front door is unchanged on purpose.
@@ -111,9 +116,9 @@ from .providers import (
 )
 from .operator import Mailbox
 from .codex_usage import CodexUsageSource, parse_rate_limits
-# `RateLimitEvent`/`rate_limit_event_from` are here and not with the runner that
-# renders them: they say what a quota's wire verdict IS, which is a fact about a
-# quota. Only `last_rate_limit_event` above stays cyclecore's — it is that
+# `RateLimitEvent`/`rate_limit_event_from` are here and not with the renderer
+# that shows them: they say what a quota's wire verdict IS, which is a fact about
+# a quota. Only `last_rate_limit_event` above stays `streamrender`'s — it is that
 # renderer's single-stream latch, not vocabulary (see its block there).
 from .usage import (
     RateLimitEvent,

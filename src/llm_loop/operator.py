@@ -37,6 +37,7 @@ import json
 import threading
 from typing import List, NamedTuple, Optional, Tuple
 
+from . import wire
 from .console import print_error
 
 __all__ = [
@@ -104,11 +105,12 @@ def user_message_line(text: str) -> str:
     The wire format the provider CLI reads: one JSON object per line, shaped
     like an API message. `ensure_ascii` is left on so the line survives a stdin
     pipe with any encoding.
+
+    The SHAPE is `wire.user_message`, not spelled here: the CLI replays this note
+    back on the stream the renderers read, where `Mailbox.claim_echo` has to
+    recognise it again — one fact with two ends, so one home.
     """
-    return json.dumps({
-        "type": "user",
-        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
-    }) + "\n"
+    return json.dumps(wire.user_message(text)) + "\n"
 
 
 class ChannelError(RuntimeError):
