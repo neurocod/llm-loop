@@ -432,9 +432,9 @@ def note_channel(proc, provider: str, mailbox: Optional[object] = None):
     the same module owns the closing rather than lending the obligation to a
     runner. Both runners had their own copy of this before, and the copies were
     not the same one - the parallel one closed the pipe only when a mailbox
-    existed, which `-j 2+` never has, so its workers started CLIs they could
-    never end (the turn finished in 2.7 s; the call returned when the process
-    was killed at 90 s).
+    existed, which `-j 2+` did not have then, so its workers started CLIs they
+    could never end (the turn finished in 2.7 s; the call returned when the
+    process was killed at 90 s).
 
     Yields something with `.close()` in every case, including "this run has no
     transport" - so a caller closing at the turn's `result` event needs no

@@ -440,7 +440,7 @@ def test_stdin_is_closed_when_the_render_loop_raises(monkeypatch):
 
 @pytest.mark.parametrize("runner", ["sequential", "parallel"])
 def test_the_pipe_is_closed_even_with_nobody_listening(monkeypatch, runner):
-    """`-j 2+` hands out no mailbox — and must still not leave the CLI alive.
+    """A transport with no mailbox must still not leave the CLI alive.
 
     Measured before the fix: the turn's result came back in 2.7 s and the call
     returned only when the process was killed at 90 s, because the close was
@@ -639,7 +639,7 @@ def _type(app, text):
 
 
 def test_the_message_key_is_absent_when_there_is_nobody_to_address():
-    """-j 3 hands out no mailbox: several workers, one keyboard, no recipient."""
+    """A dry run hands out no mailbox, so there is no recipient."""
     keys = dict(_app().legend_entries())
 
     assert "m" not in keys
@@ -892,7 +892,50 @@ def test_the_legend_counts_what_is_still_waiting(tmp_path):
     assert dict(app.legend_entries())["m"] == "message (2 queued)"
 
 
-# --- the parallel runner: one worker, one recipient -----------------------------
+def test_a_fleet_note_is_routed_to_the_selected_job(tmp_path):
+    mailboxes = operator.MailboxSet([1, 2, 10])
+    app = _app(mailboxes, stop_file=str(tmp_path / "stop"))
+
+    app.handle_event(tio.Key("m"))
+    assert app.mode.name == "message-target"
+    _type(app, "10")
+    app.handle_event(tio.Key("\r"))
+
+    assert app.mode.name == "message"
+    assert app.render(width=80)[-1].startswith(" ✉ job 10 ")
+    _type(app, "check the long rails")
+    app.handle_event(tio.Key("\r"))
+
+    assert mailboxes.mailbox(1).queued_count == 0
+    assert mailboxes.mailbox(2).queued_count == 0
+    assert mailboxes.mailbox(10).take_queued() == ["check the long rails"]
+
+
+def test_an_unknown_fleet_job_does_not_steal_the_note(tmp_path):
+    mailboxes = operator.MailboxSet([1, 3])
+    app = _app(mailboxes, stop_file=str(tmp_path / "stop"))
+    app.handle_event(tio.Key("m"))
+    _type(app, "2")
+
+    app.handle_event(tio.Key("\r"))
+
+    assert app.mode.name == "message-target"
+    assert "job 2 is not available" in app.status.note
+    assert mailboxes.queued_count == 0
+
+
+def test_fleet_undelivered_report_names_the_job(capsys):
+    mailboxes = operator.MailboxSet([1, 2])
+    mailboxes.mailbox(2).submit("finish the current drawing")
+
+    operator.report_undelivered_notes(mailboxes)
+
+    out = capsys.readouterr().out
+    assert "1 undelivered operator note" in out
+    assert "job 2: finish the current drawing" in out
+
+
+# --- the parallel runner: one mailbox per worker -------------------------------
 
 
 class _MemDriver(parallel.ListFileDriver):
@@ -931,9 +974,8 @@ def _par_args(project_dir, jobs):
     return ns
 
 
-@pytest.mark.parametrize("jobs, addressable", [(1, True), (2, False)])
-def test_only_a_single_worker_run_has_a_mailbox(tmp_path, monkeypatch, jobs,
-                                                addressable):
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_every_parallel_worker_run_is_addressable(tmp_path, monkeypatch, jobs):
     seen = _capture_status_app(monkeypatch)
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
@@ -942,4 +984,38 @@ def test_only_a_single_worker_run_has_a_mailbox(tmp_path, monkeypatch, jobs,
                           _par_args(str(tmp_path), jobs),
                           app_name="pytest-operator-parallel")
 
-    assert (seen["messages"] is not None) is addressable
+    messages = seen["messages"]
+    if jobs == 1:
+        assert isinstance(messages, operator.Mailbox)
+    else:
+        assert isinstance(messages, operator.MailboxSet)
+        assert messages.target_ids == (1, 2)
+
+
+def test_a_queued_fleet_note_rides_only_its_workers_prompt(tmp_path, monkeypatch):
+    real_app_class = sl.StatusApp
+    prompts = {}
+    both_workers = threading.Barrier(2)
+
+    def _build(**kwargs):
+        messages = kwargs["messages"]
+        messages.mailbox(2).submit("use the second fixture")
+        return real_app_class(terminal=tio.NullTerminal(),
+                              input_source=tio.NullInputSource(), refresh=60,
+                              **{k: v for k, v in kwargs.items()
+                                 if k != "enabled"})
+
+    monkeypatch.setattr(sl, "StatusApp", _build)
+
+    def record(job_id, command, mailbox=None):
+        prompts[job_id] = command.prompt
+        both_workers.wait(timeout=5)
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", record)
+    parallel.run_parallel(_MemDriver(["a.md", "b.md"]),
+                          _par_args(str(tmp_path), 2),
+                          app_name="pytest-operator-parallel-routing")
+
+    assert operator.QUEUED_NOTES_HEADER not in prompts[1]
+    assert prompts[2].rstrip().endswith("- use the second fixture")

@@ -114,7 +114,7 @@ from .providers import (
     runtime_argv,
     usage_source_for,
 )
-from .operator import Mailbox
+from .operator import Mailbox, MailboxSet
 from .codex_usage import CodexUsageSource, parse_rate_limits
 # `RateLimitEvent`/`rate_limit_event_from` are here and not with the renderer
 # that shows them: they say what a quota's wire verdict IS, which is a fact about
@@ -182,6 +182,7 @@ __all__ = [
     # `mailbox=`/`messages=`, so an embedder building its own front end needs it
     # from the front door rather than from llm_loop.operator.
     "Mailbox",
+    "MailboxSet",
     "LoopStop",
     "Mode",
     "NumberSetting",

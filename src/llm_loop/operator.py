@@ -35,7 +35,7 @@ speaking and how much authority the sentence carries.
 
 import json
 import threading
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from . import wire
 from .console import print_error
@@ -45,6 +45,7 @@ __all__ = [
     "ChannelError",
     "Delivery",
     "Mailbox",
+    "MailboxSet",
     "NullChannel",
     "append_notes",
     "frame_live",
@@ -224,8 +225,9 @@ class Delivery(NamedTuple):
 class Mailbox:
     """Where a note waits: in the running turn if there is one, else in the queue.
 
-    One per run. Every method is safe to call from any thread; `submit` is the
-    console's, `attach`/`detach`/`take_queued`/`claim_echo` are the runner's.
+    One per sequential run or parallel worker. Every method is safe to call from
+    any thread; `submit` is the console's, while `attach`/`detach`/`take_queued`/
+    `claim_echo` are the runner's.
     """
 
     def __init__(self):
@@ -329,6 +331,40 @@ class Mailbox:
             return Delivery(live=False, queued=len(self._queued), error=error)
 
 
+class MailboxSet:
+    """One independently queued mailbox for every addressable parallel job.
+
+    Worker identity is stable for the lifetime of a parallel run, while the item
+    in a worker's row changes after every turn. Routing by job id therefore keeps
+    a note attached to the recipient the operator selected even when it lands
+    between turns and has to wait for that worker's next prompt.
+    """
+
+    def __init__(self, job_ids: Iterable[int]):
+        ids = tuple(dict.fromkeys(job_ids))
+        if not ids:
+            raise ValueError("a mailbox set needs at least one job")
+        self._mailboxes: Dict[int, Mailbox] = {
+            job_id: Mailbox() for job_id in ids
+        }
+
+    @property
+    def target_ids(self) -> Tuple[int, ...]:
+        return tuple(self._mailboxes)
+
+    @property
+    def queued_count(self) -> int:
+        return sum(mailbox.queued_count for mailbox in self._mailboxes.values())
+
+    def mailbox(self, job_id: int) -> Mailbox:
+        """The mailbox owned by `job_id`; unknown ids are programmer errors."""
+        return self._mailboxes[job_id]
+
+    def items(self) -> Iterable[Tuple[int, Mailbox]]:
+        """Stable job/mailbox pairs for end-of-run reporting."""
+        return self._mailboxes.items()
+
+
 def report_undelivered_notes(mailbox) -> None:
     """Say so when the run ends holding notes nobody ever saw.
 
@@ -346,10 +382,16 @@ def report_undelivered_notes(mailbox) -> None:
     """
     if mailbox is None:
         return
-    notes = mailbox.take_queued()
+    if isinstance(mailbox, MailboxSet):
+        notes = [(job_id, note)
+                 for job_id, target in mailbox.items()
+                 for note in target.take_queued()]
+    else:
+        notes = [(None, note) for note in mailbox.take_queued()]
     if not notes:
         return
     print_error(f"\n  ⚠ the run ended holding {len(notes)} undelivered operator "
                 f"note(s) — there was no next iteration to carry them:")
-    for note in notes:
-        print_error(f"      {note}")
+    for job_id, note in notes:
+        target = f"job {job_id}: " if job_id is not None else ""
+        print_error(f"      {target}{note}")

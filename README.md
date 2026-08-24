@@ -585,9 +585,11 @@ log — at the point where the agent received it, so an iteration that changed
 course mid-flight is explainable afterwards. The receipt is the CLI's own replay
 of the message, not this end assuming the pipe was read.
 
-The key exists only when the run has exactly one agent to address: the sequential
-loop, or `-j 1`. With several workers sharing one terminal there is no
-unambiguous recipient, so `m` is not offered.
+With one agent, `m` opens the editor directly. With several workers, `m` first
+asks for a job number; Enter selects it and opens an editor labelled with that
+job. Each job has its own queue, so a note typed between that worker's turns
+rides its next prompt rather than being picked up by whichever worker starts
+next.
 
 A note still queued when the run ends is reported, with its text, rather than
 dropped in silence: "the next iteration" is a promise the last iteration cannot

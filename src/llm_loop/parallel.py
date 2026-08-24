@@ -222,8 +222,8 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     at a time, so several of these can run at once without their output
     colliding. Returns (returncode, cost_usd, duration_s).
 
-    `mailbox` is passed only by a single-worker run (see run_parallel); it lends
-    the console this turn's stdin, exactly as the sequential runner does.
+    `mailbox` belongs to this worker; it lends the console this turn's stdin,
+    exactly as the sequential runner does.
     """
     out = job_lines(job_id)
     provider = command.provider or "claude"
@@ -873,8 +873,9 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             shared.start_turn(line)
             turn_started = True
             command = shared.driver.command_for(line)
-            # Notes typed while no turn was in flight ride this prompt (only a
-            # single-worker run has a mailbox at all — see run_parallel).
+            # Notes typed while this worker had no turn in flight ride its next
+            # prompt. Every worker has a separate mailbox, so another worker can
+            # neither consume nor receive them.
             if mailbox is not None:
                 spliced, notes = mailbox.splice(command.prompt)
                 if notes:
@@ -1065,18 +1066,18 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # the push policy and is why that knob did nothing in this mode.
     settings = runlifecycle.script_settings(
         run_settings, progress if owns_progress else None)
-    # A note is addressed to "the agent", and only a one-worker run has exactly
-    # one of those: with N workers the same keystroke would have to pick a
-    # recipient, and the console shows their output interleaved. So a mailbox
-    # exists here only at jobs == 1 — which is also what keeps the `m` key out of
-    # the legend of a fleet run rather than offering something ambiguous.
-    mailbox = operator.Mailbox() if jobs == 1 else None
+    # Each worker owns a mailbox for both live delivery and notes queued between
+    # its turns. The one-worker shape stays a bare Mailbox, preserving the direct
+    # `m` -> editor path; a fleet exposes the keyed set so the console can ask for
+    # an unambiguous recipient first.
+    mailboxes = (operator.Mailbox() if jobs == 1
+                 else operator.MailboxSet(range(1, jobs + 1)))
     app = statusline.StatusApp(
         # Jobs come from the invocation's pool, so a second batch resumes the
         # rows of the first instead of starting a fresh set at iteration 1.
         status=statusline.LoopStatus(jobs=progress.jobs(jobs)),
         settings=settings,
-        messages=mailbox,
+        messages=mailboxes,
         enabled=not getattr(args, "no_statusline", False))
     app.update(
         provider=provider,
@@ -1120,7 +1121,9 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     threads = [
         threading.Thread(target=worker, name=f"job{j}",
                          args=(j, shared, source, policy, session_start_box,
-                               usage_lock, app, progress, mailbox),
+                               usage_lock, app, progress,
+                               (mailboxes if jobs == 1
+                                else mailboxes.mailbox(j))),
                          daemon=True)
         for j in range(1, jobs + 1)
     ]
@@ -1209,7 +1212,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                            iterations=shared.claimed, completed=shared.done)
         runlifecycle.close_run(
             ctx, usage_source=source, limit_policy=policy,
-            snapshot_label="at end (interrupted)", mailbox=mailbox,
+            snapshot_label="at end (interrupted)", mailbox=mailboxes,
             push_lock=push_lock)
         sys.exit(130)
 
@@ -1233,5 +1236,5 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     return runlifecycle.end_run(
         ctx, reason, iterations=shared.claimed, completed=shared.done,
         remaining=remaining, usage_source=source, limit_policy=policy,
-        snapshot_label="at end (parallel)", mailbox=mailbox,
+        snapshot_label="at end (parallel)", mailbox=mailboxes,
         push_lock=push_lock)

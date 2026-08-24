@@ -58,6 +58,8 @@ __all__ = [
     "MessageAction",
     "MessageMode",
     "MessagePromptRow",
+    "MessageTargetMode",
+    "MessageTargetRow",
     "Mode",
     "NoteRow",
     "NormalMode",
@@ -1253,7 +1255,6 @@ class MessagePromptRow(Row):
     anything having to push updates into a row object.
     """
 
-    prefix = " ✉ "
     caret = "▏"
     # Shown while the line is empty — which is also the state the editor returns
     # to after Enter, so it doubles as "you are still in here".
@@ -1264,9 +1265,11 @@ class MessagePromptRow(Row):
 
     def render(self, status, width, now=None):
         editor = self.mode.editor
+        prefix = (f" ✉ job {self.mode.target_id} "
+                  if self.mode.target_id is not None else " ✉ ")
         body = fit_edit_line(editor.head + self.caret, editor.tail,
-                             max(0, width - textwidth.cell_width(self.prefix)))
-        line = self.prefix + body
+                             max(0, width - textwidth.cell_width(prefix)))
+        line = prefix + body
         if not editor.buffer:
             line += self.hint
         return textwidth.fit(line, width)
@@ -1283,9 +1286,11 @@ class MessageMode(Mode):
 
     name = "message"
 
-    def __init__(self, app):
+    def __init__(self, app, mailbox=None, target_id: Optional[int] = None):
         super().__init__(app)
         self.editor = LineEditor()
+        self.mailbox = mailbox if mailbox is not None else app.messages
+        self.target_id = target_id
 
     @property
     def buffer(self) -> str:
@@ -1326,7 +1331,7 @@ class MessageMode(Mode):
         """
         text = self.editor.buffer.strip()
         self.editor.clear()
-        delivery = self.app.messages.submit(text) if self.app.messages else None
+        delivery = self.mailbox.submit(text) if self.mailbox else None
         self.app.note(delivery.message if delivery is not None
                       else "empty note discarded")
 
@@ -1344,13 +1349,90 @@ class MessageMode(Mode):
         self.app.pop_mode()
 
 
+class MessageTargetRow(Row):
+    """The job-id field shown before a fleet note gets its line editor."""
+
+    prefix = " ✉ send to job "
+    caret = "▏"
+
+    def __init__(self, mode: "MessageTargetMode"):
+        self.mode = mode
+
+    def render(self, status, width, now=None):
+        editor = self.mode.editor
+        body = fit_edit_line(editor.head + self.caret, editor.tail,
+                             max(0, width - textwidth.cell_width(self.prefix)))
+        line = self.prefix + body
+        if not editor.buffer:
+            choices = ",".join(str(job_id) for job_id in self.mode.target_ids)
+            line += f"  choose {choices} · Enter selects · Esc leaves"
+        return textwidth.fit(line, width)
+
+
+class MessageTargetMode(Mode):
+    """Choose which parallel job owns the next operator note."""
+
+    name = "message-target"
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.editor = LineEditor()
+        self.target_ids = tuple(app.messages.target_ids)
+
+    @property
+    def buffer(self) -> str:
+        return self.editor.buffer
+
+    def rows(self, status):
+        return [MessageTargetRow(self)]
+
+    def legend(self):
+        return [("0-9", "job"), ("Enter", "select"),
+                ("Esc", "clear / leave"), ("←/→", "move")]
+
+    def handle(self, event):
+        if not isinstance(event, termio.Key):
+            return False
+        char = event.char
+        if char in ("\r", "\n"):
+            self.submit()
+        elif char == "\x1b":
+            self.escape()
+        elif ((len(char) == 1 and char.isdigit())
+              or char in LineEditor.ACTIONS):
+            self.editor.handle(char)
+        return True
+
+    def submit(self):
+        if not self.editor.buffer:
+            self.app.note("enter a job number")
+            return
+        try:
+            job_id = int(self.editor.buffer)
+        except ValueError:
+            self.app.note("invalid job number")
+            return
+        if job_id not in self.target_ids:
+            choices = ", ".join(str(target) for target in self.target_ids)
+            self.app.note(f"job {job_id} is not available — choose {choices}")
+            return
+        mailbox = self.app.messages.mailbox(job_id)
+        self.app.pop_mode()
+        self.app.push_mode(MessageMode(self.app, mailbox, target_id=job_id))
+
+    def escape(self):
+        if self.editor.buffer:
+            self.editor.clear()
+            self.app.note("job selection cleared — Esc again to leave")
+            return
+        self.app.pop_mode()
+
+
 class MessageAction(Action):
     """`m` — send the agent a note.
 
-    Registered only when the run has a mailbox, which is what makes the key
-    honest: several concurrent workers share one terminal and one keyboard, so
-    there is no unambiguous "the agent" to talk to, and the runner hands out no
-    mailbox in that case (see parallel.run_parallel).
+    A single-agent run opens the note editor directly. A fleet first opens the
+    job selector, because the worker id is the stable address across turns.
     """
 
     key = "m"
@@ -1367,6 +1449,14 @@ class MessageAction(Action):
         # No note announcing the mode: the editor's own row carries the hint
         # while the line is empty, and the note row is where each delivery
         # reports itself a moment later.
+        target_ids = tuple(getattr(app.messages, "target_ids", ()))
+        if len(target_ids) > 1:
+            app.push_mode(MessageTargetMode(app))
+            return
+        if target_ids:
+            app.push_mode(MessageMode(
+                app, app.messages.mailbox(target_ids[0]), target_ids[0]))
+            return
         app.push_mode(MessageMode(app))
 
 
@@ -1739,9 +1829,9 @@ class StatusApp:
                  default_actions: bool = True):
         self.status = status or LoopStatus()
         self.settings = settings or SettingsRegistry()
-        # This run's operator.Mailbox, or None when there is nobody to address
-        # (a dry run, several concurrent workers). Registering the key on the
-        # same condition keeps the legend from offering what it cannot do.
+        # This run's operator.Mailbox/MailboxSet, or None when there is nobody to
+        # address (a dry run). Registering the key on the same condition keeps
+        # the legend from offering what it cannot do.
         self.messages = messages
         self.terminal = terminal if terminal is not None else termio.terminal_for(
             enabled=enabled)
