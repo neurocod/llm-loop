@@ -139,7 +139,7 @@ QUOTA_BY_FIELD = {quota.field: quota for quota in QUOTAS}
 # stream it renders, the parallel one out of each worker's stream — so living in
 # either made the other import a loop it does not run. What does NOT live here is
 # the latch remembering the last verdict: that is single-stream state, and it
-# stays with the single-stream renderer (see `cyclecore._last_rate_limit_event`).
+# stays with the single-stream renderer, behind `cyclecore.last_rate_limit_event`.
 
 # Quota id -> the name the CLI itself uses for it in limit messages.
 #

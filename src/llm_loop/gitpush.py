@@ -51,7 +51,8 @@ class GitPushPolicy(Enum):
 # Default push policy. Override on the command line with --git-push.
 GIT_PUSH_POLICY = GitPushPolicy.EACH_HOUR
 
-# What this knob is called on the pinned row (see `cyclecore._script_settings`).
+# What this knob is called on the pinned row: each runner registers a
+# `statusline.Setting` under this label.
 # A constant because `statusline.colorize` anchors on it to find the VALUE it has
 # to light up: the policy words are ordinary English ("none"), so the label is
 # what tells a mode word from a file called none.md on a job row. Renaming the

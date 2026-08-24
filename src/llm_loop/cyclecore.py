@@ -391,8 +391,9 @@ _turn_cost_base = 0.0
 # `_last_rate_limit_event` answers "the verdict of the run that just finished",
 # which is a question only a caller with ONE run in flight can ask. This
 # renderer is that caller by construction — it already keeps module-global
-# streaming state that "cannot serve several concurrent streams without
-# garbling" (parallel.py's header), and `run_agent_streaming` clears the latch on
+# streaming state that no second concurrent stream could share, which is why
+# `parallel.run_job` prints its own compact lines instead of reusing it, and
+# `run_agent_streaming` clears the latch on
 # entry so the answer describes this run and not the previous one. The parallel
 # runner has N streams at once and keeps each job's verdict as a LOCAL in
 # `run_job`, which is the only correct shape there. Moving the latch into a

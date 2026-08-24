@@ -1086,8 +1086,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         set_max_items,
         minimum=1,
         # Not a field of its own — the summary counter's denominator is this cap
-        # (or the list's size, whichever is smaller). See the sequential
-        # registration in cyclecore._script_settings.
+        # (or the list's size, whichever is smaller). The sequential runner
+        # registers the same knob, under the same label, from `run_loop`.
         show_in_status=False))
     # A note is addressed to "the agent", and only a one-worker run has exactly
     # one of those: with N workers the same keystroke would have to pick a
