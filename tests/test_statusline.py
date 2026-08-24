@@ -1457,6 +1457,42 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
     # shown at all, since a field of its own would say the same number twice.
     assert app.status.max_iterations == 2
     assert "max-runs" not in dict(app.status.script_limits)
+
+
+def test_a_batchs_cap_edit_leaves_the_invocations_denominator_alone(
+        monkeypatch, tmp_path):
+    """Under a wrapper, `--max-runs` sizes THIS batch and not the whole run.
+
+    The runner hands `runlifecycle.script_settings` its progress only when it
+    owns the figures (`progress if owns_progress else None`), and that gate is
+    the whole of what keeps a batch from rewriting the invocation's
+    denominator — a periodic wrapper slices one invocation into many runner
+    calls, each with its own `--max`, and the row must go on counting the
+    invocation. The cap itself must still move, or this would pass just as well
+    with the knob broken.
+    """
+    from llm_loop.agentwork import AgentCommand, Driver
+
+    class _RaisesItsOwnCap(Driver):
+        app = None
+        calls = 0
+
+        def next_command(self):
+            self.calls += 1
+            if self.calls == 1:
+                self.app.settings.get("max-runs").set(2)
+            return AgentCommand("do the thing", "", f"item-{self.calls}")
+
+    driver = _RaisesItsOwnCap()
+    invocation = sl.InvocationProgress(max_items=99)
+    app, _source = _run_with_status(monkeypatch, tmp_path, driver,
+                                    progress=invocation,
+                                    on_app=lambda a: setattr(driver, "app", a))
+
+    assert driver.calls == 2, "the batch's own cap edit did not take effect"
+    assert invocation.max_items == 99, \
+        "a batch rewrote the invocation's cap — the owns_progress gate is gone"
+    assert app.status.max_iterations == 99
     assert app.settings.get("max-runs").get() == 2     # still an editable knob
 
 

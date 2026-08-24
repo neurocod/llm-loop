@@ -614,6 +614,42 @@ def test_job_rows_resume_in_the_next_call_of_the_invocation(tmp_path, monkeypatc
     assert "iter 2   " in made["app"].render(width=200)[2]
 
 
+def test_a_batchs_cap_edit_leaves_the_invocations_denominator_alone(
+        tmp_path, monkeypatch):
+    """The parallel half of the same gate the sequential runner is pinned on.
+
+    `--max-runs` is a live knob in both modes now, and both hand
+    `runlifecycle.script_settings` their progress only when they own the
+    figures. Under a wrapper this batch's cap sizes THIS batch: the claim loop
+    must obey the edit, and the invocation's denominator must not move with it.
+    Both halves are asserted, because either one alone passes with the other
+    broken.
+    """
+    made = _live_statusline(monkeypatch, {})
+    edited = threading.Event()
+
+    def raise_the_cap_from_the_first_file(job_id, command, mailbox=None):
+        if not edited.is_set():
+            edited.set()
+            made["app"].settings.get("max-runs").set(3)
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", raise_the_cap_from_the_first_file)
+    driver = _MemDriver([f"products/f{i}.md" for i in range(5)])
+    invocation = sl.InvocationProgress(max_items=99)
+    previous = projectroot.project_dir()
+    try:
+        _batch(driver, _args(str(tmp_path), jobs=1, max_runs=1), invocation)
+    finally:
+        projectroot.set_project_root(previous)
+
+    assert edited.is_set(), "no file ran, so nothing edited the cap"
+    assert len(driver.pending_lines()) == 2, \
+        "the claim loop did not act on the edited cap (expected 3 of 5 claimed)"
+    assert invocation.max_items == 99, \
+        "a batch rewrote the invocation's cap — the owns_progress gate is gone"
+
+
 def test_a_capped_run_never_reports_more_than_it_promised():
     """`done` follows the list, and a preflight can strike items this run never
     touched — but the row must not report past the cap it displayed."""

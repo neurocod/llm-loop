@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from llm_loop import console, cyclecore, parallel, projectroot
+from llm_loop import console, cyclecore, exitlog, parallel, projectroot
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
@@ -220,6 +220,25 @@ def _restore_project_root():
     projectroot.set_project_root(previous)
 
 
+def _elsewhere(tmp_path) -> str:
+    """A project root whose FOLDER NAME is provably not this process's own.
+
+    The mirror log's file name carries the project folder, so that name is the
+    whole of what the two `--cost` pins below tell apart. On a machine where
+    pytest happened to run from a directory of the same name they would pass
+    while proving nothing — the same vacuity `test_git_push._elsewhere` guards
+    against, and for the same reason.
+    """
+    project = tmp_path / "some-project"
+    project.mkdir(exist_ok=True)
+    root = os.path.abspath(str(project))
+    assert os.path.normcase(os.path.basename(root)) != \
+        os.path.normcase(os.path.basename(os.getcwd())), \
+        "the project folder and the process cwd share a name, so this pin " \
+        "cannot tell an anchored root from an ambient one"
+    return root
+
+
 def _drop_logger(app_name):
     """Release the handler's file so the tmp dir can be cleaned up."""
     logger = logging.getLogger(f"runCycle.{app_name}")
@@ -355,12 +374,11 @@ def test_cost_reads_the_named_projects_log_not_the_launch_directorys(
     root unanchored reads the log of whatever directory the process happened to
     be launched from — and reports "no cost lines" about a project with plenty.
     """
-    project = tmp_path / "some-project"
-    project.mkdir()
+    project = _elsewhere(tmp_path)
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "pytest-costs-some-project.log").write_text(
         _TWO_SESSIONS, encoding="utf-8")
-    args = _seq_args(str(project), dry_run=False)
+    args = _seq_args(project, dry_run=False)
     args.cost = True
 
     driver = _OneShotDriver()
@@ -369,6 +387,46 @@ def test_cost_reads_the_named_projects_log_not_the_launch_directorys(
 
     assert driver.served == 0, "the loop ran instead of reporting"
     assert "TOTAL: 2 sessions, 3 costs, $2.2500" in capsys.readouterr().out
+
+
+def test_cost_neither_mirrors_its_report_nor_opens_an_exit_record(
+        tmp_path, log_dir, monkeypatch, capsys):
+    """The other half of why `--cost` sits before the shared prologue.
+
+    A report is not a run. `runlifecycle.begin_run`'s first two acts are raising
+    the tee and opening the exit record, and a `--cost` that went through it
+    would push its own output into the shared rotating log — displacing real
+    runs' records out of a chain that is already the thing a post-mortem reads —
+    and leave an exit record naming a run that never happened.
+
+    Measured 2026-08-24: moving the whole `--cost` block to AFTER `begin_run`
+    left all 492 tests green. The pin that existed only asserted the OTHER half
+    (that the report resolves its log against --project-dir), so the branch could
+    have drifted back into the prologue unnoticed.
+    """
+    project = _elsewhere(tmp_path)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    named = tmp_path / "named.log"
+    named.write_text(_TWO_SESSIONS, encoding="utf-8")
+    # No record of an earlier run to inherit: `exitlog.begin` is idempotent per
+    # process, so a leftover one would make this pass whatever the branch did.
+    monkeypatch.setattr(exitlog, "_record", None)
+    _drop_logger("pytest-costs-record")
+    args = _seq_args(project, dry_run=False)
+    args.cost_log = str(named)
+
+    try:
+        cyclecore.run_loop(_OneShotDriver(), args,
+                           app_name="pytest-costs-record", wait_on_start=False)
+
+        assert "TOTAL: 2 sessions, 3 costs, $2.2500" in capsys.readouterr().out
+        assert exitlog.current() is None, \
+            "--cost opened an exit record for a run that never ran"
+        assert not console.log_file_path("pytest-costs-record").exists(), \
+            "--cost mirrored its report into the shared rotating log"
+    finally:
+        _drop_logger("pytest-costs-record")
+        exitlog.finish()
 
 
 def test_naming_a_log_reports_instead_of_running_the_loop(

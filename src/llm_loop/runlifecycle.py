@@ -247,7 +247,13 @@ def end_run(ctx: RunContext, reason, *, iterations: int = 0,
     # logged before the first turn — so each run records where it finished.
     # Forced fresh (cache_value=False) so it reflects the true post-run state
     # rather than a possibly-recent cached reading from the last limit check.
-    if not ctx.dry_run and usage_source is not None and limit_policy is not None:
+    #
+    # The source alone decides, and `limit_policy` is deliberately NOT part of
+    # the condition: both runners set the two together (no source, no policy —
+    # `limits.default_policy` never returns None), so a None policy here means
+    # the caller's pairing broke, and the answer to that is an AttributeError
+    # naming the line, not a snapshot silently skipped for the rest of time.
+    if not ctx.dry_run and usage_source is not None:
         limit_policy.log_snapshot(usage_source, snapshot_label,
                                   cache_value=False)
 
