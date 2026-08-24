@@ -111,6 +111,33 @@ def git_push(cwd: str) -> bool:
     return False
 
 
+def final_git_push(policy: GitPushPolicy, cwd: str) -> None:
+    """Push whatever is still local on the way out of a run.
+
+    Regardless of the EACH_HOUR cadence: the run is ending, so work must not be
+    left only on the local branch. A no-op for NONE (never auto-push), and the
+    "nothing to push" case says so rather than staying silent, because a run that
+    printed nothing about pushing reads like a run whose push failed.
+
+    THIS FUNCTION DOES NOT LOCK, and that is the answer to "who owns the mutual
+    exclusion of the exit push". Both runners end with this call and only one of
+    them has threads: the parallel one wraps it in the same `push_lock` its
+    background pusher takes, and the sequential one has nothing to exclude. Put
+    the lock in here instead and it becomes a lock the single-threaded caller
+    pays for and a lock the threaded caller cannot see it depends on — while a
+    function that pushes A REPOSITORY has no business knowing whether its caller
+    is threaded (the same argument that made `cwd` a parameter; see the header).
+    """
+    if policy == GitPushPolicy.NONE:
+        return
+    count = git_unpushed_count(cwd)
+    if count is None or count > 0:
+        print("  · final git push on exit…")
+        git_push(cwd)
+    else:
+        print("  · final git push: nothing to push.")
+
+
 def maybe_git_push(policy: GitPushPolicy, last_push: float, cwd: str) -> float:
     """Apply the GitPushPolicy at the start of an iteration.
 

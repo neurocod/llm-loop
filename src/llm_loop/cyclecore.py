@@ -118,8 +118,7 @@ from .gitpush import (
     GIT_PUSH_POLICY,
     GIT_PUSH_SETTING,
     GitPushPolicy,
-    git_push,
-    git_unpushed_count,
+    final_git_push,
     maybe_git_push,
 )
 # What is known about a quota lives in `usage`, so the limit rules (and the
@@ -1291,16 +1290,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     iterations=iteration, completed=completed)
                 sys.exit(returncode)
 
-    # Final push: regardless of the EACH_HOUR cadence, push any pending commits
-    # on the way out so work isn't left only on the local branch — unless the
-    # policy is NONE (never auto-push).
-    if not dry_run and run_settings.git_push != GitPushPolicy.NONE:
-        count = git_unpushed_count(projectroot.project_dir())
-        if count is None or count > 0:
-            print("  · final git push on exit…")
-            git_push(projectroot.project_dir())
-        else:
-            print("  · final git push: nothing to push.")
+    # Final push on the way out. Bare, with no lock around it: this runner has
+    # one thread and nothing to exclude — see `gitpush.final_git_push` for why
+    # the lock belongs to the caller that has threads rather than to the call.
+    if not dry_run:
+        final_git_push(run_settings.git_push, projectroot.project_dir())
 
     # End-of-run usage snapshot (the policy's watched quotas), mirroring the one
     # logged before iteration 1 — so each run records where it finished. Forced

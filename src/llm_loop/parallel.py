@@ -56,8 +56,7 @@ from .console import print_markup
 from .gitpush import (
     GIT_PUSH_POLICY,
     GitPushPolicy,
-    git_push,
-    git_unpushed_count,
+    final_git_push,
     maybe_git_push,
 )
 from .stopchannel import RunResult, RunStopReason
@@ -83,6 +82,16 @@ FAILURE_TAIL_LINES = 5
 # is unreachable in a run that lasts less than one interval, and the handover it
 # makes (which repository to push) had no pin at all.
 PUSH_PUMP_INTERVAL_S = 60
+
+# How long the run waits for the background pusher to finish its current turn
+# before going on to the exit push. Short on purpose — a run that has done its
+# work should not sit here — which is exactly why it is not a guarantee that the
+# pusher has stopped: `git push` gets a 300 s subprocess timeout, so a pusher
+# caught mid-push is still running (and still holding `push_lock`) when this
+# returns. That is what makes the lock around the exit push load-bearing rather
+# than decorative, and the reason this is a named constant is the same as
+# PUSH_PUMP_INTERVAL_S's: a test cannot otherwise reach the timed-out case.
+PUSHER_JOIN_TIMEOUT_S = 5
 
 # Per-file retry budget: a path that fails this many times in a row is parked in
 # the `failed` set so it stops blocking the queue (and is reported at the end)
@@ -1107,9 +1116,12 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # A background pusher applies the policy on its own cadence while the
     # workers run; the workers never push. git is not thread-safe to call
     # concurrently, so every push in the run goes through one thread and one
-    # lock — including the exit push below, which runs after this thread is
-    # joined but takes the lock anyway, so the rule holds by reading the code
-    # rather than by remembering the join.
+    # lock — including the exit push below, which takes it because the join
+    # before it CAN TIME OUT (see PUSHER_JOIN_TIMEOUT_S). The old wording here
+    # said that push "runs after this thread is joined but takes the lock
+    # anyway", i.e. that the lock was decorative; a `git push` may sit in a
+    # subprocess for five minutes, the join waits five seconds, so it is the
+    # only thing standing between two concurrent pushes.
     #
     # The first push is one interval in, not up front: the loop asks
     # `shared.stop.wait` BEFORE pushing, so a run shorter than the interval
@@ -1166,18 +1178,19 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
         shared.stop.set()  # release the pusher's wait()
         if pusher is not None:
-            pusher.join(timeout=5)
+            pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
         app.update(phase="idle")
 
-    # Final push on the way out (unless policy is NONE), mirroring run_loop.
-    if git_push_policy != GitPushPolicy.NONE:
-        count = git_unpushed_count(projectroot.project_dir())
-        if count is None or count > 0:
-            print("  · final git push on exit…")
-            with push_lock:
-                git_push(projectroot.project_dir())
-        else:
-            print("  · final git push: nothing to push.")
+    # Final push on the way out, the same call the sequential runner makes —
+    # inside the run's one push lock, because the join above may have given up
+    # on a pusher that is still in `git push`. The lock is HERE and not inside
+    # `final_git_push` on purpose: this is the runner with threads, so the
+    # exclusion is its own (see that function's docstring). Note the whole call
+    # is inside, `git_unpushed_count` included: reading the count while the
+    # pusher pushes is how the old spelling could print "nothing to push" about
+    # a repository that was being pushed at that moment.
+    with push_lock:
+        final_git_push(git_push_policy, projectroot.project_dir())
 
     if source is not None:
         policy.log_snapshot(source, "at end (parallel)", cache_value=False)

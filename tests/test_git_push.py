@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -90,6 +91,17 @@ class _FakeGitModule:
     @property
     def dirs(self):
         return {cwd for _, cwd in self.calls}
+
+    @property
+    def pushes(self):
+        """Only the `git push` calls.
+
+        Asserting on `calls` cannot tell a push from the `rev-list` that decides
+        whether to push, so a run that stopped pushing entirely still filled
+        `calls` and still passed. Measured: neutering the exit push's `git_push`
+        left every pin in this file green.
+        """
+        return [call for call in self.calls if call[0][:2] == ("git", "push")]
 
 
 def _elsewhere(tmp_path) -> str:
@@ -207,9 +219,13 @@ def test_the_sequential_runner_pushes_the_project_it_was_pointed_at(
         tmp_path, monkeypatch):
     """`run_loop` must hand `gitpush` its --project-dir, not the process cwd.
 
-    Both of the loop's push sites are covered by one run: the per-iteration
-    `maybe_git_push` at the top of the iteration and the final push on the way
-    out.
+    Both of the loop's push sites are covered by one run, and the COUNT is what
+    covers them: `maybe_git_push` runs at the top of every PASS through the loop
+    — the one that serves the command and the one that finds the queue empty —
+    and `final_git_push` once on the way out, so three. Asserting merely "a push
+    happened" would leave either site free to disappear; measured, when
+    `final_git_push` was extracted: neutering its `git_push` left this file
+    green.
     """
     fake = _FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
@@ -220,7 +236,8 @@ def test_the_sequential_runner_pushes_the_project_it_was_pointed_at(
     cyclecore.run_loop(_OneShotDriver(), _seq_args(root),
                        app_name="pytest-gitpush")
 
-    assert fake.calls, "the run pushed nothing at all — the pin proved nothing"
+    assert len(fake.pushes) == 3, \
+        f"expected two per-pass pushes and the exit push: {fake.calls}"
     assert fake.dirs == {root}, \
         f"the sequential runner pushed the wrong repository: {fake.calls}"
 
@@ -246,7 +263,10 @@ def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(
     except SystemExit:
         pass
 
-    assert fake.calls, "the run pushed nothing at all — the pin proved nothing"
+    # Exactly one, and it is the exit push: the periodic pusher's first turn is
+    # a whole PUSH_PUMP_INTERVAL_S (60 s) away, so nothing else can have pushed.
+    assert len(fake.pushes) == 1, \
+        f"the exit push did not happen exactly once: {fake.calls}"
     assert fake.dirs == {root}, \
         f"the parallel runner pushed the wrong repository: {fake.calls}"
 
@@ -300,3 +320,95 @@ def test_the_parallel_pusher_pushes_the_project_it_was_pointed_at(
         f"the background pusher never took a turn — the pin proved nothing: {saw_push}"
     assert fake.dirs == {root}, \
         f"the parallel pusher pushed the wrong repository: {fake.calls}"
+
+
+class _OverlapWatchingGit(_FakeGitModule):
+    """`_FakeGitModule` that HOLDS each `git push` and records concurrency.
+
+    `max_live` is the most pushes ever in flight at once. git is not safe to call
+    concurrently, so the whole point of the run's push lock is that this number
+    is 1; without the lock around the exit push it is 2.
+
+    The first push blocks on `release` instead of sleeping, so the overlap is
+    staged rather than raced: the pusher is provably still inside `git push` when
+    the main thread reaches the exit push.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.live = 0
+        self.max_live = 0
+        self._live_lock = threading.Lock()
+
+    def run(self, argv, **kwargs):
+        if tuple(argv)[:2] != ("git", "push"):
+            return super().run(argv, **kwargs)
+        with self._live_lock:
+            self.live += 1
+            self.max_live = max(self.max_live, self.live)
+        try:
+            return super().run(argv, **kwargs)
+        finally:
+            # A bounded wait: a broken staging must fail the assertions, not
+            # hang the suite.
+            self.release.wait(timeout=HELD_PUSH_TIMEOUT_S)
+            with self._live_lock:
+                self.live -= 1
+
+
+# Upper bound on how long a staged push is held if nothing releases it.
+HELD_PUSH_TIMEOUT_S = 10.0
+# How long the stager waits, after the first push starts, before releasing it.
+# It only has to outlast "a worker returns, two joins, the status area closes",
+# all of which are immediate here — and erring long only makes the overlap more
+# certain, never less.
+HANDOVER_S = 0.5
+
+
+def test_the_exit_push_never_runs_beside_the_background_pusher(
+        tmp_path, monkeypatch):
+    """Two `git push`es at once is the thing the run's push lock exists to stop.
+
+    The exit push takes that lock because the join before it CAN TIME OUT: a
+    `git push` gets a 300 s subprocess timeout and the join waits
+    PUSHER_JOIN_TIMEOUT_S, so "the pusher has been joined" is not a fact the exit
+    push may assume. Both constants are shortened here so the timed-out case is
+    reachable at all — with the shipped five seconds the pusher always finishes
+    first and this pin would be green whatever the exit push did.
+
+    Staged, not raced: the pusher's first push blocks until the stager releases
+    it HANDOVER_S later, by which time the main thread is already at the exit
+    push. Remove the `with push_lock:` around it and `max_live` reads 2.
+    """
+    fake = _OverlapWatchingGit()
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
+    monkeypatch.setattr(parallel, "PUSHER_JOIN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None:
+                            (fake.pushed.wait(timeout=PUMP_WAIT_S),
+                             (0, None, None))[1])
+    root = _elsewhere(tmp_path)
+
+    def stage_the_handover():
+        if fake.pushed.wait(timeout=PUMP_WAIT_S):
+            time.sleep(HANDOVER_S)
+        fake.release.set()
+
+    stager = threading.Thread(target=stage_the_handover, name="stager",
+                              daemon=True)
+    stager.start()
+    try:
+        parallel.run_parallel(_MemListDriver(["products/only.md"]),
+                              _par_args(root), app_name="pytest-gitpush")
+    except SystemExit:
+        pass
+    finally:
+        fake.release.set()
+        stager.join(timeout=PUMP_WAIT_S)
+
+    assert fake.max_live >= 1, \
+        "no push happened at all, so nothing about concurrency was measured"
+    assert fake.max_live == 1, \
+        f"two git pushes were in flight at once: {fake.calls}"

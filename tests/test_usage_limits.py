@@ -309,11 +309,31 @@ def test_a_weekly_refusal_waits_out_the_week_not_the_session(tmp_path, monkeypat
     assert waits[0] == pytest.approx(resets + 5, abs=0.1)
 
 
+# The length of the session window, spelled here INDEPENDENTLY of the engine's
+# `usage.CLAUDE_SESSION_DURATION`, because "five hours" is not this test's guess:
+# it is what the quota id on the wire — "five_hour", the very string the verdict
+# below carries — names. The engine's constant adds an unmeasured +3 s margin and
+# the loop adds +5 s more, both of which the tolerance below absorbs.
+#
+# It has to be an independent spelling. Read from the engine, the assertion
+# compares the code's answer against the code's own input and passes for ANY
+# value of it: with `CLAUDE_SESSION_DURATION` set to one second the old form was
+# still green, so it could catch a wrong FORMULA (waiting for something other
+# than a session) and never a wrong NUMBER. That was the whole defect.
+SESSION_WINDOW_S = 5 * 60 * 60
+# Slack above the window: the two margins (3 s + 5 s) plus whatever the run took.
+# Wide enough never to flake, far too narrow to hide a window of the wrong size.
+SESSION_WINDOW_SLACK_S = 60
+
+
 def test_a_refusal_without_a_reset_time_waits_out_a_session(tmp_path, monkeypatch):
     before = time.time()
     _, waits = _run_with_verdict(
         tmp_path, monkeypatch, RateLimitEvent("rejected", "five_hour", None))
-    assert waits[0] >= before + cyclecore.CLAUDE_SESSION_DURATION
+    assert waits[0] >= before + SESSION_WINDOW_S, \
+        "a refusal with no reset time woke up before the session window was out"
+    assert waits[0] <= before + SESSION_WINDOW_S + SESSION_WINDOW_SLACK_S, \
+        "the wait is longer than one session window — the quota is back by then"
 
 
 @pytest.mark.parametrize("verdict", [
