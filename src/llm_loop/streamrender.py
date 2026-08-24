@@ -18,7 +18,7 @@ the same reason its rate-limit verdict is a local there and a latch here.
 
 The loop that OWNS the run (when to start another iteration, when to pause on a
 quota, when to stop) is `cyclecore`, and it reaches these through its own module
-globals so a test can replace them: 18 pins across six files patch
+globals so a test can replace them: 19 pins across six files patch
 `cyclecore.run_claude_streaming` / `cyclecore.run_agent_streaming`, and they
 still bite because the loop calls the name it imported rather than reaching
 through this module.

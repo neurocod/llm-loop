@@ -108,7 +108,7 @@ from .providers import prompt_on_stdin, usage_source_for
 # flight — is `streamrender`, its own module.
 #
 # Imported BY NAME, deliberately, and that is the load-bearing half of this
-# move: 18 pins across six test files replace `cyclecore.run_claude_streaming` /
+# move: 19 pins across six test files replace `cyclecore.run_claude_streaming` /
 # `cyclecore.run_agent_streaming`, and a `from … import` is exactly what keeps
 # those bites landing — the loop below calls the name in THIS module's globals,
 # which is the name a `monkeypatch.setattr(cyclecore, …)` rebinds. Reaching
