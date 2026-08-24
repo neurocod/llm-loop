@@ -26,8 +26,25 @@ from llm_loop.cmdline import FLAG_ALIASES
 MODES = [clispec.SEQUENTIAL, clispec.PARALLEL]
 
 
-def _built(mode):
-    return clispec.build_parser(mode, prog="runGate.py")
+def _known_wrapper_options(parser):
+    """A wrapper's `Driver.add_cli_options`, standing in for every host that has
+    one.
+
+    `build_parser` is a loop over the table, so inside this package the only way
+    an undeclared flag can reach a parser is through this hook — which means a
+    gate that never passes one is checking the loop, not the seam where a host
+    project actually adds options. The flags used here are real ones a wrapper
+    registers (runGenerateModels does, for both), and they belong to the table:
+    a hook that stays inside it must leave the parser clean.
+    """
+    parser.add_argument("-p", "--parallel", action="store_true")
+    parser.add_argument("--random", action="store_true")
+
+
+def _built(mode, *, hooked=False):
+    return clispec.build_parser(
+        mode, prog="runGate.py",
+        extra_options=_known_wrapper_options if hooked else None)
 
 
 def _real_actions(parser):
@@ -44,11 +61,12 @@ def _spelling_owner():
 
 # --- the gate ------------------------------------------------------------------
 
+@pytest.mark.parametrize("hooked", [False, True], ids=["bare", "wrapper-hook"])
 @pytest.mark.parametrize("mode", MODES)
-def test_every_spelling_a_parser_offers_is_strippable(mode):
+def test_every_spelling_a_parser_offers_is_strippable(mode, hooked):
     owner = _spelling_owner()
     unknown = [opt
-               for action in _real_actions(_built(mode))
+               for action in _real_actions(_built(mode, hooked=hooked))
                for opt in action.option_strings
                if opt not in owner]
 
@@ -57,13 +75,14 @@ def test_every_spelling_a_parser_offers_is_strippable(mode):
         f"them in clispec.OPTIONS instead of calling add_argument directly.")
 
 
+@pytest.mark.parametrize("hooked", [False, True], ids=["bare", "wrapper-hook"])
 @pytest.mark.parametrize("mode", MODES)
-def test_the_table_and_argparse_agree_on_arity(mode):
+def test_the_table_and_argparse_agree_on_arity(mode, hooked):
     # `takes_value` decides whether the NEXT token is this flag's value. Wrong,
     # and removing the flag either eats a neighbouring token or leaves an orphan
     # value on the line.
     owner = _spelling_owner()
-    for action in _real_actions(_built(mode)):
+    for action in _real_actions(_built(mode, hooked=hooked)):
         canonical = owner.get(action.option_strings[0])
         if canonical is None:
             continue            # the test above owns "the table has never heard of it"
@@ -77,6 +96,10 @@ def test_the_table_and_argparse_agree_on_arity(mode):
 def test_a_parser_offers_every_spelling_its_row_declares(mode):
     # The other direction: a row may not promise a spelling the parser does not
     # accept, or `rebuild_argv` would strip a flag that a relaunch then rejects.
+    # What it pins is one expression — that `build_parser` splats the WHOLE
+    # alias tuple. Narrow, and worth saying so: handing argparse `aliases[0]`
+    # instead is a one-character edit that keeps every --help line looking right
+    # while quietly retiring `--max` and `--startIn`.
     offered = {opt
                for action in _real_actions(_built(mode))
                for opt in action.option_strings}
@@ -123,6 +146,15 @@ def test_a_parallel_help_override_belongs_to_a_shared_option():
 
 
 def test_the_alias_table_is_the_option_table():
+    """No row may be dropped on the way to the rewriter, and none reordered.
+
+    The comparison of KEYS is the load-bearing half. A projection that skipped
+    the parser-less rows would still satisfy every other test in this file — the
+    parsers would look complete — while `--parallel`, `--grow-kit`, `--random`
+    and `--finish` silently left the rewriter's vocabulary. The order matters
+    for a different reason: overrides are appended in it, so a rendered command
+    line must not depend on dict insertion luck.
+    """
     assert list(FLAG_ALIASES) == list(clispec.OPTIONS)
     for name, option in clispec.OPTIONS.items():
         assert FLAG_ALIASES[name] == clispec.Flag(option.aliases,

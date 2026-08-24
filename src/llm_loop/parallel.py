@@ -55,7 +55,6 @@ from .agentwork import (
 )
 from .console import print_markup
 from .gitpush import (
-    GIT_PUSH_POLICY,
     GitPushPolicy,
     final_git_push,
     maybe_git_push,

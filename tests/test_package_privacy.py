@@ -76,28 +76,31 @@ def test_no_module_reads_another_module_s_private_name(path):
           "owner has not offered yet.")
 
 
-def test_the_gate_can_see_both_spellings():
+def test_the_gate_can_see_both_spellings(tmp_path):
     """The gate is only as good as the two forms it recognises.
 
     Both reach a sibling's private, and code here uses both: `limits` imports
     names it calls on nearly every path, while `termio` goes through the module
-    so a test can replace the target. A gate blind to either would have called
-    the package clean while half of the 21 sites were still there.
-    """
-    source = ("from . import console\n"
-              "from .console import _fmt_left\n"
-              "from .console import print_done\n"
-              "console._real_stream()\n"
-              "console.print_done()\n"
-              "self._own_field\n")
-    tree = ast.parse(source)
-    aliases = _sibling_aliases(tree)
-    found = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module in MODULES:
-            found += [alias.name for alias in node.names if _is_private(alias.name)]
-        elif (isinstance(node, ast.Attribute) and _is_private(node.attr)
-                and isinstance(node.value, ast.Name) and node.value.id in aliases):
-            found.append(f"{node.value.id}.{node.attr}")
+    so a test can replace the target. A gate blind to either would call the
+    package clean while half of the 21 sites were still there — and a clean
+    package is exactly what the check above reports either way, so blindness in
+    it is invisible unless something feeds it a file that IS dirty.
 
-    assert sorted(found) == ["_fmt_left", "console._real_stream"]
+    Which is why this drives `_reaches_into_a_sibling` itself on a written file
+    rather than repeating its walk over a parsed string. Repeating it was the
+    first version of this test, and deleting either branch of the real function
+    left all 23 cases green: it was pinning a copy.
+    """
+    sample = tmp_path / "sample.py"
+    sample.write_text("from . import console\n"
+                      "from .console import _fmt_left\n"
+                      "from .console import print_done\n"   # public import: fine
+                      "console._real_stream()\n"
+                      "console.print_done()\n"              # public attr: fine
+                      "self._own_field\n",                  # own private: fine
+                      encoding="utf-8")
+
+    found = [what for _line, what in _reaches_into_a_sibling(sample)]
+
+    assert sorted(found) == ["console._real_stream",
+                             "from .console import _fmt_left"]

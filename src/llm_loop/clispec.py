@@ -41,6 +41,7 @@ __all__ = [
     "FLAG_ALIASES",
     "Flag",
     "OPTIONS",
+    "OPTION_ORDER",
     "PARALLEL",
     "SEQUENTIAL",
     "build_parser",
