@@ -321,7 +321,13 @@ class Mailbox:
                 with self._lock:
                     if (framed, text) in self._awaiting:
                         self._awaiting.remove((framed, text))
-                return self._queue(text, error=str(exc))
+                    # Moving a failed live send into the queue is one state
+                    # transition. The end-of-run reporter takes the same lock,
+                    # so it sees the note either awaiting confirmation or queued
+                    # for the next prompt, never in the gap between the two.
+                    self._queued.append(text)
+                    queued = len(self._queued)
+                return Delivery(live=False, queued=queued, error=str(exc))
             return Delivery(live=True, queued=0)
         return self._queue(text)
 
@@ -329,6 +335,21 @@ class Mailbox:
         with self._lock:
             self._queued.append(text)
             return Delivery(live=False, queued=len(self._queued), error=error)
+
+    def take_pending(self) -> Tuple[List[str], List[str]]:
+        """Drain (queued notes, live notes still lacking a provider receipt).
+
+        Used only when the run is ending. A live write can still be blocked on a
+        provider pipe after the status input and workers reached their bounded
+        shutdown waits. Remembering `_awaiting` in the same locked snapshot as
+        `_queued` makes such a note visible as unconfirmed instead of letting a
+        later ChannelError queue it after the only closing report has passed.
+        """
+        with self._lock:
+            queued, self._queued = self._queued, []
+            unconfirmed = [original for _framed, original in self._awaiting]
+            self._awaiting = []
+            return queued, unconfirmed
 
 
 class MailboxSet:
@@ -366,13 +387,18 @@ class MailboxSet:
 
 
 def report_undelivered_notes(mailbox) -> None:
-    """Say so when the run ends holding notes nobody ever saw.
+    """Report notes still queued or lacking a live-delivery receipt at shutdown.
 
     A queued note promises "the next iteration" — and there is not always a next
     one (the list drained, --max-runs, a stop request, a quota pause that
     outlasts the run). Whoever typed it during the last iteration would
     otherwise have no way to learn it was never delivered, and the text itself
     is printed so it can be pasted into the next run rather than retyped.
+
+    `_awaiting` is included because bounded Ctrl+C shutdown can outlast a write
+    blocked in the status-input thread. The provider may eventually accept that
+    write, but without its replay receipt the only honest verdict is unconfirmed;
+    printing the text is what keeps that uncertainty from becoming silent loss.
 
     Both runners end with this call and neither owns it, so it is here — with
     the mailbox it is about — rather than in whichever loop happened to grow it
@@ -382,16 +408,25 @@ def report_undelivered_notes(mailbox) -> None:
     """
     if mailbox is None:
         return
-    if isinstance(mailbox, MailboxSet):
-        notes = [(job_id, note)
-                 for job_id, target in mailbox.items()
-                 for note in target.take_queued()]
-    else:
-        notes = [(None, note) for note in mailbox.take_queued()]
-    if not notes:
-        return
-    print_error(f"\n  ⚠ the run ended holding {len(notes)} undelivered operator "
-                f"note(s) — there was no next iteration to carry them:")
-    for job_id, note in notes:
+    targets = (mailbox.items() if isinstance(mailbox, MailboxSet)
+               else [(None, mailbox)])
+    queued = []
+    unconfirmed = []
+    for job_id, target in targets:
+        target_queued, target_unconfirmed = target.take_pending()
+        queued.extend((job_id, note) for note in target_queued)
+        unconfirmed.extend((job_id, note) for note in target_unconfirmed)
+
+    if queued:
+        print_error(f"\n  ⚠ the run ended holding {len(queued)} undelivered "
+                    f"operator note(s) — there was no next iteration to carry "
+                    f"them:")
+    for job_id, note in queued:
+        target = f"job {job_id}: " if job_id is not None else ""
+        print_error(f"      {target}{note}")
+    if unconfirmed:
+        print_error(f"\n  ⚠ the run ended with {len(unconfirmed)} operator "
+                    f"note(s) whose live delivery was not confirmed:")
+    for job_id, note in unconfirmed:
         target = f"job {job_id}: " if job_id is not None else ""
         print_error(f"      {target}{note}")

@@ -935,6 +935,44 @@ def test_fleet_undelivered_report_names_the_job(capsys):
     assert "job 2: finish the current drawing" in out
 
 
+def test_fleet_report_keeps_a_live_send_blocked_during_shutdown(capsys):
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingBrokenPipe:
+        def write(self, _text):
+            started.set()
+            assert release.wait(timeout=5)
+            raise OSError("broken during shutdown")
+
+        def flush(self):
+            return None
+
+        def close(self):
+            return None
+
+    mailboxes = operator.MailboxSet([1, 2])
+    mailbox = mailboxes.mailbox(2)
+    operator.AgentChannel(_BlockingBrokenPipe(), mailbox)
+    deliveries = []
+    sender = threading.Thread(
+        target=lambda: deliveries.append(mailbox.submit("must survive Ctrl+C")))
+    sender.start()
+    try:
+        assert started.wait(timeout=2)
+        operator.report_undelivered_notes(mailboxes)
+        out = capsys.readouterr().out
+    finally:
+        release.set()
+        sender.join(timeout=2)
+
+    assert not sender.is_alive()
+    assert "1 operator note(s) whose live delivery was not" in out
+    assert "confirmed:" in out
+    assert "job 2: must survive Ctrl+C" in out
+    assert deliveries and not deliveries[0].live
+
+
 # --- the parallel runner: one mailbox per worker -------------------------------
 
 

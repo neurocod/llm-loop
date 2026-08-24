@@ -593,7 +593,8 @@ next.
 
 A note still queued when the run ends is reported, with its text, rather than
 dropped in silence: "the next iteration" is a promise the last iteration cannot
-keep.
+keep. A live send still lacking the provider's replay receipt at shutdown is
+reported separately as unconfirmed, so an interrupted write cannot disappear.
 
 `m` works with both providers. Claude receives a streaming-input user message;
 Codex receives an app-server `turn/steer` request for the active turn. With
