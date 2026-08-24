@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from llm_loop import console, cyclecore, usage
+from llm_loop import console, cyclecore, providers, usage
 from llm_loop.cyclecore import ClaudeCommand, Driver, RateLimitEvent
 from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
 
@@ -336,7 +336,11 @@ def test_the_verdict_does_not_outlive_its_run(monkeypatch):
     def boom(*a, **k):
         raise FileNotFoundError
 
-    monkeypatch.setattr(cyclecore.subprocess, "Popen", boom)
+    # `providers`, because that is the module that launches the CLI. This used
+    # to say `cyclecore.subprocess`, which worked only because a module object
+    # is shared process-wide — an address that outlived cyclecore's own use of
+    # `subprocess` and pointed at nothing this test is about.
+    monkeypatch.setattr(providers.subprocess, "Popen", boom)
     with pytest.raises(SystemExit):
         cyclecore.run_claude_streaming(["claude"], raw=False, partial=True)
     assert cyclecore.last_rate_limit_event() is None

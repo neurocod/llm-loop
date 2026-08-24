@@ -74,6 +74,14 @@ DEFAULT_JOBS = 10
 # is what keeps a chatty one from growing a long-running worker.
 FAILURE_TAIL_LINES = 5
 
+# How often the background pusher wakes to apply the git-push policy. Not the
+# cadence of pushing — EACH_HOUR's hour is its own — but how finely that cadence
+# is checked, which is why a minute is plenty. A named constant rather than a
+# literal in `push_pump` so a test can shorten it: without that, the pump's body
+# is unreachable in a run that lasts less than one interval, and the handover it
+# makes (which repository to push) had no pin at all.
+PUSH_PUMP_INTERVAL_S = 60
+
 # Per-file retry budget: a path that fails this many times in a row is parked in
 # the `failed` set so it stops blocking the queue (and is reported at the end)
 # instead of being retried forever.
@@ -1089,14 +1097,21 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         script_limits=settings.status_entries(),
     )
 
-    # Push pending commits up front on EACH_HOUR/AFTER_NEW_COMMITS, then let a
-    # background pusher apply the policy on its cadence while workers run. git is
-    # not thread-safe to call concurrently, so all pushes go through one thread.
+    # A background pusher applies the policy on its own cadence while the
+    # workers run; the workers never push. git is not thread-safe to call
+    # concurrently, so every push in the run goes through one thread and one
+    # lock — including the exit push below, which runs after this thread is
+    # joined but takes the lock anyway, so the rule holds by reading the code
+    # rather than by remembering the join.
+    #
+    # The first push is one interval in, not up front: the loop asks
+    # `shared.stop.wait` BEFORE pushing, so a run shorter than the interval
+    # pushes only on the way out.
     last_push_box = [0.0]
     push_lock = threading.Lock()
 
     def push_pump():
-        while not shared.stop.wait(60):
+        while not shared.stop.wait(PUSH_PUMP_INTERVAL_S):
             with push_lock:
                 last_push_box[0] = maybe_git_push(git_push_policy,
                                                   last_push_box[0],

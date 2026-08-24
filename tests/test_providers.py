@@ -419,6 +419,49 @@ def test_a_dying_sequential_turn_does_not_leave_the_provider_running(monkeypatch
         "run_agent_streaming unwound past a live provider child: orphaned, not reaped"
 
 
+def test_a_failed_prompt_handover_does_not_leave_the_provider_running(monkeypatch):
+    """The one stretch neither runner's `finally` can cover.
+
+    Both runners guard from `start_agent_process`'s RETURN onwards, so an
+    exception between `Popen` and that return leaves a live CLI with no reaper
+    anywhere — nobody has the handle yet. Building the stdin payload is inside
+    that stretch, and it can raise on its own (a pipe closed under us, a payload
+    that will not encode).
+
+    A real subprocess again, and a real failure at the real seam: the launcher
+    is asked for the live-message transport, and the call that builds its first
+    message raises.
+    """
+    started = []
+    real_popen = subprocess.Popen
+
+    def watch_popen(argv, **kwargs):
+        proc = real_popen(argv, **kwargs)
+        started.append(proc)
+        return proc
+
+    def boom(prompt):
+        raise ValueError("the payload could not be encoded")
+
+    previous = providers.live_messages_enabled("claude")
+    providers.set_live_messages(True)
+    try:
+        monkeypatch.setattr(
+            providers, "runtime_argv",
+            lambda argv, provider: [sys.executable, "-c", _FAKE_PROVIDER_SRC])
+        monkeypatch.setattr(providers, "user_message_line", boom)
+        monkeypatch.setattr(providers.subprocess, "Popen", watch_popen)
+
+        with pytest.raises(ValueError):
+            start_agent_process(["claude", "-p"], "claude", "work", os.getcwd())
+    finally:
+        providers.set_live_messages(previous)
+
+    assert started, "no process was started — the pin proved nothing"
+    assert not _outlived_the_runner(started[0]), \
+        "start_agent_process raised past a live provider child: orphaned, not reaped"
+
+
 def test_codex_events_render_message_commands_and_usage(capsys):
     cyclecore._render_codex_event({
         "type": "item.started",

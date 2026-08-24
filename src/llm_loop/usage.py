@@ -60,8 +60,8 @@ USAGE_CACHE_TTL = 30  # seconds
 # Here rather than in a runner because it is a fact about the QUOTA, and this is
 # the module that reads quotas — it was the last thing `limits` had to import a
 # runner for, and that import is what made the limit rules unusable without the
-# sequential loop. The +3s is a safety margin: waking exactly on the boundary
-# has been observed to retry into a window that had not quite rolled over.
+# sequential loop. The +3s is an unmeasured safety margin against waking exactly
+# on the boundary; it moved here verbatim and nothing here justifies the number.
 CLAUDE_SESSION_DURATION = 5 * 60 * 60 + 3  # 5 hours, in seconds
 
 

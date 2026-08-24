@@ -54,14 +54,13 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Union
 
-from . import (compactline, console, exitlog, gitpush, operator, providers,
-               stopchannel, textwidth)
+from . import (compactline, console, exitlog, operator, providers, stopchannel,
+               textwidth)
 # What the run PRINTS, and the mirror log that is the second copy of it, are
 # `console` (see its header for why those are one module). The line helpers are
 # imported by name because this module calls them on nearly every path; the
@@ -921,8 +920,8 @@ def _script_settings(run_settings: RunSettings, statusline) -> "SettingsRegistry
     (`status_entries()`) and the reproducing command line (`overrides()`), so a
     figure on screen can never disagree with the flag that would reproduce it;
     the flags are checked against `cmdline.FLAG_ALIASES` at registration.
-    `statusline` is passed in because cyclecore must not import it at module
-    level (statusline imports cyclecore).
+    `statusline` is passed in because `run_loop` imports it lazily and hands it
+    down — see the note there. It was once a cycle break, and is no longer one.
     """
     registry = statusline.SettingsRegistry()
     registry.add(statusline.NumberSetting(
@@ -1134,8 +1133,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     call is the invocation and owns its own figures.
     """
     # The usage-limit query/parse (UsageSource) and pausing policy (LimitPolicy)
-    # live in their own modules; imported here to avoid an import cycle
-    # (limits/usage/statusline import cyclecore for its helpers).
+    # live in their own modules. The import is local for history, not necessity:
+    # it broke a cycle until the git-push policy and the session-window constant
+    # moved out of here, and neither `limits` nor `statusline` imports this
+    # module any more. Kept local because hoisting it changes what a bare
+    # `import llm_loop.cyclecore` drags in, which is a different question.
     from . import limits, statusline
 
     owns_progress = progress is None

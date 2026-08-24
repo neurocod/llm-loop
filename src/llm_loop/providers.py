@@ -12,7 +12,9 @@ import subprocess
 from typing import Optional, Protocol
 
 from . import operator
+from .codex_usage import CodexUsageSource
 from .operator import user_message_line
+from .usage import UsageSource
 
 
 class AgentCommandLike(Protocol):
@@ -91,16 +93,9 @@ def usage_source_for(provider: str):
     spec = provider_spec(provider)
     if not spec.supports_usage_limits:
         return None
-    # Imported here rather than at the top: a run talks to exactly one provider,
-    # and the loser of that choice costs nothing — `codex_usage` starts no
-    # process on import, but it does drag in the whole app-server client for a
-    # run that will never call it. Both modules sit below this one (they import
-    # nothing from the package but each other), so this is a cost, not a cycle.
     if provider == "claude":
-        from .usage import UsageSource
         return UsageSource()
     if provider == "codex":
-        from .codex_usage import CodexUsageSource
         return CodexUsageSource()
     raise NotImplementedError(f"No usage source adapter for {spec.display_name}")
 
@@ -128,6 +123,15 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
       * codex - the prompt is read from a stdin closed immediately after: this
         preserves non-interactive JSONL mode while avoiding Windows command-line
         length limits, especially when the executable is an npm ``codex.CMD`` shim.
+
+    Everything after `Popen` runs with a child alive and is therefore inside a
+    guard of its own, ending it if the function does not get to return. Both
+    runners wrap their whole render loop in `try/finally: reap_agent_process`,
+    but that guard begins where THIS function ends — so the few lines below are
+    the one stretch in which a live provider has no reaper anywhere, and an
+    exception in them (a `ValueError` on a pipe closed under us, a
+    `UnicodeEncodeError` from the payload) would orphan the CLI before any
+    caller had a handle to reap.
     """
     kwargs = {
         "cwd": project_dir,
@@ -144,22 +148,30 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
         kwargs["stdin"] = subprocess.PIPE
 
     proc = subprocess.Popen(runtime_argv(argv, provider), **kwargs)
-    if on_stdin:
-        payload = user_message_line(prompt) if keep_open else prompt
-        try:
-            proc.stdin.write(payload)
-            if keep_open:
-                proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            # The CLI may reject its flags before reading stdin. Its stdout/stderr
-            # still carries the useful diagnostic, so let the renderer show it.
-            pass
-        finally:
-            if not keep_open:
-                try:
-                    proc.stdin.close()
-                except (BrokenPipeError, OSError):
-                    pass
+    try:
+        if on_stdin:
+            payload = user_message_line(prompt) if keep_open else prompt
+            try:
+                proc.stdin.write(payload)
+                if keep_open:
+                    proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                # The CLI may reject its flags before reading stdin. Its
+                # stdout/stderr still carries the useful diagnostic, so let the
+                # renderer show it.
+                pass
+            finally:
+                if not keep_open:
+                    try:
+                        proc.stdin.close()
+                    except (BrokenPipeError, OSError):
+                        pass
+    except BaseException:
+        # Re-raised, not swallowed: the caller asked for a running CLI and did
+        # not get one, so it must hear why. All this guard owes the child is an
+        # ending before the news travels.
+        reap_agent_process(proc)
+        raise
     return proc
 
 
@@ -261,12 +273,32 @@ def reap_agent_process(proc) -> None:
     Safe on a child that has already exited (only the pipe is closed) and
     bounded on every other path: told to end, then killed if it will not be.
 
-    NOTHING HERE MAY RAISE. It runs from a `finally`, so an exception escaping
-    this function REPLACES the one being unwound — the `BrokenPipeError` that
-    the whole seam exists to survive would reach the caller as a
-    `PermissionError` from the reaper, and the guard above it would report the
-    wrong cause.
+    NOTHING HERE MAY RAISE, and that is enforced call by call rather than
+    asserted. It runs from a `finally`, so an exception escaping this function
+    REPLACES the one being unwound — the `BrokenPipeError` that the whole seam
+    exists to survive would reach the caller as a `PermissionError` from the
+    reaper, and the guard above it would report the wrong cause. `poll()` and
+    `wait()` are guarded against `OSError` for that reason and not a theoretical
+    one: on Windows both raise it on a handle the OS has already reclaimed.
+
+    KeyboardInterrupt is caught here too, and only here. The sequential runner
+    calls this from the MAIN thread — the one Ctrl+C lands on — inside the
+    handler for the first Ctrl+C, and the ending it performs can take a few
+    seconds (`REAP_GRACE_S` twice over, plus `taskkill`). A second press during
+    that window would otherwise escape the `finally`, replace the `SystemExit`
+    the first press earned with a traceback, and change the exit code from 130
+    to 1 — while the child it interrupted stays alive, which is precisely what
+    the impatient second press was asking to end. So it is absorbed: the run is
+    already leaving, and the press only asks it to leave faster.
     """
+    try:
+        _reap(proc)
+    except KeyboardInterrupt:
+        pass
+
+
+def _reap(proc) -> None:
+    """The body of `reap_agent_process`; see there for the no-raise contract."""
     # Before the poll, not after it: the read end is a descriptor the caller
     # would otherwise leak until GC even on the common path (an exception raised
     # while printing the LAST lines, after the CLI has already exited), and a
@@ -277,11 +309,16 @@ def reap_agent_process(proc) -> None:
             proc.stdout.close()
         except OSError:
             pass
-    if proc.poll() is not None:
-        return
+    try:
+        if proc.poll() is not None:
+            return
+    except OSError:
+        return  # the handle is gone; there is nothing left to end
     _ask_agent_process_to_end(proc)
     try:
         proc.wait(timeout=REAP_GRACE_S)
+    except OSError:
+        return
     except subprocess.TimeoutExpired:
         try:
             proc.kill()
@@ -289,6 +326,8 @@ def reap_agent_process(proc) -> None:
             pass  # gone between the wait and here — `wait` below collects it
         try:
             proc.wait(timeout=REAP_GRACE_S)
+        except OSError:
+            return
         except subprocess.TimeoutExpired:
             # Unkillable (a stuck kernel-mode handle) — deliberately not waited
             # on any longer. In the parallel runner the thread is dying either

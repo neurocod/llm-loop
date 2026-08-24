@@ -34,6 +34,21 @@ def _restore_streams():
     sys.stdout, sys.stderr = out, err
 
 
+@pytest.fixture(autouse=True)
+def _restore_project_root():
+    """Put the process-wide project root back after a run has moved it.
+
+    Every pin here points a runner at a tmp_path, and `set_project_root` also
+    moves the stop sentinel and the mirror log's file name with it. This file
+    collects second alphabetically, so without this every later file would
+    inherit a tmp root that no longer exists — green today, and the standard
+    seed of an order-dependent flake.
+    """
+    previous = cyclecore.project_dir()
+    yield
+    cyclecore.set_project_root(previous)
+
+
 class _FakeGitModule:
     """Stands in for `gitpush.subprocess`, recording (argv, cwd) per call.
 
@@ -45,6 +60,10 @@ class _FakeGitModule:
     Every `git` invocation succeeds and `rev-list --count` answers 1, so the
     policy takes each branch that runs git at all rather than short-circuiting
     on "nothing to push".
+
+    `pushed` fires on each `git push`. The parallel pin needs it: its pusher
+    runs on a thread of its own, and the only way to know it has taken a turn
+    without guessing at a sleep is to wait for the push itself.
     """
 
     PIPE = subprocess.PIPE
@@ -53,9 +72,12 @@ class _FakeGitModule:
 
     def __init__(self):
         self.calls = []
+        self.pushed = threading.Event()
 
     def run(self, argv, **kwargs):
         self.calls.append((tuple(argv), kwargs.get("cwd")))
+        if tuple(argv)[:2] == ("git", "push"):
+            self.pushed.set()
         return subprocess.CompletedProcess(argv, 0, stdout="1")
 
     @property
@@ -201,8 +223,9 @@ def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(
     """The same handover from the other runner, on its exit push.
 
     Its periodic pusher wakes on a 60 s timer, so the exit push is the site a
-    test can reach; both read the same `cyclecore.project_dir()`, and a run over
-    a drained list reaches the exit push immediately.
+    test can reach; both read the same `cyclecore.project_dir()`. One pending
+    item rather than none, because a run with an empty list reports "nothing to
+    do" and returns BEFORE the exit push — see `_MemListDriver`.
     """
     fake = _FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
@@ -219,3 +242,54 @@ def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(
     assert fake.calls, "the run pushed nothing at all — the pin proved nothing"
     assert fake.dirs == {root}, \
         f"the parallel runner pushed the wrong repository: {fake.calls}"
+
+
+# How long the pusher pin gives the background thread to take one turn. Only the
+# FAILING case ever approaches it: a healthy pump wakes every
+# PUMP_INTERVAL_S (0.01 below) and the worker is released the moment it pushes.
+PUMP_WAIT_S = 10.0
+
+
+def test_the_parallel_pusher_pushes_the_project_it_was_pointed_at(
+        tmp_path, monkeypatch):
+    """The periodic pusher's handover — the site the exit push does not cover.
+
+    This is where a long run's pushing actually happens; the exit push only
+    mops up what the last interval left. It is also the only one of the four
+    handovers that a normal run cannot reach in a test: the pump asks
+    `shared.stop.wait(PUSH_PUMP_INTERVAL_S)` BEFORE pushing, so with the shipped
+    minute a run that ends in under a second never enters the body at all — and
+    a pin over it was green with `os.getcwd()` substituted.
+
+    The interval is shortened and the worker is held until the pusher has
+    actually pushed, which is a handshake rather than a sleep: the run cannot
+    finish before the thread under test has taken its turn, and cannot hang if
+    it never does.
+
+    `saw_push` is what makes it a pin instead of a formality. The exit push
+    would set the same event a moment later, so "a push happened" proves
+    nothing; what it records is that a push was seen WHILE a worker was still
+    running, which only the pusher thread can produce.
+    """
+    fake = _FakeGitModule()
+    saw_push = []
+
+    def held_job(job_id, command, mailbox=None):
+        saw_push.append(fake.pushed.wait(timeout=PUMP_WAIT_S))
+        return 0, None, None
+
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
+    monkeypatch.setattr(parallel, "run_job", held_job)
+    root = _elsewhere(tmp_path)
+
+    try:
+        parallel.run_parallel(_MemListDriver(["products/only.md"]),
+                              _par_args(root), app_name="pytest-gitpush")
+    except SystemExit:
+        pass
+
+    assert saw_push == [True], \
+        f"the background pusher never took a turn — the pin proved nothing: {saw_push}"
+    assert fake.dirs == {root}, \
+        f"the parallel pusher pushed the wrong repository: {fake.calls}"
