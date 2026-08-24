@@ -30,6 +30,11 @@ fatal error: the loop degrades to the free backstop instead, i.e. the
 `rate_limit_event` the CLI emits on its own stream — which reports a hard
 refusal even when this reading is missing, and which is `RateLimitEvent` below,
 here for the same reason `CLAUDE_SESSION_DURATION` is.
+
+`EMPTY_READING`, `EMPTY_USAGE` and `summary_line` are public here because
+`codex_usage` builds the same snapshots from its own protocol and needs them;
+`_` in this package means "this file's business" and nothing wider — see
+tests/test_package_privacy.py.
 """
 
 import json
@@ -45,7 +50,7 @@ from typing import NamedTuple, Optional
 # not that wording — it is the "Aug 15, 6:19pm" of the usage summary lines, whose
 # exact text is a contract with LimitPolicy.log_snapshot — so the verdict's
 # `describe()` borrows the console's spelling rather than growing a third.
-from .console import _fmt_moment
+from .console import fmt_moment
 
 # The usage endpoint, and the OAuth credentials the CLI stores for its own calls.
 # ANTHROPIC_BASE_URL / CLAUDE_CONFIG_DIR are the CLI's own environment overrides,
@@ -175,7 +180,7 @@ class RateLimitEvent(NamedTuple):
         return RATE_LIMIT_LABELS.get(self.limit_type, self.limit_type or "limit")
 
     def describe(self) -> str:
-        when = f", resets {_fmt_moment(self.resets_at)}" if self.resets_at else ""
+        when = f", resets {fmt_moment(self.resets_at)}" if self.resets_at else ""
         return f"{self.label} {self.status}{when}"
 
 
@@ -219,8 +224,8 @@ class Usage(NamedTuple):
         return tuple((quota, getattr(self, quota.field)) for quota in QUOTAS)
 
 
-_EMPTY_READING = UsageReading(None, None)
-_EMPTY_USAGE = Usage(_EMPTY_READING, _EMPTY_READING, _EMPTY_READING, [])
+EMPTY_READING = UsageReading(None, None)
+EMPTY_USAGE = Usage(EMPTY_READING, EMPTY_READING, EMPTY_READING, [])
 
 
 def _config_dir() -> str:
@@ -283,7 +288,7 @@ def _reading_from(entry) -> UsageReading:
     both mean "no figure", which is what an all-None reading says.
     """
     if not isinstance(entry, dict):
-        return _EMPTY_READING
+        return EMPTY_READING
     percent = entry.get("utilization")
     percent = float(percent) if isinstance(percent, (int, float)) else None
     return UsageReading(percent, _iso_to_ts(entry.get("resets_at")))
@@ -304,7 +309,7 @@ def _fmt_reset(ts: float) -> str:
     return f"{dt.strftime('%b')} {dt.day}, {hour}:{dt.minute:02d}{ampm}"
 
 
-def _summary_line(label: str, reading: UsageReading) -> str:
+def summary_line(label: str, reading: UsageReading) -> str:
     """One "Current session: 9% used · resets Aug 15, 6:19pm" line for the log."""
     line = f"{label}: {_fmt_percent(reading.percent)} used"
     if reading.reset_ts is not None:
@@ -320,14 +325,14 @@ def parse_usage(data: dict) -> Usage:
     say about it (and a rule watching it never fires).
     """
     if not isinstance(data, dict):
-        return _EMPTY_USAGE
+        return EMPTY_USAGE
     readings = {}
     summary = []
     for quota in QUOTAS:
         reading = _reading_from(data.get(quota.key))
         readings[quota.field] = reading
         if reading.percent is not None:
-            summary.append(_summary_line(quota.label, reading))
+            summary.append(summary_line(quota.label, reading))
     return Usage(readings["session"], readings["week_all"],
                  readings["week_sonnet"], summary)
 
@@ -401,7 +406,7 @@ class UsageSource:
             return self._cached
         data = self.query_usage_json()
         if data is None:
-            return _EMPTY_USAGE
+            return EMPTY_USAGE
         usage = parse_usage(data)
         self._cached = usage
         self._cached_ts = now

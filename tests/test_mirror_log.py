@@ -99,7 +99,7 @@ def test_a_logging_failure_never_recurses_through_the_tee(tmp_path):
 
     handler = Exploding()
     logger = _logger("runCycle.test-recursion", handler)
-    sys.stderr = console._TeeToLog(sys.stderr, logger)
+    sys.stderr = console.TeeToLog(sys.stderr, logger)
 
     print("something the loop printed", file=sys.stderr)
 
@@ -109,7 +109,7 @@ def test_a_logging_failure_never_recurses_through_the_tee(tmp_path):
 def test_the_tee_still_logs_normally_after_a_guarded_call(tmp_path):
     handler = _handler(tmp_path)
     logger = _logger("runCycle.test-normal", handler)
-    sys.stdout = console._TeeToLog(sys.stdout, logger)
+    sys.stdout = console.TeeToLog(sys.stdout, logger)
 
     print("first")
     print("second")

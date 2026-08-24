@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Optional
 
-from .usage import Usage, UsageReading, _EMPTY_READING, _EMPTY_USAGE, _summary_line
+from .usage import EMPTY_READING, EMPTY_USAGE, Usage, UsageReading, summary_line
 
 APP_SERVER_TIMEOUT = 15.0
 USAGE_CACHE_TTL = 30.0
@@ -26,7 +26,7 @@ LONG_WINDOW_MINUTES = 24 * 60
 
 def _reading(entry, *, reached: bool = False) -> UsageReading:
     if not isinstance(entry, dict):
-        return _EMPTY_READING
+        return EMPTY_READING
     percent = entry.get("usedPercent")
     percent = float(percent) if isinstance(percent, (int, float)) else None
     if reached:
@@ -55,14 +55,14 @@ def parse_rate_limits(data: dict) -> Usage:
     current weekly-only plan, where ``primary`` itself is seven days.
     """
     if not isinstance(data, dict):
-        return _EMPTY_USAGE
+        return EMPTY_USAGE
     bucket = data.get("rateLimits")
     if not isinstance(bucket, dict):
-        return _EMPTY_USAGE
+        return EMPTY_USAGE
 
     reached_type = str(bucket.get("rateLimitReachedType") or "").lower()
-    session = _EMPTY_READING
-    week = _EMPTY_READING
+    session = EMPTY_READING
+    week = EMPTY_READING
     for name in ("primary", "secondary"):
         entry = bucket.get(name)
         if not isinstance(entry, dict):
@@ -91,10 +91,10 @@ def parse_rate_limits(data: dict) -> Usage:
 
     summary = []
     if session.percent is not None:
-        summary.append(_summary_line("Current session", session))
+        summary.append(summary_line("Current session", session))
     if week.percent is not None:
-        summary.append(_summary_line("Current week (all models)", week))
-    return Usage(session, week, _EMPTY_READING, summary)
+        summary.append(summary_line("Current week (all models)", week))
+    return Usage(session, week, EMPTY_READING, summary)
 
 
 class CodexUsageSource:
@@ -195,7 +195,7 @@ class CodexUsageSource:
             return self._cached
         data = self.query_rate_limits_json()
         if data is None:
-            return _EMPTY_USAGE
+            return EMPTY_USAGE
         snapshot = parse_rate_limits(data)
         self._cached = snapshot
         self._cached_ts = now

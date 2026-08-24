@@ -40,7 +40,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from .console import _fmt_clock, _fmt_left, print_percents
+from .console import fmt_clock, fmt_left, print_percents
 from .stopchannel import sleep_unless
 from .usage import (CLAUDE_SESSION_DURATION, QUOTA_BY_FIELD, Usage,
                     UsageReading)
@@ -294,7 +294,7 @@ class LimitPolicy:
                 # percentage means (10% with four hours left is a different
                 # situation from 10% with ten minutes left), and the quantity a
                 # DayNightLimit ceiling is itself computed from.
-                left = (f", {_fmt_left(rd.reset_ts - now)} left"
+                left = (f", {fmt_left(rd.reset_ts - now)} left"
                         if rd.reset_ts is not None else " now")
                 print_percents(f"  · {r.label} usage: {rd.percent:.0f}% "
                                f"(ceiling {c:.0f}%{left}){note}")
@@ -336,7 +336,7 @@ class LimitPolicy:
                 if not violated:
                     # About to resume; force a fresh reading on the next check.
                     source.invalidate()
-                    print(f"  ▶ Back under all usage limits (now {_fmt_clock(now)}) "
+                    print(f"  ▶ Back under all usage limits (now {fmt_clock(now)}) "
                           f"— resuming.")
                     return True, session_start
 
@@ -349,7 +349,7 @@ class LimitPolicy:
 
                 if now >= next_reset:
                     # A window refreshed — the frozen percentages are stale.
-                    print(f"  ▶ A usage window reset (now {_fmt_clock(now)}) — "
+                    print(f"  ▶ A usage window reset (now {fmt_clock(now)}) — "
                           f"re-checking with fresh figures.")
                     # If it was the session window, restart the session clock.
                     session = usage.session
@@ -362,8 +362,8 @@ class LimitPolicy:
                 over = ", ".join(
                     f"{r.label} {rd.percent:.0f}% ≥ {c:.0f}%"
                     for r, rd, c in violated)
-                print_percents(f"    … {over}; {_fmt_left(next_reset - now)} "
-                               f"to next reset (now {_fmt_clock(now)})")
+                print_percents(f"    … {over}; {fmt_left(next_reset - now)} "
+                               f"to next reset (now {fmt_clock(now)})")
                 sleep_unless(min(next_reset - now, 60), should_stop)
         except KeyboardInterrupt:
             print("\nWait interrupted by user (Ctrl+C).")

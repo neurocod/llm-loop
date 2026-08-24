@@ -927,9 +927,9 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # a preview, not a run, and stays out of the shared record entirely: see the
     # same branch in cyclecore.run_loop for the incident behind it.
     if setup_logging and not args.dry_run:
-        logger = console._setup_file_logging(app_name)
-        sys.stdout = console._TeeToLog(sys.stdout, logger)
-        sys.stderr = console._TeeToLog(sys.stderr, logger)
+        logger = console.setup_file_logging(app_name)
+        sys.stdout = console.TeeToLog(sys.stdout, logger)
+        sys.stderr = console.TeeToLog(sys.stderr, logger)
     if not args.dry_run:
         # See the same call in cyclecore.run_loop: after the tee, so a vanished
         # run's report lands in the log whose abrupt end it explains.

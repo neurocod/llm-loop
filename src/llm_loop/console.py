@@ -5,10 +5,10 @@ TWICE: styled to the terminal, and plain to a rotating mirror log. That is one
 job, not two, which is why the log lives in this module rather than beside the
 runner that produces the lines:
 
-  * both writers of the log are printing paths — `_TeeToLog`, which wraps
+  * both writers of the log are printing paths — `TeeToLog`, which wraps
     `sys.stdout` for the whole run, and `_log_plain`, the second sink of
     `print_markup` for the Rich path whose live frames must never reach a file
-    (see `_real_stream`). Nothing else writes to it;
+    (see `real_stream`). Nothing else writes to it;
   * the split between them is a TERMINAL detail: escape codes and cursor
     repaints belong on a screen and nowhere else, and deciding that for each
     line is what `print_markup` is;
@@ -21,6 +21,12 @@ this log back and parses the runner's own vocabulary out of it ("=== Iteration 1
 renderers, so its patterns belong next to THEM, in `cyclecore`. `exitlog` is the
 same shape from the other side: it is handed `LOG_DIR` and writes its own file
 beside the mirror, so it stays a module of its own and imports the constant.
+
+Names without a leading underscore here are the PACKAGE's, not the front door's:
+nine of them (`fmt_clock`, `TeeToLog`, `real_stream` and the rest) are read by
+runners and by the status line, and `_` was dropped so it can go on meaning "this
+file's business" — see tests/test_package_privacy.py, which is what keeps that
+true. What an ADOPTER may name is `__init__.__all__`, pinned separately.
 
 The rule for anything added here: this module must not import a runner. The one
 thing it needs that a runner used to own — the project root, whose folder name
@@ -82,7 +88,7 @@ def log_file_path(app_name: str = "runCycle") -> Path:
 # --- mirror-log writer -----------------------------------------------------
 
 # The app-specific logger that owns the mirror-log file handler, set by
-# _setup_file_logging. `_log_plain` (the Rich path) must target *this* logger:
+# setup_file_logging. `_log_plain` (the Rich path) must target *this* logger:
 # the handler lives on "runCycle.<app_name>" (which does not propagate), so
 # logging to a bare "runCycle" would silently drop the message. Kept in a module
 # global because the Rich print helpers have no reference to the configured logger.
@@ -101,7 +107,7 @@ class _MirrorLogHandler(RotatingFileHandler):
     run, the grow-kit pass), and same-named runs share one mirror log. On Windows
     a rename fails while another process has the file open, and the stock handler
     reports that through `logging.raiseExceptions`, i.e. by printing to
-    `sys.stderr` — which is the `_TeeToLog` mirror, which logs the line, which
+    `sys.stderr` — which is the `TeeToLog` mirror, which logs the line, which
     fails again: an unbounded recursion that ends the run with a RecursionError
     over a *log file*. Measured, not theorised: two runs colliding on a 25 MB
     rollover killed the second one outright.
@@ -128,7 +134,7 @@ class _MirrorLogHandler(RotatingFileHandler):
         the tee — see the class docstring for why that cannot be allowed."""
 
 
-def _setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
+def setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
     """Configure the rotating file logger at log_file_path(app_name)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(f"runCycle.{app_name}")
@@ -148,7 +154,7 @@ def _setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
     return logger
 
 
-class _TeeToLog:
+class TeeToLog:
     """Wrap a console stream so everything printed is also captured into the file
     logger, one record per line.
 
@@ -202,17 +208,17 @@ try:
     from rich.console import Console as _RichConsole
     from rich.live import Live as _RichLive
     from rich.markdown import Markdown as _RichMarkdown
-    _RICH_AVAILABLE = True
+    RICH_AVAILABLE = True
 except ImportError:
-    _RICH_AVAILABLE = False
+    RICH_AVAILABLE = False
 
 
-def _real_stream():
+def real_stream():
     """The underlying console stream, unwrapping the line-logging tee.
 
     Rich's Live repaints the frame many times a second using cursor-movement
     escape codes that must not end up in the file log, so its output goes
-    straight to the real terminal rather than through `_TeeToLog`.
+    straight to the real terminal rather than through `TeeToLog`.
     """
     out = sys.stdout
     return getattr(out, "_stream", out)
@@ -224,7 +230,7 @@ def _log_plain(text: str) -> None:
     Used on the Rich path, where the live frames bypass the tee — we still want
     the assistant's words in the log, just without the ANSI/redraw noise.
 
-    Targets the app-specific logger configured by _setup_file_logging (which owns
+    Targets the app-specific logger configured by setup_file_logging (which owns
     the file handler and does not propagate); falling back to a bare "runCycle"
     logger only if logging was never set up (e.g. in tests). Using the wrong
     logger name here silently drops every Rich-path line — including the
@@ -236,7 +242,7 @@ def _log_plain(text: str) -> None:
         logger.info(line)
 
 
-class _MarkdownStream:
+class MarkdownStream:
     """Render one assistant text block as live-updating Markdown.
 
     The model streams Markdown token by token; we accumulate it and let Rich
@@ -252,8 +258,8 @@ class _MarkdownStream:
 
     def start(self) -> None:
         self._buf = ""
-        if _RICH_AVAILABLE:
-            self._console = _RichConsole(file=_real_stream())
+        if RICH_AVAILABLE:
+            self._console = _RichConsole(file=real_stream())
             self._console.print("\n[dim]  💬[/dim]")
             self._live = _RichLive(
                 _RichMarkdown(""),
@@ -261,7 +267,7 @@ class _MarkdownStream:
                 refresh_per_second=12,
                 vertical_overflow="visible",
                 # Nothing else prints during a text block, so we don't need Rich
-                # to hijack stdout/stderr (which would fight with _TeeToLog).
+                # to hijack stdout/stderr (which would fight with TeeToLog).
                 redirect_stdout=False,
                 redirect_stderr=False,
             )
@@ -284,7 +290,7 @@ class _MarkdownStream:
             self._console = None
             # Guarantee the next output (tool calls, etc.) starts on a fresh line,
             # regardless of how Live left the cursor on this terminal.
-            print(file=_real_stream())
+            print(file=real_stream())
             if self._buf.strip():
                 _log_plain(self._buf)
         else:
@@ -292,7 +298,7 @@ class _MarkdownStream:
         self._buf = ""
 
 
-def _render_markdown_block(text: str) -> None:
+def render_markdown_block(text: str) -> None:
     """Print a complete Markdown string formatted (Rich) or plain (fallback).
 
     Used for non-streaming assistant text (when --include-partial-messages is off
@@ -301,8 +307,8 @@ def _render_markdown_block(text: str) -> None:
     text = text.strip()
     if not text:
         return
-    if _RICH_AVAILABLE:
-        console = _RichConsole(file=_real_stream())
+    if RICH_AVAILABLE:
+        console = _RichConsole(file=real_stream())
         console.print("[dim]  💬[/dim]")
         console.print(_RichMarkdown(text))
         _log_plain(text)
@@ -323,8 +329,8 @@ def print_markup(plain: str, markup: str) -> None:
     the tee). Note: terminals can't switch *font family*; only colour and the
     bold/italic/underline attributes are available.
     """
-    if _RICH_AVAILABLE:
-        _RichConsole(file=_real_stream()).print(markup)
+    if RICH_AVAILABLE:
+        _RichConsole(file=real_stream()).print(markup)
         _log_plain(plain)
     else:
         print(plain)
@@ -434,11 +440,11 @@ def print_note(text: str) -> None:
 # the three drift. Everything that speaks to the person watching the run lives
 # in this module, and that includes how long it says something will take.
 
-def _fmt_clock(ts: float) -> str:
+def fmt_clock(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
 
-def _fmt_left(seconds: float) -> str:
+def fmt_left(seconds: float) -> str:
     """"4d3h" / "3h24m" / "24m" — a duration in the two largest units that matter.
 
     The zero-valued smaller unit is dropped ("3h", not "3h0m"), and anything under
@@ -457,12 +463,12 @@ def _fmt_left(seconds: float) -> str:
     return f"{minutes}m" if minutes else "<1m"
 
 
-def _fmt_moment(ts: float) -> str:
-    """Like _fmt_clock, but names the day too once the moment is far enough away
+def fmt_moment(ts: float) -> str:
+    """Like fmt_clock, but names the day too once the moment is far enough away
     that a bare clock reading would be ambiguous — a weekly quota resets days out,
     and "12:59:59" alone reads as "in a few hours"."""
     if ts - time.time() < 18 * 3600:
-        return _fmt_clock(ts)
+        return fmt_clock(ts)
     return datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
 
 

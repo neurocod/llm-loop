@@ -19,8 +19,8 @@ both this and `cyclecore` sit on top of; neither is the terminal, which is
 Two things are load-bearing and easy to get wrong:
 
   * nothing here writes an escape or reads a key: it all goes through `termio`,
-    whose bytes reach ``console._real_stream()`` rather than ``sys.stdout``,
-    the ``_TeeToLog`` mirror (see there).
+    whose bytes reach ``console.real_stream()`` rather than ``sys.stdout``,
+    the ``TeeToLog`` mirror (see there).
   * anything that fails here disables the status line (a `termio.NullTerminal`
     takes over) and the run continues. A cosmetic feature must never be able to
     stop an eight-hour loop.
@@ -688,7 +688,7 @@ class QuotaSegment(Segment):
             # that stops being reported is visible instead of invisible.
             provider = f"{row.label} n/a"
         else:
-            left = (console._fmt_left(
+            left = (console.fmt_left(
                 row.reset_ts - (time.time() if now is None else now))
                 if row.reset_ts else "")
             provider = f"{row.label} {row.percent:.0f}%" + (f" ({left})" if left else "")

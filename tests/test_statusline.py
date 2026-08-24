@@ -1159,7 +1159,7 @@ class _CollectingHandler(logging.Handler):
 
 def test_a_default_terminal_targets_the_real_stream_not_the_tee(monkeypatch):
     screen = _FakeStream(True)
-    monkeypatch.setattr(console, "_real_stream", lambda: screen)
+    monkeypatch.setattr(console, "real_stream", lambda: screen)
 
     assert tio.Terminal()._stream is screen
 
@@ -1173,7 +1173,7 @@ def test_the_pinned_rows_never_reach_the_mirror_log(monkeypatch):
     logger.handlers = [_CollectingHandler(logged)]
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    monkeypatch.setattr(sys, "stdout", console._TeeToLog(screen, logger))
+    monkeypatch.setattr(sys, "stdout", console.TeeToLog(screen, logger))
     monkeypatch.setattr(tio, "_enable_windows_vt", lambda s: True)
     monkeypatch.setattr(tio.shutil, "get_terminal_size",
                         lambda fallback=(0, 0): os.terminal_size((100, 30)))

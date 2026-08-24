@@ -188,7 +188,7 @@ def test_a_failed_query_is_not_cached(monkeypatch):
     (-5, "<1m"),
 ])
 def test_time_left_reads_as_a_quantity(seconds, expected):
-    assert console._fmt_left(seconds) == expected
+    assert console.fmt_left(seconds) == expected
 
 
 def test_the_status_line_says_how_long_the_window_has_left(capsys):

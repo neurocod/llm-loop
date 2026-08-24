@@ -468,8 +468,8 @@ def wait_for_stop_file_clear() -> None:
             waited += STOP_POLL_SECONDS
             if waited % 60 == 0:
                 # The wall clock, spelled with the stdlib rather than borrowed
-                # from cyclecore's `_fmt_clock`: the same %H:%M:%S, and one
-                # import fewer between a stop channel and a runner.
+                # from `console.fmt_clock`: the same %H:%M:%S, and one import
+                # fewer between a stop channel and what a run prints with.
                 print(f"    … still waiting ({waited // 60} min, now "
                       f"{time.strftime('%H:%M:%S')})", flush=True)
     except KeyboardInterrupt:

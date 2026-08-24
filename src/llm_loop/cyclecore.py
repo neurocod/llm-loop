@@ -73,15 +73,15 @@ from .agentwork import Driver, LoopStop, build_agent_argv
 # would be a second address for a test or a wrapper to miss.
 from .console import (
     LINES,
-    _fmt_clock,
-    _fmt_left,
-    _fmt_moment,
-    _MarkdownStream,
-    _render_markdown_block,
+    MarkdownStream,
+    fmt_clock,
+    fmt_left,
+    fmt_moment,
     print_done,
     print_error,
     print_note,
     print_percents,
+    render_markdown_block,
 )
 # The vocabulary of stopping and pausing is `stopchannel`, its own module,
 # because both runners and a host wrapper speak it and none of them should have
@@ -321,7 +321,7 @@ def parse_duration(text: str) -> float:
 # Streaming print state: the single content-block index text is currently flowing
 # into (assistant replies stream one text block at a time), plus its live renderer.
 _active_text_index = None
-_md_stream = _MarkdownStream()
+_md_stream = MarkdownStream()
 
 # The session cost already reported by earlier `result` events of the process
 # now streaming. Reset by run_agent_streaming; see the result branch for why the
@@ -415,7 +415,7 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
             if bt == "text":
                 if partial:
                     continue  # already printed streaming from the deltas
-                _render_markdown_block(block.get("text", ""))
+                render_markdown_block(block.get("text", ""))
             elif bt == "tool_use":
                 LINES.tool_use(block.get("name", "?"),
                                block.get("input", {}) or {})
@@ -481,7 +481,7 @@ def _render_codex_event(ev: dict) -> None:
         return
 
     if event_type == "item.completed" and item_type == "agent_message":
-        _render_markdown_block(str(item.get("text") or ""))
+        render_markdown_block(str(item.get("text") or ""))
         return
 
     if event_type == "item.started" and item_type == "command_execution":
@@ -641,7 +641,7 @@ def _count_down_to(target_ts: float, should_stop=None) -> bool:
             remaining = target_ts - now
             if remaining <= 0:
                 return False
-            print(f"    … {_fmt_left(remaining)} left (now {_fmt_clock(now)})",
+            print(f"    … {fmt_left(remaining)} left (now {fmt_clock(now)})",
                   flush=True)
             if stopchannel.sleep_unless(min(remaining, 60), should_stop):
                 return True
@@ -665,7 +665,7 @@ def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
     """
     if reason is None:
         reason = ("Looks like the token limit is exhausted. Waiting until "
-                  f"{_fmt_clock(target_ts)} (until the 5-hour session window refreshes)…")
+                  f"{fmt_clock(target_ts)} (until the 5-hour session window refreshes)…")
     print(f"  ⏳ {reason}")
     if _count_down_to(target_ts, should_stop):
         print("  ⏹ Stop requested — leaving the wait.")
@@ -693,7 +693,7 @@ def wait_before_start(spec: str) -> None:
     if seconds <= 0:
         return
     target_ts = time.time() + seconds
-    print(f"  ⏳ --start-in {spec}: waiting until {_fmt_clock(target_ts)} before starting…")
+    print(f"  ⏳ --start-in {spec}: waiting until {fmt_clock(target_ts)} before starting…")
     _count_down_to(target_ts)
     print("  ▶ Starting the loop.")
 
@@ -818,9 +818,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # explain rotated off the end). Said on screen so the missing log is visible
     # rather than mysterious.
     if setup_logging and not dry_run:
-        logger = console._setup_file_logging(app_name)
-        sys.stdout = console._TeeToLog(sys.stdout, logger)
-        sys.stderr = console._TeeToLog(sys.stderr, logger)
+        logger = console.setup_file_logging(app_name)
+        sys.stdout = console.TeeToLog(sys.stdout, logger)
+        sys.stderr = console.TeeToLog(sys.stderr, logger)
     if not dry_run:
         # After the tee, so the report of a run that vanished lands in the very
         # log whose abrupt end it explains. Idempotent per process: the periodic
@@ -834,7 +834,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     else:
         print(f"  · logging to {console.log_file_path(app_name)}")
     print(f"  · provider: {spec.display_name}")
-    if not console._RICH_AVAILABLE:
+    if not console.RICH_AVAILABLE:
         print("  · Markdown rendering is off (the 'rich' library is missing). "
               "Enable it with:")
         print(f"      {sys.executable} -m pip install rich")
@@ -1175,7 +1175,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 app.update(phase="paused")
                 wait_until(target_ts,
                            reason=f"Hit the {refusal.label} — this run was refused. "
-                                  f"Waiting until {_fmt_moment(target_ts)} for that "
+                                  f"Waiting until {fmt_moment(target_ts)} for that "
                                   f"window to refresh…",
                            should_stop=stop_pending)
                 usage_source.invalidate()  # the figures behind the refusal are stale
