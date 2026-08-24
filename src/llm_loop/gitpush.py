@@ -8,8 +8,10 @@ moved to `console`/`termio` the cut became clean, and a module that had to
 import a runner back stopped being one.
 
 THE REPOSITORY IS A PARAMETER, NOT AN AMBIENT FACT. Every call here takes the
-directory to run git in. The old spelling read `cyclecore.PROJECT_DIR` directly,
-which is what tied the policy to the runner: a caller could not push a
+directory to run git in. The old spelling read the runner's own project-root
+global directly (`cyclecore.PROJECT_DIR`, a name that no longer exists anywhere
+— the root is `projectroot` now), which is what tied the policy to the runner:
+a caller could not push a
 repository the sequential runner did not happen to be pointed at, and the module
 could not be tested without setting a runner's global. The engine is meant to be
 vendored under a host project whose root is NOT the process cwd (see

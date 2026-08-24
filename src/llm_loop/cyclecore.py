@@ -85,12 +85,16 @@ from .console import (
 # because both runners and a host wrapper speak it and none of them should have
 # to import the sequential runner to do so.
 #
-# Reached through the module, never `from .stopchannel import …`, and that is
-# mechanics rather than style: `STOP_FILE` moves when --project-dir does, and a
-# name imported here would freeze at the launch directory; a stop function
+# Reached through the module, never `from .stopchannel import …`: a name
 # imported here would be a SECOND address for it, so a test (or a wrapper) that
 # replaced `stopchannel.pause_requested` would change what the parallel runner
 # does and not what this one does. One address, one thing to patch.
+#
+# The stale half of this rule is deleted rather than reworded: it used to add
+# that `STOP_FILE` moves when --project-dir does, so a `from … import` would
+# freeze it at the launch directory. That constant is gone — the sentinel is
+# `stop_file_path()`, derived on read — and a function imported by name would
+# NOT freeze. Only the second-address argument was ever load-bearing.
 from .providers import (
     build_agent_argv as provider_argv,
     note_channel,

@@ -1,7 +1,9 @@
 """The git-push policy, and the repository each runner applies it to.
 
-`gitpush` used to read `cyclecore.PROJECT_DIR` itself, so "which repository" was
-never passed anywhere and could not be got wrong. Now it is an argument, and a
+`gitpush` used to read the runner's own project-root global itself (spelled
+`cyclecore.PROJECT_DIR` then; the root is `projectroot` now), so "which
+repository" was never passed anywhere and could not be got wrong. Now it is an
+argument, and a
 handover is exactly the thing that regresses silently: the engine is vendored
 under a host project whose root is NOT the process cwd (see
 `projectroot.set_project_root`), so a caller that quietly substituted `os.getcwd()`
