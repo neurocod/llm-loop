@@ -203,8 +203,9 @@ class _FakeAgentProcess:
     def poll(self):
         # Always "already exited": this fake's stdout is a fixed string, so it
         # models a process whose stream has ended, never one still running.
-        # `run_job` asks before reaping (see `_reap_agent_process`), and a fake
-        # that answered None would have the reaper signalling a pid nobody owns.
+        # Both runners ask before reaping (see `providers.reap_agent_process`),
+        # and a fake that answered None would have the reaper signalling a pid
+        # nobody owns.
         return self.returncode
 
 
@@ -328,6 +329,94 @@ def test_parallel_runner_ignores_non_object_json(monkeypatch, line):
 
     command = AgentCommand("parallel prompt", "gpt-test", "job", "codex")
     assert parallel.run_job(1, command) == (0, None, None)
+
+
+# --- the sequential runner owes its child an ending too --------------------------
+
+# The fake provider writes one line and then simply stays alive. Long enough
+# that "still running when the runner returned" cannot be a race with a child
+# about to exit by itself — the question this pin asks is whether anything
+# ENDED it.
+_ORPHAN_LIFETIME_S = 120
+
+# The text of that line. A non-JSON line is printed straight through by
+# `run_agent_streaming`, so this is what lets the stub stdout fail on the ONE
+# write that happens with a child process running.
+_KILLS_THE_WRITER = "boom"
+
+_FAKE_PROVIDER_SRC = (
+    "import sys, time\n"
+    "sys.stdout.write(%r)\n"
+    "sys.stdout.flush()\n"
+    "time.sleep(%d)\n"
+) % (_KILLS_THE_WRITER + "\n", _ORPHAN_LIFETIME_S)
+
+# How long a child gets to be dead once the runner has returned. The reaping is
+# synchronous inside `run_agent_streaming`, so a healthy call has already
+# collected it and this bound is never approached; it is here so the FAILING
+# case reports an orphan instead of blocking for `_ORPHAN_LIFETIME_S`.
+REAP_WAIT_S = 5.0
+
+
+class _StdoutThatDies:
+    """A terminal that goes away mid-line, as a closed pipe does."""
+
+    def write(self, text):
+        if _KILLS_THE_WRITER in text:
+            raise BrokenPipeError("the terminal went away mid-line")
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+def _outlived_the_runner(proc, timeout=REAP_WAIT_S) -> bool:
+    """Is `proc` still running `timeout` after the call that started it returned?
+
+    Always leaves the child dead: a pin that fails must not also leak the very
+    process it is complaining about into the rest of the suite.
+    """
+    try:
+        proc.wait(timeout=timeout)
+        return False
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=REAP_WAIT_S)
+        return True
+
+
+def test_a_dying_sequential_turn_does_not_leave_the_provider_running(monkeypatch):
+    """`run_agent_streaming` that raises must not walk away from a live child.
+
+    Its `proc.wait()` is the only reaping exit, and every write to the terminal
+    sits above it — the sequential runner used to guard only `KeyboardInterrupt`,
+    and even that guard called `proc.terminate()`, which on Windows aims at the
+    npm `.cmd` shim and leaves the CLI (a grandchild) running.
+
+    A real subprocess rather than a stub, because the defect is exactly the
+    thing a stub does not have — an OS process that outlives the function that
+    started it.
+    """
+    children = []
+
+    def fake_provider(argv, provider, prompt, project_dir):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _FAKE_PROVIDER_SRC],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", bufsize=1)
+        children.append(proc)
+        return proc
+
+    monkeypatch.setattr(cyclecore, "start_agent_process", fake_provider)
+    monkeypatch.setattr(sys, "stdout", _StdoutThatDies())
+
+    with pytest.raises(BrokenPipeError):
+        cyclecore.run_agent_streaming(
+            ["codex", "exec", "--json", "-"], "codex", False)
+
+    assert children, "the fake provider was never started — the pin proved nothing"
+    assert not _outlived_the_runner(children[0]), \
+        "run_agent_streaming unwound past a live provider child: orphaned, not reaped"
 
 
 def test_codex_events_render_message_commands_and_usage(capsys):

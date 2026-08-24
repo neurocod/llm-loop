@@ -112,8 +112,9 @@ class _ClosableLines:
     """A line source that can also be closed, as a real `Popen.stdout` can.
 
     A bare iterator was enough while nothing but the render loop touched the
-    stream; `run_job` now closes it on the way out (`_reap_agent_process`), so a
-    fake without `close` fails where a real process would not.
+    stream; both runners now close it on the way out
+    (`providers.reap_agent_process`), so a fake without `close` fails where a
+    real process would not.
     """
 
     def __init__(self, lines):
@@ -139,8 +140,9 @@ class _FakeProc:
     def poll(self):
         # Always "already exited": stdout here is a finite iterable, so this
         # fake models a process whose stream has ended, never one still running.
-        # `run_job` asks before reaping (see `_reap_agent_process`), and a fake
-        # that answered None would have the reaper signalling a pid nobody owns.
+        # Both runners ask before reaping (see `providers.reap_agent_process`),
+        # and a fake that answered None would have the reaper signalling a pid
+        # nobody owns.
         return self._returncode
 
     def terminate(self):

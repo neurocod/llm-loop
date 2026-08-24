@@ -30,7 +30,6 @@ import argparse
 import collections
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -57,8 +56,9 @@ from .cyclecore import (
     set_project_root,
 )
 from .stopchannel import RunResult, RunStopReason
-from .providers import (note_channel, provider_spec, set_live_messages,
-                        start_agent_process, usage_source_for)
+from .providers import (note_channel, provider_spec, reap_agent_process,
+                        set_live_messages, start_agent_process,
+                        usage_source_for)
 from .drivers import ListFileDriver
 
 # Default worker count. The work is cheap and fully independent, so a handful of
@@ -198,108 +198,6 @@ def emit_note(lines: compactline.LineWriter, note: str) -> None:
 
 # --- one provider round-trip for one file --------------------------------------
 
-# How long a provider child gets after being told to end before it is killed
-# outright, and the ceiling on the `taskkill` call itself. The bound is what
-# keeps the reaping from becoming a second hang inside the guard that exists to
-# end the first one: this runs on a thread that is ALREADY dying, so nothing
-# above it is left to notice a wait that never returns.
-REAP_GRACE_S = 2.0
-
-
-def _ask_agent_process_to_end(proc) -> None:
-    """Aim the ending at the provider CLI, not at the shim standing in front of it.
-
-    On Windows the handle we hold is usually `cmd.exe`: `runtime_argv` resolves
-    the provider to an npm `.cmd` shim and CreateProcess runs a batch file
-    through the interpreter, so the CLI itself is a GRANDCHILD. TerminateProcess
-    on the shim leaves it running, still holding the stdout handle it inherited
-    and still printing over whatever the terminal does next — which is the whole
-    symptom being fixed, so the Windows branch has to reach the tree
-    (`taskkill /T`). On POSIX an npm bin is the executable itself (a shebang
-    script), so the handle IS the provider and SIGTERM lands where it is aimed.
-
-    ASYMMETRY WORTH KNOWING, because the two halves do NOT offer the same deal:
-    POSIX gets a real request — SIGTERM, which a CLI can catch and use to close
-    its session store — and only then, after `REAP_GRACE_S`, the kill. Windows
-    gets no such step, because there is nothing to ask WITH: `taskkill` without
-    `/F` posts WM_CLOSE, which a windowless console process never receives, so
-    the polite spelling would do nothing at all and the child would be killed
-    two seconds later regardless. `/F` is therefore not impatience — it is the
-    only thing that ends the tree there, and the cost (a session store torn
-    mid-write) is charged on Windows whichever spelling is used.
-    """
-    if os.name == "nt":
-        try:
-            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                  capture_output=True, timeout=REAP_GRACE_S)
-            if done.returncode == 0:
-                return
-            # Non-zero means the tree was NOT ended (no such pid, access
-            # denied): fall through rather than return, or the caller's wait
-            # would be a two-second pause on the way to the same `kill`.
-        except (OSError, subprocess.SubprocessError):
-            pass  # no taskkill, or it hung — fall back to the handle we hold
-    try:
-        proc.terminate()
-    except OSError:
-        pass  # it died between the poll and here; `wait` below collects it
-
-
-def _reap_agent_process(proc) -> None:
-    """End and collect a provider child whose reader is not coming back.
-
-    `run_job`'s only reaping exit is the `proc.wait()` at the bottom, and every
-    step above it can raise while the CLI runs: the console write behind each
-    `out.*` line (a `BrokenPipeError` there is exactly what the pin uses),
-    `note_channel`'s close, a decoder error on the child's own stream. Without
-    this the exception unwinds past `wait()` and the provider is simply left
-    ALIVE — nothing has asked it to stop, and it goes on writing into the same
-    terminal, over the output of whatever the run does next.
-
-    Why it took until now to be worth fixing: before 27e34c3 such an exception
-    hung the entire run, so an orphan nobody could see was the smaller half of
-    the damage. Now the run ends cleanly and the orphan is all that is left of
-    it.
-
-    Safe on a child that has already exited (only the pipe is closed) and
-    bounded on every other path: told to end, then killed if it will not be.
-
-    NOTHING HERE MAY RAISE. It runs from `run_job`'s `finally`, so an exception
-    escaping this function REPLACES the one being unwound — the `BrokenPipeError`
-    that the whole seam exists to survive would reach the worker as a
-    `PermissionError` from the reaper, and the guard in `worker` would report the
-    wrong cause for a dead thread.
-    """
-    # Before the poll, not after it: the read end is a descriptor this worker
-    # would otherwise leak until GC even on the common path (an exception raised
-    # while printing the LAST lines, after the CLI has already exited), and a
-    # child blocked writing into a pipe nobody will read again cannot act on
-    # anything it is told until that pipe is gone.
-    if proc.stdout is not None:
-        try:
-            proc.stdout.close()
-        except OSError:
-            pass
-    if proc.poll() is not None:
-        return
-    _ask_agent_process_to_end(proc)
-    try:
-        proc.wait(timeout=REAP_GRACE_S)
-    except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except OSError:
-            pass  # gone between the wait and here — `wait` below collects it
-        try:
-            proc.wait(timeout=REAP_GRACE_S)
-        except subprocess.TimeoutExpired:
-            # Unkillable (a stuck kernel-mode handle) — deliberately not waited
-            # on any longer. The thread is dying either way, and hanging here
-            # would take the rest of the fleet with it, which is the one thing
-            # this whole seam exists to prevent.
-            pass
-
-
 def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     """Run one provider command, rendering a compact per-job trace.
 
@@ -335,7 +233,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # alive, and every step of it can raise: the console write behind each
     # `out.*` line, `note_channel`'s close, a decoder error on the child's own
     # stream. `wait()` is the only exit that reaps, so an exception used to
-    # walk away from a running provider — see `_reap_agent_process`.
+    # walk away from a running provider — see `providers.reap_agent_process`.
     try:
         with note_channel(proc, provider, mailbox) as channel:
             for line in proc.stdout:
@@ -430,7 +328,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
         # run whose final join() never finishes is the whole fleet.
         returncode = proc.wait()
     finally:
-        _reap_agent_process(proc)
+        reap_agent_process(proc)
     if returncode == 0 and provider_failed:
         returncode = 1
     # Last resort only: a codex error/turn.failed already printed its own ⚠ line

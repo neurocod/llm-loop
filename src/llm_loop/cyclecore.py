@@ -95,6 +95,7 @@ from .providers import (
     note_channel,
     prompt_on_stdin,
     provider_spec,
+    reap_agent_process,
     set_live_messages,
     start_agent_process,
     usage_source_for,
@@ -849,6 +850,16 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     in the `finally` — closing stdin is what ends a streaming-input session, so
     an unclosed pipe is a run that never returns, and the redundancy is
     deliberate: a crash that swallows `result` must not be able to hang the loop.
+
+    Everything from `start_agent_process` down to `proc.wait()` runs with a
+    child process alive, and `wait()` is the only exit that reaps it: the
+    console write behind each rendered line, `note_channel`'s close and a
+    decoder error on the child's own stream all raise past it. Hence the
+    `finally` — `reap_agent_process` is what ends the CLI, and it is the whole
+    ending: the `except KeyboardInterrupt` below deliberately no longer calls
+    `proc.terminate()` itself, because on Windows that aims at the npm `.cmd`
+    shim and leaves the CLI — a GRANDCHILD — running with the terminal's stdout
+    in hand.
     """
     global _last_rate_limit_event, _turn_cost_base
     _last_rate_limit_event = None
@@ -897,9 +908,10 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
         returncode = proc.wait()
         return 1 if returncode == 0 and provider_failed else returncode
     except KeyboardInterrupt:
-        proc.terminate()
         print("\nInterrupted by user (Ctrl+C).")
         sys.exit(130)
+    finally:
+        reap_agent_process(proc)
 
 
 def run_claude_streaming(cmd: list, raw: bool, partial: bool,

@@ -191,6 +191,109 @@ def note_channel(proc, provider: str, mailbox: Optional[object] = None):
         channel.close()
 
 
+# How long a provider child gets after being told to end before it is killed
+# outright, and the ceiling on the `taskkill` call itself. The bound is what
+# keeps the reaping from becoming a second hang inside the guard that exists to
+# end the first one: the parallel runner calls it from a thread that is ALREADY
+# dying, so nothing above it is left to notice a wait that never returns.
+REAP_GRACE_S = 2.0
+
+
+def _ask_agent_process_to_end(proc) -> None:
+    """Aim the ending at the provider CLI, not at the shim standing in front of it.
+
+    On Windows the handle we hold is usually `cmd.exe`: `runtime_argv` resolves
+    the provider to an npm `.cmd` shim and CreateProcess runs a batch file
+    through the interpreter, so the CLI itself is a GRANDCHILD. TerminateProcess
+    on the shim leaves it running, still holding the stdout handle it inherited
+    and still printing over whatever the terminal does next — which is the whole
+    symptom being fixed, so the Windows branch has to reach the tree
+    (`taskkill /T`). On POSIX an npm bin is the executable itself (a shebang
+    script), so the handle IS the provider and SIGTERM lands where it is aimed.
+
+    ASYMMETRY WORTH KNOWING, because the two halves do NOT offer the same deal:
+    POSIX gets a real request — SIGTERM, which a CLI can catch and use to close
+    its session store — and only then, after `REAP_GRACE_S`, the kill. Windows
+    gets no such step, because there is nothing to ask WITH: `taskkill` without
+    `/F` posts WM_CLOSE, which a windowless console process never receives, so
+    the polite spelling would do nothing at all and the child would be killed
+    two seconds later regardless. `/F` is therefore not impatience — it is the
+    only thing that ends the tree there, and the cost (a session store torn
+    mid-write) is charged on Windows whichever spelling is used.
+    """
+    if os.name == "nt":
+        try:
+            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                  capture_output=True, timeout=REAP_GRACE_S)
+            if done.returncode == 0:
+                return
+            # Non-zero means the tree was NOT ended (no such pid, access
+            # denied): fall through rather than return, or the caller's wait
+            # would be a two-second pause on the way to the same `kill`.
+        except (OSError, subprocess.SubprocessError):
+            pass  # no taskkill, or it hung — fall back to the handle we hold
+    try:
+        proc.terminate()
+    except OSError:
+        pass  # it died between the poll and here; `wait` below collects it
+
+
+def reap_agent_process(proc) -> None:
+    """End and collect a provider child whose reader is not coming back.
+
+    Both runners have exactly one reaping exit — the `proc.wait()` after the
+    stream ends — and every step above it can raise while the CLI runs: the
+    console write behind each rendered line, `note_channel`'s close, a decoder
+    error on the child's own stream, a Ctrl+C. Without this the exception
+    unwinds past `wait()` and the provider is simply left ALIVE — nothing has
+    asked it to stop, and it goes on writing into the same terminal, over the
+    output of whatever the run does next.
+
+    Here rather than in either runner because the obligation belongs to whoever
+    started the process, and that is `start_agent_process` above: the sequential
+    runner used to spell its half as a bare `proc.terminate()` under
+    `except KeyboardInterrupt`, which on Windows aims at the shim and leaves
+    exactly the child being complained about (see `_ask_agent_process_to_end`).
+
+    Safe on a child that has already exited (only the pipe is closed) and
+    bounded on every other path: told to end, then killed if it will not be.
+
+    NOTHING HERE MAY RAISE. It runs from a `finally`, so an exception escaping
+    this function REPLACES the one being unwound — the `BrokenPipeError` that
+    the whole seam exists to survive would reach the caller as a
+    `PermissionError` from the reaper, and the guard above it would report the
+    wrong cause.
+    """
+    # Before the poll, not after it: the read end is a descriptor the caller
+    # would otherwise leak until GC even on the common path (an exception raised
+    # while printing the LAST lines, after the CLI has already exited), and a
+    # child blocked writing into a pipe nobody will read again cannot act on
+    # anything it is told until that pipe is gone.
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    if proc.poll() is not None:
+        return
+    _ask_agent_process_to_end(proc)
+    try:
+        proc.wait(timeout=REAP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass  # gone between the wait and here — `wait` below collects it
+        try:
+            proc.wait(timeout=REAP_GRACE_S)
+        except subprocess.TimeoutExpired:
+            # Unkillable (a stuck kernel-mode handle) — deliberately not waited
+            # on any longer. In the parallel runner the thread is dying either
+            # way, and hanging here would take the rest of the fleet with it,
+            # which is the one thing this whole seam exists to prevent.
+            pass
+
+
 def build_agent_argv(command: AgentCommandLike, provider: str,
                      project_dir: str) -> list[str]:
     """Build one unattended JSONL-producing provider invocation."""
