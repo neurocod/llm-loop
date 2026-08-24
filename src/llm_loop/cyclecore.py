@@ -57,11 +57,11 @@ import re
 import subprocess
 import sys
 import time
-from enum import Enum
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Union
 
-from . import compactline, console, exitlog, operator, providers, stopchannel, textwidth
+from . import (compactline, console, exitlog, gitpush, operator, providers,
+               stopchannel, textwidth)
 # What the run PRINTS, and the mirror log that is the second copy of it, are
 # `console` (see its header for why those are one module). The line helpers are
 # imported by name because this module calls them on nearly every path; the
@@ -100,44 +100,27 @@ from .providers import (
     start_agent_process,
     usage_source_for,
 )
-
-# Claude sessions last ~5 hours; after a token-limit error we wait out that window.
-CLAUDE_SESSION_DURATION = 5 * 60 * 60 + 3  # 5 hours as seconds and + 3s as a safety margin
-LIMIT_RETRY_THRESHOLD = CLAUDE_SESSION_DURATION
+# The git-push policy is `gitpush`, its own module, for the same reason as the
+# two above: both runners apply it and neither owns it. Imported by name because
+# these are the spellings both runners and the host wrappers already use, and
+# `GitPushPolicy` is part of the package's public surface (see __init__).
+from .gitpush import (
+    GIT_PUSH_POLICY,
+    GIT_PUSH_SETTING,
+    GitPushPolicy,
+    git_push,
+    git_unpushed_count,
+    maybe_git_push,
+)
+# The length of the window a token-limited run waits out. In `usage`, with the
+# rest of what is known about a quota, so the limit rules can use it without
+# importing this runner.
+from .usage import CLAUDE_SESSION_DURATION
 
 # The usage-limit policy (which quota to gate on, what ceiling to allow,
 # when to pause) lives in limits.py / usage.py, chosen per project via a Driver's
 # `limit_policy` attribute — see Driver and run_loop.
 
-
-class GitPushPolicy(Enum):
-    """When the loop should run `git push` between iterations.
-
-    Checked at the start of every iteration (see ``maybe_git_push``):
-
-      * ``NONE``            — never push automatically.
-      * ``AFTER_NEW_COMMITS`` — push whenever HEAD is ahead of its upstream
-        (i.e. there are local commits that haven't been pushed yet).
-      * ``EACH_HOUR``       — push at most once per hour, and only when there is
-        something to push.
-    """
-    NONE = "none"
-    AFTER_NEW_COMMITS = "after_new_commits"
-    EACH_HOUR = "each_hour"
-
-
-# Default push policy. Override on the command line with --git-push.
-GIT_PUSH_POLICY = GitPushPolicy.EACH_HOUR
-
-# What this knob is called on the pinned row (see `_script_settings`). A
-# constant because `statusline.colorize` anchors on it to find the VALUE it has
-# to light up: the policy words are ordinary English ("none"), so the label is
-# what tells a mode word from a file called none.md on a job row. Renaming the
-# knob here therefore moves the colouring with it instead of silently losing it.
-GIT_PUSH_SETTING = "git-push"
-
-# EACH_HOUR cadence: push no more often than this many seconds.
-GIT_PUSH_INTERVAL = 3600  # seconds — one hour
 
 # The Windows console is often cp1252 — switch output to UTF-8 so we can print Cyrillic.
 try:
@@ -441,87 +424,6 @@ def parse_duration(text: str) -> float:
     if not matched:
         raise ValueError(f"cannot parse duration: {text!r}")
     return total
-
-
-def git_unpushed_count() -> Optional[int]:
-    """Number of local commits ahead of the upstream branch (HEAD not yet pushed).
-
-    Returns the count, or None if it can't be determined (no upstream configured,
-    git missing, not a repo, …) — in which case callers treat a push as worth
-    attempting rather than silently skipping.
-    """
-    try:
-        proc = subprocess.run(
-            ["git", "rev-list", "--count", "@{u}..HEAD"],
-            cwd=PROJECT_DIR,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=30,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        return int((proc.stdout or "").strip())
-    except ValueError:
-        return None
-
-
-def git_push() -> bool:
-    """Run `git push`, printing the outcome. Returns True on success."""
-    try:
-        proc = subprocess.run(
-            ["git", "push"],
-            cwd=PROJECT_DIR,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=300,
-        )
-    except FileNotFoundError:
-        print_error("  · git push skipped: 'git' not found on PATH.")
-        return False
-    except subprocess.TimeoutExpired:
-        print_error("  · git push timed out.")
-        return False
-    if proc.returncode == 0:
-        print_done("  · git push: done.")
-        return True
-    LINES.fitted(f"  · git push failed (exit {proc.returncode}): ",
-                 proc.stdout or "", "bold red")
-    return False
-
-
-def maybe_git_push(policy: GitPushPolicy, last_push: float) -> float:
-    """Apply the GitPushPolicy at the start of an iteration.
-
-    `last_push` is the epoch time of the previous push attempt (0.0 if never).
-    Returns the updated `last_push` so the caller can carry it to the next
-    iteration. A no-op for NONE; pushes when commits are pending for
-    AFTER_NEW_COMMITS; for EACH_HOUR pushes pending commits at most once an hour.
-    """
-    if policy == GitPushPolicy.NONE:
-        return last_push
-
-    if policy == GitPushPolicy.AFTER_NEW_COMMITS:
-        count = git_unpushed_count()
-        if count is None or count > 0:
-            if git_push():
-                return time.time()
-        return last_push
-
-    if policy == GitPushPolicy.EACH_HOUR:
-        now = time.time()
-        if now - last_push < GIT_PUSH_INTERVAL:
-            return last_push
-        # An hour has passed — push if there is anything to push, and reset the
-        # timer either way so we re-check at most once per hour.
-        count = git_unpushed_count()
-        if count is None or count > 0:
-            git_push()
-        return now
-
-    return last_push
 
 
 class AgentCommand(NamedTuple):
@@ -1453,7 +1355,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
             # Git push policy: evaluated at the start of every iteration.
             if not dry_run:
-                last_git_push = maybe_git_push(run_settings.git_push, last_git_push)
+                last_git_push = maybe_git_push(run_settings.git_push,
+                                               last_git_push, project_dir())
 
             max_runs = run_settings.max_runs
             if max_runs is not None and iteration >= max_runs:
@@ -1708,10 +1611,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # on the way out so work isn't left only on the local branch — unless the
     # policy is NONE (never auto-push).
     if not dry_run and run_settings.git_push != GitPushPolicy.NONE:
-        count = git_unpushed_count()
+        count = git_unpushed_count(project_dir())
         if count is None or count > 0:
             print("  · final git push on exit…")
-            git_push()
+            git_push(project_dir())
         else:
             print("  · final git push: nothing to push.")
 

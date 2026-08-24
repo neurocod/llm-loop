@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import cmdline, console, cyclecore, stopchannel, termio, textwidth
+from . import cmdline, console, gitpush, stopchannel, termio, textwidth
 
 __all__ = [
     "Action",
@@ -224,12 +224,12 @@ _SGR_RESET = "\x1b[0m"
 # the field's data just as much as a percentage is, so it is lit rather than
 # left at label intensity — and the words come from the enum itself, so a policy
 # added there is coloured with no edit here. Anchored on the knob's own name
-# (`cyclecore.GIT_PUSH_SETTING`, fixed width, hence a legal lookbehind) because
+# (`gitpush.GIT_PUSH_SETTING`, fixed width, hence a legal lookbehind) because
 # "none" is ordinary English: unanchored it would also light up a job row
 # working on a file called none.md.
-_MODE_VALUE_PATTERN = (rf"(?<={re.escape(cyclecore.GIT_PUSH_SETTING)} )(?:"
+_MODE_VALUE_PATTERN = (rf"(?<={re.escape(gitpush.GIT_PUSH_SETTING)} )(?:"
                        + "|".join(re.escape(policy.value)
-                                  for policy in cyclecore.GitPushPolicy)
+                                  for policy in gitpush.GitPushPolicy)
                        + r")")
 # One pass over the line: a percentage takes the usage scale's colour, a mode
 # word the healthy end of it, a pipe or a run of rule glyphs the muted chrome

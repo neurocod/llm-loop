@@ -48,12 +48,15 @@ from . import textwidth
 from .console import print_markup
 from .cyclecore import (
     AgentCommand,
-    GitPushPolicy,
     build_agent_argv,
+    set_project_root,
+)
+from .gitpush import (
+    GIT_PUSH_POLICY,
+    GitPushPolicy,
     git_push,
     git_unpushed_count,
     maybe_git_push,
-    set_project_root,
 )
 from .stopchannel import RunResult, RunStopReason
 from .providers import (note_channel, provider_spec, reap_agent_process,
@@ -123,9 +126,9 @@ def parse_args(argv=None, *, prog: str = "parallel",
                         "and don't touch the list")
     p.add_argument("-g", "--git-push", dest="git_push",
                    choices=[pol.value for pol in GitPushPolicy],
-                   default=cyclecore.GIT_PUSH_POLICY.value,
+                   default=GIT_PUSH_POLICY.value,
                    help="when to `git push`: none | after_new_commits | each_hour "
-                        f"(default: {cyclecore.GIT_PUSH_POLICY.value})")
+                        f"(default: {GIT_PUSH_POLICY.value})")
     p.add_argument("-C", "--project-dir", dest="project_dir", metavar="DIR",
                    default=None,
                    help="project root: cwd for git/provider CLI, base for the stop "
@@ -1095,7 +1098,9 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     def push_pump():
         while not shared.stop.wait(60):
             with push_lock:
-                last_push_box[0] = maybe_git_push(git_push_policy, last_push_box[0])
+                last_push_box[0] = maybe_git_push(git_push_policy,
+                                                  last_push_box[0],
+                                                  cyclecore.project_dir())
 
     threads = [
         threading.Thread(target=worker, name=f"job{j}",
@@ -1144,11 +1149,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     # Final push on the way out (unless policy is NONE), mirroring run_loop.
     if git_push_policy != GitPushPolicy.NONE:
-        count = git_unpushed_count()
+        count = git_unpushed_count(cyclecore.project_dir())
         if count is None or count > 0:
             print("  · final git push on exit…")
             with push_lock:
-                git_push()
+                git_push(cyclecore.project_dir())
         else:
             print("  · final git push: nothing to push.")
 

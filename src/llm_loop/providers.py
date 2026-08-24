@@ -91,9 +91,12 @@ def usage_source_for(provider: str):
     spec = provider_spec(provider)
     if not spec.supports_usage_limits:
         return None
+    # Imported here rather than at the top: a run talks to exactly one provider,
+    # and the loser of that choice costs nothing — `codex_usage` starts no
+    # process on import, but it does drag in the whole app-server client for a
+    # run that will never call it. Both modules sit below this one (they import
+    # nothing from the package but each other), so this is a cost, not a cycle.
     if provider == "claude":
-        # Lazy import avoids providers -> usage -> cyclecore -> providers while
-        # the package is being initialized.
         from .usage import UsageSource
         return UsageSource()
     if provider == "codex":

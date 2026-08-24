@@ -52,7 +52,6 @@ from .cyclecore import (
     ClaudeCommand,
     ConsumedByWrapperAction,
     Driver,
-    GitPushPolicy,
     LoopStop,
     RateLimitEvent,
     build_agent_argv,
@@ -72,6 +71,9 @@ from .cyclecore import (
 # log it writes moved out of cyclecore into `console`, and the front door is
 # unchanged on purpose — an embedder asks the PACKAGE where its log is.
 from .console import log_file_path
+# And again for the git-push policy, which moved out into `gitpush`: a wrapper
+# that names a policy names the PACKAGE's, not the runner it happens to drive.
+from .gitpush import GitPushPolicy
 # The stop/pause vocabulary moved out of cyclecore into its own module; the
 # front door is unchanged on purpose, since an embedder asks the PACKAGE for
 # `pending_stop`, not the module that used to hold it.

@@ -53,6 +53,17 @@ HTTP_ATTEMPTS = 2        # one retry: a dropped connection shouldn't blind the g
 # one request, not to ration the query.
 USAGE_CACHE_TTL = 30  # seconds
 
+# How long a Claude session window lasts. The one number both users of it need:
+# a run that hit a token limit waits out that window before retrying, and a
+# policy with no reset time in the report falls back to "one window from now".
+#
+# Here rather than in a runner because it is a fact about the QUOTA, and this is
+# the module that reads quotas — it was the last thing `limits` had to import a
+# runner for, and that import is what made the limit rules unusable without the
+# sequential loop. The +3s is a safety margin: waking exactly on the boundary
+# has been observed to retry into a window that had not quite rolled over.
+CLAUDE_SESSION_DURATION = 5 * 60 * 60 + 3  # 5 hours, in seconds
+
 
 class UsageReading(NamedTuple):
     """One quota from the usage report: its utilisation % and reset time.

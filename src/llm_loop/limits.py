@@ -41,9 +41,9 @@ from datetime import datetime
 from typing import Optional
 
 from .console import _fmt_clock, _fmt_left, print_percents
-from .cyclecore import CLAUDE_SESSION_DURATION
 from .stopchannel import sleep_unless
-from .usage import QUOTA_BY_FIELD, Usage, UsageReading
+from .usage import (CLAUDE_SESSION_DURATION, QUOTA_BY_FIELD, Usage,
+                    UsageReading)
 
 # Default ceilings for the ready-made rules (all overridable per instance).
 NIGHT_USAGE_LIMIT = 95          # % — overnight, when leftover session budget is wasted
