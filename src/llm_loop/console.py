@@ -23,10 +23,11 @@ same shape from the other side: it is handed `LOG_DIR` and writes its own file
 beside the mirror, so it stays a module of its own and imports the constant.
 
 Names without a leading underscore here are the PACKAGE's, not the front door's:
-nine of them (`fmt_clock`, `TeeToLog`, `real_stream` and the rest) are read by
-runners and by the status line, and `_` was dropped so it can go on meaning "this
-file's business" — see tests/test_package_privacy.py, which is what keeps that
-true. What an ADOPTER may name is `__init__.__all__`, pinned separately.
+`fmt_clock`, `TeeToLog`, `real_stream` and the others published in `c087700` are
+read by the runners and by the status line, and `_` was dropped so it can go on
+meaning "this file's business" — see tests/test_package_privacy.py, which is what
+keeps that true. What an ADOPTER may name is `__init__.__all__`, pinned
+separately.
 
 The rule for anything added here: this module must not import a runner. The one
 thing it needs that a runner used to own — the project root, whose folder name

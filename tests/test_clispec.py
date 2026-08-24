@@ -145,6 +145,27 @@ def test_a_parallel_help_override_belongs_to_a_shared_option():
     assert stray == [], f"parallel_help on options the parallel parser is alone in: {stray}"
 
 
+def test_canonical_key_is_among_its_own_aliases():
+    for canonical, spec in FLAG_ALIASES.items():
+        assert isinstance(spec, clispec.Flag)
+        assert canonical in spec.aliases
+
+
+def test_no_spelling_is_claimed_by_two_flags():
+    seen = {}
+    for canonical, spec in FLAG_ALIASES.items():
+        for alias in spec.aliases:
+            assert alias not in seen, f"{alias} in {seen.get(alias)} and {canonical}"
+            seen[alias] = canonical
+
+
+def test_deprecated_aliases_are_known():
+    # The spellings the sequential parser still accepts for compatibility. They
+    # exist only to be removable from an argv, so nothing else would miss them.
+    assert "--max" in FLAG_ALIASES["--max-runs"].aliases
+    assert "--startIn" in FLAG_ALIASES["--start-in"].aliases
+
+
 def test_the_alias_table_is_the_option_table():
     """No row may be dropped on the way to the rewriter, and none reordered.
 

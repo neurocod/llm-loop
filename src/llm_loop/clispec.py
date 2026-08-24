@@ -34,6 +34,7 @@ import argparse
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 from . import providers
+from . import termio
 from .gitpush import GIT_PUSH_POLICY, GitPushPolicy
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "Flag",
     "OPTIONS",
     "OPTION_ORDER",
+    "Option",
     "PARALLEL",
     "SEQUENTIAL",
     "build_parser",
@@ -55,9 +57,10 @@ PARALLEL = "parallel"
 
 # Default worker count. The work is cheap and fully independent, so a handful of
 # concurrent jobs is the sweet spot before the shared session budget, not CPU,
-# becomes the bottleneck. It lives here rather than in the runner because it is
-# the default of `--jobs`, and the help text that states it is declared below;
-# `parallel` imports it back so `parallel.DEFAULT_JOBS` still resolves.
+# becomes the bottleneck. `--jobs` itself defaults to None and `run_parallel`
+# applies this number; what forces the constant to live HERE is the help text
+# below, which has to print it. (The other direction is closed anyway: `parallel`
+# imports this module, so this module cannot import `parallel`.)
 DEFAULT_JOBS = 10
 
 
@@ -213,7 +216,7 @@ OPTIONS: Dict[str, Option] = {
         takes_value=False,
         kwargs=dict(dest="no_statusline", action="store_true"),
         help="do not pin the interactive status rows at the bottom of "
-             "the terminal (same as LLM_LOOP_STATUSLINE=0)",
+             f"the terminal (same as {termio.ENV_FLAG}=0)",
     ),
     # Same shape of rescue hatch as --no-statusline, and for the same reason: it
     # turns off a transport, not a feature. A note typed with the `m` key still
@@ -273,7 +276,10 @@ OPTION_ORDER: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
-DESCRIPTIONS: Dict[str, str] = {
+# Underscored because nothing outside this file reads it — which is what `_`
+# means here now (see tests/test_package_privacy.py). Each mode's default
+# `--help` blurb; a caller that passes `description=` overrides it.
+_DESCRIPTIONS: Dict[str, str] = {
     SEQUENTIAL: "Autonomous loop driving an LLM CLI.",
     PARALLEL: "Parallel autonomous loop running N concurrent LLM workers "
               "over a list file.",
@@ -298,7 +304,7 @@ def build_parser(mode: str, *, prog: str, description: Optional[str] = None,
     """
     parser = argparse.ArgumentParser(
         prog=prog,
-        description=description or DESCRIPTIONS[mode],
+        description=description or _DESCRIPTIONS[mode],
     )
     for name in OPTION_ORDER[mode]:
         option = OPTIONS[name]

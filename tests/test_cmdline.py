@@ -10,7 +10,8 @@ import sys
 
 import pytest
 
-from llm_loop.cmdline import FLAG_ALIASES, Flag, quote, rebuild_argv, render
+from llm_loop import clispec, cmdline
+from llm_loop.cmdline import quote, rebuild_argv, render
 
 
 # --- removal: every spelling of one flag ---------------------------------------
@@ -147,26 +148,17 @@ def test_zero_is_a_value_not_a_removal():
     assert rebuild_argv([], {"--max-runs": 0}) == ["--max-runs", "0"]
 
 
-# --- the flag table -------------------------------------------------------------
+# --- the table's address --------------------------------------------------------
+# Its SHAPE is pinned where it is now declared, in test_clispec.py: this module
+# consumes the table, it no longer owns it. What stays this module's business is
+# that both names still answer here, since `statusline.SettingsRegistry` and the
+# host wrappers reach for `cmdline.FLAG_ALIASES`, not for clispec's.
 
-def test_canonical_key_is_among_its_own_aliases():
-    for canonical, spec in FLAG_ALIASES.items():
-        assert isinstance(spec, Flag)
-        assert canonical in spec.aliases
+def test_the_table_still_answers_at_this_module_s_address():
+    assert cmdline.FLAG_ALIASES is clispec.FLAG_ALIASES
+    assert cmdline.Flag is clispec.Flag
+    assert set(cmdline.__all__) >= {"FLAG_ALIASES", "Flag"}
 
-
-def test_no_spelling_is_claimed_by_two_flags():
-    seen = {}
-    for canonical, spec in FLAG_ALIASES.items():
-        for alias in spec.aliases:
-            assert alias not in seen, f"{alias} in {seen.get(alias)} and {canonical}"
-            seen[alias] = canonical
-
-
-def test_deprecated_aliases_are_known():
-    # The spellings cyclecore.parse_args still accepts for compatibility.
-    assert "--max" in FLAG_ALIASES["--max-runs"].aliases
-    assert "--startIn" in FLAG_ALIASES["--start-in"].aliases
 
 
 # --- render ---------------------------------------------------------------------

@@ -23,9 +23,10 @@ What this shares with the sequential runner, and what it deliberately drops:
     formed line per event, prefixed `[job k]`, under a single output lock. You
     trade the live view for throughput — the right call for mechanical bulk work.
 
-CLI mirrors the family (see `--help`); the additions are `-j/--jobs N`
-(default 10) and `-C/--project-dir`. `--max-runs N` caps the *total* number of
-files processed this run (across all workers), not iterations.
+CLI mirrors the family (see `--help`) because both parsers are built from the
+same table, `clispec.OPTIONS`; what this mode adds there is `-j/--jobs N`
+(`clispec.DEFAULT_JOBS`), and `--max-runs N` caps the *total* number of files
+processed this run (across all workers), not iterations.
 """
 
 import argparse
@@ -64,11 +65,6 @@ from .providers import (note_channel, provider_spec, reap_agent_process,
                         set_live_messages, start_agent_process,
                         usage_source_for)
 from .drivers import ListFileDriver
-
-# Default worker count. Declared with the `--jobs` option it is the default OF
-# (see clispec), because the help text there has to state the number; re-bound
-# here so this runner's own fallback reads as one of its constants.
-DEFAULT_JOBS = clispec.DEFAULT_JOBS
 
 # How many of a failed job's discarded non-JSON lines are kept as its failure
 # explanation. The reason a dying CLI gives is in its last lines, and the bound
@@ -904,7 +900,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     if jobs is None:
         jobs = getattr(driver, "jobs", None)
     if jobs is None:
-        jobs = DEFAULT_JOBS
+        jobs = clispec.DEFAULT_JOBS
     jobs = max(1, jobs)
     git_push_policy = GitPushPolicy(args.git_push)
     # No wrapper above us: this call is the whole invocation, so its own --max is
