@@ -250,6 +250,10 @@ class Mailbox:
         # Receipt matching remains bounded; the closing report makes any
         # evictions observable instead of pretending its snapshot was complete.
         self._forgotten_receipts = 0
+        # An entry can age out while a concurrent submit still owns its write.
+        # Account for it only when that write finishes; shutdown may instead
+        # report its text explicitly from `_sending`.
+        self._evicted_sends = set()
 
     # --- the runner's side -------------------------------------------------
 
@@ -346,8 +350,13 @@ class Mailbox:
             # that its bounded receipt window is incomplete.
             overflow = max(0, len(self._awaiting) - MAX_AWAITING_ECHO)
             if overflow:
+                evicted = self._awaiting[:overflow]
                 del self._awaiting[:overflow]
-                self._forgotten_receipts += overflow
+                for _framed, _original, evicted_token in evicted:
+                    if evicted_token in self._sending:
+                        self._evicted_sends.add(evicted_token)
+                    else:
+                        self._forgotten_receipts += 1
         try:
             channel.send(framed)
         except ChannelError as exc:
@@ -355,6 +364,7 @@ class Mailbox:
                 if pair in self._awaiting:
                     self._awaiting.remove(pair)
                 self._sending.pop(token, None)
+                self._evicted_sends.discard(token)
                 reported = token in self._reported_sends
                 self._reported_sends.discard(token)
                 if not reported:
@@ -365,6 +375,9 @@ class Mailbox:
         with self._lock:
             self._sending.pop(token, None)
             self._reported_sends.discard(token)
+            if token in self._evicted_sends:
+                self._evicted_sends.remove(token)
+                self._forgotten_receipts += 1
         return Delivery(live=True, queued=0)
 
     def take_pending(self) -> Tuple[List[str], List[str], int]:
@@ -386,6 +399,9 @@ class Mailbox:
             unconfirmed.extend(text for token, text in self._sending.items()
                                if token not in awaiting_tokens)
             self._reported_sends.update(self._sending)
+            # These writes are represented by their text in `unconfirmed`, so
+            # counting their evicted receipt slots too would double-account.
+            self._evicted_sends.difference_update(self._sending)
             self._awaiting = []
             forgotten, self._forgotten_receipts = self._forgotten_receipts, 0
             return queued, unconfirmed, forgotten

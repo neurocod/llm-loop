@@ -1031,6 +1031,50 @@ def test_fleet_report_discloses_receipts_aged_out_of_its_bound(capsys):
     assert "3 receipt(s) no longer tracked" in out
 
 
+def test_concurrent_inflight_eviction_is_not_double_reported(capsys):
+    count = operator.MAX_AWAITING_ECHO + 1
+    entered = 0
+    entered_lock = threading.Lock()
+    all_entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingChannel:
+        def send(self, _text):
+            nonlocal entered
+            with entered_lock:
+                entered += 1
+                if entered == count:
+                    all_entered.set()
+            assert release.wait(timeout=5)
+            raise operator.ChannelError("broken during shutdown")
+
+    mailbox = operator.Mailbox()
+    mailbox.attach(_BlockingChannel())
+    deliveries = []
+    senders = [
+        threading.Thread(
+            target=lambda index=index: deliveries.append(
+                mailbox.submit(f"concurrent note {index}")))
+        for index in range(count)
+    ]
+    for sender in senders:
+        sender.start()
+    try:
+        assert all_entered.wait(timeout=2)
+        operator.report_undelivered_notes(mailbox)
+        out = capsys.readouterr().out
+    finally:
+        release.set()
+        for sender in senders:
+            sender.join(timeout=2)
+
+    assert all(not sender.is_alive() for sender in senders)
+    assert "aged out" not in out
+    assert all(f"concurrent note {index}" in out for index in range(count))
+    assert len(deliveries) == count and all(d.reported for d in deliveries)
+    assert mailbox.queued_count == 0
+
+
 # --- the parallel runner: one mailbox per worker -------------------------------
 
 
