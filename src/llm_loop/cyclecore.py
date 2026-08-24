@@ -37,10 +37,12 @@ guessed from error counts, in two layers:
     reading lives in usage.py (UsageSource, an HTTP GET of the usage endpoint)
     and the pausing policy in limits.py (LimitPolicy and the ready-made
     SessionLimit / DayNightLimit / WeeklyLimit rules).
-  * reactive — every Claude run streams its own rate-limit verdict, which this module
-    picks out of the stream it is already parsing (see RateLimitEvent): a
-    "rejected" means the wall was hit, and the loop waits that quota out even if
-    the proactive reading was unavailable.
+  * reactive — every Claude run streams its own rate-limit verdict, which this
+    module picks out of the stream it is already parsing and latches for the
+    iteration to read (`usage.RateLimitEvent` says what one is; the latch is
+    here, and the block above `_last_rate_limit_event` says why): a "rejected"
+    means the wall was hit, and the loop waits that quota out even if the
+    proactive reading was unavailable.
 """
 
 import argparse
@@ -54,6 +56,19 @@ from typing import Callable, NamedTuple, Optional, Union
 
 from . import (compactline, console, exitlog, operator, projectroot, providers,
                stopchannel, textwidth)
+# The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
+# Driver protocol that produces them — is `agentwork`, for the same reason as the
+# rest of this list: both runners execute that contract and neither owns it.
+# Imported by name because these are the spellings the loop uses on nearly every
+# path, and all six are part of the package's public surface (see __init__).
+from .agentwork import (
+    AgentCommand,
+    ClaudeCommand,
+    Driver,
+    LoopStop,
+    build_agent_argv,
+    build_claude_argv,
+)
 # What the run PRINTS, and the mirror log that is the second copy of it, are
 # `console` (see its header for why those are one module). The line helpers are
 # imported by name because this module calls them on nearly every path; the
@@ -86,19 +101,6 @@ from .console import (
 # freeze it at the launch directory. That constant is gone — the sentinel is
 # `stop_file_path()`, derived on read — and a function imported by name would
 # NOT freeze. Only the second-address argument was ever load-bearing.
-# The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
-# Driver protocol that produces them — is `agentwork`, for the same reason as the
-# rest of this list: both runners execute that contract and neither owns it.
-# Imported by name because these are the spellings the loop uses on nearly every
-# path, and all six are part of the package's public surface (see __init__).
-from .agentwork import (
-    AgentCommand,
-    ClaudeCommand,
-    Driver,
-    LoopStop,
-    build_agent_argv,
-    build_claude_argv,
-)
 from .providers import (
     note_channel,
     prompt_on_stdin,
@@ -370,26 +372,6 @@ def parse_duration(text: str) -> float:
     if not matched:
         raise ValueError(f"cannot parse duration: {text!r}")
     return total
-
-
-def report_undelivered_notes(mailbox) -> None:
-    """Say so when the run ends holding notes nobody ever saw.
-
-    A queued note promises "the next iteration" — and there is not always a next
-    one (the list drained, --max-runs, a stop request, a quota pause that
-    outlasts the run). Whoever typed it during the last iteration would
-    otherwise have no way to learn it was never delivered, and the text itself
-    is printed so it can be pasted into the next run rather than retyped.
-    """
-    if mailbox is None:
-        return
-    notes = mailbox.take_queued()
-    if not notes:
-        return
-    print_error(f"\n  ⚠ the run ended holding {len(notes)} undelivered operator "
-                f"note(s) — there was no next iteration to carry them:")
-    for note in notes:
-        print_error(f"      {note}")
 
 
 # Streaming print state: the single content-block index text is currently flowing
@@ -1328,7 +1310,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         limit_policy.log_snapshot(usage_source, "at end (after last cycle)",
                                   cache_value=False)
 
-    report_undelivered_notes(mailbox)
+    operator.report_undelivered_notes(mailbox)
 
     # Closing line, if the driver has one (e.g. "Final state: …").
     summary = driver.final_summary()

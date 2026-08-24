@@ -5,10 +5,15 @@ see often deserves a sentence ("that folder already has a research.md", "use the
 kit's lathe instead of rolling your own"). Without a way in, that sentence costs
 a stop, an edit and a relaunch - so it usually goes unsaid.
 
-This module is the mailbox between the console and the run. It knows nothing
-about terminals or providers; the status line puts text IN (from its key-reader
-thread) and the runners take it OUT (on the main thread), which is what keeps the
-UI and the transport from having to know about each other.
+This module is the mailbox between the console and the run: the status line puts
+text IN (from its key-reader thread) and the runners take it OUT (on the main
+thread), which is what keeps the UI and the transport from having to know about
+each other. The TRANSPORT knows nothing about terminals or providers — a note is
+a string here, framed but never rendered — and the one exception is deliberate
+and one-directional: `report_undelivered_notes` at the bottom is the closing
+word about a mailbox that ends a run still holding notes, so it prints, through
+`console` like everything else with something to say. It carries no knowledge
+back the other way; nothing above it may.
 
 Two deliveries, and the difference is only WHEN the agent sees the note:
 
@@ -32,6 +37,8 @@ import json
 import threading
 from typing import List, NamedTuple, Optional, Tuple
 
+from .console import print_error
+
 __all__ = [
     "AgentChannel",
     "ChannelError",
@@ -40,6 +47,7 @@ __all__ = [
     "NullChannel",
     "append_notes",
     "frame_live",
+    "report_undelivered_notes",
     "user_message_line",
 ]
 
@@ -312,3 +320,29 @@ class Mailbox:
         with self._lock:
             self._queued.append(text)
             return Delivery(live=False, queued=len(self._queued), error=error)
+
+
+def report_undelivered_notes(mailbox) -> None:
+    """Say so when the run ends holding notes nobody ever saw.
+
+    A queued note promises "the next iteration" — and there is not always a next
+    one (the list drained, --max-runs, a stop request, a quota pause that
+    outlasts the run). Whoever typed it during the last iteration would
+    otherwise have no way to learn it was never delivered, and the text itself
+    is printed so it can be pasted into the next run rather than retyped.
+
+    Both runners end with this call and neither owns it, so it is here — with
+    the mailbox it is about — rather than in whichever loop happened to grow it
+    first. Same shape as `gitpush.git_push`, and it stayed behind for the same
+    reason that one did: it had to print, and printing used to live in the
+    sequential runner too.
+    """
+    if mailbox is None:
+        return
+    notes = mailbox.take_queued()
+    if not notes:
+        return
+    print_error(f"\n  ⚠ the run ended holding {len(notes)} undelivered operator "
+                f"note(s) — there was no next iteration to carry them:")
+    for note in notes:
+        print_error(f"      {note}")

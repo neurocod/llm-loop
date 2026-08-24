@@ -14,7 +14,9 @@ What this shares with the sequential runner, and what it deliberately drops:
   * Reused — the ListFileDriver (list parsing, is_pending, pick, command_for,
     strike),
     build_agent_argv, the usage session-limit machinery, the git-push policy
-    and the rotating mirror log.
+    and the rotating mirror log. Every one of those is now a module of its own,
+    so this runner no longer imports the sequential one at all: the two are
+    siblings over shared parts, not a runner and its borrower.
   * Dropped — the live token-by-token Markdown rendering. cyclecore's stream
     renderer keeps module-global state that cannot serve several concurrent
     streams without garbling, so here each worker prints one compact, fully
@@ -37,7 +39,6 @@ from typing import Callable, Optional
 
 from . import compactline
 from . import console
-from . import cyclecore
 from . import exitlog
 from . import limits
 from . import operator
@@ -1189,7 +1190,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
               f"{MAX_ATTEMPTS} failed attempts:")
         for line in sorted(shared.failed):
             print(f"      {os.path.basename(line.strip())}")
-    cyclecore.report_undelivered_notes(mailbox)
+    operator.report_undelivered_notes(mailbox)
     # `stop_reason` unset means no worker ever reached a verdict about the run:
     # every one of the endings — the cap, the drained queue, a latched stop —
     # writes it before a worker can leave. So the threads did not run out of
