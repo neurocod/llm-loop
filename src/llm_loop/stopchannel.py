@@ -139,6 +139,44 @@ STOP_POLL_SECONDS = 2
 # the same rate — and the only cost is one os.path.exists per interval.
 STOP_RECHECK_SECONDS = 0.25
 
+# The sentinel's lifecycle state, and it is PROCESS-global on purpose — asked
+# and answered 2026-08-24, because "a stop belongs to the run" is the obvious
+# reading and it is the wrong one.
+#
+# What the promise says: the file a run obeyed stays on disk until the
+# APPLICATION exits, not until that run returns (pinned by
+# `test_sequential_stop_file_lives_until_outer_application_exit` and its
+# parallel twin). So the latch must outlive every object a run has.
+#
+# What settles it is measured, not argued — the producer and the consumer of the
+# latch are BOTH outside every run, and no run object exists between them:
+#
+#   * `runGenerateModels._detect_periodic_stop` calls `mark_stop_file_detected`
+#     from the host wrapper, BETWEEN two runner calls, with no runner on the
+#     stack at all;
+#   * the removal happens when the wrapper's own `main()` leaves the lifecycle
+#     it entered around its whole invocation.
+#
+#   Pinned end to end by `test_periodic_boundary_keeps_stop_file_until_outer_exit`
+#   in the host suite, which enters the lifecycle and marks a detection without
+#   ever building a run.
+#
+# Hanging the latch on a run object would therefore need a channel to hand it UP
+# to something that outlives the run — and that channel, for a single-process
+# engine, is this module global. `_stop_file_lifecycle_depth` is what makes
+# nested runner calls (sequential inside periodic inside a wrapper) leave the
+# file alone: only the outermost frame removes it.
+#
+# The lock is not decoration either: in the parallel runner `commit_stop` runs
+# on whichever WORKER THREAD won the latch, while the removal runs on the main
+# thread as `run_parallel` returns. Cross-thread within one process is the
+# narrowest true scope this state has.
+#
+# The cost is real and is accepted: a test that reaches
+# `mark_stop_file_detected` without entering a lifecycle leaves the latch set
+# for the next test in the file. Entering the lifecycle (as every test here
+# does) clears it on both edges — depth 0 on the way in, and again on the way
+# out — so the leak is bounded to that one shape.
 _stop_file_lifecycle_lock = threading.Lock()
 _stop_file_lifecycle_depth = 0
 _detected_stop_file: Optional[str] = None
