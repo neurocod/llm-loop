@@ -266,11 +266,20 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     continue  # valid JSON can still be a diagnostic, not an event
                 et = wire.event_type(ev)
                 if provider == "codex":
+                    if et in (wire.TURN_COMPLETED, wire.TURN_FAILED):
+                        channel.close()
                     item = wire.codex_item(ev)
                     item_type = wire.codex_item_type(item)
                     if et == wire.ITEM_COMPLETED and item_type == wire.AGENT_MESSAGE:
                         for text in wire.codex_message_text(item).splitlines():
                             out.line(f"💬 {text}")
+                    elif (et == wire.ITEM_COMPLETED
+                          and item_type == wire.USER_MESSAGE
+                          and mailbox is not None):
+                        note = mailbox.claim_echo(
+                            wire.codex_user_message_text(item))
+                        if note is not None:
+                            emit_note(out, note)
                     elif et == wire.ITEM_STARTED and item_type == wire.COMMAND_EXECUTION:
                         out.fitted("💻 ", wire.codex_command(item))
                     elif et == wire.ITEM_COMPLETED and item_type == wire.COMMAND_EXECUTION:

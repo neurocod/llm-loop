@@ -192,8 +192,8 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
         return
 
 
-def _render_codex_event(ev: dict) -> None:
-    """Render one event from ``codex exec --json``."""
+def _render_codex_event(ev: dict, mailbox=None) -> None:
+    """Render one normalised Codex event."""
     event_type = wire.event_type(ev)
     item = wire.codex_item(ev)
     item_type = wire.codex_item_type(item)
@@ -204,6 +204,13 @@ def _render_codex_event(ev: dict) -> None:
 
     if event_type == wire.ITEM_COMPLETED and item_type == wire.AGENT_MESSAGE:
         render_markdown_block(wire.codex_message_text(item))
+        return
+
+    if event_type == wire.ITEM_COMPLETED and item_type == wire.USER_MESSAGE:
+        if mailbox is not None:
+            note = mailbox.claim_echo(wire.codex_user_message_text(item))
+            if note is not None:
+                print_note(note)
         return
 
     if event_type == wire.ITEM_STARTED and item_type == wire.COMMAND_EXECUTION:
@@ -300,9 +307,6 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                if raw:
-                    print(line)
-                    continue
                 try:
                     ev = json.loads(line)
                 except json.JSONDecodeError:
@@ -313,15 +317,21 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                     # A JSON scalar/array is diagnostic output, not a JSONL event.
                     print(line)
                     continue
-                if provider == "claude":
+                event_type = wire.event_type(ev)
+                if ((provider == "claude" and event_type == wire.RESULT)
+                        or (provider == "codex" and event_type in (
+                            wire.TURN_COMPLETED, wire.TURN_FAILED))):
                     # Before rendering, so the console cannot take a note for a
-                    # turn that has already reported its result.
-                    if wire.event_type(ev) == wire.RESULT:
-                        channel.close()
+                    # turn that has already reported its ending.
+                    channel.close()
+                if raw:
+                    print(line)
+                    continue
+                if provider == "claude":
                     _render_claude_event(ev, partial, mailbox)
                 else:
-                    _render_codex_event(ev)
-                    provider_failed = provider_failed or wire.event_type(ev) in (
+                    _render_codex_event(ev, mailbox)
+                    provider_failed = provider_failed or event_type in (
                         wire.ERROR, wire.TURN_FAILED)
         # Outside the `with`, so the pipe is already closed: waiting on a
         # process whose stdin is still open is the hang this whole seam exists

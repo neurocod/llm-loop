@@ -16,6 +16,7 @@ Two deliveries and one hazard, and every test here is about one of the three:
 import io
 import json
 import os
+import queue
 import threading
 
 import pytest
@@ -54,12 +55,11 @@ def test_claude_argv_moves_the_prompt_onto_the_stream():
     assert argv[argv.index("--output-format") + 1] == "stream-json"
 
 
-def test_codex_is_untouched_by_the_live_transport():
+def test_codex_live_transport_uses_app_server():
     argv = build_agent_argv(AgentCommand("work", "gpt-test"), "codex", "/repo")
 
-    assert argv[-1] == "-"
-    assert "--input-format" not in argv
-    assert not providers.live_messages_enabled("codex")
+    assert argv == ["codex", "app-server", "--stdio"]
+    assert providers.live_messages_enabled("codex")
 
 
 def _capture_status_app(monkeypatch):
@@ -148,6 +148,108 @@ class _FakeProc:
 
     def terminate(self):
         pass
+
+
+class _AppServerLines:
+    """A blocking app-server stdout fed by the fake stdin below."""
+
+    _END = object()
+
+    def __init__(self):
+        self.lines = queue.Queue()
+        self.closed = False
+
+    def __iter__(self):
+        while True:
+            line = self.lines.get(timeout=2)
+            if line is self._END:
+                return
+            yield json.dumps(line) + "\n"
+
+    def put(self, message):
+        self.lines.put(message)
+
+    def finish(self):
+        self.lines.put(self._END)
+
+    def close(self):
+        self.closed = True
+
+
+class _SteeringAppServerInput(_Sink):
+    def __init__(self, output):
+        super().__init__()
+        self.output = output
+
+    def write(self, value):
+        written = super().write(value)
+        request = json.loads(value)
+        if request.get("method") == "turn/steer":
+            text = request["params"]["input"][0]["text"]
+            self.output.put({"id": request["id"],
+                             "result": {"turnId": "turn-1"}})
+            self.output.put({
+                "method": "item/completed",
+                "params": {"item": {"id": "note-1", "type": "userMessage",
+                                    "content": [{"type": "text", "text": text}]},
+                           "threadId": "thread-1", "turnId": "turn-1",
+                           "completedAtMs": 1},
+            })
+            self.output.put({
+                "method": "turn/completed",
+                "params": {"threadId": "thread-1",
+                           "turn": {"id": "turn-1", "items": [],
+                                    "status": "completed"}},
+            })
+            self.output.finish()
+        return written
+
+
+class _RawAppServer:
+    def __init__(self):
+        self.stdout = _AppServerLines()
+        self.stdin = _SteeringAppServerInput(self.stdout)
+        self.returncode = 0
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+
+def test_a_codex_note_uses_turn_steer_and_its_replay_is_logged(capsys):
+    raw = _RawAppServer()
+    proc = providers._CodexAppProcess(
+        raw, [], thread_id="thread-1", turn_id="turn-1")
+    mailbox = operator.Mailbox()
+    delivered = []
+
+    with providers.note_channel(proc, "codex", mailbox) as channel:
+        sender = threading.Thread(
+            target=lambda: delivered.append(mailbox.submit("check the hinges")))
+        sender.start()
+        for line in proc.stdout:
+            event = json.loads(line)
+            if wire.event_type(event) == wire.TURN_COMPLETED:
+                channel.close()
+            streamrender._render_codex_event(event, mailbox)
+        sender.join(timeout=2)
+
+    request = next(json.loads(line) for line in raw.stdin.text.splitlines()
+                   if json.loads(line).get("method") == "turn/steer")
+    assert request["params"]["threadId"] == "thread-1"
+    assert request["params"]["expectedTurnId"] == "turn-1"
+    assert operator.LIVE_NOTE_HEADER in request["params"]["input"][0]["text"]
+    assert delivered and delivered[0].live
+    assert "operator note: check the hinges" in capsys.readouterr().out
+    assert raw.stdin.closed
 
 
 def test_the_prompt_is_written_as_a_user_message_and_the_pipe_stays_open(monkeypatch):

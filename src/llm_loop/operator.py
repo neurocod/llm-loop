@@ -151,8 +151,13 @@ class AgentChannel:
             if self._closed:
                 raise ChannelError("the turn is over")
             try:
-                self._stream.write(user_message_line(text))
-                self._stream.flush()
+                send_user_message = getattr(self._stream,
+                                            "send_user_message", None)
+                if send_user_message is not None:
+                    send_user_message(text)
+                else:
+                    self._stream.write(user_message_line(text))
+                    self._stream.flush()
             except (OSError, ValueError) as exc:
                 # ValueError: the file object was closed under us. Both mean the
                 # same thing to the caller - the note did not reach the agent.

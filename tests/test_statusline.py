@@ -1624,7 +1624,8 @@ def test_a_driver_with_no_total_gets_no_invented_denominator(monkeypatch, tmp_pa
     from llm_loop import cyclecore
 
     monkeypatch.setattr(cyclecore, "run_agent_streaming",
-                        lambda cmd, provider, raw, partial, prompt: 0)
+                        lambda cmd, provider, raw, partial, prompt,
+                        mailbox=None: 0)
     app, _source = _run_with_status(monkeypatch, tmp_path, _counts_down(3),
                                     max=None, provider="codex")
 
@@ -1678,7 +1679,8 @@ def test_a_capped_run_with_no_list_shows_the_cap_it_was_given(monkeypatch,
     from llm_loop import cyclecore
 
     monkeypatch.setattr(cyclecore, "run_agent_streaming",
-                        lambda cmd, provider, raw, partial, prompt: 0)
+                        lambda cmd, provider, raw, partial, prompt,
+                        mailbox=None: 0)
     app, _source = _run_with_status(monkeypatch, tmp_path, _counts_down(10),
                                     max=2, provider="codex")
 
@@ -1725,7 +1727,8 @@ def test_the_sequential_loop_counts_items_struck_not_iterations(monkeypatch,
 
     codes = [1, 0, 0, 0]        # the first item fails once and comes back
     monkeypatch.setattr(cyclecore, "run_agent_streaming",
-                        lambda cmd, provider, raw, partial, prompt: codes.pop(0))
+                        lambda cmd, provider, raw, partial, prompt,
+                        mailbox=None: codes.pop(0))
     driver = _list_driver([f"products/f{i}.md" for i in range(3)])
     app, _source = _run_with_status(monkeypatch, tmp_path, driver, max=None,
                                     provider="codex")
@@ -1743,7 +1746,8 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
     monkeypatch.setattr(cyclecore, "usage_source_for",
                         lambda provider: _CountingSource())
     monkeypatch.setattr(cyclecore, "run_agent_streaming",
-                        lambda cmd, provider, raw, partial, prompt: 0)
+                        lambda cmd, provider, raw, partial, prompt,
+                        mailbox=None: 0)
     made = []
     real_app_class = sl.StatusApp        # captured before the patch below
 

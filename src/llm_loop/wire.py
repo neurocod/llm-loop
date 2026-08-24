@@ -62,7 +62,7 @@ TEXT_DELTA = "text_delta"
 TOTAL_COST_USD = "total_cost_usd"
 DURATION_MS = "duration_ms"
 
-# --- Codex `codex exec --json`: event types -------------------------------
+# --- Codex events normalised from `exec --json` or app-server -------------
 THREAD_STARTED = "thread.started"
 ITEM_STARTED = "item.started"
 ITEM_COMPLETED = "item.completed"
@@ -74,6 +74,25 @@ ERROR = "error"
 AGENT_MESSAGE = "agent_message"
 COMMAND_EXECUTION = "command_execution"
 FILE_CHANGE = "file_change"
+USER_MESSAGE = "user_message"
+
+# --- Codex app-server JSON-RPC methods and item types ---------------------
+APP_INITIALIZE = "initialize"
+APP_INITIALIZED = "initialized"
+APP_THREAD_START = "thread/start"
+APP_THREAD_STARTED = "thread/started"
+APP_TURN_START = "turn/start"
+APP_TURN_STEER = "turn/steer"
+APP_ITEM_STARTED = "item/started"
+APP_ITEM_COMPLETED = "item/completed"
+APP_TURN_COMPLETED = "turn/completed"
+APP_TOKEN_USAGE_UPDATED = "thread/tokenUsage/updated"
+APP_RATE_LIMITS_READ = "account/rateLimits/read"
+APP_ERROR = "error"
+APP_AGENT_MESSAGE = "agentMessage"
+APP_COMMAND_EXECUTION = "commandExecution"
+APP_FILE_CHANGE = "fileChange"
+APP_USER_MESSAGE = "userMessage"
 
 # --- Codex: the fields worth naming ---------------------------------------
 EXIT_CODE = "exit_code"
@@ -250,6 +269,11 @@ def codex_message_text(item: dict) -> str:
     return str(item.get(BLOCK_TEXT) or "")
 
 
+def codex_user_message_text(item: dict) -> str:
+    """Text replayed by an app-server ``userMessage`` item."""
+    return str(item.get(BLOCK_TEXT) or "")
+
+
 def codex_command(item: dict) -> str:
     """A `command_execution` item's command line, ready to print.
 
@@ -308,6 +332,176 @@ def codex_error(ev: dict) -> Any:
     """
     item = codex_item(ev)
     return ev.get("message") or ev.get(ERROR) or item.get(ERROR) or ev
+
+
+# --- Codex app-server -----------------------------------------------------
+
+def _rpc(method: str, request_id: Optional[int] = None,
+         params: Optional[dict] = None) -> dict:
+    message = {"method": method}
+    if request_id is not None:
+        message["id"] = request_id
+    if params is not None:
+        message["params"] = params
+    return message
+
+
+def codex_app_initialize(request_id: int) -> dict:
+    return _rpc(APP_INITIALIZE, request_id, {"clientInfo": {
+        "name": "llm_loop",
+        "title": "llm-loop",
+        "version": "1.0.0",
+    }})
+
+
+def codex_app_initialized() -> dict:
+    return _rpc(APP_INITIALIZED, params={})
+
+
+def codex_app_rate_limits_read(request_id: int) -> dict:
+    return _rpc(APP_RATE_LIMITS_READ, request_id)
+
+
+def codex_app_thread_start(request_id: int, project_dir: str, model: str,
+                           sandbox_mode: str) -> dict:
+    explicit_sandbox = bool(sandbox_mode)
+    params = {
+        "cwd": project_dir,
+        "model": model or None,
+        "sandbox": sandbox_mode or "workspace-write",
+        # This is the app-server spelling of `exec --approve-for-me`: requests
+        # stay enabled, but their reviewer is Codex's automatic reviewer.
+        "approvalPolicy": "never" if explicit_sandbox else "on-request",
+        "approvalsReviewer": None if explicit_sandbox else "auto_review",
+    }
+    return _rpc(APP_THREAD_START, request_id, params)
+
+
+def codex_app_turn_start(request_id: int, thread_id: str, prompt: str) -> dict:
+    return _rpc(APP_TURN_START, request_id, {
+        "threadId": thread_id,
+        "input": [{"type": BLOCK_TEXT, "text": prompt}],
+    })
+
+
+def codex_app_turn_steer(request_id: int, thread_id: str, turn_id: str,
+                         text: str) -> dict:
+    return _rpc(APP_TURN_STEER, request_id, {
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": [{"type": BLOCK_TEXT, "text": text}],
+    })
+
+
+def codex_rpc_response_id(message: dict) -> Optional[int]:
+    value = message.get("id")
+    return value if isinstance(value, int) else None
+
+
+def codex_rpc_result(message: dict) -> dict:
+    value = message.get("result")
+    return value if isinstance(value, dict) else {}
+
+
+def codex_rpc_error(message: dict) -> str:
+    value = message.get(ERROR)
+    if not value:
+        return ""
+    if isinstance(value, dict):
+        return str(value.get("message") or value)
+    return str(value)
+
+
+def codex_app_thread_id(result: dict) -> str:
+    thread = result.get("thread") or {}
+    return str(thread.get("id") or "")
+
+
+def codex_app_turn_id(result: dict) -> str:
+    turn = result.get("turn") or {}
+    return str(turn.get("id") or "")
+
+
+def codex_app_token_usage(message: dict) -> Optional[dict]:
+    """The latest turn token counts, in the normalised ``exec --json`` shape."""
+    if message.get("method") != APP_TOKEN_USAGE_UPDATED:
+        return None
+    params = message.get("params") or {}
+    usage = (params.get("tokenUsage") or {}).get("last") or {}
+    if not usage:
+        return {}
+    return {
+        INPUT_TOKENS: usage.get("inputTokens", 0),
+        CACHED_INPUT_TOKENS: usage.get("cachedInputTokens", 0),
+        OUTPUT_TOKENS: usage.get("outputTokens", 0),
+    }
+
+
+def _codex_app_text(content: Any) -> str:
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(part.get(BLOCK_TEXT) or "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == BLOCK_TEXT
+    )
+
+
+def _codex_app_item(item: Any) -> dict:
+    if not isinstance(item, dict):
+        return {}
+    normalised = dict(item)
+    item_type = item.get("type")
+    if item_type == APP_AGENT_MESSAGE:
+        normalised["type"] = AGENT_MESSAGE
+    elif item_type == APP_COMMAND_EXECUTION:
+        normalised["type"] = COMMAND_EXECUTION
+        normalised[EXIT_CODE] = item.get("exitCode")
+        normalised[AGGREGATED_OUTPUT] = item.get("aggregatedOutput") or ""
+    elif item_type == APP_FILE_CHANGE:
+        normalised["type"] = FILE_CHANGE
+    elif item_type == APP_USER_MESSAGE:
+        normalised["type"] = USER_MESSAGE
+        normalised[BLOCK_TEXT] = _codex_app_text(item.get("content"))
+    return normalised
+
+
+def codex_app_event(message: dict, usage: Optional[dict] = None) -> Optional[dict]:
+    """Translate one app-server notification to the existing Codex event wire.
+
+    Keeping this adapter at the wire boundary lets both renderers and the old
+    result parsers continue to consume exactly one provider-neutral Codex shape.
+    JSON-RPC responses and notifications with no ``exec --json`` counterpart
+    return ``None``.
+    """
+    method = message.get("method")
+    params = message.get("params") or {}
+    if method == APP_THREAD_STARTED:
+        thread = params.get("thread") or {}
+        return {"type": THREAD_STARTED,
+                "thread_id": str(thread.get("id") or "?")}
+    if method in (APP_ITEM_STARTED, APP_ITEM_COMPLETED):
+        return {
+            "type": ITEM_STARTED if method == APP_ITEM_STARTED else ITEM_COMPLETED,
+            "item": _codex_app_item(params.get("item")),
+        }
+    if method == APP_ERROR:
+        error = params.get(ERROR) or {}
+        detail = error.get("message") if isinstance(error, dict) else error
+        return {"type": ERROR, "message": str(detail or params)}
+    if method == APP_TURN_COMPLETED:
+        turn = params.get("turn") or {}
+        status = turn.get("status")
+        if status != "completed":
+            error = turn.get(ERROR) or {}
+            detail = error.get("message") if isinstance(error, dict) else error
+            return {"type": TURN_FAILED,
+                    ERROR: str(detail or status or "turn failed")}
+        event = {"type": TURN_COMPLETED}
+        if usage:
+            event["usage"] = usage
+        return event
+    return None
 
 
 # --- writing one event ----------------------------------------------------

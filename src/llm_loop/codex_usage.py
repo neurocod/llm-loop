@@ -17,6 +17,7 @@ import threading
 import time
 from typing import Optional
 
+from . import wire
 from .usage import EMPTY_READING, EMPTY_USAGE, Usage, UsageReading, summary_line
 
 APP_SERVER_TIMEOUT = 15.0
@@ -156,18 +157,10 @@ class CodexUsageSource:
         timer.daemon = True
         timer.start()
         try:
-            self._write(proc, {
-                "method": "initialize",
-                "id": 0,
-                "params": {"clientInfo": {
-                    "name": "llm_loop",
-                    "title": "llm-loop",
-                    "version": "1.0.0",
-                }},
-            })
+            self._write(proc, wire.codex_app_initialize(0))
             self._read_response(proc, 0, timed_out)
-            self._write(proc, {"method": "initialized", "params": {}})
-            self._write(proc, {"method": "account/rateLimits/read", "id": 1})
+            self._write(proc, wire.codex_app_initialized())
+            self._write(proc, wire.codex_app_rate_limits_read(1))
             return self._read_response(proc, 1, timed_out)
         except (BrokenPipeError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
             print(f"  · no Codex usage figures: {exc}")

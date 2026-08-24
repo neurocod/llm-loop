@@ -775,7 +775,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     mailbox=mailbox)
             else:
                 returncode = run_agent_streaming(
-                    cmd, provider, raw, partial=False, prompt=command.prompt)
+                    cmd, provider, raw, partial=False, prompt=command.prompt,
+                    mailbox=mailbox)
             app.job(1).finish()
             app.update(phase="idle")
 

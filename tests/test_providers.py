@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from llm_loop import (codex_usage, compactline, console, cyclecore, limits,
-                      parallel, providers, streamrender, textwidth)
+                      parallel, providers, streamrender, textwidth, wire)
 from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
@@ -38,15 +38,12 @@ def test_claude_argv_keeps_existing_contract(no_live_messages):
     assert "--input-format" not in argv
 
 
-def test_codex_argv_is_non_interactive_jsonl():
+def test_codex_argv_uses_the_steerable_app_server():
     argv = build_agent_argv(AgentCommand("work", "gpt-test"), "codex", "/repo")
-    assert argv[:3] == ["codex", "exec", "--json"]
-    assert "--approve-for-me" in argv
-    assert "--sandbox" not in argv
-    assert argv[argv.index("-C") + 1] == "/repo"
-    assert argv[argv.index("--model") + 1] == "gpt-test"
+    assert argv == ["codex", "app-server", "--stdio"]
+    assert argv.model == "gpt-test"
+    assert argv.sandbox_mode == ""
     assert "work" not in argv
-    assert argv[-1] == "-"
 
 
 def test_codex_argv_can_select_a_workflow_specific_sandbox():
@@ -54,9 +51,30 @@ def test_codex_argv_can_select_a_workflow_specific_sandbox():
                            sandbox_mode="danger-full-access")
     argv = build_agent_argv(command, "codex", "/repo")
 
-    assert "--approve-for-me" not in argv
-    assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
-    assert argv[argv.index("--config") + 1] == 'approval_policy="never"'
+    assert argv == ["codex", "app-server", "--stdio"]
+    assert argv.sandbox_mode == "danger-full-access"
+
+
+def test_codex_no_live_messages_keeps_the_closed_stdin_fallback(
+        no_live_messages):
+    argv = build_agent_argv(AgentCommand("work", "gpt-test"), "codex", "/repo")
+
+    assert argv[:3] == ["codex", "exec", "--json"]
+    assert "--approve-for-me" in argv
+    assert argv[-1] == "-"
+
+
+def test_codex_app_server_thread_policy_matches_the_exec_policy():
+    automatic = wire.codex_app_thread_start(1, "/repo", "gpt-test", "")
+    explicit = wire.codex_app_thread_start(
+        1, "/repo", "gpt-test", "danger-full-access")
+
+    assert automatic["params"]["sandbox"] == "workspace-write"
+    assert automatic["params"]["approvalPolicy"] == "on-request"
+    assert automatic["params"]["approvalsReviewer"] == "auto_review"
+    assert explicit["params"]["sandbox"] == "danger-full-access"
+    assert explicit["params"]["approvalPolicy"] == "never"
+    assert explicit["params"]["approvalsReviewer"] is None
 
 
 def test_unknown_provider_is_rejected():
@@ -187,6 +205,9 @@ class _PromptSink:
         self.text += value
         return len(value)
 
+    def flush(self):
+        pass
+
     def close(self):
         self.closed = True
 
@@ -209,24 +230,57 @@ class _FakeAgentProcess:
         return self.returncode
 
 
-def test_codex_process_receives_prompt_via_closed_stdin(monkeypatch):
+def test_codex_process_starts_an_app_server_thread_and_turn(monkeypatch):
     created = []
 
     def fake_popen(argv, **kwargs):
-        proc = _FakeAgentProcess(has_stdin=kwargs.get("stdin") is subprocess.PIPE)
+        replies = "".join(json.dumps(message) + "\n" for message in [
+            {"id": 0, "result": {"userAgent": "test"}},
+            {"id": 1, "result": {"thread": {"id": "thread-1"}}},
+            {"id": 2, "result": {"turn": {"id": "turn-1"}}},
+        ])
+        proc = _FakeAgentProcess(
+            has_stdin=kwargs.get("stdin") is subprocess.PIPE, stdout=replies)
         created.append((argv, kwargs, proc))
         return proc
 
     monkeypatch.setattr(providers.subprocess, "Popen", fake_popen)
     prompt = "x" * 50_000
 
+    command = AgentCommand(prompt, "gpt-test")
     proc = start_agent_process(
-        ["codex", "exec", "--json", "-"], "codex", prompt, "/repo")
+        build_agent_argv(command, "codex", "/repo"),
+        "codex", prompt, "/repo")
 
-    argv, kwargs, _ = created[0]
-    assert argv[-1] == "-"
+    argv, kwargs, raw_proc = created[0]
+    assert argv[-2:] == ["app-server", "--stdio"]
     assert kwargs["stdin"] is subprocess.PIPE
-    assert proc.stdin.text == prompt
+    requests = [json.loads(line) for line in raw_proc.stdin.text.splitlines()]
+    assert [request["method"] for request in requests] == [
+        "initialize", "initialized", "thread/start", "turn/start"]
+    assert requests[2]["params"]["model"] == "gpt-test"
+    assert requests[3]["params"]["input"][0]["text"] == prompt
+    assert not raw_proc.stdin.closed
+    proc.stdin.close()
+    assert raw_proc.stdin.closed
+
+
+def test_codex_no_live_process_closes_stdin_after_the_prompt(
+        monkeypatch, no_live_messages):
+    created = []
+
+    def fake_popen(argv, **kwargs):
+        proc = _FakeAgentProcess(has_stdin=True)
+        created.append((argv, proc))
+        return proc
+
+    monkeypatch.setattr(providers.subprocess, "Popen", fake_popen)
+    argv = build_agent_argv(AgentCommand("work", "gpt-test"), "codex", "/repo")
+
+    proc = start_agent_process(argv, "codex", "work", "/repo")
+
+    assert created[0][0][-1] == "-"
+    assert proc.stdin.text == "work"
     assert proc.stdin.closed
 
 
@@ -276,7 +330,7 @@ def test_parallel_codex_runner_forwards_prompt_to_stdin_transport(monkeypatch):
     command = AgentCommand("parallel prompt", "gpt-test", "job", "codex")
 
     assert parallel.run_job(1, command)[0] == 0
-    assert calls[0][0][-1] == "-"
+    assert calls[0][0][-1] == "--stdio"
     assert calls[0][1:3] == ("codex", "parallel prompt")
 
 
@@ -514,7 +568,7 @@ def test_codex_dry_run_uses_codex_policy_not_claude_usage_source(
     assert "provider: Codex CLI" in output
     assert "Current session" in output
     assert "Current week (all models)" in output
-    assert "DRY-RUN: codex exec --json" in output
+    assert "DRY-RUN: codex app-server --stdio" in output
 
 
 # --- a failed parallel job must say why ----------------------------------------

@@ -17,12 +17,14 @@ and the second is the larger half:
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import json
 import os
 import shutil
 import subprocess
+import threading
 from typing import Optional, Protocol
 
-from . import operator
+from . import operator, wire
 from .codex_usage import CodexUsageSource
 from .operator import user_message_line
 from .usage import UsageSource
@@ -57,18 +59,18 @@ def set_live_messages(enabled: bool) -> None:
 def live_messages_enabled(provider: str) -> bool:
     """Whether `provider`'s process will accept notes while it works.
 
-    Only claude has the transport; codex's `exec --json` reads one prompt from a
-    stdin it then needs closed, so a second message has nowhere to go.
+    Claude uses streaming input; Codex uses app-server's active-turn steering.
     """
-    return _LIVE_MESSAGES and provider == "claude"
+    return _LIVE_MESSAGES and provider in ("claude", "codex")
 
 
 def prompt_on_stdin(provider: str) -> bool:
     """Whether this provider's prompt travels on stdin rather than in argv.
 
-    True for codex always, and for claude whenever the live-message transport is
-    on - `--input-format stream-json` ignores an argv prompt (measured: the
-    session did not start until the first stdin message arrived), so the two go
+    True for codex always (as an app-server request, or the fallback ``exec -``),
+    and for claude whenever the live-message transport is on. Claude's
+    `--input-format stream-json` ignores an argv prompt (measured: the session
+    did not start until the first stdin message arrived), so its two switches go
     together.
     """
     return provider == "codex" or live_messages_enabled(provider)
@@ -87,6 +89,238 @@ PROVIDERS = {
     "codex": ProviderSpec("codex", "Codex CLI", "codex", True),
 }
 PROVIDER_NAMES = tuple(PROVIDERS)
+
+
+class _CodexArgv(list):
+    """A real app-server argv carrying thread options that are not CLI flags."""
+
+    def __init__(self, values, *, model: str, sandbox_mode: str):
+        super().__init__(values)
+        self.model = model
+        self.sandbox_mode = sandbox_mode
+
+
+APP_SERVER_RESPONSE_TIMEOUT = 15.0
+
+
+def _write_app_message(stream, message: dict) -> None:
+    stream.write(json.dumps(message, separators=(",", ":")) + "\n")
+    stream.flush()
+
+
+def _read_app_response(proc, request_id: int, buffered: list) -> dict:
+    """Read one startup response, preserving notifications for the renderer."""
+    for line in proc.stdout:
+        try:
+            message = json.loads(line)
+        except (TypeError, ValueError):
+            buffered.append(line)
+            continue
+        if not isinstance(message, dict):
+            buffered.append(line)
+            continue
+        if wire.codex_rpc_response_id(message) != request_id:
+            buffered.append(line)
+            continue
+        error = wire.codex_rpc_error(message)
+        if error:
+            raise RuntimeError(error)
+        return wire.codex_rpc_result(message)
+    raise RuntimeError("codex app-server closed before replying")
+
+
+class _CodexSteerStream:
+    """The stdin-like endpoint consumed by ``operator.AgentChannel``."""
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    @property
+    def closed(self) -> bool:
+        return self._owner.input_closed
+
+    def send_user_message(self, text: str) -> None:
+        self._owner.steer(text)
+
+    def close(self) -> None:
+        self._owner.close_input()
+
+
+class _CodexEventStream:
+    """Turn app-server JSON-RPC notifications into ``exec --json`` events."""
+
+    def __init__(self, owner, buffered: list):
+        self._owner = owner
+        self._buffered = iter(buffered)
+        self._source = iter(owner._proc.stdout)
+        self._latest_usage = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            try:
+                line = next(self._buffered)
+            except StopIteration:
+                try:
+                    line = next(self._source)
+                except StopIteration:
+                    self._owner.fail_pending("codex app-server closed")
+                    raise
+            try:
+                message = json.loads(line)
+            except (TypeError, ValueError):
+                return line
+            if not isinstance(message, dict):
+                return line
+            if wire.codex_rpc_response_id(message) is not None:
+                self._owner.resolve_response(message)
+                continue
+            usage = wire.codex_app_token_usage(message)
+            if usage is not None:
+                self._latest_usage = usage
+                continue
+            event = wire.codex_app_event(message, self._latest_usage)
+            if event is not None:
+                return json.dumps(event, ensure_ascii=True) + "\n"
+
+    def close(self) -> None:
+        try:
+            self._owner._proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+
+
+class _CodexAppProcess:
+    """Popen-compatible app-server process with a steering channel."""
+
+    def __init__(self, proc, buffered: list, thread_id: str, turn_id: str):
+        self._proc = proc
+        self.thread_id = thread_id
+        self.turn_id = turn_id
+        self._write_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending = {}
+        self._next_request_id = 3
+        self.input_closed = False
+        self.stdin = _CodexSteerStream(self)
+        self.stdout = _CodexEventStream(self, buffered)
+
+    @property
+    def pid(self):
+        return self._proc.pid
+
+    @property
+    def returncode(self):
+        return self._proc.returncode
+
+    def poll(self):
+        return self._proc.poll()
+
+    def wait(self, timeout=None):
+        return self._proc.wait(timeout=timeout)
+
+    def terminate(self):
+        return self._proc.terminate()
+
+    def kill(self):
+        return self._proc.kill()
+
+    def steer(self, text: str) -> None:
+        with self._pending_lock:
+            if self.input_closed:
+                raise OSError("the turn is over")
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            pending = {"event": threading.Event(), "failure": ""}
+            self._pending[request_id] = pending
+        try:
+            with self._write_lock:
+                if self.input_closed:
+                    raise OSError("the turn is over")
+                _write_app_message(
+                    self._proc.stdin,
+                    wire.codex_app_turn_steer(
+                        request_id, self.thread_id, self.turn_id, text),
+                )
+        except BaseException:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise
+        if not pending["event"].wait(APP_SERVER_RESPONSE_TIMEOUT):
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise OSError("codex app-server did not acknowledge the note")
+        if pending["failure"]:
+            raise OSError(pending["failure"])
+
+    def resolve_response(self, message: dict) -> None:
+        request_id = wire.codex_rpc_response_id(message)
+        with self._pending_lock:
+            pending = self._pending.pop(request_id, None)
+        if pending is None:
+            return
+        pending["failure"] = wire.codex_rpc_error(message)
+        pending["event"].set()
+
+    def fail_pending(self, error: str) -> None:
+        with self._pending_lock:
+            pending, self._pending = self._pending, {}
+        for response in pending.values():
+            response["failure"] = error
+            response["event"].set()
+
+    def close_input(self) -> None:
+        with self._write_lock:
+            if self.input_closed:
+                return
+            self.input_closed = True
+            try:
+                self._proc.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        self.fail_pending("the turn is over")
+
+
+def _start_codex_app_server(argv: list, prompt: str, project_dir: str):
+    options = argv if isinstance(argv, _CodexArgv) else None
+    app_argv = [argv[0], "app-server", "--stdio"]
+    proc = subprocess.Popen(
+        runtime_argv(app_argv, "codex"),
+        cwd=project_dir,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    buffered = []
+    try:
+        _write_app_message(proc.stdin, wire.codex_app_initialize(0))
+        _read_app_response(proc, 0, buffered)
+        _write_app_message(proc.stdin, wire.codex_app_initialized())
+        _write_app_message(proc.stdin, wire.codex_app_thread_start(
+            1, project_dir,
+            options.model if options is not None else "",
+            options.sandbox_mode if options is not None else "",
+        ))
+        thread = _read_app_response(proc, 1, buffered)
+        thread_id = wire.codex_app_thread_id(thread)
+        if not thread_id:
+            raise RuntimeError("codex app-server returned no thread id")
+        _write_app_message(proc.stdin,
+                           wire.codex_app_turn_start(2, thread_id, prompt))
+        turn = _read_app_response(proc, 2, buffered)
+        turn_id = wire.codex_app_turn_id(turn)
+        if not turn_id:
+            raise RuntimeError("codex app-server returned no turn id")
+        return _CodexAppProcess(proc, buffered, thread_id, turn_id)
+    except BaseException:
+        reap_agent_process(proc)
+        raise
 
 
 def provider_spec(name: str) -> ProviderSpec:
@@ -122,7 +356,7 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
                         project_dir: str):
     """Start a provider CLI with its provider-specific prompt transport.
 
-    Three shapes, and which one applies is `prompt_on_stdin`'s answer:
+    Four shapes, selected by provider and the live-message switch:
 
       * claude with live messages - the prompt is the first JSON line on a stdin
         that STAYS OPEN, so the console can send more user messages while the
@@ -131,9 +365,10 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
         arrange the closing itself.
       * claude without them - the prompt sits in argv, stdin is inherited, and
         the process exits on its own when the turn is done.
-      * codex - the prompt is read from a stdin closed immediately after: this
-        preserves non-interactive JSONL mode while avoiding Windows command-line
-        length limits, especially when the executable is an npm ``codex.CMD`` shim.
+      * codex with live messages - app-server owns the open stdin and accepts
+        active-turn steering requests through it.
+      * codex without them - ``exec --json`` reads the prompt from a stdin closed
+        immediately after, preserving the old fallback transport.
 
     Everything after `Popen` runs with a child alive and is therefore inside a
     guard of its own, ending it if the function does not get to return. Both
@@ -144,6 +379,9 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
     `UnicodeEncodeError` from the payload) would orphan the CLI before any
     caller had a handle to reap.
     """
+    if provider == "codex" and live_messages_enabled(provider):
+        return _start_codex_app_server(argv, prompt, project_dir)
+
     kwargs = {
         "cwd": project_dir,
         "stdout": subprocess.PIPE,
@@ -375,12 +613,19 @@ def build_agent_argv(command: AgentCommandLike, provider: str,
             ]
         return argv
 
+    sandbox_mode = getattr(command, "sandbox_mode", "")
+    if live_messages_enabled(provider):
+        return _CodexArgv(
+            [spec.executable, "app-server", "--stdio"],
+            model=command.model,
+            sandbox_mode=sandbox_mode,
+        )
+
     argv = [
         spec.executable,
         "exec",
         "--json",
     ]
-    sandbox_mode = getattr(command, "sandbox_mode", "")
     if sandbox_mode:
         # --approve-for-me itself selects workspace-write and cannot be combined
         # with an explicit sandbox. An unattended explicit mode also needs an
