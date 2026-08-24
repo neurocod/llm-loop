@@ -50,11 +50,9 @@ from . import exitlog
 from . import stopchannel
 from .cyclecore import (
     ConsumedByWrapperAction,
-    RateLimitEvent,
     last_rate_limit_event,
     parse_args,
     parse_duration,
-    rate_limit_event_from,
     report_costs,
     run_loop,
     run_agent_streaming,
@@ -112,7 +110,19 @@ from .providers import (
 )
 from .operator import Mailbox
 from .codex_usage import CodexUsageSource, parse_rate_limits
-from .usage import Usage, UsageReading, UsageSource, oauth_token, parse_usage
+# `RateLimitEvent`/`rate_limit_event_from` are here and not with the runner that
+# renders them: they say what a quota's wire verdict IS, which is a fact about a
+# quota. Only `last_rate_limit_event` above stays cyclecore's — it is that
+# renderer's single-stream latch, not vocabulary (see its block there).
+from .usage import (
+    RateLimitEvent,
+    Usage,
+    UsageReading,
+    UsageSource,
+    oauth_token,
+    parse_usage,
+    rate_limit_event_from,
+)
 from .limits import (
     DayNightLimit,
     LimitPolicy,

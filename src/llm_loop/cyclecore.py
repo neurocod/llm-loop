@@ -120,10 +120,16 @@ from .gitpush import (
     git_unpushed_count,
     maybe_git_push,
 )
-# The length of the window a token-limited run waits out. In `usage`, with the
-# rest of what is known about a quota, so the limit rules can use it without
-# importing this runner.
-from .usage import CLAUDE_SESSION_DURATION
+# What is known about a quota lives in `usage`, so the limit rules (and the
+# parallel runner) can use it without importing this one: the length of the
+# window a token-limited run waits out, and the vocabulary of the verdict the
+# wire streams back on every request. Only the LATCH holding the last such
+# verdict stays here — see the block above `_last_rate_limit_event` for why.
+from .usage import (
+    CLAUDE_SESSION_DURATION,
+    RateLimitEvent,
+    rate_limit_event_from,
+)
 
 # The usage-limit policy (which quota to gate on, what ceiling to allow,
 # when to pause) lives in limits.py / usage.py, chosen per project via a Driver's
@@ -399,60 +405,23 @@ _turn_cost_base = 0.0
 
 # --- the free half of the limit machinery: the run's own rate-limit events -----
 #
-# Every `claude` run streams a line of its own, built from the ratelimit headers
-# the API already returned to it:
+# What such an event IS — `RateLimitEvent`, `rate_limit_event_from`, and the
+# labels the CLI gives each quota — is `usage`, next to everything else known
+# about a quota, because the PARALLEL runner parses the same events out of the
+# same stream and had to import this loop to name them.
 #
-#   {"type":"rate_limit_event","rate_limit_info":{"status":"allowed",
-#     "resetsAt":1786807200,"rateLimitType":"five_hour", …}}
-#
-# Reading it costs nothing — that stream is parsed anyway — and unlike a queried
-# figure it cannot be stale or unavailable: it is the wire's own verdict on the
-# request that just went out. It carries no percentage, so it cannot drive a
-# ceiling; it is the backstop *under* the proactive check in limits.py. "rejected"
-# means this run hit the wall, and `resetsAt` says when that quota comes back.
-
-# Quota id -> the name the CLI itself uses for it in limit messages.
-RATE_LIMIT_LABELS = {
-    "five_hour": "session limit",
-    "seven_day": "weekly limit",
-    "seven_day_opus": "Opus limit",
-    "seven_day_sonnet": "Sonnet limit",
-    "seven_day_overage_included": "usage-credit limit",
-}
-
-
-class RateLimitEvent(NamedTuple):
-    """One rate_limit_event: which quota it is about, how it stands, when it resets.
-
-    `status` is the API's own verdict — "allowed", "allowed_warning" (close to
-    the wall) or "rejected" (refused). `resets_at` is epoch seconds, or None when
-    the event carried no reset time.
-    """
-    status: str
-    limit_type: str
-    resets_at: Optional[float]
-
-    @property
-    def label(self) -> str:
-        return RATE_LIMIT_LABELS.get(self.limit_type, self.limit_type or "limit")
-
-    def describe(self) -> str:
-        when = f", resets {_fmt_moment(self.resets_at)}" if self.resets_at else ""
-        return f"{self.label} {self.status}{when}"
-
-
-def rate_limit_event_from(ev: dict) -> Optional[RateLimitEvent]:
-    """The RateLimitEvent carried by a stream-json event, or None if it isn't one."""
-    if ev.get("type") != "rate_limit_event":
-        return None
-    info = ev.get("rate_limit_info") or {}
-    resets = info.get("resetsAt")
-    return RateLimitEvent(
-        status=str(info.get("status") or "unknown"),
-        limit_type=str(info.get("rateLimitType") or ""),
-        resets_at=float(resets) if isinstance(resets, (int, float)) else None,
-    )
-
+# THE LATCH BELOW STAYS HERE, and that is a decision rather than a leftover.
+# `_last_rate_limit_event` answers "the verdict of the run that just finished",
+# which is a question only a caller with ONE run in flight can ask. This
+# renderer is that caller by construction — it already keeps module-global
+# streaming state that "cannot serve several concurrent streams without
+# garbling" (parallel.py's header), and `run_agent_streaming` clears the latch on
+# entry so the answer describes this run and not the previous one. The parallel
+# runner has N streams at once and keeps each job's verdict as a LOCAL in
+# `run_job`, which is the only correct shape there. Moving the latch into a
+# module both runners import would publish an address that cannot be right for
+# one of them — a process-global "the last verdict" is meaningless when ten runs
+# are in flight — so the vocabulary is shared and the latch is not.
 
 # The last verdict seen by run_claude_streaming, cleared when a run starts — so it
 # always describes the run that just finished, never the one before it.

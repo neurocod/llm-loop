@@ -27,8 +27,9 @@ rewording. This costs no tokens and ~0.3 s.
 
 The endpoint is undocumented, so treat a failure as "no figures" rather than a
 fatal error: the loop degrades to the free backstop instead, i.e. the
-`rate_limit_event` the CLI emits on its own stream (see cyclecore.RateLimitEvent),
-which reports a hard refusal even when this reading is missing.
+`rate_limit_event` the CLI emits on its own stream — which reports a hard
+refusal even when this reading is missing, and which is `RateLimitEvent` below,
+here for the same reason `CLAUDE_SESSION_DURATION` is.
 """
 
 import json
@@ -38,6 +39,13 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional
+
+# The one thing this module prints rather than computes: a reset MOMENT in the
+# same wording every other line of the run uses for one. `_fmt_reset` below is
+# not that wording — it is the "Aug 15, 6:19pm" of the usage summary lines, whose
+# exact text is a contract with LimitPolicy.log_snapshot — so the verdict's
+# `describe()` borrows the console's spelling rather than growing a third.
+from .console import _fmt_moment
 
 # The usage endpoint, and the OAuth credentials the CLI stores for its own calls.
 # ANTHROPIC_BASE_URL / CLAUDE_CONFIG_DIR are the CLI's own environment overrides,
@@ -109,6 +117,79 @@ QUOTAS = (
           "week/sonnet", False),
 )
 QUOTA_BY_FIELD = {quota.field: quota for quota in QUOTAS}
+
+
+# --- the other source of the same knowledge: the wire's own verdict ------------
+#
+# Every `claude` run streams a line of its own, built from the ratelimit headers
+# the API already returned to it:
+#
+#   {"type":"rate_limit_event","rate_limit_info":{"status":"allowed",
+#     "resetsAt":1786807200,"rateLimitType":"five_hour", …}}
+#
+# Reading it costs nothing — that stream is parsed anyway — and unlike the
+# queried figures above it cannot be stale or unavailable: it is the wire's own
+# verdict on the request that just went out. It carries no percentage, so it
+# cannot drive a ceiling; it is the backstop *under* the proactive check in
+# limits.py. "rejected" means this run hit the wall, and `resetsAt` says when
+# that quota comes back.
+#
+# Here rather than in a runner for the reason `CLAUDE_SESSION_DURATION` is: it is
+# a fact about a QUOTA, and BOTH runners read it — the sequential one out of the
+# stream it renders, the parallel one out of each worker's stream — so living in
+# either made the other import a loop it does not run. What does NOT live here is
+# the latch remembering the last verdict: that is single-stream state, and it
+# stays with the single-stream renderer (see `cyclecore._last_rate_limit_event`).
+
+# Quota id -> the name the CLI itself uses for it in limit messages.
+#
+# A fifth naming of the windows `Quota` above describes, and deliberately not
+# folded into it: this table is keyed by the ids that appear on the WIRE, and it
+# carries two the usage report has no entry for at all ("seven_day_opus",
+# "seven_day_overage_included"). Merging it would mean inventing report keys and
+# status-line abbreviations for windows the report never mentions. Adjacency is
+# the point instead — a sixth window arriving on the wire is now visibly a
+# question about both tables rather than about whichever file was open.
+RATE_LIMIT_LABELS = {
+    "five_hour": "session limit",
+    "seven_day": "weekly limit",
+    "seven_day_opus": "Opus limit",
+    "seven_day_sonnet": "Sonnet limit",
+    "seven_day_overage_included": "usage-credit limit",
+}
+
+
+class RateLimitEvent(NamedTuple):
+    """One rate_limit_event: which quota it is about, how it stands, when it resets.
+
+    `status` is the API's own verdict — "allowed", "allowed_warning" (close to
+    the wall) or "rejected" (refused). `resets_at` is epoch seconds, or None when
+    the event carried no reset time.
+    """
+    status: str
+    limit_type: str
+    resets_at: Optional[float]
+
+    @property
+    def label(self) -> str:
+        return RATE_LIMIT_LABELS.get(self.limit_type, self.limit_type or "limit")
+
+    def describe(self) -> str:
+        when = f", resets {_fmt_moment(self.resets_at)}" if self.resets_at else ""
+        return f"{self.label} {self.status}{when}"
+
+
+def rate_limit_event_from(ev: dict) -> Optional[RateLimitEvent]:
+    """The RateLimitEvent carried by a stream-json event, or None if it isn't one."""
+    if ev.get("type") != "rate_limit_event":
+        return None
+    info = ev.get("rate_limit_info") or {}
+    resets = info.get("resetsAt")
+    return RateLimitEvent(
+        status=str(info.get("status") or "unknown"),
+        limit_type=str(info.get("rateLimitType") or ""),
+        resets_at=float(resets) if isinstance(resets, (int, float)) else None,
+    )
 
 
 class Usage(NamedTuple):

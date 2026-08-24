@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 import pytest
 
 from llm_loop import console, cyclecore, providers, usage
-from llm_loop.cyclecore import RateLimitEvent
+from llm_loop.usage import RateLimitEvent
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
 
@@ -215,13 +215,13 @@ def test_a_reading_without_a_reset_time_still_prints(capsys):
 def test_event_parse():
     ev = {"type": "rate_limit_event", "rate_limit_info": {
         "status": "rejected", "resetsAt": 1786807200, "rateLimitType": "five_hour"}}
-    rl = cyclecore.rate_limit_event_from(ev)
+    rl = usage.rate_limit_event_from(ev)
     assert (rl.status, rl.limit_type, rl.resets_at) == (
         "rejected", "five_hour", 1786807200.0)
     assert rl.label == "session limit"
-    assert cyclecore.rate_limit_event_from({"type": "result"}) is None
+    assert usage.rate_limit_event_from({"type": "result"}) is None
     # A verdict with fields missing still parses — it must not throw mid-stream.
-    bare = cyclecore.rate_limit_event_from({"type": "rate_limit_event"})
+    bare = usage.rate_limit_event_from({"type": "rate_limit_event"})
     assert bare.resets_at is None and bare.status == "unknown"
 
 

@@ -46,6 +46,7 @@ from . import providers
 from . import statusline
 from . import stopchannel
 from . import textwidth
+from . import usage
 from .agentwork import (
     AgentCommand,
     build_agent_argv,
@@ -313,11 +314,16 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                                 )
                             out.fitted("  ✗ ", content, "red")
                 elif et == "rate_limit_event":
-                    # The run's own rate-limit verdict (see cyclecore.RateLimitEvent).
+                    # The run's own rate-limit verdict (see usage.RateLimitEvent).
                     # Surfaced, not acted on: with N workers the pause belongs to the
                     # shared usage gate, which sees the same wall as a pegged
                     # percentage when the next worker checks in.
-                    rl = cyclecore.rate_limit_event_from(ev)
+                    #
+                    # A LOCAL, deliberately: the sequential renderer latches its
+                    # last verdict in a module global because it has exactly one
+                    # stream: here there are `jobs` of them at once, so "the last
+                    # verdict" is not a question this runner can answer.
+                    rl = usage.rate_limit_event_from(ev)
                     if rl is not None and rl.status != "allowed":
                         out.line(f"⚠ rate limit: {rl.describe()}", "bold red")
                 elif et == "result":
