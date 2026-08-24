@@ -22,7 +22,7 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, gitpush, parallel, projectroot, runlifecycle
+from llm_loop import cyclecore, gitpush, parallel, projectroot, statusline
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
@@ -321,6 +321,26 @@ def test_the_parallel_pusher_pushes_the_project_it_was_pointed_at(
         f"the parallel pusher pushed the wrong repository: {fake.calls}"
 
 
+def _capture_status_app(monkeypatch) -> dict:
+    """Hand the test the run's own StatusApp, and with it the knob registry.
+
+    Through the seam a run already has — the app is handed the registry it will
+    edit — rather than by replacing `runlifecycle.script_settings`: the editor a
+    key press reaches is `app.settings`, so a pin about editing a knob should
+    hold the same object the `l` key does. `test_parallel_statusline` reaches it
+    the same way.
+    """
+    made = {}
+    real_app_class = statusline.StatusApp        # captured before the patch
+
+    def _app(**kwargs):
+        made["app"] = real_app_class(**kwargs)
+        return made["app"]
+
+    monkeypatch.setattr(statusline, "StatusApp", _app)
+    return made
+
+
 def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
     """`--git-push` is an editable knob in BOTH runners, not only the sequential one.
 
@@ -336,21 +356,14 @@ def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
     a run that read the policy after the edit rather than before it.
     """
     fake = _FakeGitModule()
-    registry = {}
-    real_script_settings = runlifecycle.script_settings
-
-    def capture(run_settings, progress=None):
-        registry["settings"] = real_script_settings(run_settings, progress)
-        return registry["settings"]
-
-    monkeypatch.setattr(runlifecycle, "script_settings", capture)
+    made = _capture_status_app(monkeypatch)
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
     saw_push = []
 
     def edit_the_knob_then_wait(job_id, command, mailbox=None):
         # The `l` key's editor, reached the way the status line reaches it.
-        registry["settings"].get(gitpush.GIT_PUSH_SETTING).set("after_new_commits")
+        made["app"].settings.get(gitpush.GIT_PUSH_SETTING).set("after_new_commits")
         saw_push.append(fake.pushed.wait(timeout=PUMP_WAIT_S))
         return 0, None, None
 

@@ -54,8 +54,15 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-from . import (clispec, compactline, console, exitlog, operator, projectroot,
-               providers, runlifecycle, stopchannel, textwidth)
+# `limits` and `statusline` were imported inside `run_loop` for years, on the
+# grounds that hoisting them would change what a bare `import llm_loop.cyclecore`
+# drags in. Measured 2026-08-24 and false: importing a submodule runs the
+# package's `__init__`, which imports both unconditionally, so they are already
+# in `sys.modules` before this line is reached. The cycle the local import
+# really was for is gone too — neither module imports this one any more.
+from . import (clispec, compactline, console, exitlog, limits, operator,
+               projectroot, providers, runlifecycle, statusline, stopchannel,
+               textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
 # Driver protocol that produces them — is `agentwork`, for the same reason as the
 # rest of this list: both runners execute that contract and neither owns it.
@@ -706,14 +713,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     makes several runner calls in one process (see run_parallel); left None, this
     call is the invocation and owns its own figures.
     """
-    # The usage-limit query/parse (UsageSource) and pausing policy (LimitPolicy)
-    # live in their own modules. The import is local for history, not necessity:
-    # it broke a cycle until the git-push policy and the session-window constant
-    # moved out of here, and neither `limits` nor `statusline` imports this
-    # module any more. Kept local because hoisting it changes what a bare
-    # `import llm_loop.cyclecore` drags in, which is a different question.
-    from . import limits, statusline
-
     # --cost: report per-run spend from the mirror log and exit, without touching
     # the loop, the tee, git, or the usage gate. BEFORE the prologue, whose first
     # act is to raise the tee and open an exit record: a report is not a run, and
@@ -728,9 +727,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         report_costs(app_name, cost_log)
         return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
 
-    # The prologue both runners share: provider, live knobs, project root, the
-    # tee, the exit record, the header. See runlifecycle for the two orderings
-    # inside it that are load-bearing.
+    # `runlifecycle.begin_run` is the prologue both runners share.
     ctx = runlifecycle.begin_run(driver, args, app_name, progress,
                                  setup_logging=setup_logging)
     provider, spec = ctx.provider, ctx.spec
@@ -771,7 +768,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     if usage_source is not None:
         limit_policy = driver.limit_policy or limits.default_policy(provider)
     last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
-    print(f"  · git push policy: {run_settings.git_push.value}")
     if ignore_usage_limits:
         print(f"  · usage limit policy: disabled (bounded run, "
               f"--max {run_settings.max_runs})")
@@ -1160,8 +1156,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     summary = driver.final_summary()
     if summary:
         print(f"\n{summary}")
-    # The epilogue both runners share: the exit push, the closing usage
-    # snapshot, the undelivered notes, the recorded reason. No `push_lock`,
+    # `runlifecycle.end_run` is the epilogue both runners share. No `push_lock`,
     # because this runner has one thread and nothing to exclude — see
     # `gitpush.final_git_push` for why the lock belongs to the caller that has
     # threads rather than to the call.

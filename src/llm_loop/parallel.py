@@ -335,7 +335,12 @@ class Shared:
     The list file (owned by `driver`) is the source of truth for what remains;
     `in_progress` keeps workers from claiming the same line, `failed` parks lines
     that exhausted their retry budget, and the counters bound/report the run. All
-    access is under `lock`.
+    access to THAT state is under `lock`.
+
+    `settings` is the exception, and it is not this object's state: the run's
+    knobs are written by whoever holds the keyboard (the status line's editor,
+    on its own thread) and only READ here, under the lock, at the moment a claim
+    is decided — see `max_items`.
     """
 
     def __init__(self, driver: ListFileDriver, settings):
@@ -910,15 +915,14 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     args.max is a slice size and this call cannot know the run's real work — the
     wrapper passes what it knows. Left None, this call is the invocation.
     """
-    # The prologue both runners share: provider, live knobs, project root, the
-    # tee, the exit record, the header. Under this runner's own app name, so its
-    # log does not fight the sequential one's. See `runlifecycle` for the two
-    # orderings inside it that are load-bearing.
+    # `runlifecycle.begin_run` is the prologue both runners share, under this
+    # runner's own app name so its log does not fight the sequential one's.
     ctx = runlifecycle.begin_run(driver, args, app_name, progress,
                                  setup_logging=setup_logging)
-    provider, spec = ctx.provider, ctx.spec
+    provider = ctx.provider
     progress, owns_progress = ctx.progress, ctx.owns_progress
     run_settings = ctx.settings
+    dry_run = ctx.dry_run
 
     # Worker count precedence: explicit -j/--jobs on the CLI, then the driver's
     # `jobs` attribute (a subclass may pin it), then the engine default. Not a
@@ -930,7 +934,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     if jobs is None:
         jobs = clispec.DEFAULT_JOBS
     jobs = max(1, jobs)
-    print(f"  · jobs: {jobs}  ·  git push policy: {run_settings.git_push.value}")
+    print(f"  · jobs: {jobs}")
 
     list_file_rel = driver.list_file
     pending_now = driver.pending_lines()
@@ -942,7 +946,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # nothing — including the stop sentinel, which only a real run claims (the
     # workers below are what detect it, and they never start here). Reported so
     # the preview says why a real run would not start yet.
-    if args.dry_run:
+    if dry_run:
         if os.path.exists(stopchannel.stop_file_path()):
             print("  · stop file present — a real run would wait here until it "
                   "went away. Left in place (a dry run never consumes it).")
@@ -1141,12 +1145,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         print(f"  ⚠ every worker thread ended before the queue drained; "
               f"{remaining} file(s) left unclaimed.")
 
-    # The epilogue both runners share: the exit push, the closing usage
-    # snapshot, the undelivered notes, the recorded reason. `push_lock` is this
-    # runner's, and it wraps the WHOLE exit push (`git_unpushed_count` included,
-    # and the reading of the policy with it) because the join above may have
-    # given up on a pusher that is still inside `git push` — see
-    # PUSHER_JOIN_TIMEOUT_S, and `runlifecycle.end_run` for the rest of why.
+    # `runlifecycle.end_run` is the epilogue both runners share. `push_lock` is
+    # this runner's, and it wraps the WHOLE exit push (`git_unpushed_count`
+    # included, and the reading of the policy with it) because the join above
+    # may have given up on a pusher that is still inside `git push` — see
+    # PUSHER_JOIN_TIMEOUT_S, and `end_run` for the rest of why.
     return runlifecycle.end_run(
         ctx, reason, iterations=shared.claimed, completed=shared.done,
         remaining=remaining, usage_source=source, limit_policy=policy,

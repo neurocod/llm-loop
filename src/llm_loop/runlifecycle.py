@@ -28,11 +28,6 @@ rather than to tidy it:
     Reading the count outside the lock is how "nothing to push" could be printed
     about a repository that was being pushed at that moment. Pinned by
     `tests/test_git_push.py`.
-
-`statusline` is imported on USE, not at module level: `cyclecore` imports this
-module, and hoisting the import here would change what a bare
-`import llm_loop.cyclecore` drags in — the same reason `run_loop` still imports
-it inside the function.
 """
 
 import contextlib
@@ -40,7 +35,7 @@ import os
 import sys
 from typing import Any, NamedTuple, Optional
 
-from . import console, exitlog, operator, projectroot, stopchannel
+from . import console, exitlog, operator, projectroot, statusline, stopchannel
 from .gitpush import (
     GIT_PUSH_POLICY,
     GIT_PUSH_SETTING,
@@ -89,7 +84,6 @@ def script_settings(run_settings: RunSettings, progress=None) -> Any:
     runner's own boundary is what lets the parallel runner have the knob at all
     — it has no boundary on the main thread to re-read anything at.
     """
-    statusline = _statusline()
     registry = statusline.SettingsRegistry()
 
     def set_max_runs(value):
@@ -133,12 +127,6 @@ class RunContext(NamedTuple):
     settings: RunSettings
 
 
-def _statusline():
-    """`statusline`, imported on use — see the module header for why not above."""
-    from . import statusline
-    return statusline
-
-
 def begin_run(driver, args, app_name: str, progress=None, *,
               setup_logging: bool = True) -> RunContext:
     """Everything both runners do before they have any work to show for it.
@@ -147,15 +135,16 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     provider, settle the run's live knobs, anchor the project root, decide the
     live-message transport, raise the tee, open the exit record, print the
     header every run starts with. A runner adds its own header lines after this
-    returns — the sequential one its Markdown notice, the parallel one its
-    worker count — because those are the lines that differ, and they are the
-    only ones that do.
+    returns.
+
+    The header covers what BOTH runners have to say, the git-push policy
+    included: it is a knob both of them register, so its line was drifting into
+    two spellings of one fact — a bare one here and a half-line tacked onto the
+    parallel runner's worker count.
 
     `setup_logging=False` is the wrapper's hook: a host script that already tees
     its own output must not have a second tee stacked on top of the first.
     """
-    statusline = _statusline()
-
     provider = getattr(args, "provider", None) or driver.provider
     spec = provider_spec(provider)
     driver.provider = provider
@@ -207,6 +196,7 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     else:
         print(f"  · logging to {console.log_file_path(app_name)}")
     print(f"  · provider: {spec.display_name}")
+    print(f"  · git push policy: {settings.git_push.value}")
     return RunContext(provider=provider, spec=spec,
                       dry_run=dry_run, progress=progress,
                       owns_progress=owns_progress, settings=settings)
