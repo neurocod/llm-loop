@@ -13,8 +13,13 @@ which is what tied the policy to the runner: a caller could not push a
 repository the sequential runner did not happen to be pointed at, and the module
 could not be tested without setting a runner's global. The engine is meant to be
 vendored under a host project whose root is NOT the process cwd (see
-`cyclecore.set_project_root`), so "wherever git happens to land" is a wrong
+`projectroot.set_project_root`), so "wherever git happens to land" is a wrong
 answer, not merely an unspecified one.
+
+The root has since become a leaf of its own (`projectroot`), so reading it here
+would no longer cost an import of a runner — and the parameter stays anyway.
+The reason was never the import: a git push is about A REPOSITORY, and this
+module has no business assuming which one.
 """
 
 from enum import Enum

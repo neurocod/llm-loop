@@ -182,6 +182,8 @@ src/
     console.py       what a run prints, and the rotating mirror log that is the
                      second copy of every line of it
     stopchannel.py   how a run is asked to stop or hold, and what it reports
+    projectroot.py   where the project being driven is, and the one place that
+                     answers it
     gitpush.py       when a run pushes what it has committed, and where
     providers.py     Claude/Codex executable flags, argv construction, and the
                      ending owed to a provider child

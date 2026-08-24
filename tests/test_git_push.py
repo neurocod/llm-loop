@@ -4,7 +4,7 @@
 never passed anywhere and could not be got wrong. Now it is an argument, and a
 handover is exactly the thing that regresses silently: the engine is vendored
 under a host project whose root is NOT the process cwd (see
-`cyclecore.set_project_root`), so a caller that quietly substituted `os.getcwd()`
+`projectroot.set_project_root`), so a caller that quietly substituted `os.getcwd()`
 would still push a repository, still print "git push: done", and still pass any
 test that only asked whether git ran.
 
@@ -20,7 +20,7 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, gitpush, parallel
+from llm_loop import cyclecore, gitpush, parallel, projectroot
 from llm_loop.cyclecore import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
@@ -38,15 +38,20 @@ def _restore_streams():
 def _restore_project_root():
     """Put the process-wide project root back after a run has moved it.
 
-    Every pin here points a runner at a tmp_path, and `set_project_root` also
-    moves the stop sentinel and the mirror log's file name with it. This file
-    collects second alphabetically, so without this every later file would
-    inherit a tmp root that no longer exists — green today, and the standard
-    seed of an order-dependent flake.
+    Every pin here points a runner at a tmp_path, and the stop sentinel and the
+    mirror log's file name are both derived from that root. This file collects
+    second alphabetically, so without this every later file would inherit a tmp
+    root that no longer exists — green today, and the standard seed of an
+    order-dependent flake.
+
+    ONE global to restore, not three: the sentinel and the log name used to be
+    mirrors with setters of their own, so this fixture was repairing a root that
+    had been copied into `stopchannel` and `console` as well. They read it now
+    (see `projectroot`), so putting the root back puts everything back.
     """
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     yield
-    cyclecore.set_project_root(previous)
+    projectroot.set_project_root(previous)
 
 
 class _FakeGitModule:
@@ -223,7 +228,7 @@ def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(
     """The same handover from the other runner, on its exit push.
 
     Its periodic pusher wakes on a 60 s timer, so the exit push is the site a
-    test can reach; both read the same `cyclecore.project_dir()`. One pending
+    test can reach; both read the same `projectroot.project_dir()`. One pending
     item rather than none, because a run with an empty list reports "nothing to
     do" and returns BEFORE the exit push — see `_MemListDriver`.
     """

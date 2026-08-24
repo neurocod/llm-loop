@@ -41,6 +41,7 @@ from . import cyclecore
 from . import exitlog
 from . import limits
 from . import operator
+from . import projectroot
 from . import providers
 from . import statusline
 from . import stopchannel
@@ -49,7 +50,6 @@ from .console import print_markup
 from .cyclecore import (
     AgentCommand,
     build_agent_argv,
-    set_project_root,
 )
 from .gitpush import (
     GIT_PUSH_POLICY,
@@ -226,7 +226,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     argv = build_agent_argv(command, provider)
     try:
         proc = start_agent_process(
-            argv, provider, command.prompt, cyclecore.project_dir())
+            argv, provider, command.prompt, projectroot.project_dir())
     except FileNotFoundError:
         out.line(f"executable {spec.executable!r} not found on PATH.", "bold red")
         return 2, None, None
@@ -939,7 +939,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         progress = statusline.InvocationProgress(max_items=args.max)
 
     # Anchor every project-relative operation before anything reads the root.
-    set_project_root(getattr(args, "project_dir", None))
+    projectroot.set_project_root(getattr(args, "project_dir", None))
 
     # Decided before the first argv is built: the transport is what this turns
     # off, and the argv and the process's stdin have to agree about it. Both
@@ -958,8 +958,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # See the same call in cyclecore.run_loop: after the tee, so a vanished
         # run's report lands in the log whose abrupt end it explains.
         exitlog.begin(app_name, console.LOG_DIR,
-                      os.path.basename(cyclecore.project_dir()))
-    print(f"  · project root: {cyclecore.project_dir()}")
+                      os.path.basename(projectroot.project_dir()))
+    print(f"  · project root: {projectroot.project_dir()}")
     if args.dry_run:
         print("  · dry run: nothing is mirrored to "
               f"{console.log_file_path(app_name)}")
@@ -979,7 +979,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # workers below are what detect it, and they never start here). Reported so
     # the preview says why a real run would not start yet.
     if args.dry_run:
-        if os.path.exists(stopchannel.STOP_FILE):
+        if os.path.exists(stopchannel.stop_file_path()):
             print("  · stop file present — a real run would wait here until it "
                   "went away. Left in place (a dry run never consumes it).")
         would_run = (len(pending_now) if args.max is None
@@ -1115,7 +1115,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             with push_lock:
                 last_push_box[0] = maybe_git_push(git_push_policy,
                                                   last_push_box[0],
-                                                  cyclecore.project_dir())
+                                                  projectroot.project_dir())
 
     threads = [
         threading.Thread(target=worker, name=f"job{j}",
@@ -1164,11 +1164,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     # Final push on the way out (unless policy is NONE), mirroring run_loop.
     if git_push_policy != GitPushPolicy.NONE:
-        count = git_unpushed_count(cyclecore.project_dir())
+        count = git_unpushed_count(projectroot.project_dir())
         if count is None or count > 0:
             print("  · final git push on exit…")
             with push_lock:
-                git_push(cyclecore.project_dir())
+                git_push(projectroot.project_dir())
         else:
             print("  · final git push: nothing to push.")
 

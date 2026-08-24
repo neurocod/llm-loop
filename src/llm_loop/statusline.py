@@ -1956,8 +1956,10 @@ class StatusApp:
 
     @property
     def stop_file(self) -> str:
-        # Read late: --project-dir moves stopchannel.STOP_FILE after import.
-        return self._stop_file or stopchannel.STOP_FILE
+        # Read late: --project-dir moves the project root after import, and the
+        # sentinel is derived from it. Not `stop_file_for(self)` — that reader
+        # asks an app for exactly this property, and would recurse.
+        return self._stop_file or stopchannel.stop_file_path()
 
     @property
     def stop_requested_here(self) -> bool:

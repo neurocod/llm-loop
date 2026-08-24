@@ -12,7 +12,7 @@ being hard-coded module constants:
     `pick_order = "list"` to walk it top to bottom instead), striking each out
     once its command succeeds; stop when the list is empty.
 
-Both resolve their relative paths against cyclecore.project_dir() (the project
+Both resolve their relative paths against projectroot.project_dir() (the project
 root, set from --project-dir / cwd), so the same code drives any host project.
 """
 
@@ -20,14 +20,14 @@ import os
 import random
 from typing import Optional
 
-from . import cyclecore
+from . import projectroot
 from .cyclecore import AgentCommand, Driver, LoopStop
 
 
 def _abs_in_project(path: str) -> str:
     """Resolve a path against the project root; absolute paths pass through."""
     return path if os.path.isabs(path) else os.path.join(
-        cyclecore.project_dir(), path)
+        projectroot.project_dir(), path)
 
 
 # --- state-machine driver ------------------------------------------------------

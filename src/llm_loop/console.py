@@ -22,9 +22,12 @@ renderers, so its patterns belong next to THEM, in `cyclecore`. `exitlog` is the
 same shape from the other side: it is handed `LOG_DIR` and writes its own file
 beside the mirror, so it stays a module of its own and imports the constant.
 
-The rule for anything added here: this module must not import a runner. What it
-needs from one is HANDED to it — see `set_log_project`, which mirrors the
-`stopchannel.set_stop_root` handover for exactly the same reason.
+The rule for anything added here: this module must not import a runner. The one
+thing it needs that a runner used to own — the project root, whose folder name
+this log is filed under — comes from `projectroot`, a leaf module below both, so
+it is READ rather than handed over. It used to be handed over (`set_log_project`
+pushed a copy in here), and the copy is what made the handover a thing that
+could silently stop happening.
 """
 
 import logging
@@ -39,6 +42,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import compactline
+from . import projectroot
 
 
 # --- mirror-log path -------------------------------------------------------
@@ -59,30 +63,20 @@ LOG_MAX_BYTES = 25 * 1024 * 1024
 # displaced the failure a live run was recording, and it was gone for good.
 LOG_BACKUP_COUNT = 5
 
-# The project folder whose name this run's log is filed under. Told, never read
-# back: asking `cyclecore.project_dir()` for it would make the printer import a
-# runner, and every module here that needed the root before this one (see
-# `stopchannel.set_stop_root`) settled that the same way. Both directions of the
-# handover are in `cyclecore.set_project_root` — the call it makes when
-# --project-dir moves the root, and the one under its definition that gives a
-# launch WITHOUT that flag the same answer.
-_LOG_PROJECT = os.path.basename(os.getcwd())
-
-
-def set_log_project(path: str) -> None:
-    """Name the project folder the mirror log is filed under (see `_LOG_PROJECT`)."""
-    global _LOG_PROJECT
-    _LOG_PROJECT = os.path.basename(path)
-
-
 def log_file_path(app_name: str = "runCycle") -> Path:
     """Path of the rotating mirror log for a given entry point.
 
     The project folder name and `app_name` are both baked in, so e.g.
     runCycle.py and runTranslate.py launched from the same project still write
     to separate logs (runCycle-<project>.log vs runTranslate-<project>.log).
+
+    Derived on every call, never cached in a module global here: --project-dir
+    moves the root after import, and a copy taken at import time would file
+    every project's log under whatever directory the process started in. That
+    copy existed (`_LOG_PROJECT`, pushed in by `set_log_project`) until the root
+    became a leaf both modules can read — see `projectroot`.
     """
-    return LOG_DIR / f"{app_name}-{_LOG_PROJECT}.log"
+    return LOG_DIR / f"{app_name}-{os.path.basename(projectroot.project_dir())}.log"
 
 
 # --- mirror-log writer -----------------------------------------------------

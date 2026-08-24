@@ -16,11 +16,11 @@ part of cyclecore, `parallel.py` had to import the module that defines the
 sequential `run_loop` in order to ask "is anything asking us to stop?" - a
 dependency on an address rather than on a subject, and the kind that makes
 adding a stop channel look like a change to the sequential runner. Nothing
-here imports the rest of the package, which is what keeps that true.
+here imports a runner, which is what keeps that true.
 
 The sentinel is anchored on the project root, which this module does not own:
-`cyclecore.set_project_root` hands it over through `set_stop_root`. See
-STOP_FILE.
+it reads it from `projectroot`, a leaf below both this module and the runners.
+See `stop_file_path`.
 """
 
 import os
@@ -30,6 +30,8 @@ import time
 from contextlib import contextmanager
 from enum import Enum
 from typing import NamedTuple, Optional, Tuple
+
+from . import projectroot
 
 
 class RunStopReason(Enum):
@@ -101,36 +103,32 @@ REQUESTED_STOP_REASONS = frozenset(
     {RunStopReason.STOP_FILE, RunStopReason.STOP_KEY})
 
 
-# A manual brake shared by every run rooted here: `touch stop` (create a file
-# named "stop" in the project root) and the loop halts at the next iteration
-# boundary - the running iteration finishes its one state transition first. The
-# file stays present while the application winds down, then the outermost
-# stop-file lifecycle removes it just before exit so other launchers can use it
-# as a mutex. Recomputed by set_stop_root().
-#
-# Deliberately NOT what the status line's `s` key writes: see StopSource. The
-# file is the cross-process channel (and the handshake for chaining runs); the
-# key is the per-run one.
-#
-# The cwd is only the pre-launch default: `cyclecore.set_project_root` calls
-# `set_stop_root` at import and again from --project-dir/-C. Readers that
-# outlive that call must read the ATTRIBUTE (`stopchannel.STOP_FILE`), never a
-# `from … import` copy of it, or a `-C` run watches the launch directory's
-# sentinel while it works somewhere else — which looks exactly like a stop file
-# nobody obeys. `stop_file_for()` is the reader that cannot be got wrong.
-STOP_FILE = os.path.join(os.getcwd(), "stop")
+def stop_file_path() -> str:
+    """The shared sentinel of the current project root.
 
+    A manual brake shared by every run rooted there: `touch stop` (create a file
+    named "stop" in the project root) and the loop halts at the next iteration
+    boundary — the running iteration finishes its one state transition first.
+    The file stays present while the application winds down, then the outermost
+    `stop_file_lifecycle` removes it just before exit so other launchers can use
+    it as a mutex.
 
-def set_stop_root(root: str) -> None:
-    """Anchor the shared sentinel on `root` (see STOP_FILE).
+    Deliberately NOT what the status line's `s` key writes: see StopSource. The
+    file is the cross-process channel (and the handshake for chaining runs); the
+    key is the per-run one.
 
-    The project root belongs to the engine, not to this module — a stop channel
-    has no opinion about where git runs or where a Driver's paths resolve — so
-    it is handed over rather than read back out of cyclecore, which would be
-    the import this split exists to remove.
+    Computed on every call rather than cached in a module constant, and that is
+    mechanics rather than taste: --project-dir moves the root after import, so a
+    constant would have to be pushed a new value by whoever moved it — which is
+    exactly the mirror (`STOP_FILE` / `set_stop_root`) this module carried until
+    the root became a leaf anyone can read (`projectroot`). A frozen copy makes
+    a `-C` run watch the launch directory's sentinel while it works somewhere
+    else, which looks exactly like a stop file nobody obeys. When there may be
+    an app in hand, prefer `stop_file_for(app)` — the reader that cannot be got
+    wrong about whose sentinel is meant.
     """
-    global STOP_FILE
-    STOP_FILE = os.path.join(root, "stop")
+    return os.path.join(projectroot.project_dir(), "stop")
+
 
 # How often wait_for_stop_file_clear() re-checks the sentinel while it holds a
 # launch back. Short enough that removing the file feels immediate.
@@ -187,7 +185,7 @@ def mark_stop_file_detected(path: Optional[str] = None) -> None:
     app, so the file that is removed is the file that was obeyed."""
     global _detected_stop_file
     with _stop_file_lifecycle_lock:
-        _detected_stop_file = path or STOP_FILE
+        _detected_stop_file = path or stop_file_path()
 
 
 def stop_file_for(app=None) -> str:
@@ -196,7 +194,7 @@ def stop_file_for(app=None) -> str:
     One reader for both, because a StatusApp built with an explicit `stop_file=`
     would otherwise show a row about one file while the runner obeyed another.
     """
-    return getattr(app, "stop_file", None) or STOP_FILE
+    return getattr(app, "stop_file", None) or stop_file_path()
 
 
 def pending_stop(app=None) -> Optional[StopSource]:
@@ -420,13 +418,14 @@ def wait_for_stop_file_clear() -> None:
     Not called on a dry run: that mode never touches the sentinel and reports it
     instead.
     """
-    if not os.path.exists(STOP_FILE):
+    sentinel = stop_file_path()
+    if not os.path.exists(sentinel):
         return
-    print(f"  ⏸ Stop file present at startup ({STOP_FILE}) — waiting for it to "
+    print(f"  ⏸ Stop file present at startup ({sentinel}) — waiting for it to "
           f"go away before starting (remove it to begin; Ctrl+C to abort)…")
     waited = 0
     try:
-        while os.path.exists(STOP_FILE):
+        while os.path.exists(sentinel):
             time.sleep(STOP_POLL_SECONDS)
             waited += STOP_POLL_SECONDS
             if waited % 60 == 0:

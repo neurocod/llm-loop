@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-from llm_loop import console, cyclecore, stopchannel, textwidth
+from llm_loop import console, cyclecore, projectroot, stopchannel, textwidth
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
@@ -376,7 +376,7 @@ def test_the_stop_key_writes_no_sentinel_so_a_neighbouring_run_keeps_going(
     """Why the key is a flag and not the file: several loops share one project
     root, and a file stops every one of them."""
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     one = sl.StatusApp(enabled=False, stop_file=str(sentinel))
     two = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
@@ -408,7 +408,7 @@ def test_what_may_be_cancelled_and_what_must_be_consumed_are_different(
     still take it back), but the FILE is what a run stopping now must consume —
     both runners latch on `latched_stop` for exactly this case."""
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
     app.handle_event(tio.Key("s"))
     sentinel.write_text("", encoding="utf-8")
@@ -421,7 +421,7 @@ def test_the_stop_file_remains_the_cross_process_channel(tmp_path, monkeypatch):
     """The fallback the key deliberately does not use: a file stops every run
     watching the root, and `s` neither writes nor withdraws it."""
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
     sentinel.write_text("", encoding="utf-8")           # another run's `touch stop`
 
@@ -435,12 +435,13 @@ def test_the_stop_file_remains_the_cross_process_channel(tmp_path, monkeypatch):
     assert stopchannel.pending_stop(app) is stopchannel.StopSource.FILE
 
 
-def test_stop_file_defaults_to_the_engine_sentinel(monkeypatch):
-    from llm_loop import cyclecore
+def test_stop_file_defaults_to_the_engine_sentinel(monkeypatch, tmp_path):
+    """A StatusApp built without an explicit `stop_file=` watches the sentinel of
+    whatever root the engine is pointed at — derived on read, so moving the root
+    moves the row without anybody pushing it a new value."""
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
 
-    monkeypatch.setattr(stopchannel, "STOP_FILE", "/somewhere/stop")
-
-    assert sl.StatusApp(enabled=False).stop_file == "/somewhere/stop"
+    assert sl.StatusApp(enabled=False).stop_file == str(tmp_path / "stop")
 
 
 # --- the pause key -------------------------------------------------------------
@@ -466,7 +467,7 @@ def test_pausing_writes_nothing_to_disk_and_leaves_the_stop_channels_alone(
     """A pause is one run's own, like `s` — and it is not a stop: a run holding
     on `p` must not report a stop pending to anything that asks."""
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
     app.handle_event(tio.Key("p"))
@@ -524,7 +525,7 @@ def test_the_hold_lasts_exactly_as_long_as_the_key_is_up():
 def test_a_stop_pressed_during_the_hold_releases_it_at_once(monkeypatch, tmp_path):
     """The hold has no timer, so `s` must be answered by it and not only by
     whatever the run does next — and the decision stays with the loop head."""
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(tmp_path / "stop"))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     app = _PausedApp(polls=1000, stop_after=2)
 
     held = stopchannel.wait_while_paused(
@@ -563,7 +564,7 @@ class _FakeApp:
 def test_a_stop_request_cancelled_inside_the_grace_leaves_no_trace(monkeypatch, tmp_path):
     from llm_loop import cyclecore
 
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(tmp_path / "stop"))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     app = _FakeApp()
     app._on_note = lambda: setattr(app, "stop_requested_here", False)  # `s` again
 
@@ -578,7 +579,7 @@ def test_a_stop_file_arriving_mid_grace_outlives_the_cancel(monkeypatch, tmp_pat
     from llm_loop import cyclecore
 
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     app = _FakeApp()
 
     def cancel_but_a_file_appears():
@@ -593,7 +594,7 @@ def test_a_stop_file_arriving_mid_grace_outlives_the_cancel(monkeypatch, tmp_pat
 def test_a_stop_request_still_pending_after_the_grace_stops_the_run(monkeypatch, tmp_path):
     from llm_loop import cyclecore
 
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(tmp_path / "stop"))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     app = _FakeApp()
 
     assert stopchannel.confirm_stop_request(app, grace=0.05, poll=0.01) is True
@@ -606,7 +607,7 @@ def test_a_non_interactive_run_stops_without_any_grace(monkeypatch, tmp_path):
 
     sentinel = tmp_path / "stop"
     sentinel.write_text("", encoding="utf-8")
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     started = time.monotonic()
 
     assert stopchannel.confirm_stop_request(None, grace=60) is True
@@ -621,7 +622,7 @@ def test_a_stop_this_run_did_not_request_stops_it_at_once(monkeypatch, tmp_path)
 
     sentinel = tmp_path / "stop"
     sentinel.write_text("", encoding="utf-8")
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     external = _FakeApp(requested_here=False)   # requested by somebody else
     started = time.monotonic()
 
@@ -635,7 +636,7 @@ def test_the_stop_key_is_what_marks_the_request_as_ours(tmp_path, monkeypatch):
     from llm_loop import cyclecore
 
     sentinel = tmp_path / "stop"
-    monkeypatch.setattr(stopchannel, "STOP_FILE", str(sentinel))
+    monkeypatch.setattr(projectroot, "PROJECT_DIR", str(tmp_path))
     app = sl.StatusApp(enabled=False, stop_file=str(sentinel))
 
     assert app.stop_requested_here is False
@@ -1128,13 +1129,13 @@ def test_a_dry_run_prints_the_prompt_block_for_job_one(tmp_path, capsys):
     args.cost = False
     args.no_statusline = False
 
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     streams = (sys.stdout, sys.stderr)
     try:
         cyclecore.run_loop(_OneShot(), args, app_name="pytest-statusline",
                            setup_logging=False, wait_on_start=False)
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
         sys.stdout, sys.stderr = streams
 
     out = capsys.readouterr().out
@@ -1390,13 +1391,13 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
     for name, value in arg_fields.items():
         setattr(args, name, value)
 
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         cyclecore.run_loop(driver, args, app_name="pytest-statusline",
                            setup_logging=False, wait_on_start=False,
                            progress=progress)
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
     return made["app"], source
 
 
@@ -1727,7 +1728,7 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
         setattr(args, name, value)
 
     progress = sl.InvocationProgress()
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         for _call in (1, 2):        # what a periodic wrapper does, twice
             cyclecore.run_loop(_counts_down(2), args,
@@ -1735,7 +1736,7 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
                                setup_logging=False, wait_on_start=False,
                                progress=progress)
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     first, second = made
     assert first.status.jobs[0] is second.status.jobs[0]

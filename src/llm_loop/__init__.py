@@ -33,8 +33,9 @@ composite `LimitPolicy([DayNightLimit(), WeeklyLimit(90)])`; unset defaults to a
 day/night session rule for Claude and a session-plus-weekly policy for Codex.
 
 See cyclecore for the engine and the Driver protocol, drivers for the two ready
-made Drivers, parallel for the concurrent list runner, usage/codex_usage for the
-provider quota query layers, and limits for the pausing policy.
+made Drivers, parallel for the concurrent list runner, projectroot for the root
+itself, usage/codex_usage for the provider quota query layers, and limits for
+the pausing policy.
 """
 
 # The single source of truth for the version: pyproject.toml reads it back out
@@ -56,17 +57,21 @@ from .cyclecore import (
     RateLimitEvent,
     build_agent_argv,
     build_claude_argv,
-    find_project_root,
     last_rate_limit_event,
     parse_args,
     parse_duration,
-    project_dir,
     rate_limit_event_from,
     report_costs,
     run_loop,
     run_agent_streaming,
-    set_project_root,
 )
+# The project root moved out of cyclecore into `projectroot`, a leaf below both
+# runners and below the two modules that used to keep MIRRORS of it (see that
+# module's header). Same story as the three below: the front door is unchanged
+# on purpose — an embedder asks the PACKAGE where the project is, not whichever
+# module currently holds the global. `cyclecore.project_dir` deliberately no
+# longer resolves, so there is exactly one internal address for it too.
+from .projectroot import find_project_root, project_dir, set_project_root
 # Same story as the stop vocabulary below: the terminal front end and the mirror
 # log it writes moved out of cyclecore into `console`, and the front door is
 # unchanged on purpose — an embedder asks the PACKAGE where its log is.

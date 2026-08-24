@@ -27,7 +27,7 @@ from typing import Optional
 
 import pytest
 
-from llm_loop import cyclecore, parallel, statusline, stopchannel
+from llm_loop import cyclecore, parallel, projectroot, statusline, stopchannel
 from llm_loop.cyclecore import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 from llm_loop.limits import LimitPolicy, SessionLimit
@@ -802,9 +802,9 @@ def test_the_post_refusal_wait_answers_a_stop_request_too():
 def test_stop_file_path_follows_the_project_root(tmp_path):
     """The sentinel is resolved against the chosen root, not the cwd — otherwise
     a -C run would watch the wrong file (and the tests would pass by accident)."""
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
-        cyclecore.set_project_root(str(tmp_path))
-        assert stopchannel.STOP_FILE == os.path.join(str(tmp_path), "stop")
+        projectroot.set_project_root(str(tmp_path))
+        assert stopchannel.stop_file_path() == os.path.join(str(tmp_path), "stop")
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)

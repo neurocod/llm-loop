@@ -20,7 +20,7 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, parallel, stopchannel
+from llm_loop import cyclecore, parallel, projectroot, stopchannel
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 from llm_loop.drivers import ListFileDriver
@@ -164,12 +164,12 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
 
     monkeypatch.setattr(parallel, "run_job", record_job)
     driver = _MemDriver([f"products/f{i}.md" for i in range(3)])
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         parallel.run_parallel(driver, _args(str(tmp_path), jobs=3),
                               app_name="pytest-parallel-statusline")
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     app = made["app"]
     assert [j.job_id for j in app.status.jobs] == [1, 2, 3]
@@ -206,14 +206,14 @@ def test_a_dead_worker_leaves_no_row_claiming_to_run(tmp_path, monkeypatch):
 
     monkeypatch.setattr(parallel, "run_job", explode)
     driver = _MemDriver(["products/only.md"])
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         # One worker and one file: nothing here depends on the fleet outliving
         # the death, only on the row the dead worker leaves behind.
         parallel.run_parallel(driver, _args(str(tmp_path), jobs=1),
                               app_name="pytest-parallel-statusline")
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     assert [(j.job_id, j.running, j.started_at)
             for j in made["app"].status.jobs] == [(1, False, 0.0)]
@@ -224,12 +224,12 @@ def test_the_summary_row_shows_the_run_counters(tmp_path, monkeypatch):
     made = _live_statusline(monkeypatch, {})
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     driver = _MemDriver([f"products/f{i}.md" for i in range(5)])
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         parallel.run_parallel(driver, _args(str(tmp_path), jobs=2, max_runs=2),
                               app_name="pytest-parallel-statusline")
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     app = made["app"]
     assert app.status.max_iterations == 2
@@ -246,13 +246,13 @@ def test_no_statusline_reaches_the_parallel_runner(tmp_path, monkeypatch):
     """The flag the periodic wrapper forwards must actually disable the area."""
     made = _live_statusline(monkeypatch, {})
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         parallel.run_parallel(_MemDriver(["products/a.md"]),
                               _args(str(tmp_path), jobs=1, no_statusline=True),
                               app_name="pytest-parallel-statusline")
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     assert made["enabled"] is False
     assert not made["app"].enabled
@@ -275,7 +275,7 @@ def test_cancelling_the_stop_reopens_claims_while_a_job_runs(tmp_path, monkeypat
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", block_the_first_job)
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=2))
         assert in_flight.wait(5), "no worker ever started a file"
@@ -292,7 +292,7 @@ def test_cancelling_the_stop_reopens_claims_while_a_job_runs(tmp_path, monkeypat
         assert done.wait(10), "the run did not carry on after the cancel"
     finally:
         release.set()
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     assert driver.pending_lines() == [], "claims never reopened"
     assert result["value"].reason is not stopchannel.RunStopReason.STOP_FILE
@@ -317,7 +317,7 @@ def test_an_interactive_stop_left_alone_ends_the_run(tmp_path, monkeypatch):
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", block_the_first_job)
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         with stopchannel.stop_file_lifecycle():
             done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=1))
@@ -329,7 +329,7 @@ def test_an_interactive_stop_left_alone_ends_the_run(tmp_path, monkeypatch):
             assert not (tmp_path / "stop").exists(), "the s key wrote a sentinel"
     finally:
         release.set()
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     assert result["value"].reason is stopchannel.RunStopReason.STOP_KEY
     assert driver.pending_lines() == ["products/b.md"]   # nothing new claimed
@@ -355,7 +355,7 @@ def test_a_sentinel_this_run_did_not_write_is_not_reopenable(tmp_path, monkeypat
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", block_the_first_job)
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         with stopchannel.stop_file_lifecycle():
             done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=2))
@@ -368,7 +368,7 @@ def test_a_sentinel_this_run_did_not_write_is_not_reopenable(tmp_path, monkeypat
             assert done.wait(10), "an external sentinel did not stop the run"
     finally:
         release.set()
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     assert made["app"].enabled is False   # released with the run, but it WAS live
     assert result["value"].reason is stopchannel.RunStopReason.STOP_FILE
@@ -460,7 +460,7 @@ def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
                             project_dir=str(tmp_path)).items():
         setattr(seq_args, name, value)
 
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         for _batch in range(2):
             parallel.run_parallel(
@@ -471,7 +471,7 @@ def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
                                app_name="pytest-parallel-statusline",
                                setup_logging=False, wait_on_start=False)
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     assert [event for event, _ in log] == ["reserve", "release"] * 4
     # Each region is closed by the run that opened it, and every run gets a new
@@ -534,7 +534,7 @@ def test_batches_of_one_invocation_share_one_rising_counter(tmp_path, monkeypatc
     seen = []
     opening = []
 
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         while driver.pending_lines():
             first = len(samples)
@@ -543,7 +543,7 @@ def test_batches_of_one_invocation_share_one_rising_counter(tmp_path, monkeypatc
             status = made["app"].status
             seen.append((status.iteration, status.max_iterations))
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     assert seen == [(3, 7), (6, 7), (7, 7)]
     assert opening == [(0, 7), (3, 7), (6, 7)]
@@ -555,7 +555,7 @@ def test_the_denominator_is_the_smaller_of_the_queue_and_the_cap(tmp_path,
     """min(pending at the start, --max), checked both ways round."""
     made = _live_statusline(monkeypatch, {})
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         # Cap smaller than the queue: the run promises only what it will do.
         capped = _MemDriver([f"products/f{i}.md" for i in range(5)])
@@ -575,7 +575,7 @@ def test_the_denominator_is_the_smaller_of_the_queue_and_the_cap(tmp_path,
         _batch(short, args, roomy)
         fourth = (made["app"].status.iteration, made["app"].status.max_iterations)
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     assert (first, second) == ((1, 2), (2, 2))
     assert (third, fourth) == ((2, 3), (3, 3))
@@ -596,7 +596,7 @@ def test_job_rows_resume_in_the_next_call_of_the_invocation(tmp_path, monkeypatc
     args = _codex_args(str(tmp_path), jobs=2, max_runs=2)   # two files per batch
     rows = []
 
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     try:
         for _batch_number in (1, 2):
             _batch(driver, args, progress)
@@ -606,7 +606,7 @@ def test_job_rows_resume_in_the_next_call_of_the_invocation(tmp_path, monkeypatc
             assert status.provider == "codex"
             assert all(job.model == "gpt-5.6-terra" for job in status.jobs)
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
 
     # One file each per batch: two rows, each counting only what it ran itself.
     assert rows == [{1: 1, 2: 1}, {1: 2, 2: 2}]
@@ -644,13 +644,13 @@ def test_the_job_pool_grows_but_never_resurrects_an_idle_row():
 def test_a_parallel_dry_run_prints_the_prompt_block_once(tmp_path, capsys):
     """The joined `-p …` argv line hides the prompt; the block is what shows it."""
     driver = _MemDriver(["products/a.md", "products/b.md"])
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     streams = (sys.stdout, sys.stderr)
     try:
         parallel.run_parallel(driver, _args(str(tmp_path), jobs=2, dry_run=True),
                               app_name="pytest-parallel-statusline")
     finally:
-        cyclecore.set_project_root(previous)
+        projectroot.set_project_root(previous)
         sys.stdout, sys.stderr = streams
 
     out = capsys.readouterr().out

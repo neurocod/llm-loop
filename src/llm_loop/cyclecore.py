@@ -61,8 +61,8 @@ import time
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Union
 
-from . import (compactline, console, exitlog, operator, providers, stopchannel,
-               textwidth)
+from . import (compactline, console, exitlog, operator, projectroot, providers,
+               stopchannel, textwidth)
 # What the run PRINTS, and the mirror log that is the second copy of it, are
 # `console` (see its header for why those are one module). The line helpers are
 # imported by name because this module calls them on nearly every path; the
@@ -130,82 +130,13 @@ try:
 except (AttributeError, ValueError):
     pass
 
-# The project root: the working directory of the project being driven. All
-# subprocesses (git, provider CLI) run with this as their cwd, the relative
-# state/list paths a Driver is given are resolved against it, and the stop/log
-# file names are derived from it.
-#
-# IMPORTANT: this is deliberately *not* the directory this module lives in. The
-# module is meant to be vendored as a submodule under some host project, so the
-# code location and the project root are different directories. It defaults to
-# the current working directory (so running a thin wrapper from the project root
-# "just works") and can be overridden with set_project_root() — which run_loop()
-# calls from the --project-dir/-C option. Use project_dir() to read it so a
-# later set_project_root() is always picked up.
-PROJECT_DIR = os.getcwd()
-
-
-def set_project_root(path: Optional[str]) -> str:
-    """Point the engine at the project root (cwd for git/provider CLI, base for the
-    stop file and relative Driver paths). `path` None/empty means "keep the
-    current value" (which defaults to the process cwd). Returns the resolved
-    absolute path.
-
-    The runners are single-process, so a module-level singleton set once at
-    startup is enough. Read it through `project_dir()` — here and everywhere
-    else, `PROJECT_DIR` being the one name in this module that a `from … import`
-    would freeze at the launch directory.
-
-    The sentinel moves with the root, and it lives in `stopchannel` — told, not
-    read back, so a stop channel never has to import a runner. Both directions
-    of that handover are here: this call, and the one under the definition
-    above, which is what gives a launch before any --project-dir the same
-    answer both modules would have computed for themselves. The mirror log's
-    file name is the same handover for the same reason (`console`).
-    """
-    global PROJECT_DIR
-    if path:
-        PROJECT_DIR = os.path.abspath(path)
-        stopchannel.set_stop_root(PROJECT_DIR)
-        console.set_log_project(PROJECT_DIR)
-    return PROJECT_DIR
-
-
-stopchannel.set_stop_root(PROJECT_DIR)
-console.set_log_project(PROJECT_DIR)
-
-
-def project_dir() -> str:
-    """The current project root (see set_project_root)."""
-    return PROJECT_DIR
-
-
-# Markers that identify a project root when walking up the directory tree. `.git`
-# is matched as either a directory (normal clone) or a file (git worktree /
-# submodule), which os.path.exists covers for both.
-ROOT_MARKERS = (".git", ".hg", ".svn")
-
-
-def find_project_root(start: Optional[str] = None) -> Optional[str]:
-    """Walk up from `start` (the current working directory by default) until a
-    directory containing a VCS marker (`ROOT_MARKERS`) is found, and return it.
-
-    A wrapper that anchors the search to its own file location (rather than the
-    process cwd) gets a project root that is independent of where the loop was
-    launched from: run it from the repo root, from a subdirectory, or from
-    anywhere else and it lands on the same root — so git/provider CLI run there, the
-    stop file lives there, and the model loads the root CLAUDE.md the same way
-    every time. Returns None if no marker is found up to the filesystem root,
-    leaving the engine's default (the current working directory) in place.
-    """
-    path = os.path.abspath(start if start else os.getcwd())
-    while True:
-        if any(os.path.exists(os.path.join(path, m)) for m in ROOT_MARKERS):
-            return path
-        parent = os.path.dirname(path)
-        if parent == path:  # reached the filesystem root without a match
-            return None
-        path = parent
+# The project root lives in `projectroot`, its own leaf module, and is reached
+# through it: `projectroot.project_dir()`. Not re-exported here on purpose —
+# this runner is a CONSUMER of the root, not its home, and a `from … import`
+# would put a second address on the same fact, which is what the split removed
+# (see that module's header for the two mirrors it deleted). The package's front
+# door still spells them `llm_loop.project_dir` / `set_project_root` /
+# `find_project_root`, so an embedder's address is unchanged.
 
 
 # Per-run cost accounting parsed straight back out of the mirror log: every run's
@@ -449,7 +380,7 @@ ClaudeCommand = AgentCommand
 def build_agent_argv(command: AgentCommand, provider: Optional[str] = None) -> list:
     """Full provider command line for one unit of work."""
     provider = provider or command.provider or "claude"
-    return provider_argv(command, provider, project_dir())
+    return provider_argv(command, provider, projectroot.project_dir())
 
 
 def build_claude_argv(command: ClaudeCommand) -> list:
@@ -770,7 +701,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     _turn_cost_base = 0.0     # a new process starts a new cost total
     spec = provider_spec(provider)
     try:
-        proc = start_agent_process(cmd, provider, prompt, project_dir())
+        proc = start_agent_process(cmd, provider, prompt, projectroot.project_dir())
     except FileNotFoundError:
         print(f"Executable {spec.executable!r} not found. "
               f"Is {spec.display_name} installed and on PATH?")
@@ -1176,7 +1107,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
     # Anchor every project-relative operation (git/provider cwd, the stop file, the
     # log name, the Driver's paths) to the chosen root before anything reads it.
-    set_project_root(getattr(args, "project_dir", None))
+    projectroot.set_project_root(getattr(args, "project_dir", None))
 
     # --cost: report per-run spend from the mirror log and exit, without touching
     # the loop, the tee, git, or the usage gate. Done here (after the root is
@@ -1203,8 +1134,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # log whose abrupt end it explains. Idempotent per process: the periodic
         # wrapper calls this runner repeatedly and keeps one record.
         exitlog.begin(app_name, console.LOG_DIR,
-                      os.path.basename(project_dir()))
-    print(f"  · project root: {project_dir()}")
+                      os.path.basename(projectroot.project_dir()))
+    print(f"  · project root: {projectroot.project_dir()}")
     if dry_run:
         print(f"  · dry run: nothing is mirrored to "
               f"{console.log_file_path(app_name)}")
@@ -1362,7 +1293,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # Git push policy: evaluated at the start of every iteration.
             if not dry_run:
                 last_git_push = maybe_git_push(run_settings.git_push,
-                                               last_git_push, project_dir())
+                                               last_git_push, projectroot.project_dir())
 
             max_runs = run_settings.max_runs
             if max_runs is not None and iteration >= max_runs:
@@ -1617,10 +1548,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # on the way out so work isn't left only on the local branch — unless the
     # policy is NONE (never auto-push).
     if not dry_run and run_settings.git_push != GitPushPolicy.NONE:
-        count = git_unpushed_count(project_dir())
+        count = git_unpushed_count(projectroot.project_dir())
         if count is None or count > 0:
             print("  · final git push on exit…")
-            git_push(project_dir())
+            git_push(projectroot.project_dir())
         else:
             print("  · final git push: nothing to push.")
 

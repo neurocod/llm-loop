@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from llm_loop import console, cyclecore, parallel
+from llm_loop import console, cyclecore, parallel, projectroot
 from llm_loop.cyclecore import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
@@ -215,9 +215,9 @@ def log_dir(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _restore_project_root():
-    previous = cyclecore.project_dir()
+    previous = projectroot.project_dir()
     yield
-    cyclecore.set_project_root(previous)
+    projectroot.set_project_root(previous)
 
 
 def _drop_logger(app_name):
@@ -274,15 +274,17 @@ def test_a_projects_log_is_named_after_that_project(tmp_path, log_dir):
     """Two projects must not end up writing to one log — the folder name in the
     file name is the whole of what keeps them apart.
 
-    Pinned because the name is now HANDED to the printer (`console`) instead of
-    read out of the runner: `set_project_root` tells it, and a handover that
-    silently stopped happening would leave every project logging under whatever
-    directory the process happened to start in. Measured: with the assignment in
-    `set_log_project` removed, nothing else in this suite goes red.
+    Pinned because the printer (`console`) DERIVES the name from the project
+    root (`projectroot.project_dir()`) on every call, rather than the root being
+    pushed into a copy here — a push that silently stopped happening would leave
+    every project logging under whatever directory the process happened to start
+    in. Measured, and still true of the derivation that replaced the push:
+    with `log_file_path` reading `os.getcwd()` instead, nothing else in this
+    suite goes red.
     """
     project = tmp_path / "some-project"
     project.mkdir()
-    cyclecore.set_project_root(str(project))
+    projectroot.set_project_root(str(project))
 
     assert console.log_file_path("pytest-named").name == \
         "pytest-named-some-project.log"

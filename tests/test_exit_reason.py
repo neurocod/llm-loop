@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from llm_loop import console, cyclecore, exitlog
+from llm_loop import console, cyclecore, exitlog, projectroot
 from llm_loop.cyclecore import ClaudeCommand, Driver
 
 
@@ -56,12 +56,12 @@ def _isolated_record(tmp_path, monkeypatch):
     """Every test gets its own log dir and its own fresh record."""
     monkeypatch.setattr(console, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(exitlog, "_record", None)
-    root = cyclecore.project_dir()
+    root = projectroot.project_dir()
     streams = sys.stdout, sys.stderr
     yield
     exitlog.finish()
     sys.stdout, sys.stderr = streams
-    cyclecore.set_project_root(root)
+    projectroot.set_project_root(root)
     for handler in list(logging.getLogger("runCycle.pytest-exit").handlers):
         handler.close()
     logging.getLogger("runCycle.pytest-exit").handlers = []
