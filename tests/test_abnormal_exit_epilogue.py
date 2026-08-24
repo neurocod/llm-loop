@@ -19,7 +19,9 @@ the sequential loop pushes at the top of every pass, so a run that failed five
 times had already pushed five times, and "a push happened" was true whether the
 exit push ran or not — the pin passed with the whole epilogue deleted. What these
 pins are about is the exit push specifically, so that is the call they watch.
-Whether it really runs git, and in which repository, is `test_git_push`'s.
+Whether it really runs git, and in which repository, is `test_git_push`'s — and
+these runs are launched `--git-push none` so that stays true of them, which it
+was not at first (see `_seq_args`).
 """
 
 import logging
@@ -116,7 +118,15 @@ def _seq_args(project_dir):
     ns.dry_run = False
     ns.raw = False
     ns.start_in = None
-    ns.git_push = "after_new_commits"
+    # NONE, and that is not laziness. `exit_pushes` replaces the EXIT push only;
+    # the sequential loop's per-pass `maybe_git_push` stays real, so under
+    # `after_new_commits` these pins ran `git push` as a subprocess six times
+    # against a pytest tmp_path (measured). Harmless there and a real push the
+    # day a tmp dir sits inside a repo with an upstream. The policy is not what
+    # is being pinned — `exit_pushes` records the call and its project whatever
+    # the policy says, and which repository a real push goes to is
+    # `test_git_push`'s question.
+    ns.git_push = "none"
     ns.project_dir = project_dir
     ns.cost = False
     ns.no_statusline = True

@@ -29,7 +29,7 @@ Two kinds of name are declared, and the difference is not stylistic:
 
 What is NOT here: the tool-INPUT schema (`Bash`'s `command`, `Grep`'s `path`,
 …). That is a layer deeper — the tools' own vocabulary rather than the
-stream's — and it already lives in one place, `compactline.tool_detail`.
+stream's — and it already lives in one place, `compactline.describe_tool`.
 """
 
 from typing import Any, Optional

@@ -21,7 +21,7 @@ import threading
 import pytest
 
 from llm_loop import (cyclecore, operator, parallel, providers, streamrender,
-                      textwidth)
+                      textwidth, wire)
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 from llm_loop.agentwork import AgentCommand, Driver
@@ -239,6 +239,29 @@ def test_only_this_mailboxs_own_notes_are_claimed_from_the_replay():
     assert mailbox.claim_echo("Generate Blender build scripts for …") is None
     assert mailbox.claim_echo(framed) == "mind the bevels"
     assert mailbox.claim_echo(framed) is None, "a receipt is claimed once"
+
+
+def test_the_note_goes_out_in_the_shape_the_renderers_read_back():
+    """The write half of the round trip, pinned against the read half.
+
+    A note leaves as a `user` event on stdin and comes back on the stream, where
+    both renderers pick it apart with `wire.message_blocks` / `block_type` /
+    `block_text` and hand the text to `claim_echo`. `wire.user_message` is the one
+    place that shape is written, and its docstring calls the two halves one fact —
+    but nothing checked it: measured 2026-08-24 by mutation, spelling the role
+    `assistant` left the whole suite green, and the CLI would have rejected every
+    note at runtime. So the pin reads the written line back THROUGH the renderer's
+    own accessors rather than comparing it to a second copy of the literal.
+    """
+    line = operator.user_message_line("mind the bevels")
+    event = json.loads(line)
+
+    assert line.endswith("\n")
+    assert wire.event_type(event) == wire.USER
+    assert event["message"]["role"] == "user"
+    block, = wire.message_blocks(event)
+    assert wire.block_type(block) == wire.BLOCK_TEXT
+    assert wire.block_text(block) == "mind the bevels"
 
 
 def test_queued_notes_are_appended_to_the_prompt_as_a_named_section():

@@ -588,6 +588,59 @@ def test_the_kept_tail_is_bounded_and_truncated(monkeypatch, capsys):
     assert all(len(ln) < 300 for ln in kept)           # each one cut to the row
 
 
+# --- the SECOND renderer reads the same stream ---------------------------------
+#
+# `parallel.run_job` renders the events `streamrender` renders, one atomic line
+# at a time. Everything below is about a branch of it that nothing else reaches:
+# the pins around the live renderer say nothing about this one, and until `wire`
+# existed the two were written independently.
+
+def test_a_worker_surfaces_the_runs_own_rate_limit_verdict(monkeypatch, capsys):
+    """The parallel runner's half of the limit backstop, and it was BROKEN.
+
+    Measured on the revision before `wire`: `run_job` bound the name `usage` as a
+    local in its `turn.completed` branch, so the `rate_limit_event` branch's
+    `usage.rate_limit_event_from(ev)` raised `UnboundLocalError` — for a claude
+    job, where the codex branch never runs and the local is never assigned. Every
+    rate-limit verdict in a parallel worker therefore blew the job up instead of
+    being reported. Reading the event through `wire` removed the local and fixed
+    it silently; nothing pinned it, so nothing would report the regression.
+    """
+    monkeypatch.setattr(
+        parallel, "start_agent_process",
+        lambda *args: _FakeAgentProcess(has_stdin=False, stdout=json.dumps({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "rejected",
+                                "rateLimitType": "five_hour"},
+        }) + "\n"))
+
+    rc, _cost, _dur = parallel.run_job(
+        4, AgentCommand("p", "opus", "job", "claude"))
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "rate limit: session limit rejected" in out
+
+
+def test_a_worker_keeps_an_empty_slot_for_a_command_that_reported_no_code(
+        monkeypatch, plain_lines):
+    """This runner's head is fixed, so an absent exit code leaves a gap.
+
+    The live renderer drops the whole "exit N: " prefix instead, which is why
+    `wire.codex_exit_code` takes the default from its CALLER. Both halves of that
+    decision need a pin or the parameter is one caller's habit: this is the
+    parallel half (the live one is
+    `test_a_missing_exit_code_does_not_shrink_the_line`).
+    """
+    _codex_job(monkeypatch, json.dumps({
+        "type": "item.completed",
+        "item": {"type": "command_execution", "command": "ls"},
+    }) + "\n", returncode=0)
+
+    line, = plain_lines
+    assert "exit : ls" in line
+
+
 # --- command lines are shown the way they can be copied ------------------------
 #
 # Codex doubles every backslash in the `command` it reports, so a Windows path

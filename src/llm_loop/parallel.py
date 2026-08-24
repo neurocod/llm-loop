@@ -53,7 +53,16 @@ from . import runlifecycle
 from . import statusline
 from . import stopchannel
 from . import textwidth
-from . import usage
+# BY NAME, not through the module, and that is the repair of a real defect: this
+# function used to reach `usage.rate_limit_event_from` while its codex branch
+# bound a LOCAL called `usage` (`usage = ev.get("usage") or {}`), which made the
+# name local to the whole function — so every rate-limit verdict in a claude
+# worker raised UnboundLocalError instead of being reported, and the parallel
+# runner's half of the limit backstop never worked. The local is gone (the token
+# counts come through `wire` now) and a bare name cannot be shadowed by one
+# appearing again. Pinned by
+# `test_providers.test_a_worker_surfaces_the_runs_own_rate_limit_verdict`.
+from .usage import rate_limit_event_from
 # The words the provider stream is made of, shared with the other renderer:
 # this runner and `streamrender` read the SAME events, and 32 of the literals
 # they read them with used to be spelled in both files (see `wire`).
@@ -312,7 +321,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     # last verdict in a module global because it has exactly one
                     # stream: here there are `jobs` of them at once, so "the last
                     # verdict" is not a question this runner can answer.
-                    rl = usage.rate_limit_event_from(ev)
+                    rl = rate_limit_event_from(ev)
                     if rl is not None and rl.status != "allowed":
                         out.line(f"⚠ rate limit: {rl.describe()}", "bold red")
                 elif et == wire.RESULT:
@@ -1116,6 +1125,12 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # released. The interrupt does NOT exit from inside the `with app:`: the
     # closing report and the exit push would then be written over a pinned status
     # area, and the run would leave without either.
+    #
+    # A fact about THIS runner, not a rule — the sequential loop's two `sys.exit`
+    # endings do close down inside its region, and correctly: it prints inside
+    # the area on every iteration and pushes there on every pass, so a few more
+    # lines are what that area is already carrying. Here the workers' output is
+    # the area, and this is the one moment it stops being written to.
     interrupted = False
 
     # The region lives exactly as long as the workers do (run_loop releases it
@@ -1170,6 +1185,17 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # commits sitting local and its mailbox unread. The reason goes down
         # first, so the record does not depend on the push surviving a second
         # Ctrl+C.
+        #
+        # THE COST, NAMED because an operator feels it: this can take minutes.
+        # `close_run` takes `push_lock`, and an interrupt that lands while
+        # `push_pump` is inside `git push` waits for a subprocess with a 300 s
+        # timeout (`gitpush.git_push`), on top of `jobs` × INTERRUPT_JOIN_TIMEOUT_S
+        # for the workers. Waited out rather than bounded, and that is the
+        # decision: the thread holding the lock is PUSHING, so the alternative to
+        # waiting is not a faster exit with the same result, it is racing a
+        # second `git` against the first one. `pusher.join` is skipped for the
+        # same reason it would be pointless — `shared.stop` is already set, the
+        # pusher is a daemon, and the lock is what actually excludes it.
         exitlog.set_reason("interrupted by the operator (Ctrl+C)",
                            iterations=shared.claimed, completed=shared.done)
         runlifecycle.close_run(
