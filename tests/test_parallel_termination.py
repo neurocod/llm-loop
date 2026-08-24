@@ -26,7 +26,7 @@ import time
 
 import pytest
 
-from llm_loop import parallel, stopchannel
+from llm_loop import parallel, runlifecycle, stopchannel
 from llm_loop.drivers import ListFileDriver
 from llm_loop.stopchannel import RunStopReason
 
@@ -236,7 +236,7 @@ def test_a_paused_fleet_still_ends_at_the_item_cap(tmp_path, monkeypatch):
 def test_release_returns_claim_to_queue():
     """release() drops the line from in_progress and undoes its --max reservation."""
     driver = _MemDriver(["a", "b"])
-    shared = parallel.Shared(driver, max_items=5)
+    shared = parallel.Shared(driver, runlifecycle.RunSettings(max_runs=5))
     line = shared.claim()
     assert line in ("a", "b")
     assert shared.claimed == 1 and line in shared.in_progress

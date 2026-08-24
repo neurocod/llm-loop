@@ -22,7 +22,8 @@ import time
 
 import pytest
 
-from llm_loop import console, cyclecore, projectroot, stopchannel, textwidth
+from llm_loop import (console, cyclecore, projectroot, runlifecycle,
+                      stopchannel, textwidth)
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
@@ -843,10 +844,10 @@ def test_disabling_mid_paint_cannot_leave_a_name_on_the_window(monkeypatch):
 
 
 def test_the_git_push_value_is_lit_like_a_healthy_figure():
-    """Through `_script_settings`, not a hand-written field: the colouring is
+    """Through `script_settings`, not a hand-written field: the colouring is
     anchored on the knob's NAME, and this is what makes renaming it move the
     colour instead of quietly losing it."""
-    settings = cyclecore._script_settings(cyclecore.RunSettings(), sl)
+    settings = runlifecycle.script_settings(runlifecycle.RunSettings())
     line = sl.render_rows(sequential_status(script_limits=settings.status_entries()),
                           200, now=NOW)[1]
 

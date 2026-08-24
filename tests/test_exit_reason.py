@@ -14,8 +14,9 @@ import sys
 
 import pytest
 
-from llm_loop import console, cyclecore, exitlog, projectroot
+from llm_loop import console, cyclecore, exitlog, parallel, projectroot
 from llm_loop.agentwork import ClaudeCommand, Driver
+from llm_loop.drivers import ListFileDriver
 
 
 class _StubPolicy:
@@ -36,6 +37,36 @@ class _NoWorkDriver(Driver):
 
     def next_command(self):
         return None
+
+
+class _OneItemListDriver(ListFileDriver):
+    """A one-item in-memory queue: enough for the parallel runner to open a run.
+
+    One item and not none, because a parallel run with an empty list reports
+    "nothing to do" and returns before it has done anything a pin can look at.
+    """
+
+    target_suffix = ".out.md"
+
+    def __init__(self):
+        super().__init__()
+        self._items = ["products/only.md"]
+        self.limit_policy = _StubPolicy()
+
+    def prompt(self, source, target):
+        return "do it"
+
+    def model(self):
+        return ""
+
+    def pending_lines(self):
+        return list(self._items)
+
+    def strike(self, line):
+        if line in self._items:
+            self._items.remove(line)
+            return True
+        return False
 
 
 def _seq_args(project_dir):
@@ -62,9 +93,15 @@ def _isolated_record(tmp_path, monkeypatch):
     exitlog.finish()
     sys.stdout, sys.stderr = streams
     projectroot.set_project_root(root)
-    for handler in list(logging.getLogger("runCycle.pytest-exit").handlers):
+    _drop_logger("pytest-exit")
+
+
+def _drop_logger(app_name):
+    """Close and forget whatever mirror handler this logger currently holds."""
+    logger = logging.getLogger(f"runCycle.{app_name}")
+    for handler in list(logger.handlers):
         handler.close()
-    logging.getLogger("runCycle.pytest-exit").handlers = []
+    logger.handlers = []
 
 
 def _run_once(tmp_path):
@@ -133,6 +170,62 @@ def test_a_record_whose_owner_still_runs_is_left_alone(
     assert orphans == []
     assert live.exists()
     assert "is live (pid 424242" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_the_report_of_a_vanished_run_lands_in_the_log(
+        tmp_path, monkeypatch, runner):
+    """The ORDER inside the shared prologue: the tee goes up BEFORE exitlog.begin.
+
+    `begin` is what prints the previous run's missing-ending report, and the
+    whole point of that report is to explain a mirror log that stops mid-line.
+    Printed before the tee exists it goes to a terminal nobody is reading any
+    more, and the log it explains never gets it — which is exactly the log the
+    next reader opens. Nothing pinned that order before this: the closing line
+    is written at exit, long after the tee is up either way, so swapping the two
+    left the whole suite green.
+
+    Asserted against the FILE, never against capsys: the report reaches the
+    screen whichever order the two are in, so a screen-based assertion cannot
+    tell them apart. Both runners, because both open a run through the one
+    prologue and the pin has to fail if either stops doing so.
+    """
+    logs = console.LOG_DIR
+    logs.mkdir(parents=True, exist_ok=True)
+    project = os.path.basename(str(tmp_path))
+    app_name = "pytest-exit"
+    # `console.setup_file_logging` attaches a mirror handler only to a logger
+    # that has none, so a handler another test left on this name would keep this
+    # run's output going to THAT test's file while this one's path is merely
+    # printed — which reads exactly like the defect below and is not it.
+    _drop_logger(app_name)
+    dead = exitlog.record_path(logs, app_name, project, 424242)
+    dead.write_text(json.dumps({
+        "pid": 424242, "app": app_name, "project": project,
+        "argv": "runGenerateModels.py --codex --random",
+        "started": 1000.0, "alive_at": 2000.0,
+        "phase": "iteration 10 — electric-guitar-hollow-body.md",
+    }), encoding="utf-8")
+    monkeypatch.setattr(exitlog, "pid_alive", lambda pid, started=None: False)
+
+    if runner == "sequential":
+        _run_once(tmp_path)
+    else:
+        monkeypatch.setattr(parallel, "run_job",
+                            lambda job_id, command, mailbox=None: (0, None, None))
+        args = _seq_args(str(tmp_path))
+        args.jobs = 1
+        args.ignore_usage = True
+        parallel.run_parallel(_OneItemListDriver(), args, app_name=app_name,
+                              wait_on_start=False)
+    exitlog.finish()
+
+    written = console.log_file_path(app_name).read_text(
+        encoding="utf-8", errors="replace")
+    assert "killed from outside" in written, (
+        "the report of the previous run that vanished never reached the mirror "
+        "log — exitlog.begin ran before the tee was up")
+    assert "electric-guitar-hollow-body.md" in written
 
 
 def test_the_liveness_probe_does_not_kill_what_it_asks_about(monkeypatch):

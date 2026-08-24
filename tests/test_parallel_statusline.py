@@ -20,7 +20,8 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, parallel, projectroot, stopchannel
+from llm_loop import (cyclecore, parallel, projectroot, runlifecycle,
+                      stopchannel)
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 from llm_loop.drivers import ListFileDriver
@@ -120,8 +121,8 @@ def _live_statusline(monkeypatch, made, *, live=True):
 
     real_shared_class = parallel.Shared
 
-    def _shared(driver, max_items):
-        shared = real_shared_class(driver, max_items)
+    def _shared(driver, settings):
+        shared = real_shared_class(driver, settings)
         made["shared"] = shared
         return shared
 
@@ -378,7 +379,7 @@ def test_a_sentinel_this_run_did_not_write_is_not_reopenable(tmp_path, monkeypat
 def test_a_max_items_stop_is_never_reopened():
     """The cap and the request both close claims; only the request is undoable."""
     driver = _MemDriver(["a", "b"])
-    shared = parallel.Shared(driver, max_items=1)
+    shared = parallel.Shared(driver, runlifecycle.RunSettings(max_runs=1))
 
     assert shared.claim() in ("a", "b")
     assert shared.claim() is None and shared.claims_closed.is_set()
@@ -393,7 +394,7 @@ def test_a_max_items_stop_is_never_reopened():
 
 def test_only_one_worker_owns_the_pending_request():
     """N workers counting down together would each latch on their own deadline."""
-    shared = parallel.Shared(_MemDriver(["a"]), max_items=None)
+    shared = parallel.Shared(_MemDriver(["a"]), runlifecycle.RunSettings())
 
     assert shared.request_stop(2) == (True, True)     # owner, and the first pass
     assert shared.request_stop(3) == (False, False)

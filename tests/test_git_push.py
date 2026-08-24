@@ -22,7 +22,7 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, gitpush, parallel, projectroot
+from llm_loop import cyclecore, gitpush, parallel, projectroot, runlifecycle
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
@@ -321,12 +321,71 @@ def test_the_parallel_pusher_pushes_the_project_it_was_pointed_at(
         f"the parallel pusher pushed the wrong repository: {fake.calls}"
 
 
+def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
+    """`--git-push` is an editable knob in BOTH runners, not only the sequential one.
+
+    It was frozen here: the policy was read into a local at startup and captured
+    by the pusher's closure, so a fleet run offered the flag on the command line
+    and then ignored every edit of it — a run launched `--git-push none` could
+    not be told to start pushing however hard its operator pressed the key. The
+    sequential runner had had the knob for as long as RunSettings existed, and
+    nothing said the two disagreed.
+
+    Launched with `none` on purpose: it is the value that used to make the run
+    skip creating a pusher thread at all, so a run that pushes ANYTHING here is
+    a run that read the policy after the edit rather than before it.
+    """
+    fake = _FakeGitModule()
+    registry = {}
+    real_script_settings = runlifecycle.script_settings
+
+    def capture(run_settings, progress=None):
+        registry["settings"] = real_script_settings(run_settings, progress)
+        return registry["settings"]
+
+    monkeypatch.setattr(runlifecycle, "script_settings", capture)
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
+    saw_push = []
+
+    def edit_the_knob_then_wait(job_id, command, mailbox=None):
+        # The `l` key's editor, reached the way the status line reaches it.
+        registry["settings"].get(gitpush.GIT_PUSH_SETTING).set("after_new_commits")
+        saw_push.append(fake.pushed.wait(timeout=PUMP_WAIT_S))
+        return 0, None, None
+
+    monkeypatch.setattr(parallel, "run_job", edit_the_knob_then_wait)
+    root = _elsewhere(tmp_path)
+    args = _par_args(root)
+    args.git_push = "none"
+
+    try:
+        parallel.run_parallel(_MemListDriver(["products/only.md"]), args,
+                              app_name="pytest-gitpush")
+    except SystemExit:
+        pass
+
+    assert saw_push == [True], (
+        "the run never pushed after the policy was edited — the parallel "
+        "runner is still reading a frozen copy of --git-push")
+    assert fake.dirs == {root}, \
+        f"the parallel runner pushed the wrong repository: {fake.calls}"
+
+
 class _OverlapWatchingGit(_FakeGitModule):
     """`_FakeGitModule` that HOLDS each `git push` and records concurrency.
 
     `max_live` is the most pushes ever in flight at once. git is not safe to call
     concurrently, so the whole point of the run's push lock is that this number
     is 1; without the lock around the exit push it is 2.
+
+    `beside_a_push` is the narrower question, and it is what pins the SCOPE of
+    that lock rather than its presence: every git command — `rev-list` included —
+    that started while a push was in flight. The exit push takes the lock around
+    the WHOLE of `final_git_push`, so the count it reads to decide "is there
+    anything to push?" is inside too; reading it outside is how "nothing to push"
+    could be printed about a repository that was being pushed at that moment, and
+    `max_live` cannot see that at all — a lone `rev-list` is not a second push.
 
     The first push blocks on `release` instead of sleeping, so the overlap is
     staged rather than raced: the pusher is provably still inside `git push` when
@@ -338,9 +397,13 @@ class _OverlapWatchingGit(_FakeGitModule):
         self.release = threading.Event()
         self.live = 0
         self.max_live = 0
+        self.beside_a_push = []
         self._live_lock = threading.Lock()
 
     def run(self, argv, **kwargs):
+        with self._live_lock:
+            if self.live:
+                self.beside_a_push.append(tuple(argv)[:2])
         if tuple(argv)[:2] != ("git", "push"):
             return super().run(argv, **kwargs)
         with self._live_lock:
@@ -494,3 +557,10 @@ def test_the_exit_push_never_runs_beside_the_background_pusher(
         f"nothing about their mutual exclusion; lock waits seen: {waits.waits}")
     assert fake.max_live == 1, \
         f"two git pushes were in flight at once: {fake.calls}"
+    # The SCOPE, not just the presence: `git_unpushed_count` is inside the lock
+    # too, so no git call of any kind may start while a push is in flight. Move
+    # that count out from under the lock and this list holds a `rev-list` while
+    # `max_live` still reads 1 — the defect the wide scope was chosen against.
+    assert fake.beside_a_push == [], (
+        "a git command ran while a push was in flight, so the exit push's lock "
+        f"does not cover the whole of final_git_push: {fake.beside_a_push}")

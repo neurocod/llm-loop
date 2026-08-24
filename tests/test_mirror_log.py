@@ -343,6 +343,34 @@ def test_a_named_log_is_read_instead_of_this_entry_points_own(
     assert "TOTAL: 2 sessions, 3 costs, $2.2500" in out
 
 
+def test_cost_reads_the_named_projects_log_not_the_launch_directorys(
+        tmp_path, log_dir, capsys):
+    """`--cost` resolves its log against `--project-dir`.
+
+    Which is why the root is anchored BEFORE that branch, in `run_loop` itself,
+    rather than by the shared prologue the branch deliberately skips: a report is
+    not a run, so it must not raise the tee or open an exit record, but it does
+    need to know which project's log to read. The mirror log's name carries the
+    project folder (see `console.log_file_path`), so a `--cost` reached with the
+    root unanchored reads the log of whatever directory the process happened to
+    be launched from — and reports "no cost lines" about a project with plenty.
+    """
+    project = tmp_path / "some-project"
+    project.mkdir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "pytest-costs-some-project.log").write_text(
+        _TWO_SESSIONS, encoding="utf-8")
+    args = _seq_args(str(project), dry_run=False)
+    args.cost = True
+
+    driver = _OneShotDriver()
+    cyclecore.run_loop(driver, args, app_name="pytest-costs",
+                       wait_on_start=False)
+
+    assert driver.served == 0, "the loop ran instead of reporting"
+    assert "TOTAL: 2 sessions, 3 costs, $2.2500" in capsys.readouterr().out
+
+
 def test_naming_a_log_reports_instead_of_running_the_loop(
         tmp_path, log_dir, capsys):
     """--cost-log implies --cost: the alternative is a silent full run.

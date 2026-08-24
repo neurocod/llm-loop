@@ -16,7 +16,11 @@ What this shares with the sequential runner, and what it deliberately drops:
     build_agent_argv, the usage session-limit machinery, the git-push policy
     and the rotating mirror log. Every one of those is now a module of its own,
     so this runner no longer imports the sequential one at all: the two are
-    siblings over shared parts, not a runner and its borrower.
+    siblings over shared parts, not a runner and its borrower. Opening and
+    closing a run is `runlifecycle`, and it is shared as CODE rather than as a
+    comment saying "the same as over there" — which is what the two runners used
+    to have, and what let `--git-push` be a live knob in one of them and a frozen
+    local in the other.
   * Dropped — the live token-by-token Markdown rendering. cyclecore's stream
     renderer keeps module-global state that cannot serve several concurrent
     streams without garbling, so here each worker prints one compact, fully
@@ -40,12 +44,12 @@ from typing import Callable, Optional
 
 from . import clispec
 from . import compactline
-from . import console
 from . import exitlog
 from . import limits
 from . import operator
 from . import projectroot
 from . import providers
+from . import runlifecycle
 from . import statusline
 from . import stopchannel
 from . import textwidth
@@ -55,15 +59,14 @@ from .agentwork import (
     build_agent_argv,
 )
 from .console import print_markup
-from .gitpush import (
-    GitPushPolicy,
-    final_git_push,
-    maybe_git_push,
-)
+# Only the per-turn call: the exit push (and the policy enum with it) belongs to
+# the shared epilogue, `runlifecycle.end_run`, which is where both runners close
+# a run down and therefore the one place that decides how the exit push is
+# guarded.
+from .gitpush import maybe_git_push
 from .stopchannel import RunResult, RunStopReason
 from .providers import (note_channel, provider_spec, reap_agent_process,
-                        set_live_messages, start_agent_process,
-                        usage_source_for)
+                        start_agent_process, usage_source_for)
 from .drivers import ListFileDriver
 
 # How many of a failed job's discarded non-JSON lines are kept as its failure
@@ -335,8 +338,13 @@ class Shared:
     access is under `lock`.
     """
 
-    def __init__(self, driver: ListFileDriver, max_items: Optional[int]):
+    def __init__(self, driver: ListFileDriver, settings):
         self.driver = driver
+        # The run's live knobs (runlifecycle.RunSettings), not a copy of the cap
+        # taken here: `--max-runs` is editable from the status line, and the
+        # claim loop below is the one place that enforces it — so it has to read
+        # the value the editor writes, at the moment it claims. See `max_items`.
+        self.settings = settings
         self.lock = threading.Lock()
         self.in_progress = set()      # raw lines a worker is currently handling
         # The subset of those whose provider turn is actually in flight. Not the
@@ -349,7 +357,6 @@ class Shared:
         self.attempts = {}            # raw line -> failed-attempt count
         self.claimed = 0              # files claimed this run (for --max-runs)
         self.done = 0                 # files processed successfully
-        self.max_items = max_items
         self.stop = threading.Event()  # cancel/wake the run on stop-file / no-work
         self.claims_closed = threading.Event()  # max reached: finish in-flight work
         # A stop request closes claims too, but REVERSIBLY (see reopen_claims).
@@ -363,6 +370,18 @@ class Shared:
         # `p` key is read by every worker, and a fleet of eight would otherwise
         # announce one keypress eight times.
         self.paused_noted = False
+
+    @property
+    def max_items(self) -> Optional[int]:
+        """The live `--max-runs` cap: how many FILES this run may claim.
+
+        Read through the run's settings on every ask rather than copied in, so
+        an edit made from the status line lands in the one place that enforces
+        the cap. It has to be a read and not a snapshot: this runner has no
+        iteration boundary on the main thread where a copy could be refreshed —
+        which is exactly why the knob used to be missing here.
+        """
+        return self.settings.max_runs
 
     def _pending(self) -> list:
         """Lines nobody holds and nobody gave up on (call under `lock`)."""
@@ -891,53 +910,27 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     args.max is a slice size and this call cannot know the run's real work — the
     wrapper passes what it knows. Left None, this call is the invocation.
     """
+    # The prologue both runners share: provider, live knobs, project root, the
+    # tee, the exit record, the header. Under this runner's own app name, so its
+    # log does not fight the sequential one's. See `runlifecycle` for the two
+    # orderings inside it that are load-bearing.
+    ctx = runlifecycle.begin_run(driver, args, app_name, progress,
+                                 setup_logging=setup_logging)
+    provider, spec = ctx.provider, ctx.spec
+    progress, owns_progress = ctx.progress, ctx.owns_progress
+    run_settings = ctx.settings
+
     # Worker count precedence: explicit -j/--jobs on the CLI, then the driver's
-    # `jobs` attribute (a subclass may pin it), then the engine default.
-    provider = getattr(args, "provider", None) or driver.provider
-    spec = provider_spec(provider)
-    driver.provider = provider
+    # `jobs` attribute (a subclass may pin it), then the engine default. Not a
+    # knob: the pool is built once, so unlike --max-runs and --git-push this one
+    # really is decided here, which is why it is printed in the header instead.
     jobs = args.jobs
     if jobs is None:
         jobs = getattr(driver, "jobs", None)
     if jobs is None:
         jobs = clispec.DEFAULT_JOBS
     jobs = max(1, jobs)
-    git_push_policy = GitPushPolicy(args.git_push)
-    # No wrapper above us: this call is the whole invocation, so its own --max is
-    # the invocation cap and it owns the figures (see the setting below).
-    owns_progress = progress is None
-    if owns_progress:
-        progress = statusline.InvocationProgress(max_items=args.max)
-
-    # Anchor every project-relative operation before anything reads the root.
-    projectroot.set_project_root(getattr(args, "project_dir", None))
-
-    # Decided before the first argv is built: the transport is what this turns
-    # off, and the argv and the process's stdin have to agree about it. Both
-    # directions, so a previous phase in the same process cannot decide it.
-    set_live_messages(not getattr(args, "no_live_messages", False))
-
-    # Mirror all output to the rotating log, same as run_loop — under its own app
-    # name so this runner's log doesn't fight the sequential one's. A dry run is
-    # a preview, not a run, and stays out of the shared record entirely: see the
-    # same branch in cyclecore.run_loop for the incident behind it.
-    if setup_logging and not args.dry_run:
-        logger = console.setup_file_logging(app_name)
-        sys.stdout = console.TeeToLog(sys.stdout, logger)
-        sys.stderr = console.TeeToLog(sys.stderr, logger)
-    if not args.dry_run:
-        # See the same call in cyclecore.run_loop: after the tee, so a vanished
-        # run's report lands in the log whose abrupt end it explains.
-        exitlog.begin(app_name, console.LOG_DIR,
-                      os.path.basename(projectroot.project_dir()))
-    print(f"  · project root: {projectroot.project_dir()}")
-    if args.dry_run:
-        print("  · dry run: nothing is mirrored to "
-              f"{console.log_file_path(app_name)}")
-    else:
-        print(f"  · logging to {console.log_file_path(app_name)}")
-    print(f"  · provider: {spec.display_name}")
-    print(f"  · jobs: {jobs}  ·  git push policy: {git_push_policy.value}")
+    print(f"  · jobs: {jobs}  ·  git push policy: {run_settings.git_push.value}")
 
     list_file_rel = driver.list_file
     pending_now = driver.pending_lines()
@@ -1005,7 +998,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     if source is not None:
         policy.log_snapshot(source, "at start (parallel)")
 
-    shared = Shared(driver, args.max)
+    shared = Shared(driver, run_settings)
 
     # What the queue holds right now: the baseline on the first call of the
     # invocation, and how far it has got on every later one. Through the
@@ -1016,34 +1009,19 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     progress.track_total(pending_total)
     progress.note_remaining(pending_total)
 
-    def set_max_items(value):
-        value = None if value is None else int(value)
-        shared.max_items = value
-        # A cap edited mid-run moves the summary row's denominator too — but only
-        # when this call IS the invocation. Under a wrapper the displayed cap is
-        # the wrapper's to set; this one only sizes the current batch.
-        if owns_progress:
-            progress.max_items = value
-
     # The pinned status area. A Job is the unit of display in BOTH runners, so
     # this is the sequential loop's wiring with N Jobs instead of one — no branch
     # anywhere in the status line separates them. Disabled it is a Null object,
     # so every call below stays a no-op and the run behaves exactly as before.
-    settings = statusline.SettingsRegistry()
-    settings.add(statusline.NumberSetting(
-        "max-runs", "--max-runs",
-        # Bound to Shared, not to a copy: here --max-runs caps FILES and the
-        # claim loop is what enforces it, so an edited cap (wave 2) lands in the
-        # one place that reads it. The run's other flags (-j, --git-push) are
-        # consumed when the threads are created and cannot be re-read mid-run,
-        # so they are printed in the header rather than offered as knobs.
-        lambda: shared.max_items,
-        set_max_items,
-        minimum=1,
-        # Not a field of its own — the summary counter's denominator is this cap
-        # (or the list's size, whichever is smaller). The sequential runner
-        # registers the same knob, under the same label, from `run_loop`.
-        show_in_status=False))
+    #
+    # The same registry the sequential runner builds, from the same function, so
+    # both modes offer the same knobs under the same labels. --max-runs reaches
+    # the claim loop through `Shared.max_items`, and --git-push reaches the
+    # pusher and the exit push through `run_settings.git_push` — neither is
+    # copied into a local here, which is what the parallel runner used to do to
+    # the push policy and is why that knob did nothing in this mode.
+    settings = runlifecycle.script_settings(
+        run_settings, progress if owns_progress else None)
     # A note is addressed to "the agent", and only a one-worker run has exactly
     # one of those: with N workers the same keystroke would have to pick a
     # recipient, and the console shows their output interleaved. So a mailbox
@@ -1087,7 +1065,12 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     def push_pump():
         while not shared.stop.wait(PUSH_PUMP_INTERVAL_S):
             with push_lock:
-                last_push_box[0] = maybe_git_push(git_push_policy,
+                # The policy is read HERE, inside the lock, off the live knobs —
+                # never captured in this closure. A run launched `--git-push
+                # none` whose operator later turns pushing on must start
+                # pushing, and a run turned off mid-push must not have its
+                # policy read half-applied beside a push already in flight.
+                last_push_box[0] = maybe_git_push(run_settings.git_push,
                                                   last_push_box[0],
                                                   projectroot.project_dir())
 
@@ -1098,9 +1081,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                          daemon=True)
         for j in range(1, jobs + 1)
     ]
-    pusher = None
-    if git_push_policy != GitPushPolicy.NONE:
-        pusher = threading.Thread(target=push_pump, name="pusher", daemon=True)
+    # Started for EVERY run, including one launched with `--git-push none`: the
+    # policy is a knob now, so "there is nothing to push on" is a fact about this
+    # instant, not about the run. `maybe_git_push` is a no-op for NONE, so the
+    # cost of a pump nobody has switched on is one thread asleep in `wait`.
+    pusher = threading.Thread(target=push_pump, name="pusher", daemon=True)
 
     # The region lives exactly as long as the workers do (run_loop releases it
     # the same way, before its final push): a periodic run alternates batches of
@@ -1118,8 +1103,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                 app, source, policy, provider=provider))
         for t in threads:
             t.start()
-        if pusher is not None:
-            pusher.start()
+        pusher.start()
 
         try:
             for t in threads:
@@ -1132,30 +1116,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             sys.exit(130)
 
         shared.stop.set()  # release the pusher's wait()
-        if pusher is not None:
-            pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
+        pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
         app.update(phase="idle")
 
-    # Final push on the way out, the same call the sequential runner makes —
-    # inside the run's one push lock, because the join above may have given up
-    # on a pusher that is still in `git push`. The lock is HERE and not inside
-    # `final_git_push` on purpose: this is the runner with threads, so the
-    # exclusion is its own (see that function's docstring).
-    #
-    # The whole call is inside, `git_unpushed_count` included, and that is the
-    # deliberate half: reading the count while the pusher pushes is how the old
-    # spelling could print "nothing to push" about a repository that was being
-    # pushed at that moment. The price is paid at exit — a run whose pusher is
-    # mid-push now waits for it (up to `git_push`'s 300 s subprocess timeout)
-    # even when it has nothing of its own to push, where before it printed and
-    # left. Worth it: the alternative is a closing line that can be false, and
-    # the wait only happens when a push really is in flight.
-    with push_lock:
-        final_git_push(git_push_policy, projectroot.project_dir())
-
-    if source is not None:
-        policy.log_snapshot(source, "at end (parallel)", cache_value=False)
-
+    # This run's own closing report, before the shared epilogue: the run talks
+    # about its work first, and the housekeeping that closes it down follows.
     remaining = driver.pending_total()
     print(f"\nProcessed {shared.done} file(s) this run; "
           f"{remaining} still pending in {list_file_rel}.")
@@ -1164,7 +1129,6 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
               f"{MAX_ATTEMPTS} failed attempts:")
         for line in sorted(shared.failed):
             print(f"      {os.path.basename(line.strip())}")
-    operator.report_undelivered_notes(mailbox)
     # `stop_reason` unset means no worker ever reached a verdict about the run:
     # every one of the endings — the cap, the drained queue, a latched stop —
     # writes it before a worker can leave. So the threads did not run out of
@@ -1176,8 +1140,15 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         reason = RunStopReason.WORKERS_DIED
         print(f"  ⚠ every worker thread ended before the queue drained; "
               f"{remaining} file(s) left unclaimed.")
-    # See run_loop's matching call: the closing line belongs to the process, so
-    # the reason is recorded here and printed by exitlog on the way out.
-    exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
-                       iterations=shared.claimed, completed=shared.done)
-    return RunResult(reason, shared.claimed, shared.done, remaining)
+
+    # The epilogue both runners share: the exit push, the closing usage
+    # snapshot, the undelivered notes, the recorded reason. `push_lock` is this
+    # runner's, and it wraps the WHOLE exit push (`git_unpushed_count` included,
+    # and the reading of the policy with it) because the join above may have
+    # given up on a pusher that is still inside `git push` — see
+    # PUSHER_JOIN_TIMEOUT_S, and `runlifecycle.end_run` for the rest of why.
+    return runlifecycle.end_run(
+        ctx, reason, iterations=shared.claimed, completed=shared.done,
+        remaining=remaining, usage_source=source, limit_policy=policy,
+        snapshot_label="at end (parallel)", mailbox=mailbox,
+        push_lock=push_lock)

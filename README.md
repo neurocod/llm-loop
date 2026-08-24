@@ -178,6 +178,8 @@ credentials — useful on a CI box with no interactive login.
 src/
   llm_loop/
     cyclecore.py     engine: parse_args, run_loop, stream-json rendering
+    runlifecycle.py  the prologue and epilogue every run has, and the live
+                     knobs (RunSettings) both runners read
     agentwork.py     what one unit of work is, and the Driver protocol a
                      wrapper subclasses to produce them
     console.py       what a run prints, and the rotating mirror log that is the

@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Callable, Optional, Union
 
 from . import (clispec, compactline, console, exitlog, operator, projectroot,
-               providers, stopchannel, textwidth)
+               providers, runlifecycle, stopchannel, textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
 # Driver protocol that produces them — is `agentwork`, for the same reason as the
 # rest of this list: both runners execute that contract and neither owns it.
@@ -102,21 +102,15 @@ from .providers import (
     prompt_on_stdin,
     provider_spec,
     reap_agent_process,
-    set_live_messages,
     start_agent_process,
     usage_source_for,
 )
 # The git-push policy is `gitpush`, its own module, for the same reason as the
-# two above: both runners apply it and neither owns it. Imported by name because
-# these are the spellings both runners and the host wrappers already use, and
-# `GitPushPolicy` is part of the package's public surface (see __init__).
-from .gitpush import (
-    GIT_PUSH_POLICY,
-    GIT_PUSH_SETTING,
-    GitPushPolicy,
-    final_git_push,
-    maybe_git_push,
-)
+# two above: both runners apply it and neither owns it. Only the per-iteration
+# call is named here now — the exit push, the policy enum and its status label
+# are the shared prologue/epilogue's (`runlifecycle`), which is the one place
+# both runners open and close a run through.
+from .gitpush import maybe_git_push
 # What is known about a quota lives in `usage`, so the limit rules (and the
 # parallel runner) can use it without importing this one: the length of the
 # window a token-limited run waits out, and the vocabulary of the verdict the
@@ -698,52 +692,6 @@ def wait_before_start(spec: str) -> None:
     print("  ▶ Starting the loop.")
 
 
-class RunSettings:
-    """The script's own knobs, held in one MUTABLE object the loop re-reads.
-
-    Plain locals froze these at startup, which made "edit the limits while the
-    run goes" (the status line's `l` key) impossible without touching the loop
-    body. The loop now reads this object at every iteration boundary, so moving
-    `--max-runs` from 40 to 60 mid-run takes effect at the next boundary and
-    nothing else has to change.
-    """
-
-    def __init__(self, *, max_runs: Optional[int] = None,
-                 git_push: "GitPushPolicy" = None):
-        self.max_runs = max_runs
-        self.git_push = git_push or GitPushPolicy(GIT_PUSH_POLICY)
-
-
-def _script_settings(run_settings: RunSettings, statusline) -> "SettingsRegistry":
-    """The script's knobs as a SettingsRegistry — the display AND edit surface.
-
-    One registry is the single source of truth for both the pinned row
-    (`status_entries()`) and the reproducing command line (`overrides()`), so a
-    figure on screen can never disagree with the flag that would reproduce it;
-    the flags are checked against `cmdline.FLAG_ALIASES` at registration.
-    `statusline` is passed in because `run_loop` imports it lazily and hands it
-    down — see the note there. It was once a cycle break, and is no longer one.
-    """
-    registry = statusline.SettingsRegistry()
-    registry.add(statusline.NumberSetting(
-        "max-runs", "--max-runs",
-        lambda: run_settings.max_runs,
-        lambda value: setattr(run_settings, "max_runs",
-                              None if value is None else int(value)),
-        minimum=1,
-        # Editable and reproducible, but not a field of its own: the counter
-        # already ends in this number (`iter 11/40`), or in the list's size when
-        # that is the smaller of the two — see InvocationProgress.summary_fields.
-        # Off the row it also stops printing `max-runs off` for every run that
-        # never set one.
-        show_in_status=False))
-    registry.add(statusline.Setting(
-        GIT_PUSH_SETTING, "--git-push",
-        lambda: run_settings.git_push.value,
-        lambda value: setattr(run_settings, "git_push", GitPushPolicy(value))))
-    return registry
-
-
 @stopchannel.stop_file_lifecycle()
 def run_loop(driver: Driver, args: argparse.Namespace,
              app_name: str = "runCycle", *, setup_logging: bool = True,
@@ -766,18 +714,30 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # `import llm_loop.cyclecore` drags in, which is a different question.
     from . import limits, statusline
 
-    owns_progress = progress is None
-    if owns_progress:
-        progress = statusline.InvocationProgress(max_items=args.max)
+    # --cost: report per-run spend from the mirror log and exit, without touching
+    # the loop, the tee, git, or the usage gate. BEFORE the prologue, whose first
+    # act is to raise the tee and open an exit record: a report is not a run, and
+    # it must neither be mirrored into the shared log nor leave a record behind.
+    # It does need the project root, so it anchors it — `begin_run` anchors the
+    # same value again, which is what makes doing it twice free.
+    # --cost-log implies --cost: naming a log to read and getting a loop run
+    # instead would be a silent misfire, and there is nothing else it could mean.
+    projectroot.set_project_root(getattr(args, "project_dir", None))
+    cost_log = getattr(args, "cost_log", None)
+    if getattr(args, "cost", False) or cost_log:
+        report_costs(app_name, cost_log)
+        return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
 
-    provider = getattr(args, "provider", None) or driver.provider
-    spec = provider_spec(provider)
-    driver.provider = provider
-    # The live knobs (see RunSettings): read at each iteration boundary, never
+    # The prologue both runners share: provider, live knobs, project root, the
+    # tee, the exit record, the header. See runlifecycle for the two orderings
+    # inside it that are load-bearing.
+    ctx = runlifecycle.begin_run(driver, args, app_name, progress,
+                                 setup_logging=setup_logging)
+    provider, spec = ctx.provider, ctx.spec
+    progress, owns_progress = ctx.progress, ctx.owns_progress
+    # The live knobs (see RunSettings): read where they are USED, never
     # snapshotted into locals, so the status line's editor can move them mid-run.
-    run_settings = RunSettings(
-        max_runs=args.max,                          # None = no limit
-        git_push=GitPushPolicy(args.git_push))      # when to `git push` each iteration
+    run_settings = ctx.settings
     # When a finite iteration cap is given (-m/--max-runs) the run is short and
     # bounded on purpose, so the usage-limit machinery (the LimitPolicy
     # pause-on-limit logic) is skipped — we just run the requested iterations
@@ -786,54 +746,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # at all, which is a property of the invocation, not of the current cap.
     ignore_usage_limits = (args.max is not None
                            or not spec.supports_usage_limits)
-    dry_run = args.dry_run
+    dry_run = ctx.dry_run
     raw = args.raw
     start_in = args.start_in      # e.g. "29m" — delay before the loop starts
-    # Decided per invocation, before the first argv is built: the transport is
-    # what --no-live-messages turns off, and both the argv and the process's
-    # stdin have to agree about it. Set in BOTH directions — a wrapper that
-    # calls two runners in one process (see runGenerateModels' periodic mode)
-    # would otherwise have the first `--no-live-messages` phase decide the
-    # transport for every phase after it.
-    set_live_messages(not getattr(args, "no_live_messages", False))
-
-    # Anchor every project-relative operation (git/provider cwd, the stop file, the
-    # log name, the Driver's paths) to the chosen root before anything reads it.
-    projectroot.set_project_root(getattr(args, "project_dir", None))
-
-    # --cost: report per-run spend from the mirror log and exit, without touching
-    # the loop, the tee, git, or the usage gate. Done here (after the root is
-    # set, so the log path resolves) rather than in the loop body proper.
-    # --cost-log implies --cost: naming a log to read and getting a loop run
-    # instead would be a silent misfire, and there is nothing else it could mean.
-    cost_log = getattr(args, "cost_log", None)
-    if getattr(args, "cost", False) or cost_log:
-        report_costs(app_name, cost_log)
-        return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
-
-    # Mirror all screen output into a rotating log file under the home dir —
-    # except for a dry run, which is a preview and not a run: its output would
-    # otherwise displace real runs' records out of the shared rotating log (a
-    # preview once pushed ~26 MB through it, and the failure it was launched to
-    # explain rotated off the end). Said on screen so the missing log is visible
-    # rather than mysterious.
-    if setup_logging and not dry_run:
-        logger = console.setup_file_logging(app_name)
-        sys.stdout = console.TeeToLog(sys.stdout, logger)
-        sys.stderr = console.TeeToLog(sys.stderr, logger)
-    if not dry_run:
-        # After the tee, so the report of a run that vanished lands in the very
-        # log whose abrupt end it explains. Idempotent per process: the periodic
-        # wrapper calls this runner repeatedly and keeps one record.
-        exitlog.begin(app_name, console.LOG_DIR,
-                      os.path.basename(projectroot.project_dir()))
-    print(f"  · project root: {projectroot.project_dir()}")
-    if dry_run:
-        print(f"  · dry run: nothing is mirrored to "
-              f"{console.log_file_path(app_name)}")
-    else:
-        print(f"  · logging to {console.log_file_path(app_name)}")
-    print(f"  · provider: {spec.display_name}")
     if not console.RICH_AVAILABLE:
         print("  · Markdown rendering is off (the 'rich' library is missing). "
               "Enable it with:")
@@ -872,7 +787,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # the sequential loop is a run with exactly one Job — no branch anywhere in
     # the status line separates it from `-j N`. Disabled it is a Null object, so
     # every call below stays a no-op and the loop behaves exactly as before.
-    settings = _script_settings(run_settings, statusline)
+    settings = runlifecycle.script_settings(
+        run_settings, progress if owns_progress else None)
     # A driver that knows how much work it has is the source of truth for it:
     # the summary row then counts items FINISHED out of that total, not
     # iterations, so a retried item is not progress and a preflight that strikes
@@ -938,11 +854,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     app, usage_source, limit_policy, provider=provider))
         while True:
             # The caps are read LIVE (see RunSettings) and republished here, so an
-            # edit made while the run is going takes effect at this boundary and
-            # is what the pinned row shows. Under a wrapper the invocation's cap
-            # is the wrapper's to set — this call's cap only sizes one batch.
-            if owns_progress:
-                progress.max_items = run_settings.max_runs
+            # edit made while the run is going is what the pinned row shows at
+            # this boundary. Only republished: the edit itself already moved both
+            # the knob and the row's denominator, in the one setter both runners
+            # register (`runlifecycle.script_settings`). Re-assigning the
+            # denominator here as well would be a second writer for one number,
+            # and the parallel runner — which has no boundary to re-read at —
+            # could not have it.
             app.update(**progress.summary_fields(),
                        script_limits=settings.status_entries())
             pending = stopchannel.pending_stop(app)
@@ -1236,30 +1154,18 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     iterations=iteration, completed=completed)
                 sys.exit(returncode)
 
-    # Final push on the way out. Bare, with no lock around it: this runner has
-    # one thread and nothing to exclude — see `gitpush.final_git_push` for why
-    # the lock belongs to the caller that has threads rather than to the call.
-    if not dry_run:
-        final_git_push(run_settings.git_push, projectroot.project_dir())
-
-    # End-of-run usage snapshot (the policy's watched quotas), mirroring the one
-    # logged before iteration 1 — so each run records where it finished. Forced
-    # fresh (cache_value=False) so it reflects the true post-run state rather
-    # than a possibly-recent cached reading from the last limit check.
-    if not dry_run and usage_source is not None:
-        limit_policy.log_snapshot(usage_source, "at end (after last cycle)",
-                                  cache_value=False)
-
-    operator.report_undelivered_notes(mailbox)
-
-    # Closing line, if the driver has one (e.g. "Final state: …").
+    # This run's own closing line, if the driver has one (e.g. "Final state: …").
+    # Before the shared epilogue, which is housekeeping: the run reports on its
+    # work first, then the run is closed down.
     summary = driver.final_summary()
     if summary:
         print(f"\n{summary}")
-    # The reason this runner returned. Recorded rather than printed: a wrapper
-    # may call several runners, and the `=== run ended: … ===` line belongs to
-    # the process, so the last reason set wins and exitlog prints it on exit.
-    exitlog.set_reason(
-        stopchannel.STOP_REASON_TEXT.get(stop_reason, stop_reason.value),
-        iterations=iteration, completed=completed)
-    return stopchannel.RunResult(stop_reason, iteration, completed)
+    # The epilogue both runners share: the exit push, the closing usage
+    # snapshot, the undelivered notes, the recorded reason. No `push_lock`,
+    # because this runner has one thread and nothing to exclude — see
+    # `gitpush.final_git_push` for why the lock belongs to the caller that has
+    # threads rather than to the call.
+    return runlifecycle.end_run(
+        ctx, stop_reason, iterations=iteration, completed=completed,
+        usage_source=usage_source, limit_policy=limit_policy,
+        snapshot_label="at end (after last cycle)", mailbox=mailbox)
