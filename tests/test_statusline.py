@@ -1113,7 +1113,7 @@ def test_format_prompt_block_survives_an_empty_prompt():
 def test_a_dry_run_prints_the_prompt_block_for_job_one(tmp_path, capsys):
     """The joined `-p …` argv line hides the prompt; the block is what shows it."""
     from llm_loop import cyclecore
-    from llm_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.agentwork import AgentCommand, Driver
 
     class _OneShot(Driver):
         def next_command(self):
@@ -1405,7 +1405,7 @@ def test_a_bounded_run_shows_the_quotas_and_never_polls_for_them(monkeypatch,
                                                                  tmp_path):
     """Priming before `with app:` published nothing (push_quotas needs an enabled
     app), and a `-m N` run has no later limit check to publish them either."""
-    from llm_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.agentwork import AgentCommand, Driver
 
     class _OneShot(Driver):
         def next_command(self):
@@ -1419,7 +1419,7 @@ def test_a_bounded_run_shows_the_quotas_and_never_polls_for_them(monkeypatch,
 
 
 def test_an_unbounded_run_keeps_the_quota_figures_refreshed(monkeypatch, tmp_path):
-    from llm_loop.cyclecore import Driver
+    from llm_loop.agentwork import Driver
 
     class _NoWork(Driver):
         def next_command(self):
@@ -1435,7 +1435,7 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
                                                                    tmp_path):
     """Wave 2 edits --max-runs while the run goes, so the loop must not be
     comparing against a local it snapshotted at startup."""
-    from llm_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.agentwork import AgentCommand, Driver
 
     class _RaisesItsOwnCap(Driver):
         app = None
@@ -1465,7 +1465,7 @@ def test_a_paused_loop_holds_before_it_asks_the_driver_for_work(monkeypatch,
     reads must be quiet while a human edits it, so a pause taken after
     `next_command()` would hold the run with the edit already missed."""
     from llm_loop import cyclecore
-    from llm_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.agentwork import AgentCommand, Driver
 
     class _TwoItems(Driver):
         calls = 0
@@ -1501,7 +1501,7 @@ def test_a_pause_pressed_at_the_usage_gate_holds_the_next_iteration(monkeypatch,
     pause, so the loop head has to re-read it: without that the window opened
     and a full iteration started under a row that already said PAUSED."""
     from llm_loop import cyclecore
-    from llm_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.agentwork import AgentCommand, Driver
 
     key = {"up": False, "reads": 0}
 
@@ -1560,7 +1560,7 @@ def test_a_pause_pressed_at_the_usage_gate_holds_the_next_iteration(monkeypatch,
 
 def _counts_down(total):
     """A non-list Driver with `total` units of work and no queue behind it."""
-    from llm_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.agentwork import AgentCommand, Driver
 
     class _CountsDown(Driver):
         provider = "codex"
@@ -1604,7 +1604,7 @@ def test_a_driver_with_a_queue_of_its_own_gets_a_denominator(monkeypatch,
     however much was left in it — the one number a watcher wants.
     """
     from llm_loop import cyclecore
-    from llm_loop.cyclecore import AgentCommand, Driver
+    from llm_loop.agentwork import AgentCommand, Driver
 
     class _DrainsAFolder(Driver):
         """Two requests; one iteration clears one of them."""

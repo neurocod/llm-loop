@@ -15,7 +15,7 @@ import sys
 import pytest
 
 from llm_loop import console, cyclecore, exitlog, projectroot
-from llm_loop.cyclecore import ClaudeCommand, Driver
+from llm_loop.agentwork import ClaudeCommand, Driver
 
 
 class _StubPolicy:

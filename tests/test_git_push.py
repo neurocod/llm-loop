@@ -23,7 +23,7 @@ import threading
 import pytest
 
 from llm_loop import cyclecore, gitpush, parallel, projectroot
-from llm_loop.cyclecore import ClaudeCommand, Driver
+from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
 

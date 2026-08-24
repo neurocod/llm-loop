@@ -177,8 +177,9 @@ credentials — useful on a CI box with no interactive login.
 ```
 src/
   llm_loop/
-    cyclecore.py     engine: parse_args, run_loop, the Driver protocol,
-                     stream-json rendering
+    cyclecore.py     engine: parse_args, run_loop, stream-json rendering
+    agentwork.py     what one unit of work is, and the Driver protocol a
+                     wrapper subclasses to produce them
     console.py       what a run prints, and the rotating mirror log that is the
                      second copy of every line of it
     stopchannel.py   how a run is asked to stop or hold, and what it reports

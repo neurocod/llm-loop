@@ -21,7 +21,10 @@ import random
 from typing import Optional
 
 from . import projectroot
-from .cyclecore import AgentCommand, Driver, LoopStop
+# The contract these two implement, not the runner that executes it: a wrapper
+# that only ever calls `.main_parallel()` used to import the SEQUENTIAL loop to
+# reach the base class it subclasses.
+from .agentwork import AgentCommand, Driver, LoopStop
 
 
 def _abs_in_project(path: str) -> str:

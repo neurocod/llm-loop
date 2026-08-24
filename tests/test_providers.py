@@ -8,7 +8,7 @@ import pytest
 
 from llm_loop import (codex_usage, compactline, console, cyclecore, limits,
                       parallel, providers, textwidth)
-from llm_loop.cyclecore import AgentCommand, Driver
+from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
                                    usage_source_for)

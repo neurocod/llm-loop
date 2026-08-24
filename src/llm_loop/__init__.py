@@ -49,14 +49,8 @@ from . import cmdline
 from . import exitlog
 from . import stopchannel
 from .cyclecore import (
-    AgentCommand,
-    ClaudeCommand,
     ConsumedByWrapperAction,
-    Driver,
-    LoopStop,
     RateLimitEvent,
-    build_agent_argv,
-    build_claude_argv,
     last_rate_limit_event,
     parse_args,
     parse_duration,
@@ -64,6 +58,19 @@ from .cyclecore import (
     report_costs,
     run_loop,
     run_agent_streaming,
+)
+# Same story as the three below: the vocabulary of WORK — what a unit of it is,
+# how it becomes an argv, and the Driver protocol a wrapper subclasses — moved
+# out of cyclecore into `agentwork`, and the front door is unchanged on purpose.
+# A wrapper names the PACKAGE's `Driver`, not the runner it happens to drive;
+# most wrappers here drive the parallel one and never call `run_loop` at all.
+from .agentwork import (
+    AgentCommand,
+    ClaudeCommand,
+    Driver,
+    LoopStop,
+    build_agent_argv,
+    build_claude_argv,
 )
 # The project root moved out of cyclecore into `projectroot`, a leaf below both
 # runners and below the two modules that used to keep MIRRORS of it (see that

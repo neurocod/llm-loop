@@ -23,7 +23,7 @@ import pytest
 from llm_loop import cyclecore, operator, parallel, providers, textwidth
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
-from llm_loop.cyclecore import AgentCommand, Driver
+from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.providers import build_agent_argv, start_agent_process
 
 

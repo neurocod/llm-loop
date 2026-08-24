@@ -46,11 +46,11 @@ from . import providers
 from . import statusline
 from . import stopchannel
 from . import textwidth
-from .console import print_markup
-from .cyclecore import (
+from .agentwork import (
     AgentCommand,
     build_agent_argv,
 )
+from .console import print_markup
 from .gitpush import (
     GIT_PUSH_POLICY,
     GitPushPolicy,

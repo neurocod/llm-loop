@@ -434,7 +434,7 @@ class _RecordingTerminal(_LiveTerminal):
 def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
     """--grow-kit-periodically alternates parallel batches with sequential
     sweeps; two regions pinned at once would fight over the same screen rows."""
-    from llm_loop.cyclecore import Driver
+    from llm_loop.agentwork import Driver
 
     log = []
     real_app_class = sl.StatusApp

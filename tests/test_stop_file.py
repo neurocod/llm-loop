@@ -28,7 +28,7 @@ from typing import Optional
 import pytest
 
 from llm_loop import cyclecore, parallel, projectroot, statusline, stopchannel
-from llm_loop.cyclecore import ClaudeCommand, Driver
+from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 from llm_loop.limits import LimitPolicy, SessionLimit
 from llm_loop.usage import Usage, UsageReading

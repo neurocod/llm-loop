@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 import pytest
 
 from llm_loop import console, cyclecore, providers, usage
-from llm_loop.cyclecore import ClaudeCommand, Driver, RateLimitEvent
+from llm_loop.cyclecore import RateLimitEvent
+from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
 
 
