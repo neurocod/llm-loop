@@ -106,17 +106,6 @@ carries the flag across: `InvocationProgress` is the seam for invocation-wide
 state, but it holds figures, not requests. Not reachable from `runCycle.py`
 (one call per process), which is why it is here rather than fixed.
 
-### [P3] Nothing ties `FLAG_ALIASES` to the parsers it mirrors
-`cmdline.FLAG_ALIASES` is hand-kept in step with `cyclecore.parse_args`,
-`parallel.parse_args` and the host wrapper's own flags — its comment says so and
-says a missing spelling is not cosmetic. But no test asserts the coverage, so
-forgetting an entry leaves the suite fully green; the symptom appears later, in
-the status line's "reproduce this run" command, where the forgotten flag's value
-token is read as a flag. A parametrized case needs the parser objects, which
-`parse_args` builds locally and never returns — so the fix starts with splitting
-out a `build_parser()`. Found by review of the `--cost-log` commit (that entry
-was added, and would have been just as green if it had not been).
-
 ## Structure worth doing when something takes you there anyway
 
 Two findings from the structural pass over the operator-note commits. Neither is

@@ -37,6 +37,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+from . import clispec
 from . import compactline
 from . import console
 from . import exitlog
@@ -65,10 +66,10 @@ from .providers import (note_channel, provider_spec, reap_agent_process,
                         usage_source_for)
 from .drivers import ListFileDriver
 
-# Default worker count. The work is cheap and fully independent, so a handful of
-# concurrent jobs is the sweet spot before the shared session budget, not CPU,
-# becomes the bottleneck.
-DEFAULT_JOBS = 10
+# Default worker count. Declared with the `--jobs` option it is the default OF
+# (see clispec), because the help text there has to state the number; re-bound
+# here so this runner's own fallback reads as one of its constants.
+DEFAULT_JOBS = clispec.DEFAULT_JOBS
 
 # How many of a failed job's discarded non-JSON lines are kept as its failure
 # explanation. The reason a dying CLI gives is in its last lines, and the bound
@@ -116,62 +117,21 @@ def parse_args(argv=None, *, prog: str = "parallel",
                ) -> argparse.Namespace:
     """CLI for the parallel runner: the family's options plus -j/--jobs.
 
-    A trimmed copy of cyclecore.parse_args (it can't be reused directly: it has
-    no --jobs, and its --max-runs means *iterations*, which here is redefined as
-    a total-files cap). Every long option keeps its single-letter alias.
+    This is no longer a trimmed copy of cyclecore.parse_args. Both parsers are
+    built from the one table in `clispec`, which is also where the two real
+    differences are now written down instead of inferred by diffing two
+    functions: this mode's option list has -j/--jobs and no --cost/--raw/
+    --start-in, and the five options whose meaning differs here (--max-runs is a
+    total-files cap, not an iteration cap, and so on) carry their own help text.
 
     `extra_options` is the same wrapper hook cyclecore.parse_args documents — a
     mode switch is usually spelled the same way in both modes, so the two
     parsers have to offer the same seam or its --help would depend on which one
     the wrapper happened to reach.
     """
-    p = argparse.ArgumentParser(
-        prog=prog,
-        description=description or "Parallel autonomous loop running N "
-                                  "concurrent LLM workers over a list file.",
-    )
-    p.add_argument("-j", "--jobs", type=int, default=None, metavar="N",
-                   help="number of concurrent workers (default: the driver's "
-                        f"`jobs`, else {DEFAULT_JOBS})")
-    p.add_argument("-m", "--max-runs", "--max", dest="max", type=int, default=None,
-                   metavar="N",
-                   help="stop after processing N files total, across all workers "
-                        "(default: drain the whole list); --max is a deprecated alias")
-    p.add_argument("--codex", action="store_const", const="codex",
-                   dest="provider", default=None,
-                   help="run Codex CLI instead of the Driver's default provider")
-    p.add_argument("-d", "--dry-run", action="store_true",
-                   help="only print the commands that would run, don't run the LLM CLI "
-                        "and don't touch the list")
-    p.add_argument("-g", "--git-push", dest="git_push",
-                   choices=[pol.value for pol in GitPushPolicy],
-                   default=GIT_PUSH_POLICY.value,
-                   help="when to `git push`: none | after_new_commits | each_hour "
-                        f"(default: {GIT_PUSH_POLICY.value})")
-    p.add_argument("-C", "--project-dir", dest="project_dir", metavar="DIR",
-                   default=None,
-                   help="project root: cwd for git/provider CLI, base for the stop "
-                        "file and the list's relative paths "
-                        "(default: the current working directory)")
-    p.add_argument("--ignore-usage", action="store_true",
-                   help="don't pause on the Current-session usage limit "
-                        "(by default the workers pause together when the session "
-                        "budget is exhausted)")
-    # Accepted here too: the flag is documented as a general one, and a periodic
-    # run hands these args to the sequential loop (which honours it), so a parser
-    # that rejected it would exit 2 on a documented spelling.
-    p.add_argument("--no-statusline", dest="no_statusline", action="store_true",
-                   help="do not pin the interactive status rows at the bottom of "
-                        "the terminal (same as LLM_LOOP_STATUSLINE=0)")
-    p.add_argument("--no-live-messages", dest="no_live_messages",
-                   action="store_true",
-                   help="do not keep the agent's stdin open for notes typed "
-                        "during an iteration; they wait for the next prompt "
-                        f"instead (same as {providers.LIVE_MESSAGES_ENV}=0). "
-                        "Notes need a single worker either way")
-    if extra_options is not None:
-        extra_options(p)
-    return p.parse_args(argv)
+    return clispec.build_parser(clispec.PARALLEL, prog=prog,
+                                description=description,
+                                extra_options=extra_options).parse_args(argv)
 
 
 # --- output helpers: every emit goes through the shared lock --------------------

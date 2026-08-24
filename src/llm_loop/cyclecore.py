@@ -54,8 +54,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-from . import (compactline, console, exitlog, operator, projectroot, providers,
-               stopchannel, textwidth)
+from . import (clispec, compactline, console, exitlog, operator, projectroot,
+               providers, stopchannel, textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
 # Driver protocol that produces them — is `agentwork`, for the same reason as the
 # rest of this list: both runners execute that contract and neither owns it.
@@ -284,66 +284,15 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
     what keeps such a flag formatted, aligned and grouped like every other
     option — and lets the hook add a real, parsed option when the flag is not
     one the wrapper strips.
+
+    The options themselves are declared once for the whole family in `clispec`,
+    which is also where the parallel runner's parser and the alias table
+    `cmdline` strips an argv with come from. This function is the sequential
+    mode's name for that parser, and nothing else.
     """
-    p = argparse.ArgumentParser(
-        prog=prog,
-        description=description or "Autonomous loop driving an LLM CLI.",
-    )
-    # Most option names are kept in sync with continuous_claude.py (kebab-case,
-    # and --max-runs for the iteration cap). The former spellings (--max,
-    # --startIn) stay on as accepted aliases so existing invocations keep
-    # working.
-    p.add_argument("-m", "--max-runs", "--max", dest="max", type=int, default=None,
-                   metavar="N",
-                   help="stop after N iterations (default: run forever); "
-                        "--max is a deprecated alias")
-    p.add_argument("--codex", action="store_const", const="codex",
-                   dest="provider", default=None,
-                   help="run Codex CLI instead of the Driver's default provider")
-    p.add_argument("-d", "--dry-run", action="store_true",
-                   help="only print the commands, don't run the LLM CLI")
-    p.add_argument("-c", "--cost", action="store_true",
-                   help="print per-session cost totals from the mirror log and "
-                        "exit (no loop is run)")
-    p.add_argument("--cost-log", dest="cost_log", metavar="LOG",
-                   help="report on this log file instead of this entry point's "
-                        "own — a rotated backup (<app>-<project>.log.1) or a "
-                        "copy; implies --cost")
-    # No -r short flag: -r is --review-prompt in continuous_claude.py, so it is
-    # left free here rather than reused for --raw.
-    p.add_argument("--raw", action="store_true",
-                   help="print raw JSON events (for debugging)")
-    p.add_argument("-s", "--start-in", "--startIn", dest="start_in", metavar="DURATION",
-                   help="wait this long before starting the loop, e.g. 29m, 1h30m")
-    p.add_argument("-g", "--git-push", dest="git_push",
-                   choices=[pol.value for pol in GitPushPolicy],
-                   default=GIT_PUSH_POLICY.value,
-                   help="when to `git push` at the start of each iteration: "
-                        "none | after_new_commits | each_hour "
-                        f"(default: {GIT_PUSH_POLICY.value})")
-    p.add_argument("-C", "--project-dir", dest="project_dir", metavar="DIR",
-                   default=None,
-                   help="project root: cwd for git/provider CLI, base for the stop "
-                        "file and the Driver's relative paths "
-                        "(default: the current working directory)")
-    # No short alias: this is a rescue hatch for an odd terminal, not a knob to
-    # reach for. LLM_LOOP_STATUSLINE=0 does the same without editing a
-    # command line, and no TTY disables it by itself.
-    p.add_argument("--no-statusline", dest="no_statusline", action="store_true",
-                   help="do not pin the interactive status rows at the bottom of "
-                        "the terminal (same as LLM_LOOP_STATUSLINE=0)")
-    # Same shape of rescue hatch as --no-statusline, and for the same reason: it
-    # turns off a transport, not a feature. A note typed with the `m` key still
-    # reaches the agent — with the next iteration's prompt instead of the one
-    # already running.
-    p.add_argument("--no-live-messages", dest="no_live_messages",
-                   action="store_true",
-                   help="do not keep the agent's stdin open for notes typed "
-                        "during an iteration; they wait for the next prompt "
-                        f"instead (same as {providers.LIVE_MESSAGES_ENV}=0)")
-    if extra_options is not None:
-        extra_options(p)
-    return p.parse_args(argv)
+    return clispec.build_parser(clispec.SEQUENTIAL, prog=prog,
+                                description=description,
+                                extra_options=extra_options).parse_args(argv)
 
 
 def parse_duration(text: str) -> float:

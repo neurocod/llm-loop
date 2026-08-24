@@ -16,65 +16,25 @@ The module is deliberately PURE: no terminal, no I/O, and no import of cyclecore
 limits or parallel. `statusline` imports this one (SettingsRegistry validates
 every Setting.flag against FLAG_ALIASES) while cyclecore/limits/parallel import
 statusline - so a single import from here in the other direction would close the
-cycle.
+cycle. `clispec` is below all of them and is safe to import; see there.
 """
 
 import os
 import shlex
 import subprocess
 import sys
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+# The flag table this module strips an argv with, and the record type it is made
+# of, are DERIVED from the family's one option table rather than kept here: the
+# hand-written copy that used to live at this spot carried a comment naming the
+# two parsers it had been transcribed from, which is the whole reason the three
+# could drift. Re-exported under these names because that is where every caller
+# (statusline's SettingsRegistry, the tests, `rebuild_argv`'s own default) still
+# reaches for them.
+from .clispec import FLAG_ALIASES, Flag
 
 __all__ = ["FLAG_ALIASES", "Flag", "rebuild_argv", "render"]
-
-
-class Flag(NamedTuple):
-    """One canonical flag: every spelling argparse accepts, and its arity."""
-
-    aliases: Tuple[str, ...]
-    takes_value: bool
-
-
-# The flag table. Keys are the canonical long spellings the `overrides` dict
-# speaks; `aliases` lists every spelling that must be REMOVED when that flag is
-# overridden, canonical form included.
-#
-# Sourced from cyclecore.parse_args, parallel.parse_args and
-# runGenerateModels.split_mode - including the deprecated aliases those parsers
-# still accept (--max, --startIn). A spelling missing here is not a
-# cosmetic bug: the old value would survive next to the new one and argparse
-# would take the LAST occurrence, which happens to be right for a value flag and
-# wrong for anything else - so keep this table complete instead of relying on it.
-#
-# Order matters and is part of the contract: overrides are appended in the order
-# below, so the rendered line is deterministic regardless of dict ordering.
-#
-# --session-limit / --weekly-limit / --no-statusline have no parser yet (a later
-# wave adds them); they are listed now so the status line can already express an
-# edited ceiling as a command line.
-FLAG_ALIASES: Dict[str, Flag] = {
-    # value-taking options
-    "--max-runs": Flag(("-m", "--max-runs", "--max"), True),
-    "--start-in": Flag(("-s", "--start-in", "--startIn"), True),
-    "--git-push": Flag(("-g", "--git-push"), True),
-    "--project-dir": Flag(("-C", "--project-dir"), True),
-    "--jobs": Flag(("-j", "--jobs"), True),
-    "--session-limit": Flag(("--session-limit",), True),
-    "--weekly-limit": Flag(("--weekly-limit",), True),
-    "--grow-kit-periodically": Flag(("--grow-kit-periodically",), True),
-    "--cost-log": Flag(("--cost-log",), True),
-    # store_true / store_const options
-    "--codex": Flag(("--codex",), False),
-    "--dry-run": Flag(("-d", "--dry-run"), False),
-    "--raw": Flag(("--raw",), False),
-    "--cost": Flag(("-c", "--cost"), False),
-    "--ignore-usage": Flag(("--ignore-usage",), False),
-    "--no-statusline": Flag(("--no-statusline",), False),
-    "--no-live-messages": Flag(("--no-live-messages",), False),
-    "--parallel": Flag(("-p", "--parallel"), False),
-    "--grow-kit": Flag(("--grow-kit",), False),
-    "--random": Flag(("--random",), False),
-}
 
 
 def _split_passthrough(argv: List[str]) -> Tuple[List[str], List[str]]:
@@ -139,7 +99,9 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
     literally so named) must not be mistaken for one. Flags this table does not
     know are copied through verbatim - which is exactly how the wrapper-only
     switches survive - but a value-taking flag missing from the table can still
-    have its value misread, so add new flags here when the parsers grow them.
+    have its value misread. A flag a parser offers cannot go missing any more
+    (the table is derived from the same declaration the parsers are built from);
+    a wrapper-only one still has to be declared in `clispec.OPTIONS` by hand.
     """
     _validate(overrides, aliases)
     head, tail = _split_passthrough(argv)

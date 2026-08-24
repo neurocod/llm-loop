@@ -199,6 +199,8 @@ src/
     termio.py        the terminal underneath: reserved region, window title, keys
     textwidth.py     how wide terminal text is, and how much a line may hold
     compactline.py   the one-event-one-line shapes both runners print
+    clispec.py       every option the family's command lines carry, declared
+                     once: both parsers and cmdline's alias table come from it
     cmdline.py       the command line that would reproduce this run
     notifications.py opt-in settings and completion sounds for unattended runs
     exitlog.py       why a run ended — including the endings it cannot report itself
