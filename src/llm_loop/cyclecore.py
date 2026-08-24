@@ -2,9 +2,11 @@
 cyclecore.py - reusable engine behind autonomous Claude/Codex CLI loops.
 
 This module holds everything that is *not* specific to one particular task:
-command-line parsing, the git-push policy, the whole token-usage/session-window
-machinery, stream-json rendering, and the generic `run_loop()` that ties it
-together. What the run PRINTS is `console` — with the rotating mirror log, which
+command-line parsing, stream-json rendering with the run's own rate-limit
+verdict picked out of that stream, and the generic `run_loop()` that ties it
+together. Reading a quota and pausing on it are `usage`/`limits`, and when a run
+pushes what it has committed is `gitpush` — both runners apply those and neither
+owns them. What the run PRINTS is `console` — with the rotating mirror log, which
 is the second copy of every printed line and therefore belongs to the printer;
 what `--cost` reads back OUT of that log is still here, because the lines it
 parses are emitted here. What is asked of a run from OUTSIDE it —
@@ -150,8 +152,9 @@ def set_project_root(path: Optional[str]) -> str:
     absolute path.
 
     The runners are single-process, so a module-level singleton set once at
-    startup is enough — and it keeps cyclecore.PROJECT_DIR working for the
-    parallel runner and the drivers, which read it directly.
+    startup is enough. Read it through `project_dir()` — here and everywhere
+    else, `PROJECT_DIR` being the one name in this module that a `from … import`
+    would freeze at the launch directory.
 
     The sentinel moves with the root, and it lives in `stopchannel` — told, not
     read back, so a stop channel never has to import a runner. Both directions
@@ -767,7 +770,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     _turn_cost_base = 0.0     # a new process starts a new cost total
     spec = provider_spec(provider)
     try:
-        proc = start_agent_process(cmd, provider, prompt, PROJECT_DIR)
+        proc = start_agent_process(cmd, provider, prompt, project_dir())
     except FileNotFoundError:
         print(f"Executable {spec.executable!r} not found. "
               f"Is {spec.display_name} installed and on PATH?")
@@ -1199,8 +1202,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # After the tee, so the report of a run that vanished lands in the very
         # log whose abrupt end it explains. Idempotent per process: the periodic
         # wrapper calls this runner repeatedly and keeps one record.
-        exitlog.begin(app_name, console.LOG_DIR, os.path.basename(PROJECT_DIR))
-    print(f"  · project root: {PROJECT_DIR}")
+        exitlog.begin(app_name, console.LOG_DIR,
+                      os.path.basename(project_dir()))
+    print(f"  · project root: {project_dir()}")
     if dry_run:
         print(f"  · dry run: nothing is mirrored to "
               f"{console.log_file_path(app_name)}")

@@ -1,7 +1,18 @@
 """LLM provider adapters used by the shared loop engine.
 
-The loop lifecycle is provider-neutral. This module owns the small part that is
-not: executable names, non-interactive flags, and command-line construction.
+A run's shape is provider-neutral; this module owns the two parts that are not,
+and the second is the larger half:
+
+  * WHAT to run — executable names, non-interactive flags, argv construction,
+    and which quota source answers for a provider.
+  * THE CHILD PROCESS ITSELF, from `Popen` to the ending owed to it:
+    `start_agent_process`, `note_channel`, `reap_agent_process`. Whoever starts
+    a process owes it an ending, and it is started here — so both runners take
+    the whole lifecycle from this module rather than keeping a copy each. That
+    is not a preference: the copies had already drifted, in a way that left
+    workers unable to end the CLIs they had started (see `note_channel`), and
+    the sequential runner aimed its ending at the wrong process on Windows (see
+    `_ask_agent_process_to_end`).
 """
 
 from contextlib import contextmanager
