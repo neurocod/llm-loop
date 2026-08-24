@@ -96,6 +96,14 @@ PUSH_PUMP_INTERVAL_S = 60
 # PUSH_PUMP_INTERVAL_S's: a test cannot otherwise reach the timed-out case.
 PUSHER_JOIN_TIMEOUT_S = 5
 
+# How long an interrupted run waits for each worker to notice `shared.stop` and
+# come back before it closes the run down anyway. Bounded because the operator
+# has already asked to leave: a worker sitting in a provider turn cannot be made
+# to return, and its process is reaped by the worker's own `finally` either way.
+# The wait is per THREAD, so a fleet of ten can cost ten times this in the worst
+# case — which is the price of letting a worker that is nearly done finish.
+INTERRUPT_JOIN_TIMEOUT_S = 5
+
 # Per-file retry budget: a path that fails this many times in a row is parked in
 # the `failed` set so it stops blocking the queue (and is reported at the end)
 # instead of being retried forever.
@@ -178,6 +186,21 @@ def emit_note(lines: compactline.LineWriter, note: str) -> None:
     the label separately, so there is no one shape for the two to share yet.
     """
     lines.line(f"✉ operator note: {note}", "magenta")
+
+
+def join_workers(threads) -> None:
+    """Wait for every worker to finish — the one place Ctrl+C lands.
+
+    A function of its own for one reason, and it is a real one: this is where a
+    run spends all of its time, so it is where `KeyboardInterrupt` is delivered,
+    and the interrupt's own ending (record the reason, push, snapshot, report the
+    undelivered notes, exit 130) cannot be pinned unless a test can stage the
+    interrupt HERE. Staging it by patching `threading.Thread.join` instead would
+    also hit the bounded re-join inside the handler and the pusher's, i.e. it
+    would break the code under test on its way in.
+    """
+    for t in threads:
+        t.join()
 
 
 # --- one provider round-trip for one file --------------------------------------
@@ -1089,6 +1112,12 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # cost of a pump nobody has switched on is one thread asleep in `wait`.
     pusher = threading.Thread(target=push_pump, name="pusher", daemon=True)
 
+    # Set by the Ctrl+C branch below and read after the status region has been
+    # released. The interrupt does NOT exit from inside the `with app:`: the
+    # closing report and the exit push would then be written over a pinned status
+    # area, and the run would leave without either.
+    interrupted = False
+
     # The region lives exactly as long as the workers do (run_loop releases it
     # the same way, before its final push): a periodic run alternates batches of
     # this runner with sequential grow-kit sweeps, and two status areas pinned at
@@ -1108,17 +1137,17 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         pusher.start()
 
         try:
-            for t in threads:
-                t.join()
+            join_workers(threads)
         except KeyboardInterrupt:
             print("\nInterrupted by user (Ctrl+C) — signalling workers to stop…")
+            interrupted = True
             shared.stop.set()
             for t in threads:
-                t.join(timeout=5)
-            sys.exit(130)
+                t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
 
-        shared.stop.set()  # release the pusher's wait()
-        pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
+        if not interrupted:
+            shared.stop.set()  # release the pusher's wait()
+            pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
         app.update(phase="idle")
 
     # This run's own closing report, before the shared epilogue: the run talks
@@ -1131,6 +1160,24 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
               f"{MAX_ATTEMPTS} failed attempts:")
         for line in sorted(shared.failed):
             print(f"      {os.path.basename(line.strip())}")
+
+    if interrupted:
+        # An interrupt is not a `RunStopReason` — nobody returns from here, so
+        # there is no `RunResult` to carry one — but it IS an ending, and it gets
+        # the same epilogue as any other. It used to get none at all: no reason
+        # recorded, no exit push, no closing snapshot, no report of the notes
+        # nobody delivered, so an operator who pressed Ctrl+C left the run's
+        # commits sitting local and its mailbox unread. The reason goes down
+        # first, so the record does not depend on the push surviving a second
+        # Ctrl+C.
+        exitlog.set_reason("interrupted by the operator (Ctrl+C)",
+                           iterations=shared.claimed, completed=shared.done)
+        runlifecycle.close_run(
+            ctx, usage_source=source, limit_policy=policy,
+            snapshot_label="at end (interrupted)", mailbox=mailbox,
+            push_lock=push_lock)
+        sys.exit(130)
+
     # `stop_reason` unset means no worker ever reached a verdict about the run:
     # every one of the endings — the cap, the drained queue, a latched stop —
     # writes it before a worker can leave. So the threads did not run out of

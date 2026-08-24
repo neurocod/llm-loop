@@ -677,9 +677,21 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             except LoopStop as stop:
                 print(stop.message)
                 if stop.exit_code:
+                    # The reason FIRST, then the housekeeping: this ending is
+                    # already an abnormal one, and the record of why must not
+                    # depend on a push or a usage query surviving. Then the same
+                    # epilogue every other ending gets — an exit code is not a
+                    # licence to strand what the run committed or to swallow the
+                    # notes nobody delivered.
                     exitlog.set_reason(
                         f"the driver stopped the run (exit {stop.exit_code}): "
-                        f"{stop.message.splitlines()[0]}")
+                        f"{stop.message.splitlines()[0]}",
+                        iterations=iteration, completed=completed)
+                    runlifecycle.close_run(
+                        ctx, usage_source=usage_source,
+                        limit_policy=limit_policy,
+                        snapshot_label="at end (driver stopped the run)",
+                        mailbox=mailbox)
                     sys.exit(stop.exit_code)
                 stop_reason = stopchannel.RunStopReason.DRIVER_STOP
                 break
@@ -849,10 +861,19 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                                else "with the session under the allowed limit")
                 print(f"  ⚠ {consecutive_errors} errors in a row {quota_state} after "
                       f"{int(elapsed // 60)} min. Stopping.")
+                # The reason FIRST, then the housekeeping — see the driver-stop
+                # exit above for why that order. The epilogue matters most here:
+                # a run that gave up after five failures may have committed four
+                # good iterations, and the notes an operator typed at the console
+                # are the likeliest explanation of what went wrong.
                 exitlog.set_reason(
                     f"{consecutive_errors} provider errors in a row "
                     f"(last exit code {returncode})",
                     iterations=iteration, completed=completed)
+                runlifecycle.close_run(
+                    ctx, usage_source=usage_source, limit_policy=limit_policy,
+                    snapshot_label="at end (provider errors in a row)",
+                    mailbox=mailbox)
                 sys.exit(returncode)
 
     # This run's own closing line, if the driver has one (e.g. "Final state: …").

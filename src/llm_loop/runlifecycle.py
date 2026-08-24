@@ -14,6 +14,13 @@ second half re-derives instead of inheriting, and the git-push knob is what that
 cost: it was a live setting in one runner and a frozen local in the other,
 though both spell the same flag.
 
+The epilogue comes in two doors for one body. `end_run` is the ending a runner
+RETURNS from; `close_run` is the same housekeeping for the three endings that
+`sys.exit` instead — a driver stopping the run with an exit code, five provider
+errors in a row, Ctrl+C in the parallel runner. Those three used to write only
+`exitlog.set_reason`, so the endings with the most to explain were the ones that
+pushed nothing and reported nothing.
+
 THE ORDER OF THE STEPS IS LOAD-BEARING, and this module exists to state it once
 rather than to tidy it:
 
@@ -202,19 +209,26 @@ def begin_run(driver, args, app_name: str, progress=None, *,
                       owns_progress=owns_progress, settings=settings)
 
 
-def end_run(ctx: RunContext, reason, *, iterations: int = 0,
-            completed: int = 0, remaining: Optional[int] = None,
-            usage_source=None, limit_policy=None,
-            snapshot_label: str = "at end",
-            mailbox=None,
-            push_lock=None) -> RunResult:
-    """Everything both runners do once the work is over, in one fixed order.
+def close_run(ctx: RunContext, *,
+              usage_source=None, limit_policy=None,
+              snapshot_label: str = "at end",
+              mailbox=None,
+              push_lock=None) -> None:
+    """The housekeeping half of the epilogue, for every ending a run can have.
 
     Push what is still local, record where the quotas finished, report the notes
-    nobody delivered, name the ending, hand back the result. A runner prints its
-    own closing report BEFORE calling this — "Final state: …", "Processed N
-    file(s) …" — because that is the run talking about its work, and everything
-    here is housekeeping that closes the run down.
+    nobody delivered. A runner prints its own closing report BEFORE calling this
+    — "Final state: …", "Processed N file(s) …" — because that is the run talking
+    about its work, and everything here is closing it down.
+
+    Separate from `end_run` because three endings are NOT returns: the driver
+    stopping the run with an exit code, five provider errors in a row, and Ctrl+C
+    in the parallel runner all `sys.exit`, so they have a reason to record but no
+    `RunResult` to hand back. They used to write only `exitlog.set_reason` and
+    leave — no exit push, no closing snapshot, no report of undelivered notes —
+    which meant the endings that most need a post-mortem were the ones that left
+    the least behind, and an operator's commits sat local until some later run
+    happened to push them. Each of those now calls this and then exits.
 
     `push_lock` is the caller's mutual exclusion, and it wraps the WHOLE of
     `final_git_push`, the `git_unpushed_count` inside it included. Only the
@@ -222,10 +236,6 @@ def end_run(ctx: RunContext, reason, *, iterations: int = 0,
     and `gitpush.final_git_push` deliberately does not lock for itself (see its
     docstring). The policy is read INSIDE that lock, off the live settings — a
     knob edited while a pusher is mid-push must not be read half-applied.
-
-    The reason is RECORDED rather than printed: a wrapper may call several
-    runners, the `=== run ended: … ===` line belongs to the process, so the last
-    reason set wins and exitlog prints it on the way out.
     """
     if not ctx.dry_run:
         # No lock is the SINGLE-THREADED case, not a missing one: the runner with
@@ -249,6 +259,26 @@ def end_run(ctx: RunContext, reason, *, iterations: int = 0,
 
     operator.report_undelivered_notes(mailbox)
 
+
+def end_run(ctx: RunContext, reason, *, iterations: int = 0,
+            completed: int = 0, remaining: Optional[int] = None,
+            usage_source=None, limit_policy=None,
+            snapshot_label: str = "at end",
+            mailbox=None,
+            push_lock=None) -> RunResult:
+    """Everything both runners do when the work is over and they RETURN.
+
+    The housekeeping is `close_run`; this adds the two things only a normal
+    ending has — a `RunStopReason` to name it by, and a `RunResult` for whoever
+    called the runner.
+
+    The reason is RECORDED rather than printed: a wrapper may call several
+    runners, the `=== run ended: … ===` line belongs to the process, so the last
+    reason set wins and exitlog prints it on the way out.
+    """
+    close_run(ctx, usage_source=usage_source, limit_policy=limit_policy,
+              snapshot_label=snapshot_label, mailbox=mailbox,
+              push_lock=push_lock)
     exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
                        iterations=iterations, completed=completed)
     return RunResult(reason, iterations, completed, remaining)
