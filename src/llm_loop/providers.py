@@ -177,6 +177,9 @@ class _CodexEventStream:
             if wire.codex_rpc_response_id(message) is not None:
                 self._owner.resolve_response(message)
                 continue
+            if not wire.codex_app_notification_belongs_to(
+                    message, self._owner.thread_id, self._owner.turn_id):
+                continue
             usage = wire.codex_app_token_usage(message)
             if usage is not None:
                 self._latest_usage = usage

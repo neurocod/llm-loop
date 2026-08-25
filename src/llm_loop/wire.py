@@ -422,6 +422,39 @@ def codex_app_turn_id(result: dict) -> str:
     return str(turn.get("id") or "")
 
 
+def codex_app_notification_belongs_to(message: dict, thread_id: str,
+                                      turn_id: str) -> bool:
+    """Whether a notification belongs to the app-server turn we started.
+
+    One app-server connection also reports work done by collaboration agents.
+    Their item and completion notifications use different thread/turn IDs; if
+    those reach the provider-neutral stream, a child's ``turn/completed`` looks
+    exactly like completion of the root job.  Require every ID declared by the
+    notification to match.  ``thread/started`` has no turn scope; every other
+    notification consumed by this adapter must also declare the expected turn,
+    so malformed completion events cannot finish the job either.
+    """
+    params = message.get("params") or {}
+    if not isinstance(params, dict):
+        return False
+    thread = params.get("thread") or {}
+    turn = params.get("turn") or {}
+    thread_ids = [params.get("threadId")]
+    turn_ids = [params.get("turnId")]
+    if isinstance(thread, dict):
+        thread_ids.append(thread.get("id"))
+    if isinstance(turn, dict):
+        turn_ids.append(turn.get("id"))
+    thread_ids = [str(value) for value in thread_ids if value]
+    turn_ids = [str(value) for value in turn_ids if value]
+    thread_matches = (bool(thread_ids)
+                      and all(value == thread_id for value in thread_ids))
+    if message.get("method") == APP_THREAD_STARTED:
+        return thread_matches
+    return (thread_matches and bool(turn_ids)
+            and all(value == turn_id for value in turn_ids))
+
+
 def codex_app_token_usage(message: dict) -> Optional[dict]:
     """The latest turn token counts, in the normalised ``exec --json`` shape."""
     if message.get("method") != APP_TOKEN_USAGE_UPDATED:

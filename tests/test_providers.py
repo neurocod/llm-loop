@@ -265,6 +265,68 @@ def test_codex_process_starts_an_app_server_thread_and_turn(monkeypatch):
     assert raw_proc.stdin.closed
 
 
+def test_codex_process_ignores_nested_agent_events():
+    def notification(method, thread_id, turn_id, **params):
+        return {
+            "method": method,
+            "params": {"threadId": thread_id, "turnId": turn_id, **params},
+        }
+
+    messages = [
+        notification("thread/tokenUsage/updated", "child-thread", "child-turn",
+                     tokenUsage={"last": {"inputTokens": 900,
+                                          "cachedInputTokens": 800,
+                                          "outputTokens": 70}}),
+        notification("item/completed", "child-thread", "child-turn",
+                     item={"id": "child-message", "type": "agentMessage",
+                           "text": "child finished"}, completedAtMs=1),
+        {"method": "turn/completed",
+         "params": {"threadId": "child-thread",
+                    "turn": {"id": "child-turn", "items": [],
+                             "status": "completed"}}},
+        notification("error", "child-thread", "child-turn",
+                     error={"message": "child failed"}, willRetry=False),
+        {"method": "turn/completed",
+         "params": {"threadId": "child-thread",
+                    "turn": {"id": "child-turn", "items": [],
+                             "status": "failed",
+                             "error": {"message": "child failed"}}}},
+        {"method": "turn/completed",
+         "params": {"threadId": "root-thread",
+                    "turn": {"id": "other-root-turn", "items": [],
+                             "status": "completed"}}},
+        {"method": "turn/completed",
+         "params": {"threadId": "root-thread",
+                    "turn": {"items": [], "status": "completed"}}},
+        notification("thread/tokenUsage/updated", "root-thread", "root-turn",
+                     tokenUsage={"last": {"inputTokens": 9,
+                                          "cachedInputTokens": 8,
+                                          "outputTokens": 7}}),
+        notification("item/completed", "root-thread", "root-turn",
+                     item={"id": "root-message", "type": "agentMessage",
+                           "text": "root finished"}, completedAtMs=2),
+        {"method": "turn/completed",
+         "params": {"threadId": "root-thread",
+                    "turn": {"id": "root-turn", "items": [],
+                             "status": "completed"}}},
+    ]
+    raw = _FakeAgentProcess(
+        stdout="".join(json.dumps(message) + "\n" for message in messages))
+    proc = providers._CodexAppProcess(
+        raw, [], thread_id="root-thread", turn_id="root-turn")
+
+    item = json.loads(next(proc.stdout))
+    completed = json.loads(next(proc.stdout))
+
+    assert item["type"] == "item.completed"
+    assert item["item"]["text"] == "root finished"
+    assert completed == {
+        "type": "turn.completed",
+        "usage": {"input_tokens": 9, "cached_input_tokens": 8,
+                  "output_tokens": 7},
+    }
+
+
 def test_codex_no_live_process_closes_stdin_after_the_prompt(
         monkeypatch, no_live_messages):
     created = []
