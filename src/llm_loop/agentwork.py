@@ -106,6 +106,9 @@ class Driver:
             state_file = "products/currentState.md"
             app_name   = "runCycle"
 
+            def prompt(self):
+                return f"Follow the instructions in {self.state_file}"
+
         if __name__ == "__main__":
             MyDriver.main()
 

@@ -52,8 +52,7 @@ class StateFileDriver(Driver):
                      only description (if any) is worth setting.
 
     Override methods to customise behaviour:
-      prompt()  -> the instruction sent every iteration (default:
-                   "Follow the instructions in <state_file>").
+      prompt()  -> the instruction sent every iteration (required).
       model()   -> pin a model, or vary it by state (read self.first_line()
                    inside). Default: "" — the CLI's own configured model.
 
@@ -75,8 +74,9 @@ class StateFileDriver(Driver):
             return ""
 
     def prompt(self) -> str:
-        """The instruction sent every iteration. Override to change the playbook."""
-        return f"Follow the instructions in {self.state_file}"
+        """The instruction sent every iteration. Subclasses must supply it."""
+        raise NotImplementedError(
+            "StateFileDriver subclasses must override prompt()")
 
     def next_command(self) -> Optional[AgentCommand]:
         state = self.first_line()

@@ -32,6 +32,10 @@ class CycleDriver(StateFileDriver):
     state_file = STATE_FILE_REL
     description = f"Autonomous loop driving Claude or Codex per {STATE_FILE_REL}."
 
+    def prompt(self) -> str:
+        """Tell each fresh agent process where its state-machine playbook is."""
+        return f"Follow the instructions in {self.state_file}"
+
     def model(self) -> str:
         """Choose the model from the current state — the point of running the
         steps as separate processes. Override as needed, or delete this method to

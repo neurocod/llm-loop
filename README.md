@@ -313,14 +313,18 @@ Codex's automatic reviewer; it does not bypass the sandbox.
 ### State-machine driver
 
 Drives the state machine shown in the diagram above — the state file's first
-line names the current mode, and an overridden `model()` picks the model per mode
-(drop it to let the CLI use its own configured model):
+line names the current mode, `prompt()` supplies the required project playbook,
+and an overridden `model()` picks the model per mode (drop `model()` to let the
+CLI use its own configured model):
 
 ```python
 from llm_loop import StateFileDriver
 
 class CycleDriver(StateFileDriver):
     state_file = "currentState.md"
+
+    def prompt(self):
+        return f"Follow the instructions in {self.state_file}"
 
     def model(self):
         return "opus"   # vary by self.first_line(), or "" for the CLI default
