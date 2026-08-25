@@ -188,6 +188,68 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
     assert app.status.iteration == 3     # the run's own counter, not a job's
 
 
+def test_plus_starts_another_worker_and_adds_its_live_surfaces(tmp_path,
+                                                               monkeypatch):
+    """`+` widens the running pool, status rows and message addresses together."""
+    made = _live_statusline(monkeypatch, {})
+    entered = {1: threading.Event(), 2: threading.Event()}
+    release = threading.Event()
+
+    def hold(job_id, command, mailbox=None):
+        entered[job_id].set()
+        assert release.wait(5), "the test never released the provider turns"
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", hold)
+    driver = _MemDriver([f"products/f{i}.md" for i in range(3)])
+    previous = projectroot.project_dir()
+    try:
+        done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=1))
+        assert entered[1].wait(5), "the initial worker never started"
+
+        app = made["app"]
+        assert dict(app.legend_entries())["+"] == "add worker"
+        app.handle_event(tio.Key("+"))
+        assert entered[2].wait(5), "the + key did not start worker 2"
+
+        assert [job.job_id for job in app.status.jobs] == [1, 2]
+        assert app.messages.target_ids == (1, 2)
+        assert "worker 2 started" in app.status.note
+
+        release.set()
+        assert done.wait(10), "the widened pool did not drain the queue"
+    finally:
+        release.set()
+        projectroot.set_project_root(previous)
+
+    assert result["value"].completed == 3
+    assert driver.pending_lines() == []
+
+
+def test_a_wider_live_pool_is_retained_for_the_next_batch():
+    progress = sl.InvocationProgress()
+
+    assert progress.worker_count(2) == 2
+    progress.set_worker_count(3)
+    assert progress.worker_count(2) == 3
+
+
+def test_plus_in_the_statusline_startup_window_does_not_restart_its_thread():
+    """Input is live before initial startup; an early added thread starts once."""
+    ran = []
+
+    def make_thread(job_id):
+        return threading.Thread(target=lambda: ran.append(job_id))
+
+    pool = parallel.WorkerPool([make_thread(1)], make_thread, lambda job_id: None)
+
+    assert pool.grow() == 2
+    pool.start_initial()
+    pool.join_all()
+
+    assert sorted(ran) == [1, 2]
+
+
 @pytest.mark.filterwarnings(
     # The worker below is killed on purpose; that IS the fixture. Silenced here
     # rather than globally, so a worker dying anywhere else is still news.

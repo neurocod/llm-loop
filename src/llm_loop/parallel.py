@@ -208,8 +208,86 @@ def join_workers(threads) -> None:
     also hit the bounded re-join inside the handler and the pusher's, i.e. it
     would break the code under test on its way in.
     """
+    join_all = getattr(threads, "join_all", None)
+    if join_all is not None:
+        join_all()
+        return
     for t in threads:
         t.join()
+
+
+class WorkerPool:
+    """The worker threads of one run, widened safely from the status-line thread.
+
+    `join_all` closes additions atomically with observing that the last thread is
+    gone. Without that handshake, `+` could append a worker just after the main
+    thread had decided its original list was finished, and the run would tear its
+    status area down around the new thread.
+    """
+
+    def __init__(self, threads, make_thread, prepare_worker):
+        self._threads = list(threads)
+        # The terminal input starts before run_parallel reaches start_initial().
+        # Keep that original set apart so an immediate `+` (whose worker starts
+        # at once) is not included and started a second time.
+        self._initial_threads = tuple(self._threads)
+        self._make_thread = make_thread
+        self._prepare_worker = prepare_worker
+        self._lock = threading.Lock()
+        self._accepting = True
+
+    def __iter__(self):
+        # A stable snapshot for bounded interrupt cleanup and test probes.
+        with self._lock:
+            return iter(tuple(self._threads))
+
+    def start_initial(self) -> None:
+        for thread in self._initial_threads:
+            thread.start()
+
+    def grow(self) -> Optional[int]:
+        """Start one more worker; return its id, or None once shutdown began."""
+        with self._lock:
+            if not self._accepting:
+                return None
+            job_id = len(self._threads) + 1
+            self._prepare_worker(job_id)
+            thread = self._make_thread(job_id)
+            self._threads.append(thread)
+            thread.start()
+            return job_id
+
+    def close(self) -> None:
+        with self._lock:
+            self._accepting = False
+
+    def join_all(self) -> None:
+        index = 0
+        while True:
+            with self._lock:
+                if index >= len(self._threads):
+                    self._accepting = False
+                    return
+                thread = self._threads[index]
+                index += 1
+            thread.join()
+
+
+class AddWorkerAction(statusline.Action):
+    """`+` — widen this parallel run by one worker immediately."""
+
+    key = "+"
+    help = "add worker"
+
+    def __init__(self, pool: WorkerPool):
+        self.pool = pool
+
+    def run(self, app):
+        job_id = self.pool.grow()
+        if job_id is None:
+            app.note("worker pool is already stopping")
+            return
+        app.note(f"worker {job_id} started — {job_id} workers now active")
 
 
 # --- one provider round-trip for one file --------------------------------------
@@ -965,15 +1043,16 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     dry_run = ctx.dry_run
 
     # Worker count precedence: explicit -j/--jobs on the CLI, then the driver's
-    # `jobs` attribute (a subclass may pin it), then the engine default. Not a
-    # knob: the pool is built once, so unlike --max-runs and --git-push this one
-    # really is decided here, which is why it is printed in the header instead.
+    # `jobs` attribute (a subclass may pin it), then the engine default. The
+    # invocation remembers later `+` presses so a periodic wrapper's next batch
+    # starts at the widened count instead of silently shrinking again.
     jobs = args.jobs
     if jobs is None:
         jobs = getattr(driver, "jobs", None)
     if jobs is None:
         jobs = clispec.DEFAULT_JOBS
     jobs = max(1, jobs)
+    jobs = progress.worker_count(jobs)
     print(f"  · jobs: {jobs}")
 
     list_file_rel = driver.list_file
@@ -1067,11 +1146,10 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     settings = runlifecycle.script_settings(
         run_settings, progress if owns_progress else None)
     # Each worker owns a mailbox for both live delivery and notes queued between
-    # its turns. The one-worker shape stays a bare Mailbox, preserving the direct
-    # `m` -> editor path; a fleet exposes the keyed set so the console can ask for
-    # an unambiguous recipient first.
-    mailboxes = (operator.Mailbox() if jobs == 1
-                 else operator.MailboxSet(range(1, jobs + 1)))
+    # its turns. This is a growable set even at one worker: MessageAction opens
+    # that sole address directly, while a later `+` can add another address
+    # without replacing (and losing the contents of) worker 1's mailbox.
+    mailboxes = operator.MailboxSet(range(1, jobs + 1))
     app = statusline.StatusApp(
         # Jobs come from the invocation's pool, so a second batch resumes the
         # rows of the first instead of starting a fresh set at iteration 1.
@@ -1118,15 +1196,23 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                                                   last_push_box[0],
                                                   projectroot.project_dir())
 
-    threads = [
-        threading.Thread(target=worker, name=f"job{j}",
-                         args=(j, shared, source, policy, session_start_box,
-                               usage_lock, app, progress,
-                               (mailboxes if jobs == 1
-                                else mailboxes.mailbox(j))),
-                         daemon=True)
-        for j in range(1, jobs + 1)
-    ]
+    def make_worker(j):
+        return threading.Thread(
+            target=worker, name=f"job{j}",
+            args=(j, shared, source, policy, session_start_box, usage_lock, app,
+                  progress, mailboxes.mailbox(j)), daemon=True)
+
+    def prepare_worker(j):
+        mailboxes.add(j)
+        progress.set_worker_count(j)
+        # Use the invocation's Job object, not LoopStatus.job's fallback, so a
+        # later periodic batch resumes the added row's iteration count.
+        app.update(jobs=progress.jobs(j))
+
+    threads = WorkerPool(
+        [make_worker(j) for j in range(1, jobs + 1)],
+        make_worker, prepare_worker)
+    app.register_action(AddWorkerAction(threads))
     # Started for EVERY run, including one launched with `--git-push none`: the
     # policy is a knob now, so "there is nothing to push on" is a fact about this
     # instant, not about the run. `maybe_git_push` is a no-op for NONE, so the
@@ -1159,8 +1245,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             statusline.push_quotas(app, source, policy)
             app.add_service(statusline.QuotaRefresher(
                 app, source, policy, provider=provider))
-        for t in threads:
-            t.start()
+        threads.start_initial()
         pusher.start()
 
         try:
@@ -1168,6 +1253,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         except KeyboardInterrupt:
             print("\nInterrupted by user (Ctrl+C) — signalling workers to stop…")
             interrupted = True
+            threads.close()
             shared.stop.set()
             for t in threads:
                 t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)

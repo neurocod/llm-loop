@@ -420,25 +420,45 @@ class MailboxSet:
         ids = tuple(dict.fromkeys(job_ids))
         if not ids:
             raise ValueError("a mailbox set needs at least one job")
+        self._lock = threading.Lock()
         self._mailboxes: Dict[int, Mailbox] = {
             job_id: Mailbox() for job_id in ids
         }
 
     @property
     def target_ids(self) -> Tuple[int, ...]:
-        return tuple(self._mailboxes)
+        with self._lock:
+            return tuple(self._mailboxes)
 
     @property
     def queued_count(self) -> int:
-        return sum(mailbox.queued_count for mailbox in self._mailboxes.values())
+        with self._lock:
+            mailboxes = tuple(self._mailboxes.values())
+        return sum(mailbox.queued_count for mailbox in mailboxes)
+
+    def add(self, job_id: int) -> Mailbox:
+        """Add one worker address and return its mailbox.
+
+        Parallel runs can grow while the terminal input thread is active. The
+        mapping therefore changes while workers and the closing report may read
+        it, so the mutation and every snapshot of the mapping share one lock.
+        """
+        with self._lock:
+            if job_id in self._mailboxes:
+                raise ValueError(f"job {job_id} already has a mailbox")
+            mailbox = Mailbox()
+            self._mailboxes[job_id] = mailbox
+            return mailbox
 
     def mailbox(self, job_id: int) -> Mailbox:
         """The mailbox owned by `job_id`; unknown ids are programmer errors."""
-        return self._mailboxes[job_id]
+        with self._lock:
+            return self._mailboxes[job_id]
 
     def items(self) -> Iterable[Tuple[int, Mailbox]]:
         """Stable job/mailbox pairs for end-of-run reporting."""
-        return self._mailboxes.items()
+        with self._lock:
+            return tuple(self._mailboxes.items())
 
 
 def report_undelivered_notes(mailbox) -> None:

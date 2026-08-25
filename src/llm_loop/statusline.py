@@ -505,9 +505,27 @@ class InvocationProgress:
         self._lock = threading.Lock()
         self.max_items = max_items   # the invocation's --max (None = uncapped)
         self._pool = {}              # job_id -> Job, reused by every runner call
+        self._worker_count = None     # live parallel width, retained across batches
         self._baseline = None        # items pending when the invocation began
         self._remaining = None       # items pending now
         self._iterations = 0         # runs with no total count iterations instead
+
+    def worker_count(self, initial: int) -> int:
+        """The parallel width for this invocation, first caller establishing it.
+
+        A periodic wrapper makes a fresh parallel runner for each batch. Keeping
+        the live width here makes a `+` press apply to the rest of that invocation
+        instead of disappearing when the current batch ends.
+        """
+        with self._lock:
+            if self._worker_count is None:
+                self._worker_count = initial
+            return self._worker_count
+
+    def set_worker_count(self, count: int) -> None:
+        """Remember a parallel width increased by the running worker pool."""
+        with self._lock:
+            self._worker_count = count
 
     def jobs(self, count: int) -> List[Job]:
         """The `count` job rows of one runner call, reused across calls.

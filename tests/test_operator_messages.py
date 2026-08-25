@@ -1125,11 +1125,8 @@ def test_every_parallel_worker_run_is_addressable(tmp_path, monkeypatch, jobs):
                           app_name="pytest-operator-parallel")
 
     messages = seen["messages"]
-    if jobs == 1:
-        assert isinstance(messages, operator.Mailbox)
-    else:
-        assert isinstance(messages, operator.MailboxSet)
-        assert messages.target_ids == (1, 2)
+    assert isinstance(messages, operator.MailboxSet)
+    assert messages.target_ids == tuple(range(1, jobs + 1))
 
 
 def test_a_queued_fleet_note_rides_only_its_workers_prompt(tmp_path, monkeypatch):

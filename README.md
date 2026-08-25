@@ -110,7 +110,7 @@ remainder. And since the items are independent, they can run **N at a time**:
  job 2 ▶ gpt-5.6-terra | iter 1    | 1m36s  | terminal-block-connector.md
  job 3 ▶ gpt-5.6-terra | iter 1    | 1m36s  | acoustic-upright-piano.md
  job 4 ▶ gpt-5.6-terra | iter 1    | 1m36s  | eggs-dozen.md
- keys: s stop | p pause | h help
+ keys: s stop | p pause | m message | + add worker | h help
 ```
 
 ## A playbook worth stealing
@@ -502,8 +502,10 @@ overriding `LimitRule.status(reading, now)`.
 
 Keys: `s` requests a graceful stop of **this** run (pressing `s` again during
 the countdown cancels it), `p` holds it at the next iteration boundary and `p`
-again lets it go (see below), `m` sends the agent a note (see below), `h` or `?`
-shows the full key list.
+again lets it go (see below), `m` sends the agent a note (see below), and in a
+parallel run `+` starts one more worker immediately. An increased worker count
+also carries into later batches of the same invocation. `h` or `?` shows the
+full key list.
 
 `s` sets an in-process flag and writes nothing to disk, so several loops
 launched in one project root are stopped one at a time — the terminal you type

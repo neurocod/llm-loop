@@ -135,9 +135,8 @@ def _seq_args(project_dir):
 
 def _par_args(project_dir):
     ns = _seq_args(project_dir)
-    # One worker, because that is the run that HAS a mailbox (see run_parallel):
-    # with `-j 2+` nobody can type a note, so an undelivered one cannot exist and
-    # a third of this pin would be measuring nothing.
+    # One worker keeps the closing report focused on one staged mailbox. Parallel
+    # runs expose a MailboxSet at every width so `+` can add addresses in place.
     ns.jobs = 1
     # And a usage source, so the closing snapshot has something to be taken from:
     # `--ignore-usage` leaves `source` None and `close_run` correctly skips the
