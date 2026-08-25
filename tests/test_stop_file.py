@@ -642,6 +642,68 @@ def cancel_it(app=None, **kwargs):
     return False
 
 
+# How long a `_Held` run may take to come back once the test has asked it to
+# stop. A BACKSTOP, not the wait itself: every test below first stages the
+# observable that makes the ending inevitable, so a healthy run returns long
+# inside a second (measured 2026-08-25: the whole parked-worker test takes
+# 0.26 s, its 0.25 s stop-channel poll included). What this bounds is the run
+# that is not slow but STUCK — a fleet parked on a usage wall whose window
+# resets in 59 minutes, with nobody left to read the request. Raising it
+# therefore buys nothing and costs the diagnosis: a run that wants more than
+# this is waiting for something that is not coming, and the number is what
+# turns that into a named failure instead of a hung suite.
+EXIT_BUDGET_SECONDS = 10
+
+
+class _WorkersLeaving:
+    """Counts workers out of the fleet, so a test can press `s` at ONE reader.
+
+    Staging, and it is what makes the withdrawn-request pin fail honestly
+    instead of hanging. `s` sets a LEVEL flag that ANY worker may read and may
+    answer, and a withdrawal staged as instantaneous (`cancel_it`) leaves that
+    flag up for no time at all: a worker that had not been scheduled when the key
+    was pressed can open the request, cancel it and be gone inside one of the
+    parked worker's 0.25 s poll gaps. The parked one then either never sees the
+    flag, or wakes on it and finds it already withdrawn when it re-reads at the
+    top of the usage hold — and goes back to sleep for the next 60 s slice of a
+    59-minute wall. Both shapes were measured 2026-08-25 under 16 competing CPU
+    burners: 4 hung runs out of 15, and none of them merely slow, which is why
+    a bigger `EXIT_BUDGET_SECONDS` was never the repair.
+
+    Waiting for the other workers to leave is not a longer wait but a different
+    question — with the fleet down to the worker the test is about, the flag
+    stays up until that worker reads it. Their departure is also what the test
+    needs anyway: the loser's claim attempt is what latches `claims_closed`
+    (`--max-runs`), i.e. the shut door that makes a handed-back claim
+    unrecoverable.
+
+    `parallel.worker` is patched rather than the threads counted, because a dead
+    thread simply vanishes from `threading.enumerate()` and the same names
+    (`job1`, …) are reused by every other run in this file.
+    """
+
+    def __init__(self, monkeypatch):
+        self._gone = 0
+        self._changed = threading.Condition()
+        real_worker = parallel.worker
+
+        def counted_worker(job_id, *args, **kwargs):
+            try:
+                return real_worker(job_id, *args, **kwargs)
+            finally:
+                with self._changed:
+                    self._gone += 1
+                    self._changed.notify_all()
+
+        monkeypatch.setattr(parallel, "worker", counted_worker)
+
+    def wait_for(self, count: int, timeout: float = 30.0) -> None:
+        with self._changed:
+            assert self._changed.wait_for(lambda: self._gone >= count, timeout), (
+                f"only {self._gone} of {count} worker(s) left the fleet in "
+                f"{timeout:g}s — the run cannot be staged down to one reader")
+
+
 class _Held:
     """A runner started on a thread, so the test can press `s` while it holds.
 
@@ -669,7 +731,7 @@ class _Held:
             f"the run never reached the hold ({needle!r} never printed)"
 
     def wait_for_exit(self, why: str) -> None:
-        assert self.done.wait(10), why
+        assert self.done.wait(EXIT_BUDGET_SECONDS), why
 
 
 def test_the_s_key_ends_a_sequential_run_parked_on_the_usage_limit(
@@ -729,6 +791,12 @@ def test_cancelling_the_stop_keeps_the_file_a_parked_worker_had_claimed(
     it back to go and read the request, and a withdrawn request has silently
     eaten a whole item of the run's budget: claims are shut, so nobody ever
     picks it up again.
+
+    Two workers, and both are load-bearing: the one that does NOT get the single
+    claim is what latches `claims_closed` on its way out, i.e. the shut door the
+    pin is about. It has to be OUT before the key is pressed, though, or it is
+    also a second reader of the request — see `_WorkersLeaving`, which is the
+    whole repair of this test's flake.
     """
     ran = []
     monkeypatch.setattr(parallel, "run_job",
@@ -737,6 +805,7 @@ def test_cancelling_the_stop_keeps_the_file_a_parked_worker_had_claimed(
     monkeypatch.setattr(parallel, "usage_source_for",
                         lambda provider: _PeggedSource())
     monkeypatch.setattr(stopchannel, "confirm_stop_request", cancel_it)
+    leaving = _WorkersLeaving(monkeypatch)
     captured = _capture_disabled_app(monkeypatch)
     driver = _MemListDriver(["products/a.md", "products/b.md"])
     driver.limit_policy = LimitPolicy([SessionLimit(80)])
@@ -747,6 +816,10 @@ def test_cancelling_the_stop_keeps_the_file_a_parked_worker_had_claimed(
     held = _Held(lambda: parallel.run_parallel(
         driver, args, app_name="pytest-stop-parallel"))
     held.wait_until_held(capsys)
+    # One worker holds the claim and is parked on the wall; every other one has
+    # already spent its claim attempt and gone. Press only now, so the parked
+    # worker is the one that reads the request and the one that answers it.
+    leaving.wait_for(args.jobs - 1)
     captured["app"].request_stop()
 
     held.wait_for_exit("the withdrawn request did not release the worker")
