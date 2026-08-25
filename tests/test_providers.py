@@ -633,6 +633,41 @@ def test_codex_dry_run_uses_codex_policy_not_claude_usage_source(
     assert "DRY-RUN: codex app-server --stdio" in output
 
 
+# --- a provider-reported failure overrides a successful process exit -----------
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+@pytest.mark.parametrize(("subtype", "expected_rc"), [
+    ("success", 0),
+    ("error_during_execution", 1),
+])
+def test_claude_result_verdict_overrides_a_zero_process_exit(
+        monkeypatch, runner, subtype, expected_rc):
+    """Claude can report a failed turn while its CLI still exits successfully."""
+    event = json.dumps({
+        "type": "result",
+        "subtype": subtype,
+        "total_cost_usd": 0.25,
+        "duration_ms": 1000,
+    }) + "\n"
+    proc = _FakeAgentProcess(
+        has_stdin=False, stdout=event, returncode=0)
+
+    if runner == "sequential":
+        monkeypatch.setattr(streamrender, "start_agent_process",
+                            lambda *args: proc)
+        rc = streamrender.run_agent_streaming(
+            ["claude", "-p"], "claude", False)
+    else:
+        monkeypatch.setattr(parallel, "start_agent_process",
+                            lambda *args: proc)
+        rc, cost, duration = parallel.run_job(
+            4, AgentCommand("p", "opus", "job", "claude"))
+        assert cost == 0.25
+        assert duration == 1.0
+
+    assert rc == expected_rc
+
+
 # --- a failed parallel job must say why ----------------------------------------
 #
 # The child's stderr is merged into its stdout, so a provider that dies with a

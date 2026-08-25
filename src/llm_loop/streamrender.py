@@ -318,6 +318,9 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                     print(line)
                     continue
                 event_type = wire.event_type(ev)
+                if (provider == "claude" and event_type == wire.RESULT
+                        and wire.result_failed(ev)):
+                    provider_failed = True
                 if ((provider == "claude" and event_type == wire.RESULT)
                         or (provider == "codex" and event_type in (
                             wire.TURN_COMPLETED, wire.TURN_FAILED))):

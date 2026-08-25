@@ -415,6 +415,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     # Before the figures: once the turn has reported, the console
                     # must not be able to write into a session that is closing.
                     channel.close()
+                    provider_failed = provider_failed or wire.result_failed(ev)
                     # A process emits a second `result` when a late note is answered
                     # as its own turn. The two figures then have to be combined
                     # differently, which is measured rather than assumed:
