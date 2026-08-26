@@ -217,7 +217,7 @@ def join_workers(threads) -> None:
 
 
 class WorkerPool:
-    """The worker threads of one run, widened safely from the status-line thread.
+    """The worker threads of one run, resized safely from the status-line thread.
 
     `join_all` closes additions atomically with observing that the last thread is
     gone. Without that handshake, `+` could append a worker just after the main
@@ -225,7 +225,9 @@ class WorkerPool:
     status area down around the new thread.
     """
 
-    def __init__(self, threads, make_thread, prepare_worker):
+    def __init__(self, threads, make_thread, prepare_worker,
+                 remove_worker=lambda job_id, count: None,
+                 finish_removal=lambda count: None):
         self._threads = list(threads)
         # The terminal input starts before run_parallel reaches start_initial().
         # Keep that original set apart so an immediate `+` (whose worker starts
@@ -233,8 +235,17 @@ class WorkerPool:
         self._initial_threads = tuple(self._threads)
         self._make_thread = make_thread
         self._prepare_worker = prepare_worker
+        self._remove_worker = remove_worker
+        self._finish_removal = finish_removal
         self._lock = threading.Lock()
         self._accepting = True
+        self._worker_count = len(self._threads)
+        self._visible_count = self._worker_count
+        self._current = {
+            job_id: thread
+            for job_id, thread in enumerate(self._threads, start=1)
+        }
+        self._departed = set()
 
     def __iter__(self):
         # A stable snapshot for bounded interrupt cleanup and test probes.
@@ -250,12 +261,66 @@ class WorkerPool:
         with self._lock:
             if not self._accepting:
                 return None
-            job_id = len(self._threads) + 1
+            self._worker_count += 1
+            job_id = self._worker_count
             self._prepare_worker(job_id)
-            thread = self._make_thread(job_id)
-            self._threads.append(thread)
-            thread.start()
+            thread = self._current.get(job_id)
+            if thread is None:
+                thread = self._make_thread(job_id)
+                self._current[job_id] = thread
+                self._threads.append(thread)
+                self._departed.discard(job_id)
+                thread.start()
+            self._visible_count = max(self._visible_count, self._worker_count)
             return job_id
+
+    def shrink(self) -> Optional[tuple]:
+        """Retire the last worker after its current item; never remove worker 1."""
+        with self._lock:
+            if not self._accepting:
+                return None
+            if self._worker_count <= 1:
+                return (None, 1)
+            job_id = self._worker_count
+            self._worker_count -= 1
+            self._remove_worker(job_id, self._worker_count)
+            return (job_id, self._worker_count)
+
+    def retirement_requested(self, job_id: int) -> bool:
+        """True at the retired worker's next claim boundary.
+
+        Committing the departure under the pool lock makes a quick `+` either
+        cancel the pending removal or start a replacement, never lose the slot
+        in the small race while the old thread is returning.
+        """
+        with self._lock:
+            return self._retire_locked(job_id)
+
+    def claim(self, job_id: int, shared) -> tuple:
+        """Atomically keep this worker in the pool and claim its next item.
+
+        `-` takes this same lock. Once it returns to the input thread, the
+        removed worker therefore cannot slip through a check/claim gap and turn
+        an idle slot into one more full provider call.
+        """
+        with self._lock:
+            if self._retire_locked(job_id):
+                return False, None
+            return True, shared.claim()
+
+    def _retire_locked(self, job_id: int) -> bool:
+        """Commit one requested retirement (call under `_lock`)."""
+        if job_id <= self._worker_count:
+            return False
+        self._current.pop(job_id, None)
+        self._departed.add(job_id)
+        old_visible = self._visible_count
+        while (self._visible_count > self._worker_count
+               and self._visible_count in self._departed):
+            self._visible_count -= 1
+        if self._visible_count != old_visible:
+            self._finish_removal(self._visible_count)
+        return True
 
     def close(self) -> None:
         with self._lock:
@@ -273,21 +338,35 @@ class WorkerPool:
             thread.join()
 
 
-class AddWorkerAction(statusline.Action):
-    """`+` — widen this parallel run by one worker immediately."""
+class ResizeWorkerPoolAction(statusline.Action):
+    """`+`/`-` — resize this parallel run one worker at a time."""
 
-    key = "+"
-    help = "add worker"
+    key = "+/-"
+    keys = ("+", "-")
+    help = "add/remove workers"
 
     def __init__(self, pool: WorkerPool):
         self.pool = pool
 
-    def run(self, app):
-        job_id = self.pool.grow()
-        if job_id is None:
+    def run_key(self, app, key):
+        if key == "+":
+            job_id = self.pool.grow()
+            if job_id is None:
+                app.note("worker pool is already stopping")
+                return
+            app.note(f"worker {job_id} started — {job_id} workers now active")
+            return
+
+        result = self.pool.shrink()
+        if result is None:
             app.note("worker pool is already stopping")
             return
-        app.note(f"worker {job_id} started — {job_id} workers now active")
+        job_id, count = result
+        if job_id is None:
+            app.note("at least one worker must remain active")
+            return
+        app.note(f"worker {job_id} retiring after its current file — "
+                 f"{count} worker{'s' if count != 1 else ''} remain active")
 
 
 # --- one provider round-trip for one file --------------------------------------
@@ -825,16 +904,18 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
 
 def worker(job_id: int, shared: Shared, source: Optional[object],
            policy, session_start_box: list, usage_lock: threading.Lock,
-           app=None, progress=None, mailbox=None) -> None:
+           app=None, progress=None, mailbox=None,
+           retirement_requested=None, claim_work=None) -> None:
     """One worker thread: claim -> (usage gate) -> run -> record, repeat.
 
-    Loops until the queue drains, the claim cap closes, or the stop sentinel is
-    latched (see apply_stop_request). A claim that returns None while every signal
-    remains clear means everything left is in flight elsewhere, so we briefly back
-    off and retry. `source`/`policy` are None when --ignore-usage disables the
-    session-limit gate. `app` is this run's status line; each worker owns the Job
-    of its own number, and Job's mutators are lock-guarded for exactly that.
-    `progress` carries the summary-row figures of the whole invocation.
+    Loops until the queue drains, the claim cap closes, the stop sentinel is
+    latched (see apply_stop_request), or the pool retires this worker at a claim
+    boundary. A claim that returns None while every signal remains clear means
+    everything left is in flight elsewhere, so we briefly back off and retry.
+    `source`/`policy` are None when --ignore-usage disables the session-limit
+    gate. `app` is this run's status line; each worker owns the Job of its own
+    number, and Job's mutators are lock-guarded for exactly that. `progress`
+    carries the summary-row figures of the whole invocation.
     """
     # A disabled StatusApp is a Null object: no terminal, no threads, every call
     # below a no-op — so the worker has no `if app is not None` in it.
@@ -844,6 +925,8 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
     job = app.job(job_id)
     out = job_lines(job_id)
     while not shared.stop.is_set():
+        if retirement_requested is not None and retirement_requested(job_id):
+            break
         if apply_stop_request(job_id, shared, app):
             break
         if shared.stop_requested.is_set():
@@ -875,7 +958,12 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # final join(). Claiming first means an empty/drained queue stops the worker
         # here (claim() sets the stop flag) and it never enters the gate with
         # nothing to do; only a worker actually holding a file ever pauses.
-        line = shared.claim()
+        if claim_work is None:
+            active, line = True, shared.claim()
+        else:
+            active, line = claim_work(job_id, shared)
+        if not active:
+            break
         if line is None:
             if shared.stop.is_set() or shared.claims_closed.is_set():
                 break
@@ -1197,23 +1285,42 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                                                   last_push_box[0],
                                                   projectroot.project_dir())
 
+    def retirement_requested(j):
+        return threads.retirement_requested(j)
+
+    def claim_work(j, worker_shared):
+        return threads.claim(j, worker_shared)
+
     def make_worker(j):
         return threading.Thread(
             target=worker, name=f"job{j}",
             args=(j, shared, source, policy, session_start_box, usage_lock, app,
-                  progress, mailboxes.mailbox(j)), daemon=True)
+                  progress, mailboxes.mailbox(j), retirement_requested,
+                  claim_work),
+            daemon=True)
 
     def prepare_worker(j):
-        mailboxes.add(j)
+        if j not in mailboxes.target_ids:
+            try:
+                mailboxes.activate(j)
+            except KeyError:
+                mailboxes.add(j)
         progress.set_worker_count(j)
         # Use the invocation's Job object, not LoopStatus.job's fallback, so a
         # later periodic batch resumes the added row's iteration count.
         app.update(jobs=progress.jobs(j))
 
+    def remove_worker(j, count):
+        mailboxes.deactivate(j)
+        progress.set_worker_count(count)
+
+    def finish_removal(count):
+        app.update(jobs=progress.jobs(count))
+
     threads = WorkerPool(
         [make_worker(j) for j in range(1, jobs + 1)],
-        make_worker, prepare_worker)
-    app.register_action(AddWorkerAction(threads))
+        make_worker, prepare_worker, remove_worker, finish_removal)
+    app.register_action(ResizeWorkerPoolAction(threads))
     # Started for EVERY run, including one launched with `--git-push none`: the
     # policy is a knob now, so "there is nothing to push on" is a fact about this
     # instant, not about the run. `maybe_git_push` is a no-op for NONE, so the

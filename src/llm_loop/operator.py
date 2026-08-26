@@ -424,11 +424,13 @@ class MailboxSet:
         self._mailboxes: Dict[int, Mailbox] = {
             job_id: Mailbox() for job_id in ids
         }
+        self._active = set(ids)
 
     @property
     def target_ids(self) -> Tuple[int, ...]:
         with self._lock:
-            return tuple(self._mailboxes)
+            return tuple(job_id for job_id in self._mailboxes
+                         if job_id in self._active)
 
     @property
     def queued_count(self) -> int:
@@ -448,7 +450,20 @@ class MailboxSet:
                 raise ValueError(f"job {job_id} already has a mailbox")
             mailbox = Mailbox()
             self._mailboxes[job_id] = mailbox
+            self._active.add(job_id)
             return mailbox
+
+    def activate(self, job_id: int) -> Mailbox:
+        """Make an existing retired worker addressable again."""
+        with self._lock:
+            mailbox = self._mailboxes[job_id]
+            self._active.add(job_id)
+            return mailbox
+
+    def deactivate(self, job_id: int) -> None:
+        """Hide a retiring worker without discarding its queued notes."""
+        with self._lock:
+            self._active.discard(job_id)
 
     def mailbox(self, job_id: int) -> Mailbox:
         """The mailbox owned by `job_id`; unknown ids are programmer errors."""

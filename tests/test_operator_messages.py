@@ -911,6 +911,20 @@ def test_a_fleet_note_is_routed_to_the_selected_job(tmp_path):
     assert mailboxes.mailbox(10).take_queued() == ["check the long rails"]
 
 
+def test_a_retired_mailbox_can_be_hidden_and_reactivated_without_losing_notes():
+    mailboxes = operator.MailboxSet([1, 2])
+    mailbox = mailboxes.mailbox(2)
+    mailbox.submit("keep this for worker 2")
+
+    mailboxes.deactivate(2)
+    assert mailboxes.target_ids == (1,)
+    assert mailboxes.queued_count == 1
+
+    assert mailboxes.activate(2) is mailbox
+    assert mailboxes.target_ids == (1, 2)
+    assert mailbox.take_queued() == ["keep this for worker 2"]
+
+
 def test_an_unknown_fleet_job_does_not_steal_the_note(tmp_path):
     mailboxes = operator.MailboxSet([1, 3])
     app = _app(mailboxes, stop_file=str(tmp_path / "stop"))

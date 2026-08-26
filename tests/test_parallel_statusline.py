@@ -208,7 +208,7 @@ def test_plus_starts_another_worker_and_adds_its_live_surfaces(tmp_path,
         assert entered[1].wait(5), "the initial worker never started"
 
         app = made["app"]
-        assert dict(app.legend_entries())["+"] == "add worker"
+        assert dict(app.legend_entries())["+/-"] == "add/remove workers"
         app.handle_event(tio.Key("+"))
         assert entered[2].wait(5), "the + key did not start worker 2"
 
@@ -224,6 +224,71 @@ def test_plus_starts_another_worker_and_adds_its_live_surfaces(tmp_path,
 
     assert result["value"].completed == 3
     assert driver.pending_lines() == []
+
+
+def test_minus_retires_one_worker_after_its_current_file(tmp_path, monkeypatch):
+    """`-` narrows the live run without abandoning either in-flight item."""
+    made = _live_statusline(monkeypatch, {})
+    entered = {1: threading.Event(), 2: threading.Event()}
+    release = threading.Event()
+    calls = []
+
+    def hold(job_id, command, mailbox=None):
+        calls.append(job_id)
+        entered[job_id].set()
+        if len(calls) <= 2:
+            assert release.wait(5), "the test never released the provider turns"
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", hold)
+    driver = _MemDriver([f"products/f{i}.md" for i in range(4)])
+    progress = sl.InvocationProgress()
+    previous = projectroot.project_dir()
+    try:
+        done = threading.Event()
+        result = {}
+
+        def go():
+            try:
+                result["value"] = parallel.run_parallel(
+                    driver, _args(str(tmp_path), jobs=2),
+                    app_name="pytest-parallel-statusline", progress=progress)
+            finally:
+                done.set()
+
+        threading.Thread(target=go, daemon=True).start()
+        assert entered[1].wait(5) and entered[2].wait(5), \
+            "the initial workers never started"
+
+        app = made["app"]
+        app.handle_event(tio.Key("-"))
+        assert app.messages.target_ids == (1,)
+        assert "worker 2 retiring" in app.status.note
+
+        release.set()
+        assert done.wait(10), "the narrowed pool did not drain the queue"
+    finally:
+        release.set()
+        projectroot.set_project_root(previous)
+
+    assert result["value"].completed == 4
+    assert calls.count(2) == 1
+    assert [job.job_id for job in made["app"].status.jobs] == [1]
+    assert progress.worker_count(99) == 1
+
+
+def test_minus_keeps_the_last_worker():
+    pool = parallel.WorkerPool(
+        [threading.Thread(target=lambda: None)],
+        lambda job_id: threading.Thread(target=lambda: None),
+        lambda job_id: None)
+    action = parallel.ResizeWorkerPoolAction(pool)
+    app = sl.StatusApp(enabled=False)
+
+    action.run_key(app, "-")
+
+    assert "at least one worker" in app.status.note
+    assert pool.shrink() == (None, 1)
 
 
 def test_a_wider_live_pool_is_retained_for_the_next_batch():
@@ -248,6 +313,44 @@ def test_plus_in_the_statusline_startup_window_does_not_restart_its_thread():
     pool.join_all()
 
     assert sorted(ran) == [1, 2]
+
+
+def test_minus_then_plus_in_the_startup_window_cancels_the_retirement():
+    """A quick correction keeps the original thread; it must not start twice."""
+    ran = []
+
+    def make_thread(job_id):
+        return threading.Thread(target=lambda: ran.append(job_id))
+
+    pool = parallel.WorkerPool(
+        [make_thread(1), make_thread(2)], make_thread, lambda job_id: None)
+
+    assert pool.shrink() == (2, 1)
+    assert pool.grow() == 2
+    pool.start_initial()
+    pool.join_all()
+
+    assert sorted(ran) == [1, 2]
+
+
+def test_a_removed_idle_worker_cannot_claim_another_file():
+    """The resize and claim boundary is atomic, not two racy checks."""
+    claimed = []
+
+    class _Shared:
+        def claim(self):
+            claimed.append(True)
+            return "products/extra.md"
+
+    pool = parallel.WorkerPool(
+        [threading.Thread(target=lambda: None),
+         threading.Thread(target=lambda: None)],
+        lambda job_id: threading.Thread(target=lambda: None),
+        lambda job_id: None)
+
+    assert pool.shrink() == (2, 1)
+    assert pool.claim(2, _Shared()) == (False, None)
+    assert claimed == []
 
 
 @pytest.mark.filterwarnings(

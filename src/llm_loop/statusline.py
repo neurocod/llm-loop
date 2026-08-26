@@ -991,6 +991,14 @@ class Action:
     def run(self, app: "StatusApp") -> None:
         raise NotImplementedError
 
+    def run_key(self, app: "StatusApp", key: str) -> None:
+        """Run for the key that selected this action.
+
+        Most actions have one meaning and ignore the key. Multi-key actions can
+        override this without making NormalMode special-case their controls.
+        """
+        self.run(app)
+
 
 class StopAction(Action):
     """Graceful stop of THIS run, as an in-process request (see StopSource.KEY).
@@ -1090,7 +1098,7 @@ class NormalMode(Mode):
             return False
         action = self.app.action_for(event.char)
         if action is not None:
-            action.run(self.app)
+            action.run_key(self.app, event.char)
             return True
         if event.char.isprintable() and event.char.strip():
             self.app.note(f"unknown key {event.char!r} — press h for help")

@@ -110,7 +110,7 @@ remainder. And since the items are independent, they can run **N at a time**:
  job 2 ▶ gpt-5.6-terra | iter 1    | 1m36s  | terminal-block-connector.md
  job 3 ▶ gpt-5.6-terra | iter 1    | 1m36s  | acoustic-upright-piano.md
  job 4 ▶ gpt-5.6-terra | iter 1    | 1m36s  | eggs-dozen.md
- keys: s stop | p pause | m message | + add worker | h help
+ keys: s stop | p pause | m message | +/- add/remove workers | h help
 ```
 
 ## A playbook worth stealing
