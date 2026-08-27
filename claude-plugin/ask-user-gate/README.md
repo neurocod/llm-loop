@@ -26,6 +26,28 @@ Nothing else is configured: `hooks/hooks.json` names the script through
 `${CLAUDE_PLUGIN_ROOT}`, so one checkout guards every project on the machine
 and no absolute path is written down anywhere. Requires `python` on PATH.
 
+## Update
+
+An installed plugin is a snapshot, not a live checkout: it is copied into
+`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`, and neither it nor
+the marketplace clone follows the repository on its own. A push reaches a
+machine only through
+
+```
+claude plugin marketplace update neurocod
+claude plugin update ask-user-gate
+```
+
+and a restart, which the CLI asks for because Claude Code snapshots its hooks
+at startup.
+
+**Maintainers: bump `version` in `.claude-plugin/plugin.json` in the same
+commit as any change to this plugin.** That version is what the cache directory
+is named after, so a push that leaves it alone risks being a no-op on every
+machine that already installed — silently, and the thing left running is a
+security-adjacent gate. `claude plugin tag` cuts the matching git tag and
+checks that the manifest and the marketplace entry still agree.
+
 ## What ships in `bin/`
 
 `replace_in_file.py` and `try_patch.py` — the two scripts the refusals send the

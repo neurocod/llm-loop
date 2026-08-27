@@ -1,5 +1,6 @@
 {
   "name": "neurocod",
+  "description": "Tools for running coding agents unattended: llm-loop, and the shell gate that keeps a session off permission dialogs.",
   "owner": {
     "name": "neurocod",
     "url": "https://github.com/neurocod/llm-loop"
