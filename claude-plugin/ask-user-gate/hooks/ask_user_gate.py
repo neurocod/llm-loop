@@ -57,7 +57,8 @@ import sys
 import tempfile
 from dataclasses import dataclass
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+SELF = os.path.abspath(__file__)
+HERE = os.path.dirname(SELF)
 
 # The scripts the refusals below send the caller to. They ship in ../bin, so a
 # machine that has this gate always has them too; see tool_path().
@@ -208,6 +209,21 @@ def is_our_copy(path: str) -> bool:
         return False
 
 
+def shipped_path(name: str) -> str:
+    """Where one of SHIPPED_TOOLS sits on THIS machine, absolute.
+
+    The layout `hooks/<this file>` beside `bin/<tool>` is what makes the pair
+    one shipping unit, so the `os.pardir` hop is a fact about the plugin rather
+    than about any checkout.
+
+    One spelling on purpose. The check with teeth is check_paths() asking the
+    FILESYSTEM whether the answer names a real file -- measured: breaking the
+    `os.pardir` hop fails the self-test 64/66 -- and its comparisons then pin
+    which BRANCH tool_path() took, not how the path is spelled.
+    """
+    return os.path.normpath(os.path.join(HERE, os.pardir, "bin", name))
+
+
 def tool_path(name: str, base: "str | None" = None) -> str:
     """How to spell one of SHIPPED_TOOLS so that THIS machine can run it.
 
@@ -228,7 +244,7 @@ def tool_path(name: str, base: "str | None" = None) -> str:
         base = caller_dir()
     if is_our_copy(os.path.join(base, "tools", name)):
         return f"tools/{name}"
-    return os.path.normpath(os.path.join(HERE, os.pardir, "bin", name))
+    return shipped_path(name)
 
 
 @dataclass(frozen=True)
@@ -441,7 +457,7 @@ def render(findings: list[Finding]) -> str:
     # loose hook on another, so a literal path lies on half of them -- and the
     # bare basename, while greppable, does not tell a reader who has never seen
     # this plugin where the thing refusing their command lives.
-    lines = [f"Blocked by {os.path.abspath(__file__)}: this command would stop "
+    lines = [f"Blocked by {SELF}: this command would stop "
              f"the session on a permission prompt, so it was not run.", ""]
     said: set[str] = set()  # several findings usually share one remedy
     for finding in findings:
@@ -570,7 +586,7 @@ def check_wiring() -> "tuple[list[str], int]":
             problems.append(f"cannot read {config}: {error}")
             continue
         ours = [entry for entry in entries
-                if any(os.path.basename(__file__) in hook.get("command", "")
+                if any(os.path.basename(SELF) in hook.get("command", "")
                        for hook in entry.get("hooks", []))]
         wired += len(ours)
         for entry in ours:
@@ -615,10 +631,23 @@ def check_paths() -> "tuple[list[str], int]":
                 f"{error}"], 1
     with project as root:
         os.mkdir(os.path.join(root, "tools"))
+
+        def plant(name: str, ours: bool) -> str:
+            """Give the fake checkout a `tools/<name>`, ours or a stranger's.
+
+            The two bodies differ only by the marker, which is the whole
+            question is_our_copy() answers -- writing them apart is how a test
+            ends up planting a marked file and asserting the unmarked answer.
+            """
+            path = os.path.join(root, "tools", name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f"# a stand-in, marked {TOOL_MARKER}\n" if ours
+                             else "# someone else's script of the same name\n")
+            return path
+
         for name in SHIPPED_TOOLS:
             checks += 4
-            shipped = os.path.normpath(os.path.join(HERE, os.pardir, "bin",
-                                                    name))
+            shipped = shipped_path(name)
             if not os.path.isfile(shipped):
                 problems.append(f"{name} is named in a refusal but is not "
                                 f"shipped at {shipped}")
@@ -626,15 +655,12 @@ def check_paths() -> "tuple[list[str], int]":
             if away != shipped:
                 problems.append(f"{name}: outside a repository the refusal "
                                 f"names {away!r}, not the shipped copy")
-            local = os.path.join(root, "tools", name)
-            with open(local, "w", encoding="utf-8") as handle:
-                handle.write(f"# a stand-in, marked {TOOL_MARKER}\n")
+            local = plant(name, ours=True)
             near = tool_path(name, base=root)
             if near != f"tools/{name}":
                 problems.append(f"{name}: a checkout with its own stand-in is "
                                 f"told {near!r}, not the short path")
-            with open(local, "w", encoding="utf-8") as handle:
-                handle.write("# someone else's script of the same name\n")
+            plant(name, ours=False)
             stranger = tool_path(name, base=root)
             if stranger != shipped:
                 problems.append(f"{name}: an unrelated tools/{name} is handed "
@@ -647,14 +673,10 @@ def check_paths() -> "tuple[list[str], int]":
         restore, _CALLER_CWD = _CALLER_CWD, root
         try:
             name = SHIPPED_TOOLS[0]  # the branch is the same for either name
-            shipped = os.path.normpath(os.path.join(HERE, os.pardir, "bin",
-                                                    name))
-            if tool_path(name) != shipped:
+            if tool_path(name) != shipped_path(name):
                 problems.append(f"{name}: with no base given the resolver does "
                                 f"not fall back to the shipped copy")
-            local = os.path.join(root, "tools", name)
-            with open(local, "w", encoding="utf-8") as handle:
-                handle.write(f"# a stand-in, marked {TOOL_MARKER}\n")
+            local = plant(name, ours=True)
             if tool_path(name) != f"tools/{name}":
                 problems.append(f"{name}: with no base given the resolver does "
                                 f"not read the caller's directory")
