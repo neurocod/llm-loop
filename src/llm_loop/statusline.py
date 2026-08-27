@@ -513,7 +513,7 @@ class InvocationProgress:
     def worker_count(self, initial: int) -> int:
         """The parallel width for this invocation, first caller establishing it.
 
-        A periodic wrapper makes a fresh parallel runner for each batch. Keeping
+        A batching wrapper makes a fresh parallel runner for each batch. Keeping
         the live width here makes a `+` press apply to the rest of that invocation
         instead of disappearing when the current batch ends.
         """
@@ -1903,7 +1903,7 @@ class StatusApp:
     def add_service(self, service) -> object:
         """Attach a start()/stop() helper to the app's lifetime (e.g. the quota
         refresher). Tying it here is what guarantees its thread dies with the
-        run — run_loop is called repeatedly by periodic wrappers."""
+        run — run_loop is called repeatedly by batching wrappers."""
         self._services.append(service)
         if self._started:
             self._start_service(service)

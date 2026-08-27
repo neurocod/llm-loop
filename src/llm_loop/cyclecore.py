@@ -525,7 +525,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     paused_since = 0.0            # start of the pause being held (0.0 = none)
     # Why a driver hook asked to hand control back, latched until the loop head
     # acts on it (see Driver.item_started / item_finished).
-    pause_reason = None
+    handback_reason = None
     stop_reason = stopchannel.RunStopReason.NO_WORK
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     dry_run_prompt_shown = False  # dry-run: show job 1's prompt once, not per pass
@@ -629,9 +629,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # that will never come. Held there, `p` would keep the caller from
             # getting control back until somebody released it, and the gate
             # would keep it until the quota window reset.
-            if pause_reason is not None:
-                print(f"  ⏸ {pause_reason} — the driver asked to hand control "
-                      f"back; stopping this run.")
+            if handback_reason is not None:
+                print(f"  ⏸ {handback_reason} — "
+                      f"{stopchannel.DRIVER_HANDBACK_CLAUSE}")
                 stop_reason = stopchannel.RunStopReason.DRIVER_PAUSE
                 break
 
@@ -796,7 +796,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # notes above are already spliced in). It cannot cancel this
             # iteration — the loop head is where a pause is acted on — so a
             # reason returned here is latched and this turn still runs.
-            pause_reason = pause_reason or driver.item_started(command)
+            handback_reason = handback_reason or driver.item_started(command)
 
             if provider == "claude":
                 returncode = run_claude_streaming(
@@ -826,7 +826,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # iteration is still an iteration whose side effects are on disk.
             # `or` keeps the FIRST reason: a pause already asked for is not
             # withdrawn by a later hook answering None.
-            pause_reason = pause_reason or driver.item_finished(command, returncode)
+            handback_reason = handback_reason or driver.item_finished(command, returncode)
 
             # The backstop under the proactive check (see RateLimitEvent): this run's
             # own verdict from the wire. A refusal needs no figure and no query to be
@@ -834,14 +834,14 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # when the report was unavailable, which is the case this exists for.
             # Checked for both outcomes: a run refused on its last turn may still have
             # exited 0 with its work recorded above.
-            # `pause_reason` excluded: this wait is the longest hold below the
+            # `handback_reason` excluded: this wait is the longest hold below the
             # loop head (a whole quota window), and the head is about to end the
             # run anyway. Sitting it out first would hand control back hours
             # after it was asked for — the window matters to the NEXT run, and
             # that one is the caller's to start.
             refusal = last_rate_limit_event() if provider == "claude" else None
             if (not ignore_usage_limits and refusal is not None
-                    and refusal.status == "rejected" and pause_reason is None):
+                    and refusal.status == "rejected" and handback_reason is None):
                 # +5s so we come back after the reset, not exactly on it.
                 target_ts = (refusal.resets_at
                              or time.time() + CLAUDE_SESSION_DURATION) + 5
@@ -871,7 +871,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             print_error(f"{spec.display_name} exited with code {returncode} "
                         f"(error #{consecutive_errors} in a row).")
 
-            if not ignore_usage_limits and pause_reason is None:
+            if not ignore_usage_limits and handback_reason is None:
                 # The pause exclusion is the refusal branch's (see there): this
                 # gate can hold for a whole window, and the head is one `continue`
                 # away from ending the run. The error itself is still counted and

@@ -295,7 +295,7 @@ def begin(app_name: str, log_dir: Path, project: str, argv=None,
     """Report previous runs that vanished, then start this run's own record.
 
     Idempotent per process: a wrapper that calls several runners in one
-    invocation (see the periodic mode) keeps one record for the whole process,
+    invocation (a batching wrapper) keeps one record for the whole process,
     because "why did the script terminate?" is a question about the process.
     """
     global _record

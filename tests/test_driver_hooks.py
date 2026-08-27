@@ -315,9 +315,9 @@ def test_an_ending_already_latched_is_not_relabelled_by_a_late_pause():
     shared.stop_reason = RunStopReason.LIMIT_REACHED
     shared.claims_closed.set()
 
-    assert shared.request_driver_pause("too late") is False
+    assert shared.request_driver_handback("too late") is False
     assert shared.stop_reason is RunStopReason.LIMIT_REACHED
-    assert shared.pause_reason is None
+    assert shared.handback_reason is None
 
 
 class _SequentialHookDriver(Driver):

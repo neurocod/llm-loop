@@ -266,7 +266,7 @@ OPTION_ORDER: Dict[str, Tuple[str, ...]] = {
         "--project-dir",
         "--ignore-usage",
         # Accepted here too: the flag is documented as a general one, and a
-        # periodic run hands these args to the sequential loop (which honours
+        # batching wrapper hands these args to the sequential loop (which honours
         # it), so a parser that rejected it would exit 2 on a documented
         # spelling.
         "--no-statusline",

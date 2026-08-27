@@ -173,7 +173,8 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     # Decided per invocation, before the first argv is built: the transport is
     # what --no-live-messages turns off, and both the argv and the process's
     # stdin have to agree about it. Set in BOTH directions — a wrapper that calls
-    # two runners in one process (see runGenerateModels' periodic mode) would
+    # two runners in one process (see runGenerateModels' parallel mode, which
+    # alternates product batches with kit-promotion passes) would
     # otherwise have the first `--no-live-messages` phase decide the transport
     # for every phase after it.
     set_live_messages(not getattr(args, "no_live_messages", False))
@@ -192,7 +193,7 @@ def begin_run(driver, args, app_name: str, progress=None, *,
         # AFTER the tee, and that is the load-bearing half of this order: `begin`
         # prints the report of a PREVIOUS run that vanished, and the report has
         # to land in the mirror log whose abrupt end it explains. Idempotent per
-        # process: the periodic wrapper calls a runner repeatedly and keeps one
+        # process: a batching wrapper calls a runner repeatedly and keeps one
         # record.
         exitlog.begin(app_name, console.LOG_DIR,
                       os.path.basename(projectroot.project_dir()))

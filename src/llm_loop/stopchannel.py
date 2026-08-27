@@ -103,7 +103,7 @@ STOP_REASON_TEXT = {
 
 # The reasons that mean "a human asked this INVOCATION to stop", as opposed to
 # "this runner call ran out of work". A wrapper that slices one invocation into
-# several runner calls — the periodic batch loop in a host project — must end on
+# several runner calls — the batch loop in a host project — must end on
 # any of them: each call builds its own StatusApp, so a key request that only
 # ended one batch is gone by the next, and the keypress is silently absorbed
 # batch after batch. Membership, never `== STOP_FILE`, so a new channel here
@@ -160,20 +160,20 @@ STOP_RECHECK_SECONDS = 0.25
 # What settles it is measured, not argued — the producer and the consumer of the
 # latch are BOTH outside every run, and no run object exists between them:
 #
-#   * `runGenerateModels._detect_periodic_stop` calls `mark_stop_file_detected`
+#   * `runGenerateModels._detect_phase_stop` calls `mark_stop_file_detected`
 #     from the host wrapper, BETWEEN two runner calls, with no runner on the
 #     stack at all;
 #   * the removal happens when the wrapper's own `main()` leaves the lifecycle
 #     it entered around its whole invocation.
 #
-#   Pinned end to end by `test_periodic_boundary_keeps_stop_file_until_outer_exit`
+#   Pinned end to end by `test_phase_boundary_keeps_stop_file_until_outer_exit`
 #   in the host suite, which enters the lifecycle and marks a detection without
 #   ever building a run.
 #
 # Hanging the latch on a run object would therefore need a channel to hand it UP
 # to something that outlives the run — and that channel, for a single-process
 # engine, is this module global. `_stop_file_lifecycle_depth` is what makes
-# nested runner calls (sequential inside periodic inside a wrapper) leave the
+# nested runner calls (a sequential and a parallel one inside a wrapper) leave the
 # file alone: only the outermost frame removes it.
 #
 # The lock is not decoration either: in the parallel runner `commit_stop` runs
@@ -197,7 +197,7 @@ def stop_file_lifecycle():
 
     Runners enter this lifecycle themselves so direct users retain one-shot stop
     semantics. A project wrapper can enter it once around its complete main()
-    lifecycle; nested sequential, parallel, and periodic runner calls then leave
+    lifecycle; nested sequential and parallel runner calls then leave
     the sentinel in place through all wrapper-level cleanup.
     """
     global _stop_file_lifecycle_depth, _detected_stop_file
@@ -278,11 +278,21 @@ def latched_stop(app=None) -> Optional[StopSource]:
 # The half of a stop-file announcement that does not depend on what found the
 # sentinel: the run ends, the FILE stays. A constant rather than a literal in
 # each sentence, because that promise is made in three places — both runners'
-# stop tail (`commit_stop`) and the wrapper that looks between periodic phases
-# (runGenerateModels._detect_periodic_stop) — and the copies had already drifted
+# stop tail (`commit_stop`) and the wrapper that looks between two phases
+# (runGenerateModels._detect_phase_stop) — and the copies had already drifted
 # into different spellings of it.
 STOP_FILE_KEPT_CLAUSE = ("stopping; it remains in place until "
                          "the application exits.")
+
+# The half of a driver hand-back's announcement that both runners make (see
+# `RunStopReason.DRIVER_PAUSE`): what the run will do about the request. Here
+# for the reason STOP_FILE_KEPT_CLAUSE is — the promise is one event's, the
+# sentences around it are each runner's, and written out twice the two drift.
+# The clause has to hold for both, so it says what a fleet and a single loop do
+# alike: neither cancels what it is doing, and neither starts anything new.
+DRIVER_HANDBACK_CLAUSE = ("the driver asked to hand control back; nothing new "
+                          "will be started and whatever is running finishes "
+                          "first.")
 
 
 def commit_stop(app, source: StopSource) -> Tuple[RunStopReason, str]:

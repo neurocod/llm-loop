@@ -569,13 +569,13 @@ class Shared:
         self.stop_owner = None        # job_id deciding the request's fate
         self.stop_reason = None
         # Why the driver asked the run to hand control back (see
-        # request_driver_pause), or None. Read by the workers as well as
+        # request_driver_handback), or None. Read by the workers as well as
         # written: it is what releases one parked on the usage gate, and what
         # tells a claim held there that it may go back to the queue. A plain
         # attribute rather than an Event because the reason travels with it, and
         # a lone assignment of one is atomic — the lock still guards the
         # transition that decides WHO latches it.
-        self.pause_reason = None
+        self.handback_reason = None
         # Whether the fleet has already said it is paused (see note_pause): the
         # `p` key is read by every worker, and a fleet of eight would otherwise
         # announce one keypress eight times.
@@ -826,7 +826,7 @@ class Shared:
         (announce or print)(announcement)
         return True
 
-    def request_driver_pause(self, reason: str) -> bool:
+    def request_driver_handback(self, reason: str) -> bool:
         """The driver asked to hand control back: close claims, keep the fleet.
 
         The same close `--max-runs` uses, and for the same reason it is not a
@@ -841,7 +841,7 @@ class Shared:
         with self.lock:
             if self.claims_closed.is_set():
                 return False
-            self.pause_reason = reason
+            self.handback_reason = reason
             self.stop_reason = RunStopReason.DRIVER_PAUSE
             self.claims_closed.set()
             return True
@@ -930,7 +930,7 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
     return True
 
 
-def note_driver_pause(job_id: int, shared: Shared, reason: Optional[str]) -> None:
+def note_driver_handback(job_id: int, shared: Shared, reason: Optional[str]) -> None:
     """Act on what a driver hook returned: nothing, or the end of this run.
 
     One place for both hooks (`Driver.item_started` / `item_finished`), because
@@ -939,10 +939,9 @@ def note_driver_pause(job_id: int, shared: Shared, reason: Optional[str]) -> Non
     """
     if not reason:
         return
-    if shared.request_driver_pause(reason):
+    if shared.request_driver_handback(reason):
         job_lines(job_id).line(
-            f"⏸ {reason} — the driver asked to hand control back; no new items "
-            f"will be claimed and work in flight finishes first.", "yellow")
+            f"⏸ {reason} — {stopchannel.DRIVER_HANDBACK_CLAUSE}", "yellow")
 
 
 def worker(job_id: int, shared: Shared, source: Optional[object],
@@ -953,7 +952,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
 
     Loops until the queue drains, the claim cap closes, the stop sentinel is
     latched (see apply_stop_request), the driver asks to hand control back from
-    one of its per-item hooks (see note_driver_pause), or the pool retires this
+    one of its per-item hooks (see note_driver_handback), or the pool retires this
     worker at a claim boundary. A claim that returns None while every signal
     remains clear means
     everything left is in flight elsewhere, so we briefly back off and retry.
@@ -1053,7 +1052,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                         paused, new_start = policy.check_and_wait(
                             source, session_start_box[0],
                             should_stop=lambda: (shared.stop_asked(app)
-                                                 or shared.pause_reason is not None))
+                                                 or shared.handback_reason is not None))
                         if paused:
                             session_start_box[0] = new_start
                         # The check just paid for a usage reading; publishing it
@@ -1096,7 +1095,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # got control back. AFTER the stop hold, so a stop that is also
             # pending is still this worker's to latch: an ending a human asked
             # for outranks one a driver did.
-            if shared.pause_reason is not None:
+            if shared.handback_reason is not None:
                 shared.release(line)
                 break
 
@@ -1129,13 +1128,11 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                       prompt=command.prompt, now=started_at)
             app.update(phase="running")
             out.line(f"▶ {command.label}", "bold cyan")
-            # The start-of-item hook, with the command as it will actually be
-            # sent (operator notes spliced in). A pause asked for here cannot
-            # cancel this item — it is claimed, it is announced, and the fleet
-            # is about to pay for it either way — so it closes claims and lets
-            # this turn finish, exactly as one asked for at the other boundary.
-            note_driver_pause(job_id, shared,
-                              shared.driver.item_started(command))
+            # The start-of-item hook (Driver.item_started), placed here so it
+            # sees the command as it will actually be sent — operator notes
+            # spliced in, the row already announced.
+            note_driver_handback(job_id, shared,
+                                 shared.driver.item_started(command))
             rc, cost_usd, dur = run_job(job_id, command, mailbox)
         except BaseException:
             # Hand the claim back (see `Shared.abandon` for which way and why),
@@ -1182,13 +1179,12 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             tail = " — parked after repeated failures" if parked else " — will retry"
             out.line(f"✗ {command.label} (exit {rc}){suffix}{tail}", "bold red")
 
-        # The end-of-item hook, after the outcome is recorded and reported: what
-        # this item wrote is on disk now, which is what a driver watching the
-        # world around the run has to look at. Outside the guard above for the
-        # same reason `shared.finish` is — the claim is already given back, so a
-        # hook that raises ends its own thread without taking the run with it.
-        note_driver_pause(job_id, shared,
-                          shared.driver.item_finished(command, rc))
+        # The end-of-item hook (Driver.item_finished). Outside the guard above
+        # for the same reason `shared.finish` is — the claim is already given
+        # back, so a hook that raises ends its own thread without taking the
+        # run with it.
+        note_driver_handback(job_id, shared,
+                             shared.driver.item_finished(command, rc))
 
 
 @stopchannel.stop_file_lifecycle()
@@ -1217,7 +1213,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     # Worker count precedence: explicit -j/--jobs on the CLI, then the driver's
     # `jobs` attribute (a subclass may pin it), then the engine default. The
-    # invocation remembers later `+` presses so a periodic wrapper's next batch
+    # invocation remembers later `+` presses so a batching wrapper's next batch
     # starts at the widened count instead of silently shrinking again.
     jobs = args.jobs
     if jobs is None:
@@ -1391,7 +1387,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                 mailboxes.add(j)
         progress.set_worker_count(j)
         # Use the invocation's Job object, not LoopStatus.job's fallback, so a
-        # later periodic batch resumes the added row's iteration count.
+        # later batch resumes the added row's iteration count.
         app.update(jobs=progress.jobs(j))
 
     def remove_worker(j, count):
@@ -1424,8 +1420,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     interrupted = False
 
     # The region lives exactly as long as the workers do (run_loop releases it
-    # the same way, before its final push): a periodic run alternates batches of
-    # this runner with sequential grow-kit sweeps, and two status areas pinned at
+    # the same way, before its final push): a batching wrapper alternates runs of
+    # this runner with sequential ones, and two status areas pinned at
     # once would fight over the same rows.
     with app:
         if source is not None:
