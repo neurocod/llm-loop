@@ -19,7 +19,7 @@ So `OPTIONS` below is the single table, and everything else is DERIVED from it:
     spelling of a flag, and whether it eats the next token.
 
 A row that no parser offers is legitimate and carries `kwargs=None`: the wrapper
-reads `--parallel`/`--grow-kit`/`--random`/`--grow-kit-periodically` out of argv
+reads `--parallel`/`--grow-kit`/`--random`/`--finish` out of argv
 before either parser exists, and `--session-limit`/`--weekly-limit` are ceilings
 the status line can edit into a command line that has no parser yet. The alias
 table must know those spellings anyway — it is what stops their values from
@@ -153,13 +153,11 @@ OPTIONS: Dict[str, Option] = {
     # already express an edited ceiling as a command line.
     "--session-limit": Option(aliases=("--session-limit",), takes_value=True),
     "--weekly-limit": Option(aliases=("--weekly-limit",), takes_value=True),
-    # Wrapper-only: runGenerateModels reads these two out of argv before either
-    # parser. Both take a value, which is the reason they must be listed even
-    # though nothing here parses them: an unlisted value-taking flag has its
+    # Wrapper-only: runGenerateModels reads this out of argv before either
+    # parser. It takes a value, which is the reason it must be listed even
+    # though nothing here parses it: an unlisted value-taking flag has its
     # VALUE read as a free-standing token, and a folder or a count that happens
     # to spell `-m` is then stripped along with the token after it.
-    "--grow-kit-periodically": Option(aliases=("--grow-kit-periodically",),
-                                      takes_value=True),
     "--finish": Option(aliases=("--finish",), takes_value=True),
     "--cost-log": Option(
         aliases=("--cost-log",),
@@ -234,7 +232,7 @@ OPTIONS: Dict[str, Option] = {
                       f"instead (same as {providers.LIVE_MESSAGES_ENV}=0). "
                       "Notes need a single worker either way",
     ),
-    # Wrapper-only, all three: see --grow-kit-periodically above.
+    # Wrapper-only, all three: see --finish above.
     "--parallel": Option(aliases=("-p", "--parallel"), takes_value=False),
     "--grow-kit": Option(aliases=("--grow-kit",), takes_value=False),
     "--random": Option(aliases=("--random",), takes_value=False),

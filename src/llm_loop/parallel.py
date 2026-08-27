@@ -568,6 +568,10 @@ class Shared:
         self.stop_requested = threading.Event()
         self.stop_owner = None        # job_id deciding the request's fate
         self.stop_reason = None
+        # Why the driver asked the run to hand control back (see
+        # request_driver_pause), or None. Reported once, by the worker that
+        # latched it.
+        self.pause_reason = None
         # Whether the fleet has already said it is paused (see note_pause): the
         # `p` key is read by every worker, and a fleet of eight would otherwise
         # announce one keypress eight times.
@@ -818,6 +822,26 @@ class Shared:
         (announce or print)(announcement)
         return True
 
+    def request_driver_pause(self, reason: str) -> bool:
+        """The driver asked to hand control back: close claims, keep the fleet.
+
+        The same close `--max-runs` uses, and for the same reason it is not a
+        `stop`: work in flight is not cancelled, only new claims are refused, so
+        the run winds down without throwing away a turn somebody has paid for.
+
+        True for the caller that latched it — one line per request however many
+        workers finish an item at once. A close that is already in place wins:
+        the cap and the drained queue are final endings (`claims_closed` is not
+        reopenable), and a pause arriving a moment later must not relabel them.
+        """
+        with self.lock:
+            if self.claims_closed.is_set():
+                return False
+            self.pause_reason = reason
+            self.stop_reason = RunStopReason.DRIVER_PAUSE
+            self.claims_closed.set()
+            return True
+
     def note_pause(self, paused: bool) -> bool:
         """True for the worker that should announce this pause (or its release).
 
@@ -902,6 +926,21 @@ def apply_stop_request(job_id: int, shared: Shared, app) -> bool:
     return True
 
 
+def note_driver_pause(job_id: int, shared: Shared, reason: Optional[str]) -> None:
+    """Act on what a driver hook returned: nothing, or the end of this run.
+
+    One place for both hooks (`Driver.item_started` / `item_finished`), because
+    the two differ only in WHEN they are asked — what a returned reason means is
+    the same either way, and the announcement has to read the same too.
+    """
+    if not reason:
+        return
+    if shared.request_driver_pause(reason):
+        job_lines(job_id).line(
+            f"⏸ {reason} — the driver asked to hand control back; no new items "
+            f"will be claimed and work in flight finishes first.", "yellow")
+
+
 def worker(job_id: int, shared: Shared, source: Optional[object],
            policy, session_start_box: list, usage_lock: threading.Lock,
            app=None, progress=None, mailbox=None,
@@ -909,8 +948,10 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
     """One worker thread: claim -> (usage gate) -> run -> record, repeat.
 
     Loops until the queue drains, the claim cap closes, the stop sentinel is
-    latched (see apply_stop_request), or the pool retires this worker at a claim
-    boundary. A claim that returns None while every signal remains clear means
+    latched (see apply_stop_request), the driver asks to hand control back from
+    one of its per-item hooks (see note_driver_pause), or the pool retires this
+    worker at a claim boundary. A claim that returns None while every signal
+    remains clear means
     everything left is in flight elsewhere, so we briefly back off and retry.
     `source`/`policy` are None when --ignore-usage disables the session-limit
     gate. `app` is this run's status line; each worker owns the Job of its own
@@ -1060,6 +1101,13 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                       prompt=command.prompt, now=started_at)
             app.update(phase="running")
             out.line(f"▶ {command.label}", "bold cyan")
+            # The start-of-item hook, with the command as it will actually be
+            # sent (operator notes spliced in). A pause asked for here cannot
+            # cancel this item — it is claimed, it is announced, and the fleet
+            # is about to pay for it either way — so it closes claims and lets
+            # this turn finish, exactly as one asked for at the other boundary.
+            note_driver_pause(job_id, shared,
+                              shared.driver.item_started(command))
             rc, cost_usd, dur = run_job(job_id, command, mailbox)
         except BaseException:
             # Hand the claim back (see `Shared.abandon` for which way and why),
@@ -1105,6 +1153,14 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             parked = line in shared.failed
             tail = " — parked after repeated failures" if parked else " — will retry"
             out.line(f"✗ {command.label} (exit {rc}){suffix}{tail}", "bold red")
+
+        # The end-of-item hook, after the outcome is recorded and reported: what
+        # this item wrote is on disk now, which is what a driver watching the
+        # world around the run has to look at. Outside the guard above for the
+        # same reason `shared.finish` is — the claim is already given back, so a
+        # hook that raises ends its own thread without taking the run with it.
+        note_driver_pause(job_id, shared,
+                          shared.driver.item_finished(command, rc))
 
 
 @stopchannel.stop_file_lifecycle()

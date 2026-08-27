@@ -479,10 +479,10 @@ class InvocationProgress:
 
     A StatusApp and its Jobs are built inside run_parallel/run_loop, so every
     counter that lives in them restarts when the call does. One process is one
-    invocation, but a wrapper may slice it into several calls — the periodic
-    runner (--grow-kit-periodically N) calls run_parallel once per batch — and
-    then per-call counters are the wrong quantity: the summary row froze at the
-    batch cap and every job row restarted at 1. So the invocation-wide figures
+    invocation, but a wrapper may slice it into several calls — a batching
+    wrapper calls run_parallel once per batch, alternating it with a different
+    kind of run — and then per-call counters are the wrong quantity: the summary
+    row froze at the batch cap and every job row restarted at 1. So the invocation-wide figures
     live here, and the wrapper hands the same instance to every call it makes.
     A runner given none makes its own, which is the single-call case unchanged.
 

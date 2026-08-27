@@ -371,6 +371,24 @@ ever reaches the parser, which means the wrapper's own scan missed a spelling
 would otherwise have gone ahead in the default mode. Anything the engine *should*
 parse is an ordinary `add_argument` here instead.
 
+### Reacting to the world around a run
+
+`Driver.item_started(command)` and `Driver.item_finished(command, returncode)`
+are called at the two boundaries of one unit of work, in both runners (the
+parallel one calls them from its worker threads, so keep them thread-safe).
+Override the one you need to watch something the run does not own — a folder the
+agents themselves write into, a lock, a budget.
+
+Return a short reason from either and the runner stops handing out new work and
+returns `RunStopReason.DRIVER_PAUSE` once everything in flight has finished:
+nothing is cancelled, nothing leaves the queue, and a fleet winds down exactly as
+it does for the `s` key. It is the ending for a wrapper that alternates two kinds
+of run — "this runner call is over, ask me again" — as opposed to
+`next_command() -> None` (the queue is empty) and `LoopStop` (abort, a human is
+wanted). A host wrapper that slices its work into fixed-size batches to get an
+inter-batch boundary usually wants this instead: the run then ends when the
+condition actually appears rather than N items later.
+
 ## Usage limits
 
 Before each iteration (and after any failed one) the loop reads the account's

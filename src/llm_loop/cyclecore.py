@@ -523,6 +523,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     iteration = 0
     completed = 0
     paused_since = 0.0            # start of the pause being held (0.0 = none)
+    # Why a driver hook asked to hand control back, latched until the loop head
+    # acts on it (see Driver.item_started / item_finished).
+    pause_reason = None
     stop_reason = stopchannel.RunStopReason.NO_WORK
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     dry_run_prompt_shown = False  # dry-run: show job 1's prompt once, not per pass
@@ -670,6 +673,18 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     # already said PAUSED.
                     continue
 
+            # A pause one of the driver's per-item hooks asked for, acted on at
+            # the boundary rather than where it was latched: an iteration that
+            # has started is never cancelled (see Driver.item_started), and the
+            # paths between a finished item and this line — a retry after a
+            # non-zero exit, the wait after a rate-limit refusal — all come back
+            # through here, so one check covers every one of them.
+            if pause_reason is not None:
+                print(f"  ⏸ {pause_reason} — the driver asked to hand control "
+                      f"back; stopping this run.")
+                stop_reason = stopchannel.RunStopReason.DRIVER_PAUSE
+                break
+
             # Ask the driver what to do next. None => no more work (stop cleanly);
             # LoopStop => abort the run (e.g. an error state needing a human).
             try:
@@ -769,6 +784,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     break
                 continue
 
+            # The start-of-item hook, with the command as it will be sent (the
+            # notes above are already spliced in). It cannot cancel this
+            # iteration — the loop head is where a pause is acted on — so a
+            # reason returned here is latched and this turn still runs.
+            pause_reason = pause_reason or driver.item_started(command)
+
             if provider == "claude":
                 returncode = run_claude_streaming(
                     cmd, raw, partial=True, prompt=command.prompt,
@@ -791,6 +812,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     if remaining is not None:
                         progress.note_remaining(remaining)
                         app.update(**progress.summary_fields())
+
+            # The end-of-item hook: after on_success, so the driver's own queue
+            # is up to date, and after the outcome either way — a failed
+            # iteration is still an iteration whose side effects are on disk.
+            # `or` keeps the FIRST reason: a pause already asked for is not
+            # withdrawn by a later hook answering None.
+            pause_reason = pause_reason or driver.item_finished(command, returncode)
 
             # The backstop under the proactive check (see RateLimitEvent): this run's
             # own verdict from the wire. A refusal needs no figure and no query to be

@@ -82,12 +82,11 @@ def test_reaching_the_parser_is_an_error_naming_the_option(capsys):
 
 
 def test_a_value_taking_switch_shows_its_argument(capsys):
-    def add_periodic(parser):
-        parser.add_argument("--grow-kit-periodically",
-                            action=ConsumedByWrapperAction, nargs=1,
-                            metavar="N", help="batches of N")
+    def add_batched(parser):
+        parser.add_argument("--batches-of", action=ConsumedByWrapperAction,
+                            nargs=1, metavar="N", help="batches of N")
 
     with pytest.raises(SystemExit):
-        cyclecore.parse_args(["--help"], extra_options=add_periodic)
+        cyclecore.parse_args(["--help"], extra_options=add_batched)
 
-    assert "--grow-kit-periodically N" in capsys.readouterr().out
+    assert "--batches-of N" in capsys.readouterr().out

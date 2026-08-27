@@ -9,7 +9,7 @@ appended.
 
 Starting from the original argv rather than from parsed values is what keeps the
 answer honest: flags this engine never parses - the host wrapper's -p/--parallel,
---grow-kit, --random, --grow-kit-periodically N - survive untouched, without this
+--grow-kit, --random, --finish FOLDER - survive untouched, without this
 module knowing what they mean.
 
 The module is deliberately PURE: no terminal, no I/O, and no import of cyclecore,

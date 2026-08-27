@@ -597,9 +597,9 @@ class _RecordingTerminal(_LiveTerminal):
         super().release()
 
 
-def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
-    """--grow-kit-periodically alternates parallel batches with sequential
-    sweeps; two regions pinned at once would fight over the same screen rows."""
+def test_a_batching_wrapper_never_stacks_two_status_areas(tmp_path, monkeypatch):
+    """A wrapper alternating parallel batches with sequential sweeps: two
+    regions pinned at once would fight over the same screen rows."""
     from llm_loop.agentwork import Driver
 
     log = []
@@ -651,7 +651,7 @@ def test_a_periodic_batch_never_stacks_two_status_areas(tmp_path, monkeypatch):
 
 # --- the counters belong to the invocation, not to one runner call ---------------
 #
-# A periodic run (--grow-kit-periodically N) calls run_parallel once per batch.
+# A batching wrapper calls run_parallel once per batch.
 # Everything below pins the figures a user reads against the whole invocation:
 # per-call counters made the summary row freeze at `iter <claimed>/<batch cap>`
 # and restarted every job row at 1.

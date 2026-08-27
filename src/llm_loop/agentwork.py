@@ -222,6 +222,58 @@ class Driver:
         """Called after an iteration whose provider CLI exited 0 — record progress
         here (mark a file done, advance a cursor). Default: nothing to do."""
 
+    # --- the two boundaries of one unit of work -------------------------------
+    # `on_success` records what the driver's OWN queue did; these two are about
+    # the world around the run — a folder another agent writes into, a lock, a
+    # budget — and they are where a driver gets to ask for the run to hand
+    # control back to whoever launched it.
+    #
+    # Both boundaries exist because they answer different questions, and a host
+    # is expected to override at most the one it needs:
+    #
+    #   * `item_started` sees the command that is about to be sent, so it can
+    #     record the attempt or notice a condition BEFORE paying for a turn. It
+    #     cannot cancel that turn — the item is already claimed and the runner
+    #     is about to launch it — so a pause asked for here still lets this item
+    #     run to the end;
+    #   * `item_finished` sees the outcome, and is the cheaper boundary to watch
+    #     the world on: whatever an iteration produced is on disk by the time it
+    #     is called, so a wrapper reacting to what the agents themselves write
+    #     (a request file, a lock, a report) wants this one.
+    #
+    # Returning a short reason from either asks the runner to STOP HANDING OUT
+    # NEW WORK and return `RunStopReason.DRIVER_PAUSE` once whatever is in
+    # flight has finished — the parallel runner therefore winds the whole fleet
+    # down without cancelling a single turn, exactly as the `s` key does.
+    # That is deliberately not the same as the two endings a driver already had:
+    # `next_command() -> None` says the queue is empty, and `LoopStop` aborts
+    # the invocation. A pause says "this runner call is over, ask me again" —
+    # which is what a wrapper alternating two kinds of run needs, and what it
+    # otherwise has to fake by slicing the work into fixed-size batches.
+    #
+    # THREAD SAFETY: the parallel runner calls both from its worker threads,
+    # several at once. Keep them cheap and re-entrant (a listdir, a counter
+    # under a lock); anything that mutates driver state has to guard it.
+
+    def item_started(self, command: AgentCommand) -> Optional[str]:
+        """About to send `command` to the provider. Default: nothing to do.
+
+        Return a short reason to ask the run to hand control back once the work
+        in flight (this item included) has finished; None to carry on.
+        """
+        return None
+
+    def item_finished(self, command: AgentCommand,
+                      returncode: int) -> Optional[str]:
+        """`command` returned `returncode` and its outcome has been recorded.
+
+        Called for failures as well as successes, and after `on_success` when
+        there was one, so the driver's own queue is already up to date here.
+        Return a short reason to ask the run to hand control back once the work
+        still in flight has finished; None to carry on.
+        """
+        return None
+
     def final_summary(self) -> Optional[str]:
         """An optional closing line printed on the way out (after the final
         git push). Return None for no summary."""

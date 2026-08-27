@@ -42,6 +42,14 @@ class RunStopReason(Enum):
     LIMIT_REACHED = "limit_reached"
     NO_WORK = "no_work"
     DRIVER_STOP = "driver_stop"
+    # The driver asked, from one of its per-item hooks, for this RUNNER CALL to
+    # end so the caller can do something the run cannot do while it is running
+    # (edit a file the workers hold read-only, run a different kind of pass).
+    # Deliberately distinct from DRIVER_STOP: that one is `LoopStop`, i.e. the
+    # invocation is over and a human is wanted. This one means "ask me again" —
+    # a wrapper that treats it as an ending would silently drop the rest of the
+    # queue, and one that treats DRIVER_STOP as this would loop on an abort.
+    DRIVER_PAUSE = "driver_pause"
     DRY_RUN = "dry_run"
     # Only the parallel runner can reach this one, and only since its workers
     # started handing their claims back as they die (Shared.abandon): a run whose
@@ -88,6 +96,7 @@ STOP_REASON_TEXT = {
     RunStopReason.LIMIT_REACHED: "iteration limit reached (--max-runs)",
     RunStopReason.NO_WORK: "no more work in the queue",
     RunStopReason.DRIVER_STOP: "the driver stopped the run",
+    RunStopReason.DRIVER_PAUSE: "the driver asked to hand control back",
     RunStopReason.DRY_RUN: "dry run finished",
     RunStopReason.WORKERS_DIED: "every worker died before the queue drained",
 }

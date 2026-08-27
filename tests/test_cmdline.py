@@ -73,10 +73,12 @@ def test_empty_overrides_is_a_no_op():
 
 
 def test_wrapper_only_flags_survive_an_override():
-    argv = ["-p", "-j", "3", "--random", "--grow-kit-periodically", "4",
+    # `--finish` is the value-taking one: an unlisted flag of that shape has its
+    # VALUE read as a free-standing token, so the folder would be stripped too.
+    argv = ["-p", "-j", "3", "--random", "--finish", "products/configs/x",
             "--max-runs", "5"]
     assert rebuild_argv(argv, {"--max-runs": 2}) == [
-        "-p", "-j", "3", "--random", "--grow-kit-periodically", "4",
+        "-p", "-j", "3", "--random", "--finish", "products/configs/x",
         "--max-runs", "2"]
 
 
