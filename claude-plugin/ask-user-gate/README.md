@@ -24,7 +24,14 @@ Escape hatch: put `allowAskUser` anywhere in the command (a trailing
 
 Nothing else is configured: `hooks/hooks.json` names the script through
 `${CLAUDE_PLUGIN_ROOT}`, so one checkout guards every project on the machine
-and no absolute path is written down anywhere. Requires `python` on PATH.
+and no absolute path is written down anywhere.
+
+Requires an interpreter named exactly `python` on PATH -- if a machine has only
+`python3`, make `python` resolve to it. A wrapper picking among `python3`,
+`python` and `py` was considered and declined (2026-08-27): the hook runs before
+EVERY shell command, so the probe such a wrapper needs -- `command -v` alone
+finds the Microsoft Store stub on Windows -- would put a second interpreter
+start on that path, roughly doubling the cost of the gate to save one symlink.
 
 ## Update
 
