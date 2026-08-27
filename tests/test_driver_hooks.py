@@ -15,6 +15,7 @@ close `--max-runs` uses and deliberately not the `stop` flag.
 """
 
 import threading
+import time
 
 import pytest
 
@@ -229,8 +230,78 @@ def test_a_pause_lets_every_turn_already_in_flight_run_to_its_end(
     assert done.wait(10), "the paused fleet did not return"
 
     assert box[0].reason is RunStopReason.DRIVER_PAUSE
-    assert sorted(completed) == sorted(inside), "a turn in flight was cut short"
+    # Three turns started, three ran to their end, three items came off the
+    # queue — the fourth, fifth and sixth were never claimed. (`completed` is
+    # asserted against the queue rather than against `inside`: nothing in this
+    # engine can cancel a `run_job` in flight, so comparing the two lists would
+    # hold with the feature removed.)
+    assert len(inside) == 3
+    assert len(driver.finished) == 3
     assert len(driver.pending_lines()) == 3
+
+
+def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatch):
+    """The gate is the longest hold in the engine, so it has to watch this too.
+
+    Without it the caller waits out a whole quota window for control it asked
+    for now: the workers still holding claims are inside `check_and_wait`, which
+    only ever watched the stop channels, and `run_parallel` cannot return until
+    they do. The claim such a worker holds goes BACK to the queue — nothing was
+    attempted with it, and unlike a `--max-runs` close this run WILL be started
+    again by the caller that asked for the pause.
+    """
+    first_gate = threading.Event()
+
+    class BlockingPolicy(_StubPolicy):
+        def check_and_wait(self, source, session_start, note="",
+                           cache_value=True, should_stop=None):
+            if not first_gate.is_set():
+                first_gate.set()      # let exactly one worker through
+                return False, session_start
+            # Every later worker parks here until something says otherwise —
+            # a fleet over its budget, in one line.
+            while not should_stop():
+                time.sleep(0.01)
+            return False, session_start
+
+    running = threading.Event()
+    release = threading.Event()
+
+    def blocked_job(job_id, command, mailbox=None):
+        running.set()
+        assert release.wait(5), "the test never released the running turn"
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", blocked_job)
+    monkeypatch.setattr(parallel, "usage_source_for", lambda provider: object())
+    driver = _HookedListDriver(
+        [f"products/f{i}.md" for i in range(3)],
+        on_finished=lambda command, rc: "a request was filed")
+    driver.limit_policy = BlockingPolicy()
+    args = _parallel_args(tmp_path, jobs=2)
+    args.ignore_usage = False
+
+    box = []
+    done = threading.Event()
+
+    def go():
+        try:
+            box.append(parallel.run_parallel(driver, args,
+                                             app_name="pytest-hooks"))
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert running.wait(5), "no worker got past the usage gate"
+    release.set()
+    assert done.wait(10), "a worker parked on the usage gate never came back"
+
+    assert box[0].reason is RunStopReason.DRIVER_PAUSE
+    assert driver.finished == [("f0.md", 0)]
+    # The claim the parked worker held is back in the queue, not spent: all
+    # three items are accounted for, and only the one that ran is gone.
+    assert len(driver.pending_lines()) == 2
+    assert box[0].attempted == 1
 
 
 def test_an_ending_already_latched_is_not_relabelled_by_a_late_pause():
@@ -294,6 +365,40 @@ def test_the_sequential_loop_stops_at_its_boundary_when_a_hook_asks(
     assert driver.started == ["a", "b"]
     assert driver.finished == [("a", 0), ("b", 0)]
     assert driver._items == ["c"], "the unreached item was consumed anyway"
+
+
+def test_a_held_sequential_run_still_hands_control_back(tmp_path, monkeypatch):
+    """`p` holds the START of work, and a paused run has none left to hold.
+
+    The same rule the cap above it follows, and the same one the parallel runner
+    spells as `shared.exhausted()`: held below the check instead, the caller
+    would wait for control until somebody at the keyboard released a key it
+    knows nothing about. Timed out on a thread because the failure mode is a
+    run that never returns.
+    """
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda *args, **kwargs: 0)
+    driver = _SequentialHookDriver(["a", "b"], pause_after="a")
+    # Held from the boundary that follows the first item — the same instant the
+    # hook asks for control back — and never released.
+    monkeypatch.setattr(stopchannel, "pause_requested",
+                        lambda app=None: bool(driver.finished))
+    box = []
+    done = threading.Event()
+
+    def go():
+        try:
+            box.append(cyclecore.run_loop(driver, _seq_args(tmp_path),
+                                          app_name="pytest-hooks",
+                                          wait_on_start=False))
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert done.wait(10), "a held run never handed control back"
+
+    assert box[0].reason is RunStopReason.DRIVER_PAUSE
+    assert driver.finished == [("a", 0)]
 
 
 def test_hooks_that_ask_for_nothing_leave_the_run_exactly_as_it_was(

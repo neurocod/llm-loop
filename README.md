@@ -380,10 +380,14 @@ Override the one you need to watch something the run does not own — a folder t
 agents themselves write into, a lock, a budget.
 
 Return a short reason from either and the runner stops handing out new work and
-returns `RunStopReason.DRIVER_PAUSE` once everything in flight has finished:
-nothing is cancelled, nothing leaves the queue, and a fleet winds down exactly as
-it does for the `s` key. It is the ending for a wrapper that alternates two kinds
-of run — "this runner call is over, ask me again" — as opposed to
+returns `RunStopReason.DRIVER_PAUSE` once everything in flight has finished: no
+turn is cancelled and nothing is lost from the queue. It is the same close
+`--max-runs` uses (new claims refused, work in flight untouched) rather than the
+`s` key's — a pause cannot be taken back, so unlike `s` a claim that has not
+started yet goes back to the queue instead of being held. A run whose LAST item
+asks for the pause may report either `DRIVER_PAUSE` or `NO_WORK`, depending on
+which worker got there first; a caller has to treat both as "come back and ask
+again". It is the ending for a wrapper that alternates two kinds of run — "this runner call is over, ask me again" — as opposed to
 `next_command() -> None` (the queue is empty) and `LoopStop` (abort, a human is
 wanted). A host wrapper that slices its work into fixed-size batches to get an
 inter-batch boundary usually wants this instead: the run then ends when the

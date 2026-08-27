@@ -615,6 +615,26 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 stop_reason = stopchannel.RunStopReason.LIMIT_REACHED
                 break
 
+            # A pause one of the driver's per-item hooks asked for, acted on at
+            # the boundary rather than where it was latched: an iteration that
+            # has started is never cancelled (see Driver.item_started), and the
+            # paths between a finished item and this line — a retry after a
+            # non-zero exit, the wait after a rate-limit refusal — all come back
+            # through here, so one check covers every one of them.
+            #
+            # HERE, and not further down, for the reason the cap above is here:
+            # everything below this line either holds the run (the `p` key) or
+            # waits on the account (the usage gate), and a run with no iteration
+            # left to hold back must end instead of standing held for a boundary
+            # that will never come. Held there, `p` would keep the caller from
+            # getting control back until somebody released it, and the gate
+            # would keep it until the quota window reset.
+            if pause_reason is not None:
+                print(f"  ⏸ {pause_reason} — the driver asked to hand control "
+                      f"back; stopping this run.")
+                stop_reason = stopchannel.RunStopReason.DRIVER_PAUSE
+                break
+
             # The `p` key's hold. AFTER the cap check, so a run that has no
             # iteration left to hold back ends instead of standing paused for a
             # boundary that will never come; BEFORE `driver.next_command()`,
@@ -672,18 +692,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     # window opening started a full iteration under a row that
                     # already said PAUSED.
                     continue
-
-            # A pause one of the driver's per-item hooks asked for, acted on at
-            # the boundary rather than where it was latched: an iteration that
-            # has started is never cancelled (see Driver.item_started), and the
-            # paths between a finished item and this line — a retry after a
-            # non-zero exit, the wait after a rate-limit refusal — all come back
-            # through here, so one check covers every one of them.
-            if pause_reason is not None:
-                print(f"  ⏸ {pause_reason} — the driver asked to hand control "
-                      f"back; stopping this run.")
-                stop_reason = stopchannel.RunStopReason.DRIVER_PAUSE
-                break
 
             # Ask the driver what to do next. None => no more work (stop cleanly);
             # LoopStop => abort the run (e.g. an error state needing a human).
@@ -826,9 +834,14 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # when the report was unavailable, which is the case this exists for.
             # Checked for both outcomes: a run refused on its last turn may still have
             # exited 0 with its work recorded above.
+            # `pause_reason` excluded: this wait is the longest hold below the
+            # loop head (a whole quota window), and the head is about to end the
+            # run anyway. Sitting it out first would hand control back hours
+            # after it was asked for — the window matters to the NEXT run, and
+            # that one is the caller's to start.
             refusal = last_rate_limit_event() if provider == "claude" else None
             if (not ignore_usage_limits and refusal is not None
-                    and refusal.status == "rejected"):
+                    and refusal.status == "rejected" and pause_reason is None):
                 # +5s so we come back after the reset, not exactly on it.
                 target_ts = (refusal.resets_at
                              or time.time() + CLAUDE_SESSION_DURATION) + 5
@@ -858,7 +871,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             print_error(f"{spec.display_name} exited with code {returncode} "
                         f"(error #{consecutive_errors} in a row).")
 
-            if not ignore_usage_limits:
+            if not ignore_usage_limits and pause_reason is None:
+                # The pause exclusion is the refusal branch's (see there): this
+                # gate can hold for a whole window, and the head is one `continue`
+                # away from ending the run. The error itself is still counted and
+                # printed above — only the waiting is skipped.
                 app.update(phase="waiting")
                 paused, session_start = limit_policy.check_and_wait(
                     usage_source, session_start, note=" (checked after error)",

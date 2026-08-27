@@ -569,8 +569,12 @@ class Shared:
         self.stop_owner = None        # job_id deciding the request's fate
         self.stop_reason = None
         # Why the driver asked the run to hand control back (see
-        # request_driver_pause), or None. Reported once, by the worker that
-        # latched it.
+        # request_driver_pause), or None. Read by the workers as well as
+        # written: it is what releases one parked on the usage gate, and what
+        # tells a claim held there that it may go back to the queue. A plain
+        # attribute rather than an Event because the reason travels with it, and
+        # a lone assignment of one is atomic — the lock still guards the
+        # transition that decides WHO latches it.
         self.pause_reason = None
         # Whether the fleet has already said it is paused (see note_pause): the
         # `p` key is read by every worker, and a fleet of eight would otherwise
@@ -1038,9 +1042,18 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                         # on the lock in front of it), the loop head that reads the
                         # request is unreachable, and the keypress looks like a
                         # hung program until the window resets hours later.
+                        # A driver pause ends the hold too, and for the same
+                        # reason: with the fleet parked on the wall, every
+                        # worker is inside this hold or blocked on the lock in
+                        # front of it, so nothing is left to notice the request
+                        # — and the caller waiting for control back waits out
+                        # the whole quota window. Unlike `s` this one cannot be
+                        # withdrawn, so the claim below is given back rather
+                        # than held.
                         paused, new_start = policy.check_and_wait(
                             source, session_start_box[0],
-                            should_stop=lambda: shared.stop_asked(app))
+                            should_stop=lambda: (shared.stop_asked(app)
+                                                 or shared.pause_reason is not None))
                         if paused:
                             session_start_box[0] = new_start
                         # The check just paid for a usage reading; publishing it
@@ -1069,6 +1082,21 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                 # on a stop latched by ANY worker, not only on this call's answer.
                 apply_stop_request(job_id, shared, app)
             if shared.stop.is_set():
+                shared.release(line)
+                break
+
+            # A driver pause latched while this worker waited — for the lock, on
+            # the budget, or in the hold above. The claim goes BACK, unlike the
+            # close just above it and unlike --max-runs: nothing was attempted
+            # with it (no turn started, no target touched), and unlike those two
+            # endings this claim CAN be made again — the caller's whole reason
+            # for asking is that it means to start another runner call. Held
+            # instead, it would be a file paid for out of --max-runs that nobody
+            # ran, and the fleet would sit out the quota window before the caller
+            # got control back. AFTER the stop hold, so a stop that is also
+            # pending is still this worker's to latch: an ending a human asked
+            # for outranks one a driver did.
+            if shared.pause_reason is not None:
                 shared.release(line)
                 break
 
