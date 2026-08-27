@@ -63,6 +63,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # machine that has this gate always has them too; see tool_path().
 SHIPPED_TOOLS = ("replace_in_file.py", "try_patch.py")
 
+# What a `tools/<name>.py` in a checkout must contain to be recognised as a
+# stand-in for one of those rather than an unrelated script of the same name.
+# The stand-ins name the plugin in their docstring and say there that this
+# string is read from here -- reword one of them and refusals silently go back
+# to naming the long path.
+TOOL_MARKER = "ask-user-gate"
+
+# The shell's working directory, from the hook payload, once main() has read
+# it. None in standalone use, where the process's own directory is the same
+# thing. See caller_dir().
+_CALLER_CWD: "str | None" = None
+
 # The marker that turns the gate off for one command, matched case-insensitively.
 MARKER = "allowaskuser"
 
@@ -167,7 +179,36 @@ def is_windows() -> bool:
     return os.name == "nt"
 
 
-def tool_path(name: str, project: "str | None" = None) -> str:
+def caller_dir() -> str:
+    """The directory a relative path in a refusal will be resolved against.
+
+    The hook payload carries the shell's working directory, and that -- not the
+    project root -- is what the agent's next command will start from. They are
+    usually the same; when they are not (this repository declares working
+    directories outside the project), answering the question about the wrong
+    one is how a refusal ends up naming a path the reader cannot open.
+    """
+    return _CALLER_CWD or os.getcwd()
+
+
+def is_our_copy(path: str) -> bool:
+    """Is that OUR script, or something else that happens to share its name?
+
+    `tools/try_patch.py` is not a reserved name, and a checkout that has one of
+    its own would be sent to it by an existence check alone -- with a confident
+    sentence describing flags it does not have, which is worse than the long
+    path it replaced. The stand-ins in this repository name the plugin in their
+    docstring, so a cheap read settles it; anything else falls back to the
+    shipped copy, which costs a longer path and nothing else.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return TOOL_MARKER in handle.read(4096)
+    except OSError:
+        return False
+
+
+def tool_path(name: str, base: "str | None" = None) -> str:
     """How to spell one of SHIPPED_TOOLS so that THIS machine can run it.
 
     A refusal that names a path which does not exist here is worse than no
@@ -175,19 +216,17 @@ def tool_path(name: str, project: "str | None" = None) -> str:
     thing. There are two spellings and the right one depends on where the
     command was issued.
 
-    A repository that keeps its own copies under `tools/` (this gate grew up in
-    one, and its CLAUDE.md, its docs and its source comments all say
-    `tools/try_patch.py`) gets the short, already-familiar path. Anywhere else
-    -- a work checkout that never heard of this convention -- gets the absolute
-    path to the copy that shipped with the plugin, which is the only one that
-    is certain to be there.
-
-    `project` is injectable for the self-test; in the hook the harness sets
-    CLAUDE_PROJECT_DIR, and the working directory is the fallback.
+    A checkout that keeps its own stand-ins under `tools/` (this gate grew up
+    in one, and its CLAUDE.md, its docs and its source comments all say
+    `tools/try_patch.py`) gets the short, already-familiar path -- but only
+    when that path resolves from where the command will actually run, because
+    that is the spelling being handed out. Anywhere else -- a work checkout
+    that never heard of this convention -- gets the absolute path to the copy
+    that shipped with the plugin, which is the only one certain to be there.
     """
-    if project is None:
-        project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    if os.path.isfile(os.path.join(project, "tools", name)):
+    if base is None:
+        base = caller_dir()
+    if is_our_copy(os.path.join(base, "tools", name)):
         return f"tools/{name}"
     return os.path.normpath(os.path.join(HERE, os.pardir, "bin", name))
 
@@ -398,10 +437,11 @@ def scan(command: str, shell: str, windows: "bool | None" = None,
 
 def render(findings: list[Finding]) -> str:
     """The refusal the agent reads, in place of the dialog the user would."""
-    # Named by file, not by a fixed path: the same script is a plugin on one
-    # machine and a loose hook on another, and a refusal that cites a path
-    # which is not where it lives sends the reader looking in the wrong place.
-    lines = [f"Blocked by {os.path.basename(__file__)}: this command would stop "
+    # Resolved, not hardcoded: the same script is a plugin on one machine and a
+    # loose hook on another, so a literal path lies on half of them -- and the
+    # bare basename, while greppable, does not tell a reader who has never seen
+    # this plugin where the thing refusing their command lives.
+    lines = [f"Blocked by {os.path.abspath(__file__)}: this command would stop "
              f"the session on a permission prompt, so it was not run.", ""]
     said: set[str] = set()  # several findings usually share one remedy
     for finding in findings:
@@ -490,44 +530,60 @@ def check_wiring() -> "tuple[list[str], int]":
     of the PreToolUse entry -- so the hook never ran. A gate that guards its own
     logic but not its wiring is a gate with a hole exactly this shape.
 
-    Both spellings of that wiring are accepted, because the file that carries
-    it depends on how the gate was installed: `hooks.json` when it is a plugin
-    (the shape is the same, one level down from settings.json's `hooks` key),
-    `settings.json` when it is a loose script wired up by hand. Whichever is
-    found NEXT TO this file is the one that runs it.
+    EVERY file that could be running it is checked, not the first one found,
+    and that is the whole point. There are two ways to be wired -- the
+    `hooks.json` shipped next to this script (a plugin), and a `settings.json`
+    naming it by path (a loose hook, which is how a checkout runs it before the
+    plugin is installed anywhere) -- and checking only one of them recreates
+    the hole: on a machine where the LIVE wiring is the settings.json and the
+    inert one is the plugin's own hooks.json, a matcher edit to the file that
+    actually runs would pass, silently, which is this repository's
+    verification-that-cannot-fail failure exactly. Measured, not reasoned: with
+    only the next-to-me candidate, dropping Monitor from `.claude/settings.json`
+    still printed a clean self-test.
     """
     problems: list[str] = []
     handled = sorted(BASH_TOOLS | POWERSHELL_TOOLS | MONITOR_TOOLS)
-    checks = 2 * len(handled) + 2
+    checks = len(handled) + 1
     for tool in handled:
         if shell_for_tool(tool) is None:
             problems.append(f"shell_for_tool({tool!r}) is None")
     if shell_for_tool("Read") is not None:
         problems.append("shell_for_tool routes a tool that carries no command")
 
-    candidates = [os.path.join(HERE, name)
-                  for name in ("hooks.json", "settings.json")]
-    config = next((path for path in candidates if os.path.isfile(path)), None)
-    if config is None:
-        return problems + [f"no wiring file next to this script; looked for "
-                           f"{', '.join(candidates)}"], checks
-    try:
-        with open(config, encoding="utf-8") as handle:
-            entries = json.load(handle).get("hooks", {}).get("PreToolUse", [])
-    except (OSError, ValueError) as error:
-        return problems + [f"cannot read {config}: {error}"], checks
-    ours = [entry for entry in entries
-            if any(os.path.basename(__file__) in hook.get("command", "")
-                   for hook in entry.get("hooks", []))]
-    if not ours:
-        return problems + [f"no PreToolUse entry in {config} runs this "
-                           f"script"], checks
-    for entry in ours:
-        matcher = entry.get("matcher", "")
-        for tool in handled:
-            if not re.search(rf"(?:^|\|){re.escape(tool)}(?:\||$)", matcher):
-                problems.append(f"{tool} is handled here but missing from the "
-                                f"hook matcher {matcher!r}")
+    candidates = list(dict.fromkeys([
+        os.path.join(HERE, "hooks.json"),
+        os.path.join(HERE, "settings.json"),
+        os.path.join(caller_dir(), ".claude", "settings.json"),
+        os.path.join(os.path.expanduser("~"), ".claude", "settings.json"),
+    ]))
+    wired = 0
+    for config in candidates:
+        if not os.path.isfile(config):
+            continue
+        checks += 1
+        try:
+            with open(config, encoding="utf-8") as handle:
+                entries = json.load(handle).get("hooks", {}).get("PreToolUse",
+                                                                 [])
+        except (OSError, ValueError) as error:
+            problems.append(f"cannot read {config}: {error}")
+            continue
+        ours = [entry for entry in entries
+                if any(os.path.basename(__file__) in hook.get("command", "")
+                       for hook in entry.get("hooks", []))]
+        wired += len(ours)
+        for entry in ours:
+            matcher = entry.get("matcher", "")
+            checks += len(handled)
+            for tool in handled:
+                if not re.search(rf"(?:^|\|){re.escape(tool)}(?:\||$)",
+                                 matcher):
+                    problems.append(f"{tool} is handled here but missing from "
+                                    f"the matcher {matcher!r} in {config}")
+    if not wired:
+        problems.append(f"nothing runs this script: no PreToolUse entry names "
+                        f"it in any of {', '.join(candidates)}")
     return problems, checks
 
 
@@ -544,29 +600,79 @@ def check_paths() -> "tuple[list[str], int]":
     copy must exist); the in-a-repo branch is checked against a directory built
     for the purpose, because whether the machine running the test happens to
     sit in such a repository is not something a test may depend on.
+
+    The last case is the one that earns the rest: `base=None`, the only spelling
+    the hook ever uses. Passing `base` explicitly everywhere leaves the default
+    -- where the directory actually comes from -- untested, and a typo there
+    degrades every refusal to the long path with nothing to say so.
     """
     problems: list[str] = []
-    checks = 3 * len(SHIPPED_TOOLS)
-    with tempfile.TemporaryDirectory() as project:
-        os.mkdir(os.path.join(project, "tools"))
+    checks = 0
+    try:
+        project = tempfile.TemporaryDirectory()
+    except OSError as error:  # a locked-down machine is where this ships
+        return [f"cannot create a temporary directory to check the paths in: "
+                f"{error}"], 1
+    with project as root:
+        os.mkdir(os.path.join(root, "tools"))
         for name in SHIPPED_TOOLS:
+            checks += 4
             shipped = os.path.normpath(os.path.join(HERE, os.pardir, "bin",
                                                     name))
             if not os.path.isfile(shipped):
                 problems.append(f"{name} is named in a refusal but is not "
                                 f"shipped at {shipped}")
-            away = tool_path(name, project=project)
+            away = tool_path(name, base=root)
             if away != shipped:
                 problems.append(f"{name}: outside a repository the refusal "
                                 f"names {away!r}, not the shipped copy")
-            local = os.path.join(project, "tools", name)
-            with open(local, "w", encoding="utf-8"):
-                pass
-            near = tool_path(name, project=project)
+            local = os.path.join(root, "tools", name)
+            with open(local, "w", encoding="utf-8") as handle:
+                handle.write(f"# a stand-in, marked {TOOL_MARKER}\n")
+            near = tool_path(name, base=root)
             if near != f"tools/{name}":
-                problems.append(f"{name}: a repository with its own copy is "
+                problems.append(f"{name}: a checkout with its own stand-in is "
                                 f"told {near!r}, not the short path")
+            with open(local, "w", encoding="utf-8") as handle:
+                handle.write("# someone else's script of the same name\n")
+            stranger = tool_path(name, base=root)
+            if stranger != shipped:
+                problems.append(f"{name}: an unrelated tools/{name} is handed "
+                                f"out as {stranger!r} instead of being ignored")
             os.remove(local)
+
+        # The default base, which is the only one the hook uses.
+        checks += 2
+        global _CALLER_CWD
+        restore, _CALLER_CWD = _CALLER_CWD, root
+        try:
+            name = SHIPPED_TOOLS[0]  # the branch is the same for either name
+            shipped = os.path.normpath(os.path.join(HERE, os.pardir, "bin",
+                                                    name))
+            if tool_path(name) != shipped:
+                problems.append(f"{name}: with no base given the resolver does "
+                                f"not fall back to the shipped copy")
+            local = os.path.join(root, "tools", name)
+            with open(local, "w", encoding="utf-8") as handle:
+                handle.write(f"# a stand-in, marked {TOOL_MARKER}\n")
+            if tool_path(name) != f"tools/{name}":
+                problems.append(f"{name}: with no base given the resolver does "
+                                f"not read the caller's directory")
+            # ... and standalone, where no payload said where the caller is.
+            checks += 1
+            here = os.getcwd()
+            _CALLER_CWD = None
+            try:
+                os.chdir(root)
+                if tool_path(name) != f"tools/{name}":
+                    problems.append(f"{name}: with no payload the resolver "
+                                    f"does not fall back to the process's own "
+                                    f"directory")
+            finally:
+                os.chdir(here)
+            os.remove(local)
+        finally:
+            _CALLER_CWD = restore
     return problems, checks
 
 
@@ -636,12 +742,16 @@ def main() -> int:
 
     # Hook mode. Anything unexpected here must fail OPEN: a broken gate that
     # blocked every command would be worse than the prompts it prevents.
+    global _CALLER_CWD
     try:
         payload = json.load(sys.stdin)
         tool_name = payload.get("tool_name", "")
         shell = shell_for_tool(tool_name)
         if shell is None:
             return 0
+        cwd = payload.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            _CALLER_CWD = cwd
         # Monitor's other form is `ws` (a socket, no shell); missing `command`
         # then means there is nothing to scan, not that something went wrong.
         command = payload.get("tool_input", {}).get("command", "")

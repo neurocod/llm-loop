@@ -4,7 +4,7 @@ A `PreToolUse` hook for Claude Code that refuses shell commands which would
 stop the session on a permission prompt, and names the replacement for each one
 instead of parking the run on a dialog nobody is watching.
 
-It refuses six shapes, all of which defeat the allow-list rather than merely
+It refuses seven shapes, all of which defeat the allow-list rather than merely
 missing it: a chain that also moves the working directory, backgrounding `&`,
 a command over the analyser's 10 000-character limit, a heredoc or PowerShell
 here-string (a file written by the command body), `sed -i`, a quote inside

@@ -37,3 +37,13 @@ jobs:
 
       - name: Test
         run: python -m pytest -q
+
+      # The ask-user-gate plugin carries its own pins and is outside
+      # `testpaths`, so pytest never reaches it. Both are stdlib-only and
+      # platform-guarded, which is why they can ride the same matrix: it is the
+      # only thing keeping the gate's path resolver and its wiring check honest
+      # on a machine that is not the author's.
+      - name: Test the ask-user-gate plugin
+        run: |
+          python claude-plugin/ask-user-gate/hooks/ask_user_gate.py --self-test
+          python claude-plugin/ask-user-gate/bin/try_patch.py --selftest
