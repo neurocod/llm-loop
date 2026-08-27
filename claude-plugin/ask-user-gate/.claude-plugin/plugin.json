@@ -1,0 +1,9 @@
+{
+  "name": "ask-user-gate",
+  "version": "1.0.0",
+  "description": "Refuse shell commands that would stop the session on a permission prompt, and name the replacement for each one.",
+  "author": {
+    "name": "neurocod"
+  },
+  "homepage": "https://github.com/neurocod/llm-loop"
+}

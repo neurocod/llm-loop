@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""PreToolUse gate: refuse shell commands that would stop for a human prompt.
+
+CLAUDE.md lists the shapes that make the permission analyser give up and ask a
+human no matter what the allow-rules say -- a command longer than the parser's
+limit, a file written by the command body, `sed -i`, and chains, of which this
+refuses the ones that also move the working directory (see CD_COMMAND for why
+the rest are let through). To those it adds a quote inside unquoted braces,
+which the analyser reads as expansion obfuscation -- observed in a refusal, not
+guessed, and waiting by the clock (`sleep`, usually inside a `while` loop),
+which no allow-rule matches and which the tools make unnecessary anyway.
+Prose only reminds; this gate is the mechanism. It runs before every call that
+carries a shell command -- Bash, PowerShell and Monitor, which has its own
+`command` field and runs it in the same local shell -- and a command that
+matches one of those shapes is denied with the reason
+and the repo's replacement for it, so the agent rewrites the call instead of
+parking the session on a dialog nobody is watching.
+
+The gate is deliberately narrow. It does NOT try to decide whether a command
+matches the allow-list -- that is the permission system's job, and guessing at
+it would deny far more than it saved. It only refuses commands that are known
+to defeat the allow-list entirely.
+
+Escape hatch: put `allowAskUser` anywhere in the command (a trailing
+`# allowAskUser` is a comment in both shells) and the gate passes it straight
+through. The prompt will then be asked -- that is the point of the marker: it
+says "I know, and I want this command anyway".
+
+It ships as a Claude Code PLUGIN rather than as a file inside one repository,
+because what it encodes -- one product's permission analyser -- is the same on
+every machine and in every project, while a path under `.claude/` is neither.
+The wiring is the hooks.json next to this file, and it names this script through
+${CLAUDE_PLUGIN_ROOT}, so installing the plugin is the whole install: no
+absolute path is written down anywhere, and one checkout guards every project
+on the machine. A missing script blocks every shell call until it is fixed
+(loudly, with python's own "can't open file"), which is the failure mode to
+prefer over a gate that silently stops guarding.
+
+The two scripts its refusals send the caller to travel WITH it, in ../bin, for
+the same reason: advice naming a path that does not exist on this machine costs
+the reader a search that ends in nothing. See tool_path() for which of the two
+copies gets named.
+
+Standalone use (same verdict, exit 1 when denied):
+  python hooks/ask_user_gate.py --check "git add -A && git commit -m x"
+  python hooks/ask_user_gate.py --check "Get-Item a; Get-Item b" --shell powershell
+  python hooks/ask_user_gate.py --check-file cmd.txt   # multi-line commands
+  python hooks/ask_user_gate.py --self-test
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+import tempfile
+from dataclasses import dataclass
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# The scripts the refusals below send the caller to. They ship in ../bin, so a
+# machine that has this gate always has them too; see tool_path().
+SHIPPED_TOOLS = ("replace_in_file.py", "try_patch.py")
+
+# The marker that turns the gate off for one command, matched case-insensitively.
+MARKER = "allowaskuser"
+
+# Hard limit of the command analyser inside Claude Code (MAX_COMMAND_LENGTH,
+# measured -- see CLAUDE.md). Above it the parse aborts, nothing can be scanned,
+# and the decision is forced down to "ask the human" whatever the allow-rules say.
+MAX_COMMAND_LENGTH = 10000
+
+BASH_TOOLS = {"Bash"}
+POWERSHELL_TOOLS = {"PowerShell"}
+# Monitor takes a `command` too, and runs it in the same local shell (its own
+# stop message calls the task `local_bash`), so the analyser judges it exactly
+# like a Bash call -- but under a tool name of its own, which is how the shape
+# this gate exists to stop walked straight past it into a dialog nobody was
+# watching (2026-08-18, a subagent polling `while true; do ... sleep 10; done`
+# for a background run to end). Allow-rules are written `Bash(...)` and do not
+# carry over to it either, so a Monitor command is MORE likely to ask, not less.
+MONITOR_TOOLS = {"Monitor"}
+
+# A redirection target that is not absolute and not a device. On Windows the
+# analyser refuses a chained command whose write target is relative: under Git
+# Bash the final working directory of a chain cannot be determined statically,
+# so it cannot check the target for a Cygwin-emulated symlink and drops to
+# "ask the human". Only used to explain the chain finding better.
+RELATIVE_REDIRECT = re.compile(r">>?\s*(?!/|[A-Za-z]:[\\/]|&)([^\s|;&<>()]+)")
+
+# A command word that moves the working directory, at the start of the command
+# or right after a separator. This is what makes a chain unanalysable: the
+# directory the rest of the chain runs in stops being a static fact, so the
+# analyser cannot resolve any relative path in it and asks a human instead.
+#
+# A chain WITHOUT one of these is currently let through, on the user's reading
+# (2026-08-15) that the dialogs they saw were all cd-compounds rather than
+# chains as such. That is a relaxation of the CLAUDE.md rule as ENFORCEMENT
+# only -- the rule itself stands, since one command per call also stays
+# retryable and lets the harness attribute a failure. If the prompts come back
+# for a plain `a; b`, widen this to any separator again: the change is the
+# `cwd_changing` guard at the end of scan_shell_syntax, nothing else.
+CD_COMMAND = re.compile(
+    r"(?:^|[;&|(){}\n])\s*(?:cd|pushd|popd|chdir|[Ss]et-[Ll]ocation|sl)(?:\s|$)")
+
+# Waiting BY THE CLOCK -- `sleep` as a command word with a duration after it,
+# and its PowerShell twin. Refused for two independent reasons, either of which
+# is enough: the allow-rules match neither `sleep` nor the `while` loop it
+# usually hides in, so the call parks the session on a dialog; and the wait is
+# unnecessary, because the tools have three ways to wait that do not burn
+# wall-clock (SLEEP_FIX names them).
+#
+# The loop keywords are anchors on purpose. The shape actually observed was
+# `i=0; while [ $i -lt 55 ]; do sleep 30; i=$((i+1)); done`, where the sleep
+# follows `do` rather than a separator -- and that loop is also how a foreground
+# `sleep`, which the Bash tool blocks on its own, gets smuggled past the block.
+# Requiring a DURATION after the word is what keeps `ls sleep.txt` and
+# `npm run x -- --sleep 5` out of the net. In PowerShell `sleep` is an alias of
+# Start-Sleep, so the first pattern is applied to both shells.
+SLEEP_COMMAND = re.compile(
+    r"(?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*sleep\b\s*[\d$]")
+START_SLEEP_COMMAND = re.compile(
+    r"(?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*start-sleep\b", re.IGNORECASE)
+
+# Printed in place of the dialog, so the agent picks a replacement instead of
+# asking what to do. Ordered by how often each one is the right answer.
+SLEEP_FIX = (
+    "wait with a tool, not with the clock. Three replacements, in order:\n"
+    "       (1) run the long command in the FOREGROUND with the tool's "
+    "`timeout` parameter (up to 600000 ms) -- the call blocks for you, so "
+    "there is nothing left to sleep for;\n"
+    "       (2) wait for a CONDITION with the Monitor tool (it is deferred: "
+    "run ToolSearch(\"select:Monitor\") first, then give it an until-loop);\n"
+    "       (3) start the work with the tool's `run_in_background` parameter "
+    "and let the completion notification reach you.\n"
+    "       A SUBAGENT is not woken by its own background job -- only the main "
+    "loop is -- so for a subagent (3) means no wakeup at all: run it in the "
+    "foreground instead. A wait longer than the 10-minute foreground cap is "
+    "the orchestrator's work, not the subagent's: report and hand it back.\n"
+    "       If you truly must idle, one long call costs one prompt and a loop "
+    "of short ones costs a prompt per iteration.")
+
+# The same wait, written inside a Monitor command. Monitor documents a poll
+# loop as its shape for "one event per OCCURRENCE, indefinitely" -- but this
+# refusal is about the other case, waiting for a condition that happens ONCE,
+# which its own description sends elsewhere too. Worth stating separately
+# because the generic advice above ends in "use Monitor", and that is exactly
+# what the author of this command did.
+MONITOR_SLEEP_FIX = (
+    "a one-shot wait (`break` when the thing is done) is not what Monitor is "
+    "for -- its own description sends that case to a foreground call or to "
+    "Bash `run_in_background`.\n"
+    "       (1) run the work itself in the FOREGROUND with the tool's "
+    "`timeout` parameter (up to 600000 ms) instead of starting it detached and "
+    "watching for its death;\n"
+    "       (2) if you are a SUBAGENT, this is the only option: background "
+    "events do not re-invoke you, so a Monitor armed by a subagent notifies "
+    "nobody and only burns its timeout. A wait longer than the foreground cap "
+    "is the orchestrator's work -- report and hand it back.\n"
+    "       Note also that allow-rules are written `Bash(...)` and do not "
+    "cover Monitor, so its command asks the human even when the same text "
+    "would have been allowed as a Bash call.")
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+def tool_path(name: str, project: "str | None" = None) -> str:
+    """How to spell one of SHIPPED_TOOLS so that THIS machine can run it.
+
+    A refusal that names a path which does not exist here is worse than no
+    advice at all: the reader spends the search before concluding the same
+    thing. There are two spellings and the right one depends on where the
+    command was issued.
+
+    A repository that keeps its own copies under `tools/` (this gate grew up in
+    one, and its CLAUDE.md, its docs and its source comments all say
+    `tools/try_patch.py`) gets the short, already-familiar path. Anywhere else
+    -- a work checkout that never heard of this convention -- gets the absolute
+    path to the copy that shipped with the plugin, which is the only one that
+    is certain to be there.
+
+    `project` is injectable for the self-test; in the hook the harness sets
+    CLAUDE_PROJECT_DIR, and the working directory is the fallback.
+    """
+    if project is None:
+        project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    if os.path.isfile(os.path.join(project, "tools", name)):
+        return f"tools/{name}"
+    return os.path.normpath(os.path.join(HERE, os.pardir, "bin", name))
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One reason to refuse, plus what to do instead."""
+    reason: str
+    fix: str
+    # Chain findings survive only when the command also moves the working
+    # directory; everything else is refused on its own.
+    chain: bool = False
+
+
+def scan_shell_syntax(command: str, shell: str, windows: bool,
+                      sleep_fix: str = SLEEP_FIX) -> list[Finding]:
+    """Walk the command outside quotes, reporting separators and heredocs.
+
+    Quote tracking is what makes this usable: `python -c 'a; b'` keeps its
+    semicolon inside a string and is not a chain, while `a; b` is. The escape
+    character differs per shell -- backslash in sh, backtick in PowerShell,
+    where a trailing backslash in a Windows path would otherwise eat the
+    closing quote and desynchronise the whole scan.
+    """
+    escape = "\\" if shell == "bash" else "`"
+    findings: list[Finding] = []
+    seen: set[str] = set()
+
+    def report(token: str, index: int, reason: str, fix: str,
+               chain: bool = False) -> None:
+        if token in seen:  # one line per kind of violation, not per occurrence
+            return
+        seen.add(token)
+        findings.append(Finding(f"{reason} (at offset {index})", fix, chain))
+
+    chain_fix = ("this chain also moves the working directory, so where the "
+                 "rest of it runs stops being a static fact and no relative "
+                 "path in it can be resolved. Name the directory with the "
+                 "tool's own flag (--cwd / --prefix / -C) or an absolute path "
+                 "instead of `cd X && ...`, and keep one command per call.")
+    if windows and RELATIVE_REDIRECT.search(command):
+        chain_fix += (" On Windows this one is unappealable: the write target "
+                      "is relative, and under Git Bash the working directory a "
+                      "chain ends in cannot be determined statically, so the "
+                      "analyser cannot check that target and refuses to "
+                      "delegate the decision at all.")
+    heredoc_fix = (f"write files with the Write tool, edit them with Edit, and "
+                   f"do scripted replacements with "
+                   f"{tool_path('replace_in_file.py')}. If the content must be "
+                   f"produced by a program, let the script write the file and "
+                   f"keep the command a call to that script.")
+
+    brace_fix = ("keep the payload out of the command line: write it to a file "
+                 "with the Write tool and let the command be a call to that "
+                 "file, or quote the whole argument so the braces sit inside a "
+                 "string.")
+
+    i, n = 0, len(command)
+    quote = None
+    braces = 0  # depth of `{ ... }` groups seen OUTSIDE quotes
+    plain: list[str] = []  # the command with quoted runs blanked out
+    while i < n:
+        c = command[i]
+        if quote is not None:
+            if c == escape and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        # From here on we are at top level, so `plain` gets this character --
+        # a quoted run collapses to one space, which keeps words apart without
+        # letting a string body look like a command word.
+        plain.append(" " if c in "'\"" else c)
+        if c == escape and i + 1 < n:
+            i += 2  # escaped char, including a line continuation
+            continue
+        if c in "'\"":
+            if braces > 0:
+                # The analyser reads a quote inside unquoted braces as
+                # expansion obfuscation and asks a human. `awk '{print "x"}'`
+                # is fine (the braces are inside the quotes, not the other way
+                # round); a heredoc body or a bare ${VAR:-"x"} is not.
+                report("{", i, "quote character inside unquoted `{ ... }` -- "
+                               "read as expansion obfuscation", brace_fix)
+            quote = c
+            i += 1
+            continue
+        if c == "{":
+            braces += 1
+            i += 1
+            continue
+        if c == "}":
+            braces = max(0, braces - 1)
+            i += 1
+            continue
+        if c == "#" and (i == 0 or command[i - 1] in " \t\n"):
+            nl = command.find("\n", i)
+            if nl < 0:
+                break
+            i = nl  # the newline itself is still a top-level separator
+            continue
+
+        two = command[i:i + 2]
+        if two in ("&&", "||"):
+            report(two, i, f"shell chain operator `{two}` in a chain that "
+                           f"changes directory", chain_fix, chain=True)
+            i += 2
+            continue
+        if two == "<<":
+            if command[i:i + 3] == "<<<":
+                i += 3  # here-string: one line, not a file body
+                continue
+            report("<<", i, "heredoc (`<<`) -- a file written by the command body",
+                   heredoc_fix)
+            i += 2
+            continue
+        if two in ("@'", '@"') and shell == "powershell":
+            report("@'", i, "PowerShell here-string -- a file written by the "
+                            "command body", heredoc_fix)
+            i += 2
+            continue
+        if c == ";":
+            report(";", i, "command separator `;` in a chain that changes "
+                           "directory", chain_fix, chain=True)
+            i += 1
+            continue
+        if c == "\n":
+            report("\n", i, "newline outside quotes -- a second command on its "
+                            "own line, in a chain that changes directory",
+                   chain_fix, chain=True)
+            i += 1
+            continue
+        if c == "&":
+            # `2>&1`, `&>file`, `|&` are redirections, not backgrounding.
+            prev = command[i - 1] if i else ""
+            if prev not in "><|" and command[i + 1:i + 2] != ">":
+                report("&", i, "backgrounding `&`",
+                       "use the tool's run_in_background parameter instead of "
+                       "detaching with `&`.")
+            i += 1
+            continue
+        i += 1
+
+    plain_command = "".join(plain)
+    # Offsets are deliberately absent here: `plain` drops quoted runs rather
+    # than blanking them, so its indices are not the command's.
+    if SLEEP_COMMAND.search(plain_command) or START_SLEEP_COMMAND.search(
+            plain_command):
+        findings.append(Finding("waiting by the clock (`sleep`)", sleep_fix))
+    if not CD_COMMAND.search(plain_command):
+        # A chain of allow-listed commands appears to be matched fine; it is
+        # the directory change that defeats the analyser. See CD_COMMAND.
+        findings = [finding for finding in findings if not finding.chain]
+    return findings
+
+
+def scan_sed_in_place(command: str) -> list[Finding]:
+    """`sed -i` -- banned by CLAUDE.md and not on any allow-list here."""
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.split()
+    for index, token in enumerate(tokens):
+        if token != "sed" and not token.endswith("/sed"):
+            continue
+        for arg in tokens[index + 1:]:
+            if arg in ("|", ";", "&&", "||"):
+                break
+            if arg == "--in-place" or arg.startswith("--in-place="):
+                pass
+            elif not (len(arg) > 1 and arg[0] == "-" and arg[1] != "-"
+                      and "i" in arg.split(".")[0].lstrip("-")):
+                continue
+            return [Finding(
+                "`sed -i`",
+                f"use {tool_path('replace_in_file.py')} (it refuses to write "
+                f"when the match count is not the one you named, so a wrong "
+                f"pattern cannot pass as a successful edit), or "
+                f"{tool_path('try_patch.py')} when the edit is temporary and "
+                f"must be undone after a test run.")]
+    return []
+
+
+def scan(command: str, shell: str, windows: "bool | None" = None,
+         tool: str = "Bash") -> list[Finding]:
+    """All reasons this command would stop for a human, or an empty list."""
+    if MARKER in command.lower():
+        return []
+    if windows is None:
+        windows = is_windows()
+    sleep_fix = MONITOR_SLEEP_FIX if tool in MONITOR_TOOLS else SLEEP_FIX
+    findings: list[Finding] = []
+    if len(command) > MAX_COMMAND_LENGTH:
+        findings.append(Finding(
+            f"the command is {len(command)} characters, over the analyser's "
+            f"{MAX_COMMAND_LENGTH}-character limit",
+            "above that limit the command cannot be parsed at all and the "
+            "decision is forced to 'ask the human' whatever the allow-rules "
+            "say. Move the payload into a file written with the Write tool and "
+            "keep the command a short call to it."))
+    findings.extend(scan_shell_syntax(command, shell, windows, sleep_fix))
+    if shell == "bash":
+        findings.extend(scan_sed_in_place(command))
+    return findings
+
+
+def render(findings: list[Finding]) -> str:
+    """The refusal the agent reads, in place of the dialog the user would."""
+    # Named by file, not by a fixed path: the same script is a plugin on one
+    # machine and a loose hook on another, and a refusal that cites a path
+    # which is not where it lives sends the reader looking in the wrong place.
+    lines = [f"Blocked by {os.path.basename(__file__)}: this command would stop "
+             f"the session on a permission prompt, so it was not run.", ""]
+    said: set[str] = set()  # several findings usually share one remedy
+    for finding in findings:
+        lines.append(f"  - {finding.reason}")
+        if finding.fix not in said:
+            said.add(finding.fix)
+            lines.append(f"    -> {finding.fix}")
+    lines.append("")
+    lines.append("If you want this exact command anyway and accept that the "
+                 "user will be asked, add the marker `allowAskUser` to it "
+                 "(e.g. append ` # allowAskUser`) and it will be passed "
+                 "through unchanged.")
+    return "\n".join(lines)
+
+
+def shell_for_tool(tool_name: str) -> "str | None":
+    if tool_name in BASH_TOOLS or tool_name in MONITOR_TOOLS:
+        return "bash"
+    if tool_name in POWERSHELL_TOOLS:
+        return "powershell"
+    return None
+
+
+SELF_TEST_CASES = [
+    # (command, shell, should_be_denied[, tool])
+    ("git status", "bash", False),
+    ("npm run build --prefix webgame", "bash", False),
+    ("git log --oneline -20 | head -5", "bash", False),
+    ("python -c 'print(1); print(2)'", "bash", False),
+    ("grep -rn 'a && b' src", "bash", False),
+    ("node -e \"console.log(1)\" 2>&1", "bash", False),
+    # A plain chain is let through; a chain that moves the cwd is not.
+    ("git add -A && git commit -m x", "bash", False),
+    ("ls; pwd", "bash", False),
+    ("rg --version; rg --files | head -2", "bash", False),
+    ("cd webgame && npx vitest run", "bash", True),
+    ("cd webgame; npx vitest run", "bash", True),
+    ("pushd webgame && npm run build", "bash", True),
+    ("echo 'cd webgame && x'", "bash", False),
+    ("git log --format=%cd; git status", "bash", False),
+    ("Set-Location webgame; npx vitest run", "powershell", True),
+    ("npm run dev &", "bash", True),
+    ("cat > f.txt <<'EOF'\nbody\nEOF", "bash", True),
+    ("ls a <<< 'x'", "bash", False),
+    ("sed -i 's/a/b/' file.ts", "bash", True),
+    ("sed -i.bak 's/a/b/' file.ts", "bash", True),
+    ("sed -n '1,5p' file.ts", "bash", False),
+    ("echo 'sed -i is banned'", "bash", False),
+    ("x" * (MAX_COMMAND_LENGTH + 1), "bash", True),
+    # Waiting by the clock, including the loop that smuggles a foreground
+    # `sleep` past the Bash tool's own block on it.
+    ("sleep 30", "bash", True),
+    ("i=0; while [ $i -lt 55 ]; do sleep 30; i=$((i+1)); done", "bash", True),
+    ("while true; do sleep $DELAY; done", "bash", True),
+    ("npm run dev --prefix webgame; sleep 2", "bash", True),
+    ("Start-Sleep -Seconds 30", "powershell", True),
+    ("sleep 5", "powershell", True),
+    # ... and the words that only look like it.
+    ("ls sleep.txt", "bash", False),
+    ("npm run probe --prefix webgame -- --sleep 5", "bash", False),
+    ("grep -n 'sleep 30' scripts/probe.sh", "bash", False),
+    ("python -c \"import time; time.sleep(1)\"", "bash", False),
+    ("awk '{print \"x\"}' file", "bash", False),
+    ("find . -name '*.tmp' -exec rm {} +", "bash", False),
+    ("echo ${VAR:-\"x\"}", "bash", True),
+    ("git add -A && git commit -m x  # allowAskUser", "bash", False),
+    ("Get-ChildItem C:\\game\\1339", "powershell", False),
+    ("Get-Item a; Get-Item b", "powershell", False),
+    ("git commit -F @'\nmsg\n'@", "powershell", True),
+    # Monitor carries a shell command under a tool name of its own. The first
+    # case is the one that walked past this gate into a dialog (2026-08-18).
+    ("while true; do if ! tasklist //FI \"IMAGENAME eq node.exe\" | grep -qi "
+     "node.exe; then echo done; break; fi; sleep 10; done", "bash", True,
+     "Monitor"),
+    ("tail -f webgame/.devlogs/latest.log | grep --line-buffered ERROR",
+     "bash", False, "Monitor"),
+]
+
+
+def check_wiring() -> "tuple[list[str], int]":
+    """Every tool this script handles must also be in the hook's matcher.
+
+    The failure this pins is the one that happened: the scanner refused the
+    command in every standalone check, and the session still stopped on a
+    dialog, because the tool that carried it (Monitor) was not in the matcher
+    of the PreToolUse entry -- so the hook never ran. A gate that guards its own
+    logic but not its wiring is a gate with a hole exactly this shape.
+
+    Both spellings of that wiring are accepted, because the file that carries
+    it depends on how the gate was installed: `hooks.json` when it is a plugin
+    (the shape is the same, one level down from settings.json's `hooks` key),
+    `settings.json` when it is a loose script wired up by hand. Whichever is
+    found NEXT TO this file is the one that runs it.
+    """
+    problems: list[str] = []
+    handled = sorted(BASH_TOOLS | POWERSHELL_TOOLS | MONITOR_TOOLS)
+    checks = 2 * len(handled) + 2
+    for tool in handled:
+        if shell_for_tool(tool) is None:
+            problems.append(f"shell_for_tool({tool!r}) is None")
+    if shell_for_tool("Read") is not None:
+        problems.append("shell_for_tool routes a tool that carries no command")
+
+    candidates = [os.path.join(HERE, name)
+                  for name in ("hooks.json", "settings.json")]
+    config = next((path for path in candidates if os.path.isfile(path)), None)
+    if config is None:
+        return problems + [f"no wiring file next to this script; looked for "
+                           f"{', '.join(candidates)}"], checks
+    try:
+        with open(config, encoding="utf-8") as handle:
+            entries = json.load(handle).get("hooks", {}).get("PreToolUse", [])
+    except (OSError, ValueError) as error:
+        return problems + [f"cannot read {config}: {error}"], checks
+    ours = [entry for entry in entries
+            if any(os.path.basename(__file__) in hook.get("command", "")
+                   for hook in entry.get("hooks", []))]
+    if not ours:
+        return problems + [f"no PreToolUse entry in {config} runs this "
+                           f"script"], checks
+    for entry in ours:
+        matcher = entry.get("matcher", "")
+        for tool in handled:
+            if not re.search(rf"(?:^|\|){re.escape(tool)}(?:\||$)", matcher):
+                problems.append(f"{tool} is handled here but missing from the "
+                                f"hook matcher {matcher!r}")
+    return problems, checks
+
+
+def check_paths() -> "tuple[list[str], int]":
+    """Both spellings tool_path() can produce must land on a real file.
+
+    Without this the resolver is untestable in the only way that matters: its
+    output is prose inside a refusal, which nothing compiles and nobody diffs,
+    so a rename in ../bin or a wrong `os.pardir` would surface as an agent
+    searching for a file that is not there -- exactly the cost the resolver
+    exists to remove. Here it surfaces as a failing self-test instead.
+
+    The away-from-a-repo branch is checked against the filesystem (the shipped
+    copy must exist); the in-a-repo branch is checked against a directory built
+    for the purpose, because whether the machine running the test happens to
+    sit in such a repository is not something a test may depend on.
+    """
+    problems: list[str] = []
+    checks = 3 * len(SHIPPED_TOOLS)
+    with tempfile.TemporaryDirectory() as project:
+        os.mkdir(os.path.join(project, "tools"))
+        for name in SHIPPED_TOOLS:
+            shipped = os.path.normpath(os.path.join(HERE, os.pardir, "bin",
+                                                    name))
+            if not os.path.isfile(shipped):
+                problems.append(f"{name} is named in a refusal but is not "
+                                f"shipped at {shipped}")
+            away = tool_path(name, project=project)
+            if away != shipped:
+                problems.append(f"{name}: outside a repository the refusal "
+                                f"names {away!r}, not the shipped copy")
+            local = os.path.join(project, "tools", name)
+            with open(local, "w", encoding="utf-8"):
+                pass
+            near = tool_path(name, project=project)
+            if near != f"tools/{name}":
+                problems.append(f"{name}: a repository with its own copy is "
+                                f"told {near!r}, not the short path")
+            os.remove(local)
+    return problems, checks
+
+
+def self_test() -> int:
+    failures = 0
+    checks = len(SELF_TEST_CASES)
+    for label, (problems, count) in (("wiring", check_wiring()),
+                                     ("paths", check_paths())):
+        checks += count
+        for problem in problems:
+            failures += 1
+            print(f"FAIL [{label}] {problem}", file=sys.stderr)
+    for case in SELF_TEST_CASES:
+        command, shell, expected = case[0], case[1], case[2]
+        tool = case[3] if len(case) > 3 else "Bash"
+        denied = bool(scan(command, shell, windows=True, tool=tool))
+        if denied != expected:
+            failures += 1
+            label = "denied" if denied else "allowed"
+            shown = command if len(command) < 60 else command[:57] + "..."
+            print(f"FAIL [{shell}/{tool}] {shown!r}: {label}, expected "
+                  f"{'denied' if expected else 'allowed'}", file=sys.stderr)
+    print(f"{checks - failures}/{checks} checks pass")
+    return 1 if failures else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Refuse shell commands that would stop for a human "
+                    "permission prompt. Reads a PreToolUse hook payload on "
+                    "stdin unless --check/--self-test is given.")
+    parser.add_argument("--check", metavar="COMMAND",
+                        help="scan one command and print the verdict")
+    parser.add_argument("--check-file", metavar="PATH",
+                        help="scan the command stored in a file (for the "
+                             "multi-line ones an argument cannot carry)")
+    parser.add_argument("--shell", choices=("bash", "powershell"),
+                        default="bash", help="shell to assume (default: bash)")
+    parser.add_argument("--tool", default="Bash",
+                        help="tool the command came from; only Monitor differs "
+                             "(its remedy is not the same one) (default: Bash)")
+    parser.add_argument("--platform", choices=("auto", "windows", "posix"),
+                        default="auto",
+                        help="host the command would run on; only the Git Bash "
+                             "note depends on it (default: auto)")
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the built-in scanner cases")
+    options = parser.parse_args()
+
+    if options.self_test:
+        return self_test()
+
+    windows = (is_windows() if options.platform == "auto"
+               else options.platform == "windows")
+
+    command = options.check
+    if options.check_file is not None:
+        with open(options.check_file, encoding="utf-8") as handle:
+            command = handle.read()
+    if command is not None:
+        findings = scan(command, options.shell, windows, options.tool)
+        if not findings:
+            print("allowed")
+            return 0
+        print(render(findings))
+        return 1
+
+    # Hook mode. Anything unexpected here must fail OPEN: a broken gate that
+    # blocked every command would be worse than the prompts it prevents.
+    try:
+        payload = json.load(sys.stdin)
+        tool_name = payload.get("tool_name", "")
+        shell = shell_for_tool(tool_name)
+        if shell is None:
+            return 0
+        # Monitor's other form is `ws` (a socket, no shell); missing `command`
+        # then means there is nothing to scan, not that something went wrong.
+        command = payload.get("tool_input", {}).get("command", "")
+        if not isinstance(command, str):
+            return 0
+        findings = scan(command, shell, tool=tool_name)
+    except Exception:
+        return 0
+
+    if not findings:
+        return 0
+    json.dump({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": render(findings),
+    }}, sys.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,14 @@
+{
+  "name": "neurocod",
+  "owner": {
+    "name": "neurocod",
+    "url": "https://github.com/neurocod/llm-loop"
+  },
+  "plugins": [
+    {
+      "name": "ask-user-gate",
+      "source": "./claude-plugin/ask-user-gate",
+      "description": "PreToolUse gate: refuse shell commands that would stop the session on a permission prompt."
+    }
+  ]
+}
