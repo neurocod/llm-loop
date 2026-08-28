@@ -32,9 +32,25 @@ every machine and in every project, while a path under `.claude/` is neither.
 The wiring is the hooks.json next to this file, and it names this script through
 ${CLAUDE_PLUGIN_ROOT}, so installing the plugin is the whole install: no
 absolute path is written down anywhere, and one checkout guards every project
-on the machine. A missing script blocks every shell call until it is fixed
-(loudly, with python's own "can't open file"), which is the failure mode to
-prefer over a gate that silently stops guarding.
+on the machine.
+
+A gate that is not there does NOT reliably stop the session, and it is worth
+knowing exactly how far the protection goes, because this docstring used to
+claim more. Claude Code blocks the tool call on hook exit 2 and lets it through
+on any other non-zero. Measured 2026-08-28, bash and cmd:
+
+    python <this script>, script missing   ->  2    2   command BLOCKED
+    python missing from PATH               -> 127    1   command RUNS
+    a compiled gate, binary missing        -> 127    1   command RUNS
+
+So the one case that fails closed does so by COINCIDENCE: the 2 is CPython's own
+exit code for "can't open file", which happens to be the number the hook
+protocol reads as a blocking error. Nothing about the wiring produces it. Lose
+the interpreter instead of the script -- an unset PATH, a different shell, a
+python that was never installed -- and the gate stops guarding as quietly as any
+missing binary would. Do not read the python wiring as a safety property it does
+not have; if a session must not run unguarded, the thing to check is that the
+gate is THERE, not the shape of its absence.
 
 The two scripts its refusals send the caller to travel WITH it, in ../bin, for
 the same reason: advice naming a path that does not exist on this machine costs
