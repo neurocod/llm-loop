@@ -47,10 +47,19 @@ So the one case that fails closed does so by COINCIDENCE: the 2 is CPython's own
 exit code for "can't open file", which happens to be the number the hook
 protocol reads as a blocking error. Nothing about the wiring produces it. Lose
 the interpreter instead of the script -- an unset PATH, a different shell, a
-python that was never installed -- and the gate stops guarding as quietly as any
-missing binary would. Do not read the python wiring as a safety property it does
-not have; if a session must not run unguarded, the thing to check is that the
-gate is THERE, not the shape of its absence.
+python that was never installed -- and the gate goes quiet as completely as any
+missing binary would.
+
+None of which is a security question, and it is worth being exact about that,
+because "the gate stops guarding" invites the wrong reading. This hook only ever
+emits `deny`; there is no code path in either half that answers `allow`. It can
+subtract a permission and never grant one, so a session running without it is a
+session under the ORDINARY permission rules -- allow-list, analyser, and a
+dialog for the human -- with nothing relaxed. What its absence costs is the
+dialog itself: the shapes below stop being refused with a replacement to use and
+go back to asking. Loudly, then, and in the way that is easiest to notice --
+attended, the prompts return; unattended, the run parks on one. That is a
+liveness failure, not a hole.
 
 The two scripts its refusals send the caller to travel WITH it, in ../bin, for
 the same reason: advice naming a path that does not exist on this machine costs
