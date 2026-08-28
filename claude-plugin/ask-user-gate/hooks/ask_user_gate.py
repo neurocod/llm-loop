@@ -41,6 +41,15 @@ the same reason: advice naming a path that does not exist on this machine costs
 the reader a search that ends in nothing. See tool_path() for which of the two
 copies gets named.
 
+This file is the REFERENCE, and there is a second implementation of it:
+../cpp/ask_user_gate.cpp, compiled, for machines where the interpreter start
+(~70 ms against the binary's ~7 ms, before every shell call) is worth removing.
+A rule changed here has to reach it too, and ../cpp/parity_check.py is the gate
+that says so -- it runs SELF_TEST_CASES below plus a corpus aimed at the seams
+through both halves and diffs verdict, exit code and rendered text. Note what
+that implies for the shape of a change: text and offsets are part of the
+contract, not decoration.
+
 Standalone use (same verdict, exit 1 when denied):
   python hooks/ask_user_gate.py --check "git add -A && git commit -m x"
   python hooks/ask_user_gate.py --check "Get-Item a; Get-Item b" --shell powershell
@@ -557,6 +566,12 @@ def check_wiring() -> "tuple[list[str], int]":
     verification-that-cannot-fail failure exactly. Measured, not reasoned: with
     only the next-to-me candidate, dropping Monitor from `.claude/settings.json`
     still printed a clean self-test.
+
+    An entry counts as ours by the STEM, not the file name, because there are
+    two implementations: a settings.json may name `ask_user_gate.exe` (the C++
+    port) while this script is the one running the check. Matching the full name
+    would silently stop looking at the live wiring the moment a checkout switched
+    to the binary -- reopening the hole above from the other side.
     """
     problems: list[str] = []
     handled = sorted(BASH_TOOLS | POWERSHELL_TOOLS | MONITOR_TOOLS)
@@ -567,6 +582,7 @@ def check_wiring() -> "tuple[list[str], int]":
     if shell_for_tool("Read") is not None:
         problems.append("shell_for_tool routes a tool that carries no command")
 
+    stem = os.path.splitext(os.path.basename(SELF))[0]
     candidates = list(dict.fromkeys([
         os.path.join(HERE, "hooks.json"),
         os.path.join(HERE, "settings.json"),
@@ -586,7 +602,7 @@ def check_wiring() -> "tuple[list[str], int]":
             problems.append(f"cannot read {config}: {error}")
             continue
         ours = [entry for entry in entries
-                if any(os.path.basename(SELF) in hook.get("command", "")
+                if any(stem in hook.get("command", "")
                        for hook in entry.get("hooks", []))]
         wired += len(ours)
         for entry in ours:
@@ -598,8 +614,8 @@ def check_wiring() -> "tuple[list[str], int]":
                     problems.append(f"{tool} is handled here but missing from "
                                     f"the matcher {matcher!r} in {config}")
     if not wired:
-        problems.append(f"nothing runs this script: no PreToolUse entry names "
-                        f"it in any of {', '.join(candidates)}")
+        problems.append(f"nothing runs this gate: no PreToolUse entry names "
+                        f"{stem} in any of {', '.join(candidates)}")
     return problems, checks
 
 
