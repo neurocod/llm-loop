@@ -470,6 +470,18 @@ def scan(command: str, shell: str, windows: "bool | None" = None,
             "decision is forced to 'ask the human' whatever the allow-rules "
             "say. Move the payload into a file written with the Write tool and "
             "keep the command a short call to it."))
+    # An over-limit command is scanned ANYWAY, and that is deliberate: the other
+    # findings are part of the refusal, and naming only the length would tell an
+    # agent to shorten a command that has a second thing wrong with it.
+    #
+    # The cost is known and was accepted (2026-08-28). scan_sed_in_place calls
+    # shlex.split, which is quadratic in a single long token -- measured here:
+    # 100 KiB takes 269 ms, 1 MiB takes 19 s, 8 MiB does not finish. The C++ port
+    # has no such curve (11 ms / 38 ms / 250 ms) because it does not build the
+    # token by repeated concatenation. Left alone because an LLM does not emit a
+    # megabyte-long command; if that ever stops being true, the fix is to skip
+    # the rest of the scan above this limit -- and it changes the refusal text on
+    # BOTH halves, so it is a parity-corpus change, not a one-line edit.
     findings.extend(scan_shell_syntax(command, shell, windows, sleep_fix))
     if shell == "bash":
         findings.extend(scan_sed_in_place(command))
