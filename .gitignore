@@ -9,3 +9,11 @@ venv/
 build/
 dist/
 .pytest_cache/
+
+# The C++ gate is built INTO hooks/, next to hooks.json, because that is where
+# its `../bin/<tool>` paths resolve from -- not because it is source. It is a
+# Windows-x64 image built from ask_user_gate.cpp; build it with cpp/build.py.
+claude-plugin/ask-user-gate/hooks/ask_user_gate.exe
+claude-plugin/ask-user-gate/hooks/ask_user_gate
+claude-plugin/ask-user-gate/hooks/*.pdb
+claude-plugin/ask-user-gate/hooks/*.ilk

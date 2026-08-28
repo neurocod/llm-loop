@@ -70,14 +70,53 @@ so a wrong pattern fails instead of silently editing nothing and exiting 0.
 `finally` — with `--expect-fail` for the usual case, proving that a test really
 does fail without its fix.
 
+## The C++ port, for machines that call it a lot
+
+`cpp/ask_user_gate.cpp` is the same gate compiled. It exists because the hook
+runs before EVERY shell call, and measured on the author's machine that call
+costs **69.8 ms as Python and 6.7 ms as the binary** (median of 60 hook-mode
+runs each, identical payload) — at ~100 000 tool calls a month, about two hours
+of wall clock spent starting an interpreter.
+
+```
+python cpp/build.py            # Release; writes hooks/ask_user_gate.exe
+python cpp/parity_check.py     # the two halves must answer identically
+```
+
+The build needs CMake and a C++23 compiler (Visual Studio 2022 or newer brings
+both). The binary lands in `hooks/`, next to `hooks.json`, and that is load-
+bearing rather than tidy: `HERE` is the binary's own directory, and the
+`../bin/<tool>` paths the refusals name — and the wiring self-test — resolve
+from it. Then point the hook at the `.exe` instead of `python …/ask_user_gate.py`
+and nothing else changes.
+
+`hooks/hooks.json` keeps naming the script, because a plugin installed from the
+marketplace is a snapshot that cannot build anything and may not be on Windows.
+Using the binary is therefore a local opt-in: name it in the `settings.json`
+that wires the gate for your checkout.
+
+**`hooks/ask_user_gate.py` stays the reference.** It carries the rationale for
+every rule and is the version to read and to change first; the port must then
+follow. `cpp/parity_check.py` is what makes "must" a mechanism rather than a
+hope — it runs the reference's own `SELF_TEST_CASES` plus a corpus aimed at the
+seams (offsets, refusal text, quoting, the shlex fallback, multi-byte lengths)
+through both halves and diffs verdict, exit code and rendered text. A rule
+changed on one side alone fails it.
+
 ## Self-test
 
 ```
 python hooks/ask_user_gate.py --self-test
+hooks/ask_user_gate.exe --self-test
 python bin/try_patch.py --selftest
 ```
 
-The first covers the scanner, the wiring (every tool the scanner handles must
+The first two cover the scanner, the wiring (every tool the scanner handles must
 also be in the matcher of `hooks/hooks.json` — a gate that guards its logic but
 not its wiring has a hole exactly the shape of the one that happened), and both
 branches of the path resolver.
+
+A self-test alone is not enough to trust the port, and that is measured: a
+deliberately broken redirect check passed `--self-test` 66/66 on both halves and
+was caught only by `parity_check.py`, because the self-test asserts the verdict
+and the bug was in the refusal text.
