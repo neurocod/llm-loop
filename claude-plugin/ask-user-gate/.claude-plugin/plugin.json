@@ -1,6 +1,6 @@
 {
   "name": "ask-user-gate",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Refuse shell commands that would stop the session on a permission prompt, and name the replacement for each one.",
   "author": {
     "name": "neurocod"

@@ -62,6 +62,7 @@ import json
 import os
 import re
 import shlex
+import string
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -86,7 +87,11 @@ TOOL_MARKER = "ask-user-gate"
 _CALLER_CWD: "str | None" = None
 
 # The marker that turns the gate off for one command, matched case-insensitively.
+# ASCII-insensitively: str.lower() folds U+212A KELVIN SIGN to "k", so
+# `allowasKuser` disarmed the gate here and not in the C++ port. The marker
+# is an ASCII token and the escape hatch should be spellable exactly one way.
 MARKER = "allowaskuser"
+ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 # Hard limit of the command analyser inside Claude Code (MAX_COMMAND_LENGTH,
 # measured -- see CLAUDE.md). Above it the parse aborts, nothing can be scanned,
@@ -109,7 +114,16 @@ MONITOR_TOOLS = {"Monitor"}
 # Bash the final working directory of a chain cannot be determined statically,
 # so it cannot check the target for a Cygwin-emulated symlink and drops to
 # "ask the human". Only used to explain the chain finding better.
-RELATIVE_REDIRECT = re.compile(r">>?\s*(?!/|[A-Za-z]:[\\/]|&)([^\s|;&<>()]+)")
+#
+# re.ASCII on this pattern and the three below, because `\s`, `\d` and `\b` are
+# Unicode-aware by default on a str and a SHELL is not. Without it `cd\xa0webgame
+# && ls` matched CD_COMMAND -- but a non-breaking space is not a word separator
+# to bash, so that text is one word `cd\xa0webgame` and no directory change at
+# all, and the same held for `sleep ٣٠` with Arabic-Indic digits. The
+# port's matchers are ASCII (see cpp/ask_user_gate.cpp); this is the half that
+# was wrong, so this is the half that moved.
+RELATIVE_REDIRECT = re.compile(r">>?\s*(?!/|[A-Za-z]:[\\/]|&)([^\s|;&<>()]+)",
+                               re.ASCII)
 
 # A command word that moves the working directory, at the start of the command
 # or right after a separator. This is what makes a chain unanalysable: the
@@ -124,7 +138,8 @@ RELATIVE_REDIRECT = re.compile(r">>?\s*(?!/|[A-Za-z]:[\\/]|&)([^\s|;&<>()]+)")
 # for a plain `a; b`, widen this to any separator again: the change is the
 # `cwd_changing` guard at the end of scan_shell_syntax, nothing else.
 CD_COMMAND = re.compile(
-    r"(?:^|[;&|(){}\n])\s*(?:cd|pushd|popd|chdir|[Ss]et-[Ll]ocation|sl)(?:\s|$)")
+    r"(?:^|[;&|(){}\n])\s*(?:cd|pushd|popd|chdir|[Ss]et-[Ll]ocation|sl)(?:\s|$)",
+    re.ASCII)
 
 # Waiting BY THE CLOCK -- `sleep` as a command word with a duration after it,
 # and its PowerShell twin. Refused for two independent reasons, either of which
@@ -141,9 +156,10 @@ CD_COMMAND = re.compile(
 # `npm run x -- --sleep 5` out of the net. In PowerShell `sleep` is an alias of
 # Start-Sleep, so the first pattern is applied to both shells.
 SLEEP_COMMAND = re.compile(
-    r"(?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*sleep\b\s*[\d$]")
+    r"(?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*sleep\b\s*[\d$]", re.ASCII)
 START_SLEEP_COMMAND = re.compile(
-    r"(?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*start-sleep\b", re.IGNORECASE)
+    r"(?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*start-sleep\b",
+    re.IGNORECASE | re.ASCII)
 
 # Printed in place of the dialog, so the agent picks a replacement instead of
 # asking what to do. Ordered by how often each one is the right answer.
@@ -440,7 +456,7 @@ def scan_sed_in_place(command: str) -> list[Finding]:
 def scan(command: str, shell: str, windows: "bool | None" = None,
          tool: str = "Bash") -> list[Finding]:
     """All reasons this command would stop for a human, or an empty list."""
-    if MARKER in command.lower():
+    if MARKER in command.translate(ASCII_LOWER):
         return []
     if windows is None:
         windows = is_windows()

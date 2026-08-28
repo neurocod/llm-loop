@@ -95,6 +95,15 @@ marketplace is a snapshot that cannot build anything and may not be on Windows.
 Using the binary is therefore a local opt-in: name it in the `settings.json`
 that wires the gate for your checkout.
 
+Being an opt-in build rather than what the marketplace delivers is also why the
+binary's `--self-test` is smaller than the script's. It does not check the hook
+WIRING — whether every tool it handles is in the matcher of whatever config runs
+the gate. That is a question about the machine, identical whichever copy asks
+it, and the script is always installed; duplicating it would mean teaching a
+hand-written JSON reader to walk arbitrary `settings.json` files and keeping two
+copies of the one check whose output is not a verdict. `parity_check.py` runs
+the script's `--self-test`, so the wiring is still checked whenever the pair is.
+
 **`hooks/ask_user_gate.py` stays the reference.** It carries the rationale for
 every rule and is the version to read and to change first; the port must then
 follow. `cpp/parity_check.py` is what makes "must" a mechanism rather than a
@@ -111,12 +120,16 @@ hooks/ask_user_gate.exe --self-test
 python bin/try_patch.py --selftest
 ```
 
-The first two cover the scanner, the wiring (every tool the scanner handles must
-also be in the matcher of `hooks/hooks.json` — a gate that guards its logic but
-not its wiring has a hole exactly the shape of the one that happened), and both
-branches of the path resolver.
+Both cover the scanner, the tool routing and both branches of the path resolver;
+the script additionally covers the wiring (every tool the scanner handles must
+also be in the matcher of whatever config runs the gate — a gate that guards its
+logic but not its wiring has a hole exactly the shape of the one that happened).
+The two therefore report different totals on purpose.
 
 A self-test alone is not enough to trust the port, and that is measured: a
 deliberately broken redirect check passed `--self-test` 66/66 on both halves and
 was caught only by `parity_check.py`, because the self-test asserts the verdict
-and the bug was in the refusal text.
+and the bug was in the refusal text. `parity_check.py` compares both halves
+through their command line AND through hook mode on a payload corpus that
+includes malformed and deeply nested JSON — a crash there is a failure even when
+both agree, because a dead hook is not a gate that failed open.

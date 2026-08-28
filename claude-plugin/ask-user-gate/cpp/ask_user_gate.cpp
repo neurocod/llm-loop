@@ -26,9 +26,14 @@
 //
 // Install: build with cpp/build.py, which drops the binary next to hooks.json
 // (see CMakeLists.txt). That location is not decoration -- `HERE` is the
-// binary's own directory, and both `../bin/<tool>` and the wiring self-test
+// binary's own directory, and the `../bin/<tool>` paths the refusals name
 // resolve from it, exactly as they do for the script. Point the PreToolUse hook
 // at the .exe instead of `python ...ask_user_gate.py` and nothing else changes.
+//
+// This binary is NOT what a marketplace install delivers, and does not try to
+// be: the plugin ships the script, and building this is something an enthusiast
+// opts into on one machine. That is why checkRouting() is thinner than the
+// reference's check_wiring() -- see the comment there.
 //
 // Standalone use (same verdict, exit 1 when denied):
 //   ask_user_gate --check "git add -A && git commit -m x"
@@ -130,7 +135,10 @@ size_t codePointCount(std::string_view text) {
 std::FILE* openFile(const fs::path& path, const char* mode) {
 #ifdef _WIN32
 	const std::wstring wideMode(mode, mode + std::strlen(mode));
-	return _wfopen(path.c_str(), wideMode.c_str());
+	std::FILE* handle = nullptr;
+	if (_wfopen_s(&handle, path.c_str(), wideMode.c_str()) != 0)
+		return nullptr;
+	return handle;
 #else
 	return std::fopen(path.c_str(), mode);
 #endif
@@ -170,22 +178,6 @@ std::string executablePath() {
 		return std::string(buffer);
 	}
 	return pathToUtf8(fs::current_path() / "ask_user_gate");
-#endif
-}
-
-std::string homeDirectory() {
-#ifdef _WIN32
-	if (const char* profile = std::getenv("USERPROFILE"))
-		return profile;
-	const char* drive = std::getenv("HOMEDRIVE");
-	const char* rest = std::getenv("HOMEPATH");
-	if (drive && rest)
-		return std::string(drive) + rest;
-	return {};
-#else
-	if (const char* home = std::getenv("HOME"))
-		return home;
-	return {};
 #endif
 }
 
@@ -328,7 +320,13 @@ bool afterSeparator(std::string_view text, size_t index) {
 // CONSUMES the whitespace, so the anchor ends just past it -- which is how
 // `; do sleep 30` is caught, the shape that smuggles a foreground `sleep` past
 // the Bash tool's own block on it.
-bool afterLoopKeyword(std::string_view text, size_t index) {
+//
+// `ignoreCase` is not a nicety: re.IGNORECASE covers a WHOLE pattern, so
+// START_SLEEP_COMMAND accepts `THEN Start-Sleep` while SLEEP_COMMAND, which
+// carries no flag, requires a lowercase `then`. Sharing one case-sensitive
+// helper between them let `Get-Job; THEN Start-Sleep -Seconds 5` through here
+// and not there.
+bool afterLoopKeyword(std::string_view text, size_t index, bool ignoreCase = false) {
 	if (index == 0 || !isSpaceChar(text[index - 1]))
 		return false;
 	const size_t wordEnd = index - 1;
@@ -337,7 +335,8 @@ bool afterLoopKeyword(std::string_view text, size_t index) {
 		if (wordEnd < keyword.size())
 			continue;
 		const size_t wordStart = wordEnd - keyword.size();
-		if (text.compare(wordStart, keyword.size(), keyword) != 0)
+		const std::string_view found = text.substr(wordStart, keyword.size());
+		if (ignoreCase ? toLowerAscii(found) != keyword : found != keyword)
 			continue;
 		if (wordStart > 0 && isWordChar(text[wordStart - 1]))
 			continue;  // the `\b` before the keyword
@@ -392,7 +391,7 @@ bool matchesSleepCommand(std::string_view text) {
 bool matchesStartSleepCommand(std::string_view text) {
 	static constexpr std::string_view word = "start-sleep";
 	for (size_t index = 0; index <= text.size(); ++index) {
-		if (!afterSeparator(text, index) && !afterLoopKeyword(text, index))
+		if (!afterSeparator(text, index) && !afterLoopKeyword(text, index, true))
 			continue;
 		const size_t start = skipSpaces(text, index);
 		if (text.size() - start < word.size())
@@ -575,9 +574,20 @@ std::vector<Finding> scanShellSyntax(const std::string& command, std::string_vie
 		}
 		if (c == '&') {
 			// `2>&1`, `&>file`, `|&` are redirections, not backgrounding.
+			//
+			// `i == 0` is the third exemption and it is load-bearing, not an
+			// off-by-one: the reference spells the guard `prev not in "><|"`
+			// with `prev = command[i - 1] if i else ""`, and in Python the
+			// EMPTY string is a substring of every string, so a leading `&` is
+			// never reported there. Which is the right answer -- a command
+			// starting with `&` is not backgrounding anything, it is
+			// PowerShell's call operator, the spelling the PowerShell tool's own
+			// description recommends for an exe path with spaces. Dropping this
+			// turned `& "C:\Program Files\App\app.exe"` into a refusal that told
+			// the agent to use run_in_background.
 			const char previous = i ? command[i - 1] : '\0';
-			const bool redirect = previous == '>' || previous == '<' || previous == '|'
-				|| (i + 1 < n && command[i + 1] == '>');
+			const bool redirect = i == 0 || previous == '>' || previous == '<'
+				|| previous == '|' || (i + 1 < n && command[i + 1] == '>');
 			if (!redirect)
 				report("&", i, "backgrounding `&`", std::string(kBackgroundFix));
 			i += 1;
@@ -602,6 +612,13 @@ std::vector<Finding> scanShellSyntax(const std::string& command, std::string_vie
 // dangling escape, which the caller answers with a plain whitespace split --
 // the same fallback the reference takes.
 bool shlexSplit(const std::string& command, std::vector<std::string>& tokens) {
+	// shlex.whitespace is exactly ' \t\r\n' -- NOT isSpaceChar's set, which also
+	// carries `\v` and `\f`. With those in, `sed\v-i x` split into two tokens
+	// here and stayed one word in the reference, so the port refused a command
+	// the reference allowed.
+	auto isShlexSpace = [](char c) {
+		return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+	};
 	tokens.clear();
 	std::string token;
 	bool started = false;  // a quoted empty string is still a token
@@ -609,7 +626,7 @@ bool shlexSplit(const std::string& command, std::vector<std::string>& tokens) {
 	const size_t n = command.size();
 	while (i < n) {
 		const char c = command[i];
-		if (isSpaceChar(c)) {
+		if (isShlexSpace(c)) {
 			if (started) {
 				tokens.push_back(token);
 				token.clear();
@@ -646,10 +663,11 @@ bool shlexSplit(const std::string& command, std::vector<std::string>& tokens) {
 				if (command[i] == '\\') {
 					if (i + 1 >= n)
 						return false;
-					// Inside double quotes a backslash escapes only `"` and `\`;
-					// anything else keeps the backslash too.
+					// Inside double quotes a backslash escapes only `"` and `\`
+					// (shlex.escapedquotes is '"', shlex.escape is '\\');
+					// anything else, `'` included, keeps the backslash too.
 					const char next = command[i + 1];
-					if (next != '"' && next != '\\' && next != '\'')
+					if (next != '"' && next != '\\')
 						token.push_back('\\');
 					token.push_back(next);
 					i += 2;
@@ -785,12 +803,16 @@ struct Json {
 	std::vector<Json> items;
 	std::vector<std::pair<std::string, Json>> members;
 
+	// The LAST entry with that key, not the first: json.load() builds a dict, so
+	// a repeated key keeps the last value, and the reference reads that dict.
+	// Measured before it was a guess -- {"tool_name":"Read","tool_name":"Bash"}
+	// had the reference denying and this port passing the command through.
 	const Json* member(std::string_view key) const {
 		if (type != Type::Object)
 			return nullptr;
-		for (const auto& entry : members)
-			if (entry.first == key)
-				return &entry.second;
+		for (size_t index = members.size(); index-- > 0;)
+			if (members[index].first == key)
+				return &members[index].second;
 		return nullptr;
 	}
 	// The value at `key` if it is a string, else an empty string. Mirrors the
@@ -819,10 +841,42 @@ public:
 private:
 	std::string_view source_;
 	size_t index_ = 0;
+	int depth_ = 0;
 
+	// Recursion is the ONE failure this file cannot absorb. Everything else
+	// unexpected reaches `catch (...)` in main() and fails open; a blown stack
+	// is an SEH exception on Windows that `catch (...)` does not see, so the
+	// process dies and the hook returns nothing at all. Measured before the
+	// limit existed: 20 000 nested arrays exited 0xC00000FD, where the
+	// reference merely hit RecursionError and failed open.
+	//
+	// A real payload nests three deep (`tool_input.command`), so this is not a
+	// budget to tune -- it is a wall far enough away that no legitimate caller
+	// can reach it. It is not fixed by swapping in a JSON library either:
+	// nlohmann/json crashed the same way in the same test, because the
+	// recursion that matters is in walking and destroying the tree.
+	static constexpr int kMaxDepth = 200;
+
+	class Nesting {
+	public:
+		explicit Nesting(int& depth) : depth_(depth) { ++depth_; }
+		~Nesting() { --depth_; }
+		bool tooDeep() const { return depth_ > kMaxDepth; }
+	private:
+		int& depth_;
+	};
+
+	// JSON's own whitespace, which is narrower than isSpaceChar: `\v` and `\f`
+	// are NOT insignificant here, and accepting them would parse a payload the
+	// reference's json.load rejects -- one half denying where the other fails
+	// open is exactly the divergence this port must not have.
 	void skipSpace() {
-		while (index_ < source_.size() && isSpaceChar(source_[index_]))
+		while (index_ < source_.size()) {
+			const char c = source_[index_];
+			if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+				return;
 			++index_;
+		}
 	}
 
 	bool literal(std::string_view word) {
@@ -923,6 +977,9 @@ private:
 	}
 
 	bool parseValue(Json& out) {
+		const Nesting nesting(depth_);
+		if (nesting.tooDeep())
+			return false;
 		if (index_ >= source_.size())
 			return false;
 		const char c = source_[index_];
@@ -1004,13 +1061,21 @@ private:
 			out.type = Json::Type::Null;
 			return literal("null");
 		}
+		// The number's extent is measured and copied before strtod sees it.
+		// strtod reads to a NUL, and a string_view carries no promise of one --
+		// true today only because both callers hand in a std::string.
 		out.type = Json::Type::Number;
-		const char* begin = source_.data() + index_;
-		char* end = nullptr;
-		out.number = std::strtod(begin, &end);
-		if (end == begin)
+		size_t end = index_;
+		while (end < source_.size() && (isDigitChar(source_[end]) || source_[end] == '-'
+				|| source_[end] == '+' || source_[end] == '.' || source_[end] == 'e'
+				|| source_[end] == 'E'))
+			++end;
+		const std::string token(source_.substr(index_, end - index_));
+		char* stopped = nullptr;
+		out.number = std::strtod(token.c_str(), &stopped);
+		if (!stopped || stopped == token.c_str())
 			return false;
-		index_ += static_cast<size_t>(end - begin);
+		index_ += static_cast<size_t>(stopped - token.c_str());
 		return true;
 	}
 };
@@ -1109,102 +1174,31 @@ std::vector<std::string> handledTools() {
 	return {"Bash", "Monitor", "PowerShell"};  // sorted, as in the reference
 }
 
-// `(?:^|\|)<tool>(?:\||$)` over a hook matcher, written out.
-bool matcherNamesTool(std::string_view matcher, std::string_view tool) {
-	size_t start = 0;
-	while (start <= matcher.size()) {
-		const size_t bar = matcher.find('|', start);
-		const size_t end = (bar == std::string_view::npos) ? matcher.size() : bar;
-		if (matcher.substr(start, end - start) == tool)
-			return true;
-		if (bar == std::string_view::npos)
-			break;
-		start = bar + 1;
-	}
-	return false;
-}
-
-// Every tool this binary handles must also be in the hook's matcher.
+// Every tool routed here must reach a shell, and nothing else may.
 //
-// The failure this pins is the one that happened: the scanner refused the
-// command in every standalone check, and the session still stopped on a dialog,
-// because the tool that carried it (Monitor) was not in the matcher of the
-// PreToolUse entry -- so the hook never ran. EVERY file that could be running it
-// is checked, not the first one found: checking only one recreates the hole on a
-// machine where the LIVE wiring is the other file.
-std::pair<std::vector<std::string>, int> checkWiring() {
+// The reference's check_wiring() does MORE than this: it opens every config
+// that could be running the gate and asks whether the PreToolUse matcher names
+// all three tools -- a check that exists because Monitor once missing from that
+// matcher let the shape this gate refuses walk straight into a dialog. That
+// half is deliberately NOT ported.
+//
+// It is a question about the MACHINE, not about an implementation: the answer
+// is the same whichever copy asks it, and the script is always present (it is
+// the reference, and it ships in the plugin) while this binary is a build an
+// enthusiast opts into. Porting it would duplicate the one check whose output
+// is not a verdict, teach a hand-written JSON reader to walk arbitrary
+// settings.json files, and leave two places to keep in step for no coverage.
+// cpp/parity_check.py runs the script's --self-test, so the wiring is still
+// checked on every run of the gate that guards this pair.
+std::pair<std::vector<std::string>, int> checkRouting() {
 	std::vector<std::string> problems;
 	const std::vector<std::string> handled = handledTools();
-	int checks = static_cast<int>(handled.size()) + 1;
+	const int checks = static_cast<int>(handled.size()) + 1;
 	for (const std::string& tool : handled)
 		if (!shellForTool(tool))
 			problems.push_back("shellForTool(" + tool + ") is empty");
 	if (shellForTool("Read"))
 		problems.push_back("shellForTool routes a tool that carries no command");
-
-	// A wiring written for the SCRIPT names ask_user_gate.py and one written for
-	// this binary names ask_user_gate.exe, and either is a live gate. Matching on
-	// the stem is what lets the same self-test answer the question -- "is the
-	// matcher complete?" -- whichever copy is wired here.
-	const std::string stem = pathToUtf8(pathFromUtf8(kSelf).stem());
-
-	std::vector<std::string> candidates;
-	auto addCandidate = [&](const fs::path& path) {
-		std::string text = pathToUtf8(path);
-		if (text.empty())
-			return;
-		if (std::find(candidates.begin(), candidates.end(), text) == candidates.end())
-			candidates.push_back(std::move(text));
-	};
-	addCandidate(pathFromUtf8(kHere) / "hooks.json");
-	addCandidate(pathFromUtf8(kHere) / "settings.json");
-	addCandidate(pathFromUtf8(callerDir()) / ".claude" / "settings.json");
-	const std::string home = homeDirectory();
-	if (!home.empty())
-		addCandidate(pathFromUtf8(home) / ".claude" / "settings.json");
-
-	int wired = 0;
-	for (const std::string& config : candidates) {
-		const fs::path path = pathFromUtf8(config);
-		std::error_code error;
-		if (!fs::is_regular_file(path, error))
-			continue;
-		checks += 1;
-		const std::optional<std::string> content = readFile(path);
-		Json root;
-		if (!content || !JsonParser(*content).parse(root)) {
-			problems.push_back("cannot read " + config);
-			continue;
-		}
-		const Json* hooks = root.member("hooks");
-		const Json* preToolUse = hooks ? hooks->member("PreToolUse") : nullptr;
-		if (!preToolUse || preToolUse->type != Json::Type::Array)
-			continue;
-		for (const Json& entry : preToolUse->items) {
-			const Json* entryHooks = entry.member("hooks");
-			bool ours = false;
-			if (entryHooks && entryHooks->type == Json::Type::Array)
-				for (const Json& hook : entryHooks->items)
-					if (hook.memberString("command").find(stem) != std::string::npos)
-						ours = true;
-			if (!ours)
-				continue;
-			wired += 1;
-			const std::string matcher = entry.memberString("matcher");
-			checks += static_cast<int>(handled.size());
-			for (const std::string& tool : handled)
-				if (!matcherNamesTool(matcher, tool))
-					problems.push_back(tool + " is handled here but missing from the matcher '"
-						+ matcher + "' in " + config);
-		}
-	}
-	if (wired == 0) {
-		std::string names;
-		for (size_t i = 0; i < candidates.size(); ++i)
-			names += (i ? ", " : "") + candidates[i];
-		problems.push_back("nothing runs this gate: no PreToolUse entry names " + stem
-			+ " in any of " + names);
-	}
 	return {problems, checks};
 }
 
@@ -1303,8 +1297,8 @@ int selfTest() {
 	int failures = 0;
 	const std::vector<SelfTestCase> cases = selfTestCases();
 	int checks = static_cast<int>(cases.size());
-	const std::pair<std::vector<std::string>, int> groups[] = {checkWiring(), checkPaths()};
-	const char* labels[] = {"wiring", "paths"};
+	const std::pair<std::vector<std::string>, int> groups[] = {checkRouting(), checkPaths()};
+	const char* labels[] = {"routing", "paths"};
 	for (size_t group = 0; group < std::size(groups); ++group) {
 		checks += groups[group].second;
 		for (const std::string& problem : groups[group].first) {
@@ -1363,7 +1357,9 @@ given. Exit 1 when a checked command is denied.
                      remedy is not the same one) (default: Bash)
   --platform HOST    host the command would run on; only the Git Bash note
                      depends on it (default: auto)
-  --self-test        run the built-in scanner, wiring and path-resolver cases
+  --self-test        run the built-in scanner, routing and path-resolver cases
+                     (the hook WIRING is checked by ask_user_gate.py, which owns
+                     that question for both halves)
 )GATE";
 
 int run(int argc, char** argv) {
@@ -1446,7 +1442,21 @@ int run(int argc, char** argv) {
 			std::fprintf(stderr, "ask_user_gate: cannot read %s\n", checkFile->c_str());
 			return 2;
 		}
-		command = *content;
+		// Universal newlines, because the reference opens this file in TEXT
+		// mode. Reading the bytes instead shifts every reported offset by one
+		// per preceding CRLF, and offsets are part of the contract.
+		std::string text;
+		text.reserve(content->size());
+		for (size_t i = 0; i < content->size(); ++i) {
+			if ((*content)[i] == '\r') {
+				if (i + 1 < content->size() && (*content)[i + 1] == '\n')
+					++i;
+				text.push_back('\n');
+				continue;
+			}
+			text.push_back((*content)[i]);
+		}
+		command = std::move(text);
 	}
 	if (command) {
 		const std::vector<Finding> findings = scan(*command, shell, windows, tool);

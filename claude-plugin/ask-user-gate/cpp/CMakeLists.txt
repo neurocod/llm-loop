@@ -10,9 +10,9 @@ add_executable(ask_user_gate ask_user_gate.cpp)
 target_compile_features(ask_user_gate PRIVATE cxx_std_23)
 
 # The binary must land next to hooks.json: `HERE` is its own directory, and both
-# `../bin/<tool>` (the paths the refusals name) and the wiring self-test resolve
-# from there. Every per-config spelling is set because a multi-config generator
-# would otherwise bury it in Release/ and break both.
+# `../bin/<tool>` (the paths the refusals name) and the path-resolver self-test
+# resolve from there. Every per-config spelling is set because a multi-config
+# generator would otherwise bury it in Release/ and break both.
 set(GATE_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../hooks")
 set_target_properties(ask_user_gate PROPERTIES
 	RUNTIME_OUTPUT_DIRECTORY "${GATE_OUTPUT_DIR}"
@@ -38,8 +38,6 @@ if(MSVC)
 	# /utf-8: the raw string literals are the refusal text, and the source is
 	# UTF-8 whatever the machine's ANSI codepage says.
 	target_compile_options(ask_user_gate PRIVATE /utf-8 /W4 /permissive-)
-	# std::getenv is only ever read here, never kept across a setenv.
-	target_compile_definitions(ask_user_gate PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 	#   /O1        optimise for size (implies /Os /Oy /Ob2 /GF /Gy -- and /Gy,
 	#              function-level COMDATs, is what gives /OPT:REF something to
