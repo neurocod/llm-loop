@@ -6,7 +6,8 @@ so a host project supplies its own paths, prompts and models instead of them
 being hard-coded module constants:
 
   * StateFileDriver - a state machine: read the first line of a state file each
-    iteration and run a fixed prompt against it, stopping on an `error` state.
+    iteration and run a fixed prompt against it, halting for a human on an
+    `error` state and stopping cleanly on a `done` / `complete` one.
   * ListFileDriver  - a work queue: hand out the files listed in a list file one
     at a time (at random by default, to spread evenly across a grouped list; set
     `pick_order = "list"` to walk it top to bottom instead), striking each out
@@ -18,7 +19,8 @@ root, set from --project-dir / cwd), so the same code drives any host project.
 
 import os
 import random
-from typing import Optional
+import re
+from typing import Optional, Tuple
 
 from . import projectroot
 # The contract these two implement, not the runner that executes it: a wrapper
@@ -40,13 +42,20 @@ class StateFileDriver(Driver):
 
     The loop never ends on its own (the state machine is meant to run forever);
     it stops only on an `error` state — which aborts the run with exit code 1 —
-    or via the usual stop file / Ctrl+C / --max-runs.
+    on a `done` / `complete` state — a clean stop, exit code 0, the final push
+    still runs — or via the usual stop file / Ctrl+C / --max-runs.
 
     Configure via class attributes on a subclass:
       state_file     relative (to the project root) or absolute path to the state
                      file whose first line is the current state.
       error_token    substring (case-insensitive) in the state line that aborts
                      the run for human intervention. Default: "error".
+      done_tokens    words that end the run cleanly when the state *begins* with
+                     one of them (case-insensitive, whole word): `done`,
+                     `done — Phase 5 reached`, `Complete`. A state that merely
+                     contains the word — `review complete`, `done-list` — is an
+                     ordinary state and keeps the loop going, so a playbook can
+                     name its steps freely. Default: ("done", "complete").
       app_name / prog / description — the entry-point labels; app_name and prog
                      default to the wrapper's filename (see Driver), so usually
                      only description (if any) is worth setting.
@@ -61,6 +70,7 @@ class StateFileDriver(Driver):
 
     state_file: str = "products/currentState.md"
     error_token: str = "error"
+    done_tokens: Tuple[str, ...] = ("done", "complete")
 
     def _state_path(self) -> str:
         return _abs_in_project(self.state_file)
@@ -72,6 +82,22 @@ class StateFileDriver(Driver):
                 return f.readline().strip()
         except FileNotFoundError:
             return ""
+
+    def state_name(self) -> str:
+        """The state the first line names, lower-cased: what follows a
+        `Current state:`-style label, or the whole line when there is none."""
+        line = self.first_line()
+        _, sep, rest = line.partition(":")
+        return (rest if sep else line).strip().lower()
+
+    def is_done(self) -> bool:
+        """True when the state begins with one of `done_tokens` as a whole word.
+
+        Not `\\b`: that puts a word boundary before a hyphen, so a step called
+        `done-list` would end the run."""
+        name = self.state_name()
+        return any(re.match(re.escape(token) + r"(?![\w-])", name)
+                   for token in self.done_tokens)
 
     def prompt(self) -> str:
         """The instruction sent every iteration. Subclasses must supply it."""
@@ -86,6 +112,11 @@ class StateFileDriver(Driver):
                 f"State '{state}' — error detected. Stopping, "
                 f"human intervention required.",
                 exit_code=1,
+            )
+        if self.is_done():
+            raise LoopStop(
+                f"State '{state}' — the work is finished. Stopping cleanly.",
+                exit_code=0,
             )
         label = state or f"{self.state_file} not found"
         return AgentCommand(self.prompt(), self.model(), label, self.provider,

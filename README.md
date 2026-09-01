@@ -30,7 +30,7 @@ overnight.
 | Model choice | one model for the whole run | `model()` per iteration — a cheap model for `cleanup`, a smart one for `implementation` |
 | Quota / rate limits | run until the CLI dies | the account's real figures are read over the provider's API **before** each iteration, and the loop waits under configurable ceilings (session / day-night / weekly), with a reactive `rate_limit_event` backstop |
 | Parallelism | sequential (fan-out only *inside* one agent) | `-j N` concurrent CLI workers draining a work-queue file, one item per job |
-| Stopping | Ctrl+C | `s` key (this run only), `stop` sentinel file (every run in the root), `--max-runs`, and an `error` state that halts for a human |
+| Stopping | Ctrl+C | `s` key (this run only), `stop` sentinel file (every run in the root), `--max-runs`, an `error` state that halts for a human, and a `done` / `complete` state that ends the run cleanly |
 | Steering | stop it, edit the prompt, start again | `m` types a note into the turn already running (or queues it for the next one); `p` holds the loop at an iteration boundary so the files it reads can be edited, `p` again lets it go |
 | Providers | whatever the pipe points at | Claude and Codex adapters (argv vs. stdin prompt transport, both stream-json rendered) |
 | Observability | terminal scrollback | pinned status line (iteration, model, elapsed, live quota, per-job rows), rotating mirror log, optional Markdown rendering |
@@ -332,6 +332,14 @@ class CycleDriver(StateFileDriver):
 if __name__ == "__main__":
     CycleDriver.main()
 ```
+
+Two states end the run. `error` (anywhere in the line) halts with exit code 1 for
+a human. A state that **begins with** `done` or `complete` — `Current state: done`,
+`Current state: done — nothing before Phase 5 is left` — is a clean stop with exit
+code 0 and the final push, for a playbook that has a finish line. The word has to
+be the state itself: `review complete` or `done-list` are ordinary steps and keep
+the loop going. Both words are the `done_tokens` class attribute if your playbook
+wants a different one.
 
 ### Parallel work queue
 
