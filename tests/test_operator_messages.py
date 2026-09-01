@@ -488,6 +488,30 @@ def test_a_note_typed_during_the_turn_reaches_the_agents_stdin(monkeypatch, caps
     assert "operator note: skip the fasteners" in capsys.readouterr().out
 
 
+def test_the_replay_may_carry_its_text_as_a_bare_string(monkeypatch, capsys):
+    """The CLI does not always echo the block LIST it was given.
+
+    Measured 2026-09-02 from a live run: the replayed `user` event came back as
+    `{"message": {"content": "…"}}`, the text itself where a list of blocks was
+    sent. Both renderers iterate `wire.message_blocks`, so they walked the string
+    character by character and the run died on `'str' object has no attribute
+    'get'` — inside the note path, which is the one thing a note is for. A
+    string content is the one text block it means, so the note is still claimed.
+    """
+    sink, mailbox = _Sink(), operator.Mailbox()
+
+    def stream():
+        mailbox.submit("skip the fasteners")
+        yield json.dumps({"type": "user",
+                          "message": {"role": "user",
+                                      "content": sink.messages()[-1]}})
+        yield json.dumps(_RESULT)
+
+    _run_streaming(monkeypatch, stream(), sink, mailbox)
+
+    assert "operator note: skip the fasteners" in capsys.readouterr().out
+
+
 def test_the_replayed_iteration_prompt_is_not_printed_as_a_note(monkeypatch, capsys):
     sink, mailbox = _Sink(), operator.Mailbox()
     replayed_prompt = {"type": "user", "message": {"role": "user", "content": [

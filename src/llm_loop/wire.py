@@ -147,8 +147,21 @@ def is_session_start(ev: dict) -> bool:
 # --- assistant / user content blocks --------------------------------------
 
 def message_blocks(ev: dict) -> list:
-    """The content blocks of an `assistant` or `user` event."""
-    return ev.get("message", {}).get("content", [])
+    """The content blocks of an `assistant` or `user` event.
+
+    `content` is a list of typed blocks on most events, but a bare STRING on a
+    `user` event the CLI writes itself — the echo of a note typed into a running
+    turn arrives as `{"message": {"content": "…"}}`. Both renderers iterate what
+    this returns, and over a string that iteration yields characters, so the
+    string is wrapped here into the one text block it means. Anything else
+    (None, a number) has no blocks in it.
+    """
+    content = ev.get("message", {}).get("content", [])
+    if isinstance(content, str):
+        return [{"type": BLOCK_TEXT, "text": content}]
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
 
 
 def block_type(block: dict) -> Optional[str]:
