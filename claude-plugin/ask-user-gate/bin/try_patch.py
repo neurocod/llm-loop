@@ -36,22 +36,29 @@ handle. `-Last N` reads the stream to the end and is safe; so is redirecting to
 a file and reading that. Same caution for any consumer that closes the pipe
 early (`| head` under a shell that turns SIGPIPE into a kill).
 
+Examples are spelled with the BARE script name here and in --help, never with a
+directory. There is no one true directory to name: this file ships as a plugin
+(`bin/`), and the repository it grew up in reaches it through a stand-in under
+`tools/`, so either spelling is a path that does not exist for half the readers
+-- the failure the gate's own `tool_path()` exists to avoid. The caller already
+knows how they spelled it; argparse says the same by printing `%(prog)s`.
+
 Usage:
-  python tools/try_patch.py --file webgame/src/sim/player.ts \\
+  python try_patch.py --file webgame/src/sim/player.ts \\
       --old 'const RISING_SPEED = 1e-4;' --new 'const RISING_SPEED = 0;' \\
       --cwd webgame --expect-fail \\
       -- npx vitest run test/player.rising.test.ts
 
   # several edits in one go: repeat --file/--old/--new as a triple
-  python tools/try_patch.py --file a.ts --old X --new Y \\
-                            --file b.ts --old P --new Q -- npm test
+  python try_patch.py --file a.ts --old X --new Y \\
+                      --file b.ts --old P --new Q -- npm test
 
   # several edits of the SAME file are fine too: each is applied on top of the
   # previous one, and the file is restored to its pre-run bytes exactly once
-  python tools/try_patch.py --file a.ts --old X --new Y \\
-                            --file a.ts --old P --new Q -- npm test
+  python try_patch.py --file a.ts --old X --new Y \\
+                      --file a.ts --old P --new Q -- npm test
 
-  python tools/try_patch.py --selftest   # pins the restore contract, no repo
+  python try_patch.py --selftest   # pins the restore contract, no repo
 """
 
 import argparse
@@ -131,8 +138,21 @@ def main() -> int:
     if "--selftest" in head:
         return selftest()
 
+    # `prog` is left to argparse: it is the basename of argv[0], so the help
+    # names the script the way the caller reached it (the stand-in sets argv[0]
+    # to the real file). Examples below reuse it via %(prog)s rather than
+    # hard-coding a directory -- see the header for why there is no right one.
     parser = argparse.ArgumentParser(
-        description="Apply edits, run a command, always restore the files.")
+        description="Apply edits, run a command, always restore the files.",
+        epilog="examples:\n"
+               "  python %(prog)s --file src/player.ts \\\n"
+               "      --old 'const SPEED = 1e-4;' --new 'const SPEED = 0;' \\\n"
+               "      --cwd webgame --expect-fail -- npx vitest run "
+               "test/player.test.ts\n"
+               "  python %(prog)s --file a.ts --old X --new Y \\\n"
+               "                      --file b.ts --old P --new Q -- npm test\n"
+               "  python %(prog)s --selftest   # pins the restore contract\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--file", action=Triple, metavar="FILE",
                         help="file to edit (repeatable, with --old/--new)")
     parser.add_argument("--old", action=Triple, metavar="TEXT")
@@ -361,8 +381,8 @@ def restore(touched: "dict[Path, Touched]") -> bool:
 #
 # There is no test runner under tools/, and this script must keep working when
 # the repo it edits does not build, so its regression lives in the script:
-# `python tools/try_patch.py --selftest`, no arguments, no fixtures, nothing
-# touched outside a temp directory.
+# `python try_patch.py --selftest`, no arguments, no fixtures, nothing touched
+# outside a temp directory.
 #
 # Every case runs THIS FILE as a subprocess. That is deliberate: the defect
 # these pin -- several edits of one file restoring the file to a half-mutated

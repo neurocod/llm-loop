@@ -19,15 +19,23 @@ Two more differences that matter on this repo:
 
 Runs from anywhere; FILE is resolved against the current directory.
 
-Usage:
-  python tools/replace_in_file.py FILE --old TEXT --new TEXT
-  python tools/replace_in_file.py FILE --old X --new Y --count 3   # expect 3
-  python tools/replace_in_file.py FILE --old X --new Y --count any # any number
-  python tools/replace_in_file.py FILE --regex --old '^const A = 1;$' --new 'const A = 0;'
-  python tools/replace_in_file.py FILE --old X --new Y --dry-run
+Examples are spelled with the BARE script name here and in --help, never with a
+directory. There is no one true directory to name: this file ships as a plugin
+(`bin/`), and the repository it grew up in reaches it through a stand-in under
+`tools/`, so either spelling is a path that does not exist for half the readers
+-- the failure the gate's own `tool_path()` exists to avoid. The caller already
+knows how they spelled it; argparse says the same by printing `%(prog)s`.
 
-To mutate a file, run something, and put it back, use tools/try_patch.py --
-it restores even when the command crashes or is interrupted.
+Usage:
+  python replace_in_file.py FILE --old TEXT --new TEXT
+  python replace_in_file.py FILE --old X --new Y --count 3   # expect 3
+  python replace_in_file.py FILE --old X --new Y --count any # any number
+  python replace_in_file.py FILE --regex --old '^const A = 1;$' --new 'const A = 0;'
+  python replace_in_file.py FILE --old X --new Y --dry-run
+
+To mutate a file, run something, and put it back, use try_patch.py (its
+neighbour in this directory) -- it restores even when the command crashes or is
+interrupted.
 """
 
 import argparse
@@ -158,9 +166,21 @@ def add_edit_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def main() -> int:
+    # `prog` is left to argparse: it is the basename of argv[0], so the help
+    # names the script the way the caller reached it (the stand-in sets argv[0]
+    # to the real file). Examples below reuse it via %(prog)s rather than
+    # hard-coding a directory -- see the header for why there is no right one.
     parser = argparse.ArgumentParser(
         description="Replace text in one file, refusing to write on a "
-                    "surprising number of matches.")
+                    "surprising number of matches.",
+        epilog="examples:\n"
+               "  python %(prog)s FILE --old TEXT --new TEXT\n"
+               "  python %(prog)s FILE --old X --new Y --count 3   # expect 3\n"
+               "  python %(prog)s FILE --old X --new Y --count any # any number\n"
+               "  python %(prog)s FILE --regex --old '^const A = 1;$' "
+               "--new 'const A = 0;'\n"
+               "  python %(prog)s FILE --old X --new Y --dry-run\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("file", type=Path, metavar="FILE")
     add_edit_arguments(parser)
     parser.add_argument("--dry-run", action="store_true",
