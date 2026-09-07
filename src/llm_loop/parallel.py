@@ -396,6 +396,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     cost_usd = None
     duration_s = None
     provider_failed = False
+    codex_outcome = wire.CodexOutcome()
     # The child's stderr is merged into its stdout (start_agent_process), so a
     # provider that dies with a plain-text message says so on these skipped
     # lines. Compact mode drops them, which is how a job once failed with
@@ -423,6 +424,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     continue  # valid JSON can still be a diagnostic, not an event
                 et = wire.event_type(ev)
                 if provider == "codex":
+                    codex_outcome.observe(ev)
                     if et in (wire.TURN_COMPLETED, wire.TURN_FAILED):
                         channel.close()
                     item = wire.codex_item(ev)
@@ -456,7 +458,6 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                             out.line(f"tokens: input {tokens_in}, "
                                      f"cached {cached}, output {tokens_out}")
                     elif et in (wire.ERROR, wire.TURN_FAILED):
-                        provider_failed = True
                         out.fitted("⚠ ", wire.codex_error(ev), "bold red")
                 elif et == wire.ASSISTANT:
                     for block in wire.message_blocks(ev):
@@ -511,6 +512,12 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
         returncode = proc.wait()
     finally:
         reap_agent_process(proc)
+    if provider == "codex":
+        provider_failed = codex_outcome.failed
+        outcome_code = codex_outcome.exit_code(returncode)
+        if outcome_code:
+            out.line(codex_outcome.describe(returncode), "bold red")
+        returncode = outcome_code
     if returncode == 0 and provider_failed:
         returncode = 1
     # Last resort only: a codex error/turn.failed already printed its own ⚠ line

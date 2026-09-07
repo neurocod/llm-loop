@@ -668,6 +668,69 @@ def test_claude_result_verdict_overrides_a_zero_process_exit(
     assert rc == expected_rc
 
 
+# --- Codex retries are diagnostics until the root turn reports its outcome ---
+
+@pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
+@pytest.mark.parametrize("events,process_rc,expected_rc", [
+    (["error", "turn.completed"], 0, 0),
+    (["error", "error", "turn.completed"], 0, 0),
+    (["turn.completed"], 0, 0),
+    (["error"], 0, 1),
+    (["error", "turn.failed"], 0, 1),
+    (["turn.failed"], 0, 1),
+    (["turn.failed", "turn.completed"], 0, 1),
+    (["turn.completed", "error"], 0, 1),
+    (["error", "turn.completed"], 7, 7),
+    (["turn.completed"], 1, 1),
+    ([], 9, 9),
+])
+def test_codex_terminal_outcome_controls_all_runners(
+        monkeypatch, capsys, runner, events, process_rc, expected_rc):
+    # The live motorhome run on 2026-09-07 reconnected, committed and completed,
+    # then printed exit 1. Replay the stream with a controlled process status.
+    stream = [{"type": event, "message": "Reconnecting... 2/5"}
+              for event in events]
+    proc = _FakeAgentProcess(
+        has_stdin=False, returncode=process_rc,
+        stdout="".join(json.dumps(event) + "\n" for event in stream))
+    if runner == "parallel":
+        monkeypatch.setattr(parallel, "start_agent_process", lambda *args: proc)
+        rc, _, _ = parallel.run_job(
+            1, AgentCommand("work", "gpt-test", "job", "codex"))
+    else:
+        monkeypatch.setattr(streamrender, "start_agent_process", lambda *args: proc)
+        rc = streamrender.run_agent_streaming(
+            ["codex", "exec", "--json", "-"], "codex", runner == "raw")
+    assert rc == expected_rc
+    output = capsys.readouterr().out
+    if "error" in events:
+        assert "Reconnecting... 2/5" in output
+    if expected_rc:
+        assert f"process exit {process_rc}" in output
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_codex_failed_tool_does_not_fail_a_completed_turn(monkeypatch, runner):
+    stream = [
+        {"type": "item.completed", "item": {
+            "type": "command_execution", "command": "rg missing",
+            "exit_code": 1, "status": "failed"}},
+        {"type": "turn.completed"},
+    ]
+    proc = _FakeAgentProcess(
+        has_stdin=False,
+        stdout="".join(json.dumps(event) + "\n" for event in stream))
+    if runner == "parallel":
+        monkeypatch.setattr(parallel, "start_agent_process", lambda *args: proc)
+        rc, _, _ = parallel.run_job(
+            1, AgentCommand("work", "gpt-test", "job", "codex"))
+    else:
+        monkeypatch.setattr(streamrender, "start_agent_process", lambda *args: proc)
+        rc = streamrender.run_agent_streaming(
+            ["codex", "exec", "--json", "-"], "codex", False)
+    assert rc == 0
+
+
 # --- a failed parallel job must say why ----------------------------------------
 #
 # The child's stderr is merged into its stdout, so a provider that dies with a

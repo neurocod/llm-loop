@@ -262,6 +262,49 @@ def result_failed(ev: dict) -> bool:
 
 # --- Codex ----------------------------------------------------------------
 
+class CodexOutcome:
+    """Reduce the root turn's events without treating retries as its verdict.
+
+    A later completion clears earlier error diagnostics (including reconnects),
+    but an explicit failed turn and a nonzero process exit remain failures.
+    An error with no later completion still fails, including a truncated stream.
+    App-server child notifications are filtered before reaching this reducer.
+    """
+
+    def __init__(self):
+        self._pending_error = False
+        self._failed_turn = False
+        self._completed = False
+
+    def observe(self, ev: dict) -> None:
+        kind = event_type(ev)
+        if kind == ERROR:
+            self._pending_error = True
+        elif kind == TURN_FAILED:
+            self._failed_turn = True
+        elif kind == TURN_COMPLETED:
+            self._pending_error = False
+            self._completed = True
+
+    @property
+    def failed(self) -> bool:
+        return self._failed_turn or self._pending_error
+
+    def exit_code(self, process_rc: int) -> int:
+        return process_rc or int(self.failed)
+
+    def describe(self, process_rc: int) -> str:
+        if self._failed_turn:
+            status = "failed"
+        elif self._pending_error:
+            status = "error without later completion"
+        elif self._completed:
+            status = "completed"
+        else:
+            status = "no terminal event"
+        return f"provider outcome: process exit {process_rc}; Codex turn {status}"
+
+
 def codex_item(ev: dict) -> dict:
     """The item an `item.*` event is about (never None — an absent one is empty)."""
     return ev.get("item") or {}

@@ -301,6 +301,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
         sys.exit(2)
 
     provider_failed = False
+    codex_outcome = wire.CodexOutcome()
     try:
         with note_channel(proc, provider, mailbox) as channel:
             for line in proc.stdout:
@@ -318,6 +319,8 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                     print(line)
                     continue
                 event_type = wire.event_type(ev)
+                if provider == "codex":
+                    codex_outcome.observe(ev)
                 if (provider == "claude" and event_type == wire.RESULT
                         and wire.result_failed(ev)):
                     provider_failed = True
@@ -334,12 +337,15 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                     _render_claude_event(ev, partial, mailbox)
                 else:
                     _render_codex_event(ev, mailbox)
-                    provider_failed = provider_failed or event_type in (
-                        wire.ERROR, wire.TURN_FAILED)
         # Outside the `with`, so the pipe is already closed: waiting on a
         # process whose stdin is still open is the hang this whole seam exists
         # to prevent.
         returncode = proc.wait()
+        if provider == "codex":
+            outcome_code = codex_outcome.exit_code(returncode)
+            if outcome_code:
+                LINES.line(codex_outcome.describe(returncode), "bold red")
+            return outcome_code
         return 1 if returncode == 0 and provider_failed else returncode
     except KeyboardInterrupt:
         print("\nInterrupted by user (Ctrl+C).")
