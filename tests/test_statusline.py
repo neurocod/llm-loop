@@ -1820,6 +1820,35 @@ def test_quota_refresher_switches_source_policy_and_default_cadence(interval):
                                   if interval is None else interval)
 
 
+def test_quota_retarget_restarts_cadence_without_an_immediate_query(monkeypatch):
+    refresher = sl.QuotaRefresher(_FakeApp(), object(), provider="claude")
+    intervals = []
+
+    class Wake:
+        ready = False
+
+        def set(self):
+            self.ready = True
+
+        def clear(self):
+            self.ready = False
+
+        def is_set(self):
+            return self.ready
+
+        def wait(self, interval):
+            intervals.append(interval)
+            if len(intervals) == 1:
+                refresher.set_source(object(), provider="codex")
+            else:
+                refresher._stop.set()
+
+    monkeypatch.setattr(refresher, "_wake", Wake())
+    monkeypatch.setattr(sl, "quota_rows", lambda *a, **k: pytest.fail("eager poll"))
+    refresher._run()
+    assert intervals == [sl.CLAUDE_QUOTA_REFRESH, sl.CODEX_QUOTA_REFRESH]
+
+
 def test_quota_refresher_discards_inflight_rows_and_diagnostics(monkeypatch,
                                                               capsys):
     old_started = threading.Event()

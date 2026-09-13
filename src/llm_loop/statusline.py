@@ -1828,9 +1828,14 @@ class QuotaRefresher:
                 interval = self.interval
             self._wake.wait(interval)
             with self._source_lock:
+                retargeted = self._wake.is_set()
                 self._wake.clear()
                 if self._stop.is_set():
                     return
+                # The loop already publishes the new account's cached figures.
+                # A retarget restarts its cadence, not an uncached network poll.
+                if retargeted:
+                    continue
                 source, policy = self.usage_source, self.limit_policy
                 generation = self._generation
             if source is None or not self.app.enabled:

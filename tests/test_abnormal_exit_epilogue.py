@@ -33,7 +33,7 @@ import pytest
 from llm_loop import (console, cyclecore, exitlog, operator, parallel,
                       projectroot, runlifecycle)
 from llm_loop.agentwork import ClaudeCommand, Driver, LoopStop
-from llm_loop.drivers import ListFileDriver
+from llm_loop.drivers import ListFileDriver, StateFileDriver
 
 # What the operator typed and never got delivered. One string, asserted by
 # identity, so a run that printed SOME note would not satisfy a pin about THIS
@@ -282,6 +282,31 @@ def test_a_driver_that_stops_the_run_still_closes_it_down(
         # The FIRST line of the driver's message, so a multi-line diagnosis does
         # not turn the one-line ending into a paragraph.
         reason="the driver stopped the run (exit 3): state file says: error")
+
+
+def test_invalid_state_model_still_closes_the_run_down(
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox):
+    class InvalidSelection(StateFileDriver):
+        def first_line(self):
+            return "Current state: implementation"
+
+        def model(self):
+            return "claud/opus"
+
+        def prompt(self):
+            return "work"
+
+    driver = InvalidSelection()
+    driver.limit_policy = _StubPolicy()
+    monkeypatch.setattr(cyclecore, "usage_source_for",
+                        lambda p: pytest.fail("opened account for invalid selector"))
+    with pytest.raises(SystemExit) as stopped:
+        cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
+                           app_name="pytest-abnormal", wait_on_start=False)
+    assert stopped.value.code == 1
+    _assert_closed_down(
+        exit_pushes, driver.limit_policy, capsys, str(tmp_path), snapshot=None,
+        reason="invalid model selection")
 
 
 def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(

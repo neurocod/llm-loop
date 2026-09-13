@@ -121,7 +121,11 @@ class StateFileDriver(Driver):
                 exit_code=0,
             )
         label = state or f"{self.state_file} not found"
-        provider, model = model_selection(self.model(), self.provider)
+        try:
+            provider, model = model_selection(self.model(), self.provider)
+        except ValueError as exc:
+            raise LoopStop(f"State '{state}' — invalid model selection: {exc}",
+                           exit_code=1) from exc
         return AgentCommand(self.prompt(), model, label, provider,
                             self.sandbox_mode)
 

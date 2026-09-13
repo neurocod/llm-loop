@@ -68,8 +68,10 @@ def test_state_step_selects_provider_and_model(monkeypatch, default, selection, 
 def test_invalid_state_step_selector_fails_before_launch(monkeypatch, selection):
     driver = driver_at("Current state: implementation")
     monkeypatch.setattr(driver, "model", lambda: selection)
-    with pytest.raises(ValueError):
+    with pytest.raises(LoopStop) as stopped:
         driver.next_command()
+    assert stopped.value.exit_code == 1
+    assert "invalid model selection" in stopped.value.message
 
 
 def test_state_file_driver_stops_cleanly_on_done():
