@@ -440,12 +440,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # The live knobs (see RunSettings): read where they are USED, never
     # snapshotted into locals, so the status line's editor can move them mid-run.
     run_settings = ctx.settings
-    # When a finite iteration cap is given (-m/--max-runs) the run is short and
-    # bounded on purpose, so the usage-limit machinery (the LimitPolicy
-    # pause-on-limit logic) is skipped — we just run the requested iterations
-    # without ever waiting out a window. Decided once, from the value the run was
-    # LAUNCHED with: it also governs whether this run talks to the usage endpoint
-    # at all, which is a property of the invocation, not of the current cap.
+    # A finite cap at launch disables automatic quota waits and background
+    # polling even if the live cap changes later. Provider quota support is
+    # re-evaluated on each switch; bounded runs still show usage snapshots.
     ignore_usage_limits = args.max is not None
     dry_run = ctx.dry_run
     raw = args.raw
