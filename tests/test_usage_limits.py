@@ -225,8 +225,8 @@ def test_event_parse():
     assert bare.resets_at is None and bare.status == "unknown"
 
 
-class _OneShotDriver(Driver):
-    """Serves one command, then reports the work exhausted."""
+class _TwoShotDriver(Driver):
+    """Serve a second command so a first-turn refusal gates real pending work."""
 
     def __init__(self):
         self.served = 0
@@ -234,7 +234,7 @@ class _OneShotDriver(Driver):
         self.limit_policy = _NeverPauses()
 
     def next_command(self):
-        if self.served:
+        if self.served >= 2:
             return None
         self.served += 1
         return ClaudeCommand("do the thing", "", "the-thing")
@@ -271,7 +271,7 @@ def _args(project_dir):
 
 
 def _run_with_verdict(tmp_path, monkeypatch, verdict):
-    """Run one iteration whose fake `claude` streams `verdict`; return the
+    """Run two iterations whose first fake `claude` streams `verdict`; return the
     wait_until targets the loop asked for."""
     waits = []
     monkeypatch.setattr(usage, "UsageSource", lambda *a, **k: _StubSource())
@@ -280,11 +280,11 @@ def _run_with_verdict(tmp_path, monkeypatch, verdict):
                             waits.append(ts))
 
     def fake_run(cmd, raw, partial, prompt="", mailbox=None):
-        streamrender._last_rate_limit_event = verdict
+        streamrender._last_rate_limit_event = verdict if driver.served == 1 else None
         return 0
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", fake_run)
-    driver = _OneShotDriver()
+    driver = _TwoShotDriver()
     cyclecore.run_loop(driver, _args(str(tmp_path)), app_name="pytest-usage")
     return driver, waits
 
@@ -297,7 +297,7 @@ def test_a_refusal_parks_the_loop_until_that_quota_resets(tmp_path, monkeypatch)
     assert waits[0] == pytest.approx(resets + 5, abs=0.1)
     # The iteration still counted: a run refused on its last turn may have
     # finished its work first, and dropping that would redo it after the wait.
-    assert driver.succeeded == 1
+    assert driver.succeeded == 2
 
 
 def test_a_weekly_refusal_waits_out_the_week_not_the_session(tmp_path, monkeypatch):
@@ -345,7 +345,7 @@ def test_anything_short_of_a_refusal_runs_on(tmp_path, monkeypatch, verdict):
     """Only "rejected" is a wall. A warning is worth printing, not stopping for."""
     driver, waits = _run_with_verdict(tmp_path, monkeypatch, verdict)
     assert waits == []
-    assert driver.succeeded == 1
+    assert driver.succeeded == 2
 
 
 def test_the_verdict_does_not_outlive_its_run(monkeypatch):

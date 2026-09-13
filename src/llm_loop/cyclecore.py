@@ -472,6 +472,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # Sources and fallback session clocks belong to accounts, not the whole
     # mixed-provider run. Populate lazily: the launch default may never run.
     usage_states = {}
+    provider_refusals = {}
     quota_refresher = None
     last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
     if ignore_usage_limits:
@@ -526,6 +527,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # next_command may claim work. A pause at the quota gate must retain that
     # claim until it is launched instead of asking the driver for another item.
     pending_command = None
+    refresh_pending_command = False
 
     def stop_pending() -> bool:
         """Is either stop channel asking for this run right now?
@@ -645,12 +647,16 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 print(f"  ▶ Pause released after "
                       f"{statusline.format_elapsed(time.time() - paused_since)}.")
                 paused_since = 0.0
+                refresh_pending_command = pending_command is not None
 
             # Ask the driver what to do next. None => no more work (stop cleanly);
             # LoopStop => abort the run (e.g. an error state needing a human).
             try:
                 if pending_command is None:
                     pending_command = driver.next_command()
+                elif refresh_pending_command:
+                    pending_command = driver.refresh_command(pending_command)
+                refresh_pending_command = False
                 command = pending_command
             except LoopStop as stop:
                 print(stop.message)
@@ -706,6 +712,27 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     if not dry_run and quota_refresher is None:
                         quota_refresher = app.add_service(statusline.QuotaRefresher(
                             app, usage_source, limit_policy, provider=provider))
+
+            # A refusal blocks this account's next command, not another
+            # provider's next step. Keep the deadline if an operator interrupts
+            # the wait and subsequently cancels the stop request.
+            if provider in provider_refusals and not ignore_usage_limits:
+                refusal, target_ts = provider_refusals[provider]
+                app.update(phase="paused")
+                wait_until(target_ts,
+                           reason=f"Hit the {refusal.label} — this run was refused. "
+                                  f"Waiting until {fmt_moment(target_ts)} for that "
+                                  f"window to refresh…",
+                           should_stop=stop_pending)
+                app.update(phase="idle")
+                if stop_pending() or stopchannel.pause_requested(app):
+                    continue
+                del provider_refusals[provider]
+                usage_source.invalidate()
+                statusline.push_quotas(app, usage_source, limit_policy)
+                if refusal.limit_type == "five_hour":
+                    session_start = time.time()
+                consecutive_errors = 0
 
             # Gate the account that will actually execute this command. Keep the
             # pending claim if the operator pauses or cancels a stop in this wait.
@@ -826,35 +853,16 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # withdrawn by a later hook answering None.
             handback_reason = handback_reason or driver.item_finished(command, returncode)
 
-            # The backstop under the proactive check (see RateLimitEvent): this run's
-            # own verdict from the wire. A refusal needs no figure and no query to be
-            # trusted, so it is honoured whatever the usage report said — including
-            # when the report was unavailable, which is the case this exists for.
-            # Checked for both outcomes: a run refused on its last turn may still have
-            # exited 0 with its work recorded above.
-            # `handback_reason` excluded: this wait is the longest hold below the
-            # loop head (a whole quota window), and the head is about to end the
-            # run anyway. Sitting it out first would hand control back hours
-            # after it was asked for — the window matters to the NEXT run, and
-            # that one is the caller's to start.
+            # Preserve the wire verdict even when the quota endpoint has no
+            # figures. A refused final turn may still exit 0 and advance the
+            # state, so defer its wait until this provider is selected again.
             refusal = last_rate_limit_event() if provider == "claude" else None
             if (not ignore_usage_limits and refusal is not None
                     and refusal.status == "rejected" and handback_reason is None):
                 # +5s so we come back after the reset, not exactly on it.
-                target_ts = (refusal.resets_at
-                             or time.time() + CLAUDE_SESSION_DURATION) + 5
-                app.update(phase="paused")
-                wait_until(target_ts,
-                           reason=f"Hit the {refusal.label} — this run was refused. "
-                                  f"Waiting until {fmt_moment(target_ts)} for that "
-                                  f"window to refresh…",
-                           should_stop=stop_pending)
-                usage_source.invalidate()  # the figures behind the refusal are stale
-                statusline.push_quotas(app, usage_source, limit_policy)
-                app.update(phase="idle")
-                if refusal.limit_type == "five_hour":
-                    session_start = time.time()
-                consecutive_errors = 0  # fresh window — start counting errors anew
+                provider_refusals[provider] = (
+                    refusal, (refusal.resets_at
+                              or time.time() + CLAUDE_SESSION_DURATION) + 5)
                 continue
 
             if returncode == 0:

@@ -182,6 +182,15 @@ class Driver:
         the loop should stop normally. May raise LoopStop to abort the run."""
         raise NotImplementedError
 
+    def refresh_command(self, command: AgentCommand) -> Optional[AgentCommand]:
+        """Revalidate pending work after the operator releases a pause.
+
+        Keep a consuming queue's existing claim by default. A driver backed by
+        editable state can re-read it instead, including returning None or
+        raising LoopStop when the operator has ended the work during the hold.
+        """
+        return command
+
     def model(self) -> str:
         """The selected provider's model for this iteration.
 

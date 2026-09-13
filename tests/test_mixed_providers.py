@@ -1,17 +1,22 @@
 """One sequential run may cross provider and quota-account boundaries."""
 
 from types import SimpleNamespace
+import time
 
 import pytest
 
 from llm_loop import cyclecore, projectroot, providers, statusline, stopchannel
 from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.drivers import StateFileDriver
+from llm_loop.usage import RateLimitEvent
 
 
 class Source:
     def __init__(self, provider):
         self.provider = provider
+
+    def invalidate(self):
+        pass
 
 
 class Policy:
@@ -181,3 +186,82 @@ def test_no_work_never_opens_the_default_provider_account(runtime):
     assert runtime.sources == []
     assert runtime.events == []
     assert runtime.refreshers == []
+
+
+@pytest.mark.parametrize("edited_state", ["planning", "done", "error"])
+def test_state_edit_during_quota_pause_revalidates_pending_step(
+        monkeypatch, tmp_path, runtime, edited_state):
+    state = tmp_path / "currentState.md"
+    state.write_text("Current state: implementation", encoding="utf-8")
+    paused = False
+    gated = False
+    calls = []
+
+    class Cycle(StateFileDriver):
+        state_file = str(state)
+
+        def prompt(self):
+            return "Follow currentState.md"
+
+        def model(self):
+            return "claude/opus" if self.state_name() == "implementation" else "codex"
+
+        def on_success(self, rc):
+            state.write_text("Current state: done", encoding="utf-8")
+
+    def gate(policy, source, session_start, **kwargs):
+        nonlocal paused, gated
+        if not gated:
+            paused = gated = True
+        return False, session_start
+
+    def hold(*args, **kwargs):
+        nonlocal paused
+        state.write_text(f"Current state: {edited_state}", encoding="utf-8")
+        paused = False
+
+    monkeypatch.setattr(Policy, "check_and_wait", gate)
+    monkeypatch.setattr(stopchannel, "pause_requested", lambda app: paused)
+    monkeypatch.setattr(stopchannel, "wait_while_paused", hold)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda *a, **k: pytest.fail("launched stale Claude step"))
+    monkeypatch.setattr(cyclecore, "run_agent_streaming",
+                        lambda argv, provider, *a, **k: calls.append(provider) or 0)
+
+    if edited_state == "error":
+        with pytest.raises(SystemExit) as stopped:
+            run(Cycle(), runtime)
+        assert stopped.value.code == 1
+    else:
+        run(Cycle(), runtime)
+    assert calls == (["codex"] if edited_state == "planning" else [])
+
+
+@pytest.mark.parametrize("return_to_claude", [False, True])
+def test_claude_refusal_only_blocks_its_next_command(monkeypatch, runtime, return_to_claude):
+    items = [AgentCommand("implementation", "opus", provider="claude"),
+             AgentCommand("cleanup", provider="codex")]
+    if return_to_claude:
+        items.append(AgentCommand("next implementation", "opus", provider="claude"))
+    commands = iter([*items, None])
+    calls, waits = [], []
+    reset = time.time() + 3600
+
+    class Queue(Driver):
+        def next_command(self):
+            return next(commands)
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda *a, **k: calls.append("claude") or 0)
+    monkeypatch.setattr(cyclecore, "run_agent_streaming",
+                        lambda argv, provider, *a, **k: calls.append(provider) or 0)
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event",
+                        lambda: RateLimitEvent("rejected", "five_hour", reset)
+                        if len(calls) == 1 else None)
+    monkeypatch.setattr(cyclecore, "wait_until",
+                        lambda target, **k: waits.append((target, list(calls))))
+
+    run(Queue(), runtime)
+
+    assert calls[:2] == ["claude", "codex"]
+    assert waits == ([(reset + 5, ["claude", "codex"])] if return_to_claude else [])

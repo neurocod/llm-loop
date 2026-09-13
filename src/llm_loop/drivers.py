@@ -125,6 +125,10 @@ class StateFileDriver(Driver):
         return AgentCommand(self.prompt(), model, label, provider,
                             self.sandbox_mode)
 
+    def refresh_command(self, command: AgentCommand) -> Optional[AgentCommand]:
+        """State-file reads claim nothing; apply edits made during a pause."""
+        return self.next_command()
+
     def final_summary(self) -> Optional[str]:
         return f"Final state: {self.first_line()}"
 
