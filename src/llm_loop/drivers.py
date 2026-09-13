@@ -23,6 +23,7 @@ import re
 from typing import Optional, Tuple
 
 from . import projectroot
+from .providers import model_selection
 # The contract these two implement, not the runner that executes it: a wrapper
 # that only ever calls `.main_parallel()` used to import the SEQUENTIAL loop to
 # reach the base class it subclasses.
@@ -62,8 +63,9 @@ class StateFileDriver(Driver):
 
     Override methods to customise behaviour:
       prompt()  -> the instruction sent every iteration (required).
-      model()   -> pin a model, or vary it by state (read self.first_line()
-                   inside). Default: "" — the CLI's own configured model.
+      model()   -> choose a provider ("codex"), a provider/model ("claude/opus"),
+                   or a bare model on the default provider. Read self.first_line()
+                   to vary it by state. Default: "" — the CLI's configured model.
 
     Entry point: ``MyStateDriver.main()``.
     """
@@ -119,7 +121,8 @@ class StateFileDriver(Driver):
                 exit_code=0,
             )
         label = state or f"{self.state_file} not found"
-        return AgentCommand(self.prompt(), self.model(), label, self.provider,
+        provider, model = model_selection(self.model(), self.provider)
+        return AgentCommand(self.prompt(), model, label, provider,
                             self.sandbox_mode)
 
     def final_summary(self) -> Optional[str]:

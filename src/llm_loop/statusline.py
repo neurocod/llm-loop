@@ -328,7 +328,7 @@ class Job:
     running: bool = False
     iteration: int = 0          # iterations this Job has started
     item: str = ""              # label of the unit of work in flight
-    model: str = ""             # exactly what driver.model() returned
+    model: str = ""             # model ID after resolving the step's provider
     prompt: str = ""            # full prompt in flight (wave 4 shows it)
     started_at: float = 0.0     # start of the CURRENT iteration, 0.0 when idle
 
@@ -1778,13 +1778,33 @@ class QuotaRefresher:
     def __init__(self, app: "StatusApp", usage_source, limit_policy=None, *,
                  provider: str = "claude", interval: Optional[float] = None):
         self.app = app
-        self.usage_source = usage_source
-        self.limit_policy = limit_policy
-        self.interval = interval if interval is not None else (
-            CODEX_QUOTA_REFRESH if provider == "codex" else CLAUDE_QUOTA_REFRESH)
+        self._source_lock = threading.Lock()
+        self._generation = 0
+        self._interval_override = interval
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._last_report = ""
+        self.set_source(usage_source, limit_policy, provider=provider)
+        self._wake.clear()
+
+    def set_source(self, usage_source, limit_policy=None, *,
+                   provider: str = "claude") -> None:
+        """Retarget without waiting for an in-flight provider request.
+
+        The generation invalidates both figures and diagnostics from that
+        request, even if a later step switches back to the same source. Only
+        the short publication section shares this lock with the caller.
+        """
+        with self._source_lock:
+            self.usage_source = usage_source
+            self.limit_policy = limit_policy
+            self.interval = (self._interval_override
+                             if self._interval_override is not None else
+                             CODEX_QUOTA_REFRESH if provider == "codex" else
+                             CLAUDE_QUOTA_REFRESH)
+            self._generation += 1
+            self._last_report = ""
+            self._wake.set()
 
     def start(self) -> None:
         if (self._thread is not None or self.usage_source is None
@@ -1797,21 +1817,36 @@ class QuotaRefresher:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=1.0)
 
     def _run(self) -> None:
-        while not self._stop.wait(self.interval):
+        while not self._stop.is_set():
+            with self._source_lock:
+                interval = self.interval
+            self._wake.wait(interval)
+            with self._source_lock:
+                self._wake.clear()
+                if self._stop.is_set():
+                    return
+                source, policy = self.usage_source, self.limit_policy
+                generation = self._generation
+            if source is None or not self.app.enabled:
+                continue
             # cache_value=False: this poll exists precisely to age out the cache.
             # Its diagnostics are captured, never printed — see
             # `_ThreadScopedCapture` — and surfaced on the note row instead,
             # which is the one place a background message can appear without
             # corrupting the stream or the mirror log.
             with capture_stdout_here() as chunks:
-                push_quotas(self.app, self.usage_source, self.limit_policy,
-                            cache_value=False)
-            self._report("".join(chunks))
+                rows = quota_rows(source, policy, cache_value=False)
+            with self._source_lock:
+                if generation != self._generation or self._stop.is_set():
+                    continue
+                self.app.update(quotas=rows)
+                self._report("".join(chunks))
 
     def _report(self, text: str) -> None:
         """Put a captured diagnostic on the note row — once per distinct message.

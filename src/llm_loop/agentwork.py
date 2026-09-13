@@ -36,6 +36,8 @@ class AgentCommand(NamedTuple):
 
     An empty `model` means "no --model flag": the selected provider then uses
     its configured default, which is the common case.
+    In the sequential loop an explicit `provider` selects this command's CLI;
+    an empty provider uses the launch default, even after a provider switch.
     """
     prompt: str
     model: str = ""

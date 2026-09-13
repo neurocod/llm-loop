@@ -1420,13 +1420,18 @@ def test_a_bounded_run_shows_the_quotas_and_never_polls_for_them(monkeypatch,
 
 
 def test_an_unbounded_run_keeps_the_quota_figures_refreshed(monkeypatch, tmp_path):
-    from llm_loop.agentwork import Driver
+    from llm_loop.agentwork import AgentCommand, Driver
 
-    class _NoWork(Driver):
+    class _OneShot(Driver):
+        served = False
+
         def next_command(self):
-            return None
+            if self.served:
+                return None
+            self.served = True
+            return AgentCommand("work")
 
-    app, _source = _run_with_status(monkeypatch, tmp_path, _NoWork(), max=None)
+    app, _source = _run_with_status(monkeypatch, tmp_path, _OneShot(), max=None)
 
     assert [type(s).__name__ for s in app._services] == ["QuotaRefresher"]
     assert app.status.quotas
@@ -1796,6 +1801,92 @@ def test_a_setting_flag_is_checked_against_the_command_line_table():
 
 
 # --- the background refresher stays out of the stream --------------------------
+
+
+@pytest.mark.parametrize("interval", [None, 0.25])
+def test_quota_refresher_switches_source_policy_and_default_cadence(interval):
+    old_source, new_source = object(), object()
+    old_policy, new_policy = object(), object()
+    refresher = sl.QuotaRefresher(_FakeApp(), old_source, old_policy,
+                                  provider="codex", interval=interval)
+    assert refresher.interval == (sl.CODEX_QUOTA_REFRESH
+                                  if interval is None else interval)
+
+    refresher.set_source(new_source, new_policy)
+
+    assert refresher.usage_source is new_source
+    assert refresher.limit_policy is new_policy
+    assert refresher.interval == (sl.CLAUDE_QUOTA_REFRESH
+                                  if interval is None else interval)
+
+
+def test_quota_refresher_discards_inflight_rows_and_diagnostics(monkeypatch,
+                                                              capsys):
+    old_started = threading.Event()
+    release_old = threading.Event()
+    switched = threading.Event()
+    published_new = threading.Event()
+    old_source, new_source = object(), object()
+    old_policy, new_policy = object(), object()
+    calls = []
+    publications = []
+    old_rows = [sl.QuotaRow("old", 10, None)]
+    new_rows = [sl.QuotaRow("new", 20, None)]
+    wait_seconds = 5  # 0.16 s measured 2026-09-13 for all three refresher tests.
+
+    def query(source, policy, *, cache_value):
+        calls.append((source, policy, cache_value))
+        if source is old_source:
+            old_started.set()
+            assert release_old.wait(wait_seconds)
+            print("old provider diagnostic")
+            return old_rows
+        print("new provider diagnostic")
+        return new_rows
+
+    monkeypatch.setattr(sl, "quota_rows", query)
+
+    class _RecordingApp(_FakeApp):
+        def update(self, **fields):
+            publications.append(fields["quotas"])
+            super().update(**fields)
+
+        def note(self, text):
+            super().note(text)
+            if "new provider" in text:
+                refresher._stop.set()
+                published_new.set()
+
+    app = _RecordingApp()
+    refresher = sl.QuotaRefresher(app, old_source, old_policy, interval=0)
+
+    def switch():
+        refresher.set_source(new_source, new_policy, provider="codex")
+        # The runner may already have published the new provider's cached rows.
+        app.fields["quotas"] = new_rows
+        switched.set()
+
+    setter = threading.Thread(target=switch, daemon=True)
+    try:
+        refresher.start()
+        assert old_started.wait(wait_seconds)
+        setter.start()
+        assert switched.wait(wait_seconds), "retarget waited for network I/O"
+        assert app.fields["quotas"] == new_rows
+        release_old.set()
+        assert published_new.wait(wait_seconds)
+    finally:
+        release_old.set()
+        if setter.ident is not None:
+            setter.join(wait_seconds)
+        refresher.stop()
+
+    assert calls == [(old_source, old_policy, False),
+                     (new_source, new_policy, False)]
+    assert publications == [new_rows]
+    assert app.fields["quotas"] == new_rows
+    assert app.notes == ["quota refresh: new provider diagnostic"]
+    assert capsys.readouterr().out == ""
 
 
 def test_a_background_quota_poll_notes_its_failure_instead_of_printing(capsys):

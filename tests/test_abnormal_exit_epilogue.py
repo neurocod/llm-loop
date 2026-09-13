@@ -76,10 +76,14 @@ class _AlwaysWorkDriver(Driver):
 class _StoppingDriver(Driver):
     """Raises LoopStop with an exit code, the way a bad state file does."""
 
-    def __init__(self):
+    def __init__(self, commands=0):
         self.limit_policy = _StubPolicy()
+        self.commands = commands
 
     def next_command(self):
+        if self.commands:
+            self.commands -= 1
+            return ClaudeCommand("do the thing")
         raise LoopStop("state file says: error\nsecond line", exit_code=3)
 
 
@@ -212,9 +216,12 @@ def _assert_closed_down(pushes, policy, capsys, project_dir, *, snapshot, reason
     out = capsys.readouterr().out
     assert [where for _policy, where in pushes] == [project_dir], (
         f"the exit push did not run once against the run's own project: {pushes}")
-    assert policy.snapshots[-1] == snapshot, (
-        f"the closing usage snapshot is missing or mislabelled: "
-        f"{policy.snapshots}")
+    if snapshot is None:
+        assert policy.snapshots == [], "no provider was selected before the stop"
+    else:
+        assert policy.snapshots[-1] == snapshot, (
+            f"the closing usage snapshot is missing or mislabelled: "
+            f"{policy.snapshots}")
     assert "undelivered operator note" in out, (
         "the run exited holding a note and never said so")
     assert NOTE in out
@@ -250,10 +257,19 @@ def test_five_provider_errors_in_a_row_still_close_the_run_down(
         reason="5 provider errors in a row (last exit code 7)")
 
 
+@pytest.mark.parametrize("commands", [0, 1])
 def test_a_driver_that_stops_the_run_still_closes_it_down(
-        tmp_path, capsys, exit_pushes, loaded_mailbox):
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox, commands):
     """`LoopStop(exit_code=…)` is a run ending badly, not a run skipping the end."""
-    driver = _StoppingDriver()
+    driver = _StoppingDriver(commands)
+
+    def succeeds(*args, **kwargs):
+        loaded_mailbox.submit(NOTE)
+        return 0
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", succeeds)
+    monkeypatch.setattr(cyclecore, "usage_source_for", lambda p: _StubSource())
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
 
     with pytest.raises(SystemExit) as exit_info:
         cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
@@ -262,7 +278,7 @@ def test_a_driver_that_stops_the_run_still_closes_it_down(
     assert exit_info.value.code == 3
     _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
-        snapshot="at end (driver stopped the run)",
+        snapshot="at end (driver stopped the run)" if commands else None,
         # The FIRST line of the driver's message, so a multi-line diagnosis does
         # not turn the one-line ending into a paragraph.
         reason="the driver stopped the run (exit 3): state file says: error")

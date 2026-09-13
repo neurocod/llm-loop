@@ -42,6 +42,36 @@ def test_state_file_driver_accepts_a_prompt_override():
         "Follow the instructions in products/currentState.md")
 
 
+@pytest.mark.parametrize("default,selection,expected", [
+    ("claude", "codex", ("codex", "")),
+    ("codex", "claude", ("claude", "")),
+    ("codex", "claude/opus", ("claude", "opus")),
+    ("claude", "codex/custom/model", ("codex", "custom/model")),
+    ("claude", "opus", ("claude", "opus")),
+    ("codex", "gpt-test", ("codex", "gpt-test")),
+    ("codex", "", ("codex", "")),
+])
+def test_state_step_selects_provider_and_model(monkeypatch, default, selection, expected):
+    driver = driver_at("Current state: implementation")
+    driver.provider = default
+    driver.sandbox_mode = "workspace-write"
+    monkeypatch.setattr(driver, "model", lambda: selection)
+
+    command = driver.next_command()
+
+    assert (command.provider, command.model) == expected
+    assert command.sandbox_mode == "workspace-write"
+    assert driver.provider == default
+
+
+@pytest.mark.parametrize("selection", ["missing/opus", "/opus", "claude/", "codex/ "])
+def test_invalid_state_step_selector_fails_before_launch(monkeypatch, selection):
+    driver = driver_at("Current state: implementation")
+    monkeypatch.setattr(driver, "model", lambda: selection)
+    with pytest.raises(ValueError):
+        driver.next_command()
+
+
 def test_state_file_driver_stops_cleanly_on_done():
     with pytest.raises(LoopStop) as stop:
         driver_at("Current state: done").next_command()

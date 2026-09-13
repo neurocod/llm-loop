@@ -298,10 +298,8 @@ draining one section of a grouped list before touching the rest. Set
 bottom instead — the setting governs the parallel runner too.
 
 Claude remains the default for compatibility. Select Codex per invocation with
-`--codex`, or set `provider = "codex"` on the Driver subclass. An empty
-`model()` result lets the selected CLI use its configured default; a non-empty
-result is forwarded to that provider. Codex normally runs through its
-app-server protocol, so `m` can steer the active turn; the same sequential and
+`--codex`, or set `provider = "codex"` on the Driver subclass. Codex normally runs
+through its app-server protocol, so `m` can steer the active turn; the same sequential and
 parallel renderers show agent messages, commands, file changes, failures, and
 final token counts. `--no-live-messages` falls back to `codex exec --json` and
 sends the prompt through a closed stdin stream (`codex exec ... -`) instead of
@@ -327,7 +325,9 @@ class CycleDriver(StateFileDriver):
         return f"Follow the instructions in {self.state_file}"
 
     def model(self):
-        return "opus"   # vary by self.first_line(), or "" for the CLI default
+        if self.state_name() == "implementation":
+            return "claude/opus"
+        return "codex"
 
 if __name__ == "__main__":
     CycleDriver.main()

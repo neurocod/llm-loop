@@ -336,6 +336,27 @@ def provider_spec(name: str) -> ProviderSpec:
         ) from exc
 
 
+def model_selection(value: str, default_provider: str) -> tuple[str, str]:
+    """Resolve a state step's provider/model selector.
+
+    A provider alone leaves its CLI's configured model untouched. A slash
+    separates the provider from its model (split once, so model IDs may contain
+    slashes). Bare model names and an empty string retain the driver's default
+    provider for existing wrappers; an explicit provider always wins over it.
+    """
+    value = value.strip()
+    provider, separator, model = value.partition("/")
+    if separator:
+        provider_spec(provider)
+        if not model.strip():
+            raise ValueError("Expected a model after the provider slash")
+        return provider, model.strip()
+    if value in PROVIDERS:
+        return value, ""
+    provider_spec(default_provider)
+    return default_provider, value
+
+
 def usage_source_for(provider: str):
     """Return the selected provider's quota source."""
     spec = provider_spec(provider)

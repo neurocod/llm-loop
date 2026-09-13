@@ -446,8 +446,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # without ever waiting out a window. Decided once, from the value the run was
     # LAUNCHED with: it also governs whether this run talks to the usage endpoint
     # at all, which is a property of the invocation, not of the current cap.
-    ignore_usage_limits = (args.max is not None
-                           or not spec.supports_usage_limits)
+    ignore_usage_limits = args.max is not None
     dry_run = ctx.dry_run
     raw = args.raw
     start_in = args.start_in      # e.g. "29m" — delay before the loop starts
@@ -468,21 +467,16 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
     session_start = time.time()   # start of the current 5-hour session window
     consecutive_errors = 0        # reset to 0 after any successful iteration
-    usage_source = usage_source_for(provider)
+    usage_source = None
     limit_policy = None
-    if usage_source is not None:
-        limit_policy = driver.limit_policy or limits.default_policy(provider)
+    # Sources and fallback session clocks belong to accounts, not the whole
+    # mixed-provider run. Populate lazily: the launch default may never run.
+    usage_states = {}
+    quota_refresher = None
     last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
     if ignore_usage_limits:
         print(f"  · usage limit policy: disabled (bounded run, "
               f"--max {run_settings.max_runs})")
-    else:
-        print_percents(f"  · usage limit policy: {limit_policy.describe()}")
-
-    # Bookend the run with a usage snapshot (the policy's watched quotas) so each
-    # run records where it started; the matching end-of-run snapshot is below.
-    if not dry_run and usage_source is not None:
-        limit_policy.log_snapshot(usage_source, "at start (iteration 1)")
 
     # The pinned status area. A Job is the unit of display in both runners, so
     # the sequential loop is a run with exactly one Job — no branch anywhere in
@@ -529,6 +523,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     stop_reason = stopchannel.RunStopReason.NO_WORK
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     dry_run_prompt_shown = False  # dry-run: show job 1's prompt once, not per pass
+    # next_command may claim work. A pause at the quota gate must retain that
+    # claim until it is launched instead of asking the driver for another item.
+    pending_command = None
 
     def stop_pending() -> bool:
         """Is either stop channel asking for this run right now?
@@ -540,22 +537,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         return stopchannel.pending_stop(app) is not None
 
     with app:
-        if usage_source is not None:
-            # Inside `with`, not before it: push_quotas is silent until start()
-            # has marked the app enabled, so priming it earlier left requirement
-            # #1 — the provider's live figures — blank until the first limit
-            # check (i.e. for the whole run when the checks are skipped). The
-            # reading itself is already paid for by the start-of-run snapshot
-            # above, so this costs no round-trip.
-            statusline.push_quotas(app, usage_source, limit_policy)
-            if not ignore_usage_limits:
-                # Only for a run that is allowed to talk to the usage endpoint at
-                # all: the poll forces a FRESH reading (cache_value=False), so on
-                # a bounded `-m N` run — whose whole point is not to touch the
-                # usage machinery — it would be an unsolicited HTTP GET every
-                # interval (a codex app-server call every 300 s).
-                app.add_service(statusline.QuotaRefresher(
-                    app, usage_source, limit_policy, provider=provider))
         while True:
             # The caps are read LIVE (see RunSettings) and republished here, so an
             # edit made while the run is going is what the pinned row shows at
@@ -665,38 +646,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                       f"{statusline.format_elapsed(time.time() - paused_since)}.")
                 paused_since = 0.0
 
-            # Proactive limit check: read the real Current-session usage from the
-            # account and pause cleanly between iterations if it is already at/over
-            # the threshold, instead of running an iteration that would hit the wall.
-            if not dry_run and not ignore_usage_limits:
-                app.update(phase="waiting")
-                paused, session_start = limit_policy.check_and_wait(
-                    usage_source, session_start, should_stop=stop_pending)
-                # The check just paid for a usage reading; publishing it here is
-                # what puts the provider's live limits on the status row without
-                # a second HTTP round-trip (the UsageSource cache serves it).
-                statusline.push_quotas(app, usage_source, limit_policy)
-                app.update(phase="idle")
-                if paused:
-                    consecutive_errors = 0  # fresh window — start counting errors anew
-                if stop_pending() or stopchannel.pause_requested(app):
-                    # Asked to stop or to hold while parked on the limit. Back to
-                    # the loop head, which owns both decisions (a key press still
-                    # gets its cancel grace, a stop file still ends the run at
-                    # once) — deciding here would be a second, divergent copy.
-                    #
-                    # The pause half is not symmetry: the gate is the longest
-                    # hold in the engine, so it is exactly where somebody watching
-                    # a run that is doing nothing reaches for `p`. Without this
-                    # re-read the flag was set, the gate did not watch it, and the
-                    # window opening started a full iteration under a row that
-                    # already said PAUSED.
-                    continue
-
             # Ask the driver what to do next. None => no more work (stop cleanly);
             # LoopStop => abort the run (e.g. an error state needing a human).
             try:
-                command = driver.next_command()
+                if pending_command is None:
+                    pending_command = driver.next_command()
+                command = pending_command
             except LoopStop as stop:
                 print(stop.message)
                 if stop.exit_code:
@@ -723,6 +678,48 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 stop_reason = stopchannel.RunStopReason.NO_WORK
                 break
 
+            app.job(1).update(model=command.model)
+            selected_provider = command.provider or ctx.provider
+            if selected_provider != provider or provider not in usage_states:
+                if provider in usage_states:
+                    usage_states[provider] = (usage_source, limit_policy, session_start)
+                provider = selected_provider
+                spec = providers.provider_spec(provider)
+                if provider not in usage_states:
+                    source = usage_source_for(provider)
+                    policy = (driver.limit_policy or limits.default_policy(provider)
+                              if source is not None else None)
+                    usage_states[provider] = (source, policy, time.time())
+                    if not dry_run and source is not None:
+                        policy.log_snapshot(source, f"at start ({provider})")
+                usage_source, limit_policy, session_start = usage_states[provider]
+                ignore_usage_limits = (args.max is not None or usage_source is None
+                                       or not spec.supports_usage_limits)
+                if quota_refresher is not None:
+                    quota_refresher.set_source(usage_source, limit_policy,
+                                               provider=provider)
+                app.update(provider=provider, quotas=[])
+                statusline.push_quotas(app, usage_source, limit_policy)
+                if not ignore_usage_limits:
+                    print_percents(f"  · {provider} usage limit policy: "
+                                   f"{limit_policy.describe()}")
+                    if not dry_run and quota_refresher is None:
+                        quota_refresher = app.add_service(statusline.QuotaRefresher(
+                            app, usage_source, limit_policy, provider=provider))
+
+            # Gate the account that will actually execute this command. Keep the
+            # pending claim if the operator pauses or cancels a stop in this wait.
+            if not dry_run and not ignore_usage_limits:
+                app.update(phase="waiting")
+                paused, session_start = limit_policy.check_and_wait(
+                    usage_source, session_start, should_stop=stop_pending)
+                statusline.push_quotas(app, usage_source, limit_policy)
+                app.update(phase="idle")
+                if paused:
+                    consecutive_errors = 0
+                if stop_pending() or stopchannel.pause_requested(app):
+                    continue
+
             # Notes typed while nothing was running (or while the transport was
             # off) ride this prompt — see Mailbox.splice for the ordering.
             if mailbox is not None:
@@ -732,12 +729,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     for note in notes:
                         print_note(note)
 
+            pending_command = None
             iteration += 1
             state_label = command.label or "(no label)"
             # Show the model this iteration will use right in the header, so the
             # per-iteration model is visible up front (an empty command.model means
             # no --model flag — the CLI falls back to its own configured default).
-            model_label = command.model or "cli default"
+            model_label = f"{provider}/{command.model or 'cli default'}"
             # Same three calls the parallel workers make, on this run's one Job:
             # the Job clock times THIS iteration, the run clock (latched once)
             # times the whole run.
