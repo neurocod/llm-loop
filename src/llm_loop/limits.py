@@ -90,9 +90,8 @@ class LimitRule:
       status(reading, now)  — this rule's one-line contribution to the pinned
                 status line, appended to the provider's own figures.
 
-    Rules are read-only and stateless (all mutable run state lives in the
-    UsageSource cache), so a single default instance is safe to share as a class
-    attribute across Drivers.
+    A shared rule also shares edits to its ceiling, including console edits.
+    Give independent policies separate rule instances.
     """
 
     quota: str = "session"
