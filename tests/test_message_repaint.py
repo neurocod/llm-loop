@@ -65,7 +65,7 @@ def test_slow_paint_does_not_block_input_and_eventually_shows_the_latest_note():
     read = threading.Event()
 
     def type_note():
-        # Open another mode first, then leave and re-enter after a send.
+        # Pause first, then leave and re-enter the editor after a send.
         for char in "pmfirst\r\x1bm" + text:
             source.handler(termio.Key(char))
         read.set()
@@ -108,3 +108,24 @@ def test_arrows_show_a_literal_caret_at_the_insertion_position():
     assert sl.colorize(app.render(width=40)[-1]) == " ✉ abXc|d"
     app.handle_event(termio.Key("\r"))
     assert app.messages.take_queued() == ["abXcd"]
+
+
+def test_restarting_the_same_app_restarts_input_repainting():
+    class Input(termio.NullInputSource):
+        def start(self, handler):
+            self.handler = handler
+
+    terminal, source = RecordingTerminal(), Input()
+    app = sl.StatusApp(terminal=terminal, input_source=source,
+                       messages=operator.Mailbox())
+    with app:
+        pass
+    with app:
+        for char in "msecond run":
+            source.handler(termio.Key(char))
+        # 3.36 s measured for the entire focused suite on 2026-09-15.
+        deadline = time.monotonic() + 15.0
+        while True:
+            frame = terminal.frames.get(timeout=max(0, deadline - time.monotonic()))
+            if frame[-1] == " ✉ second run|":
+                break

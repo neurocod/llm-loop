@@ -1968,6 +1968,10 @@ class StatusApp:
     def start(self) -> "StatusApp":
         if self._started:
             return self
+        # stop() wakes and ends the painter; a reused app needs a live consumer
+        # again before its input callback starts queueing repaint requests.
+        self._paint_stop.clear()
+        self._paint_requested.clear()
         self._started = True
         try:
             with self._stop_lock:
