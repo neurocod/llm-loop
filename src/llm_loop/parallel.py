@@ -1333,6 +1333,9 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         settings=settings,
         messages=mailboxes,
         enabled=not getattr(args, "no_statusline", False))
+    app.register_action(statusline.WeeklyLimitAction(
+        lambda: policy,
+        lambda: statusline.push_quotas(app, source, policy)))
     app.update(
         provider=provider,
         # Files COMPLETED out of the run's real work (see InvocationProgress) —

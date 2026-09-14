@@ -1264,6 +1264,42 @@ class LineEditor:
         return False
 
 
+class SpinBox(LineEditor):
+    """An integer line editor; empty is editable but cannot be submitted.
+
+    Only ASCII digits enter the buffer, including pasted text and Tab. Bounds
+    are checked on submission; arrows clamp to them and treat empty as minimum.
+    """
+
+    def __init__(self, value: int, *, minimum: int = 0, maximum: int = 100):
+        self.minimum = minimum
+        self.maximum = maximum
+        super().__init__(str(value))
+
+    def insert(self, text: str) -> None:
+        if text and all("0" <= char <= "9" for char in text):
+            super().insert(text)
+
+    @property
+    def value(self) -> Optional[int]:
+        try:
+            value = int(self.buffer)
+        except ValueError:
+            return None
+        return value if self.minimum <= value <= self.maximum else None
+
+    def handle(self, char: str) -> bool:
+        if char in ("up", "down"):
+            try:
+                value = int(self.buffer) if self.buffer else self.minimum
+            except ValueError:
+                value = self.maximum
+            value += 1 if char == "up" else -1
+            self.set(str(max(self.minimum, min(self.maximum, value))))
+            return True
+        return super().handle(char)
+
+
 def fit_edit_line(head: str, tail: str, width: int) -> str:
     """`head`+`tail` windowed to `width` columns with the join kept visible.
 
@@ -1492,6 +1528,86 @@ class MessageAction(Action):
                 app, app.messages.mailbox(target_ids[0]), target_ids[0]))
             return
         app.push_mode(MessageMode(app))
+
+
+class WeeklyLimitRow(Row):
+    def __init__(self, mode: "WeeklyLimitMode"):
+        self.mode = mode
+
+    def render(self, status, width, now=None):
+        prefix = " Weekly limit (%) "
+        editor = self.mode.editor
+        body = fit_edit_line(editor.head + "|", editor.tail,
+                             max(0, width - textwidth.cell_width(prefix)))
+        return textwidth.fit(prefix + body, width)
+
+
+class WeeklyLimitMode(Mode):
+    """Edit the active all-models weekly rule, committing only on Enter.
+
+    Like MessageMode, Enter stays in the field so a multiline paste cannot
+    dispatch normal-mode shortcuts. Esc discards pending edits and leaves.
+    A provider switch invalidates the draft rather than editing another account.
+    """
+
+    name = "weekly-limit"
+
+    def __init__(self, app, action):
+        super().__init__(app)
+        self.action = action
+        self.rule = action.rule()
+        self.editor = SpinBox(round(self.rule.limit))
+
+    def rows(self, status):
+        return [WeeklyLimitRow(self)]
+
+    def legend(self):
+        return [("0-9", "limit"), ("↑/↓", "+1 / -1"),
+                ("Enter", "apply"), ("Esc", "cancel / leave"),
+                ("←/→", "move"), ("^U", "erase")]
+
+    def handle(self, event):
+        if not isinstance(event, termio.Key):
+            return False
+        if event.char == "\x1b":
+            self.app.pop_mode()
+        elif event.char in ("\r", "\n"):
+            if self.action.rule() is not self.rule:
+                self.app.note("usage policy changed — Esc, then w to reopen")
+            elif self.editor.value is None:
+                self.app.note("enter a weekly limit from 0 to 100")
+            else:
+                self.rule.limit = float(self.editor.value)
+                self.action.refresh()
+                self.app.note(f"weekly limit set to {self.rule.limit:.0f}% — Esc leaves")
+        else:
+            self.editor.handle(event.char)
+        return True
+
+
+class WeeklyLimitAction(Action):
+    """Resolve the live policy at keypress time, including provider switches."""
+
+    key = "w"
+    help = "edit weekly limits"
+
+    def __init__(self, policy: Callable, refresh: Callable):
+        self.policy = policy
+        self.refresh = refresh
+
+    def rule(self):
+        from .limits import WeeklyLimit
+
+        return next((rule for rule in getattr(self.policy(), "rules", ())
+                     if isinstance(rule, WeeklyLimit) and rule.quota == "week_all"),
+                    None)
+
+    def available(self, app):
+        return self.rule() is not None
+
+    def run(self, app):
+        if self.available(app):
+            app.push_mode(WeeklyLimitMode(app, self))
 
 
 # --- settings ------------------------------------------------------------------

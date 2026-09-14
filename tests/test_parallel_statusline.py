@@ -130,6 +130,31 @@ def _live_statusline(monkeypatch, made, *, live=True):
     return made
 
 
+def test_parallel_weekly_key_changes_the_shared_policy(tmp_path, monkeypatch):
+    from llm_loop.limits import LimitPolicy, WeeklyLimit
+    from test_statusline import _CountingSource
+
+    made = _live_statusline(monkeypatch, {})
+    driver = _MemDriver(["item.md"])
+    driver.limit_policy = LimitPolicy([WeeklyLimit(98)])
+    source = _CountingSource()
+    monkeypatch.setattr(parallel, "usage_source_for", lambda provider: source)
+
+    def run(*args, **kwargs):
+        app = made["app"]
+        for key in ("w", "down", "\r"):
+            app.handle_event(tio.Key(key))
+        assert app.mode.editor.buffer == "97"
+        assert "97%" in " ".join(app.render(200))
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", run)
+    args = _args(str(tmp_path), 1)
+    args.ignore_usage = False
+    parallel.run_parallel(driver, args, setup_logging=False, wait_on_start=False)
+    assert driver.limit_policy.rules[0].limit == 97
+
+
 def _run_in_thread(driver, args, done=None):
     done = done or threading.Event()
     result = {}

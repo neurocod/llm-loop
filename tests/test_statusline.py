@@ -1402,6 +1402,35 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
     return made["app"], source
 
 
+def test_sequential_weekly_key_changes_the_driver_policy(monkeypatch, tmp_path):
+    from llm_loop import cyclecore
+    from llm_loop.agentwork import AgentCommand, Driver
+    from llm_loop.limits import LimitPolicy, WeeklyLimit
+
+    class _OneShot(Driver):
+        limit_policy = LimitPolicy([WeeklyLimit(98)])
+        provider = "codex"
+
+        def next_command(self):
+            return AgentCommand("work", "", "item")
+
+    made = []
+
+    def run(*args, **kwargs):
+        app = made[0]
+        for key in ("w", "up", "\r"):
+            app.handle_event(tio.Key(key))
+        assert app.mode.editor.buffer == "99"
+        assert "99%" in " ".join(app.render(200))
+        return 0
+
+    monkeypatch.setattr(cyclecore, "run_agent_streaming", run)
+    driver = _OneShot()
+    _run_with_status(monkeypatch, tmp_path, driver, on_app=made.append,
+                     provider="codex")
+    assert driver.limit_policy.rules[0].limit == 99
+
+
 def test_a_bounded_run_shows_the_quotas_and_never_polls_for_them(monkeypatch,
                                                                  tmp_path):
     """Priming before `with app:` published nothing (push_quotas needs an enabled
