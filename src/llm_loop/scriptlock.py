@@ -74,9 +74,11 @@ def ensure_script_lock() -> None:
     releases the owner's lock nor becomes an owner after that process exits.
     EOF refuses to run without an explicit decision, including redirected stdin.
     """
-    lock = ScriptLock(sys.argv[0])
-    if lock.script in _launches:
+    # One process has one invoking script. Check the retained decision BEFORE
+    # resolving argv[0] again: a batching wrapper may have changed its cwd.
+    if _launches:
         return
+    lock = ScriptLock(sys.argv[0])
     try:
         if not lock.acquire():
             print(f"Another instance of this script is running: {lock.script}",

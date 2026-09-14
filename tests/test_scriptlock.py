@@ -1,5 +1,6 @@
 """Exercise contention across real processes, including a forcibly killed owner."""
 
+import atexit
 import os
 from pathlib import Path
 import queue
@@ -48,7 +49,10 @@ class Child:
     def until(self, text):
         output = []
         while True:
-            line = self.lines.get(timeout=PROCESS_TIMEOUT)
+            try:
+                line = self.lines.get(timeout=PROCESS_TIMEOUT)
+            except queue.Empty:
+                pytest.fail(f"Timed out waiting for {text!r}; output: {''.join(output)!r}")
             assert line is not None, ''.join(output)
             output.append(line)
             if text in line:
@@ -68,6 +72,17 @@ class Child:
         self.reader.join(timeout=PROCESS_TIMEOUT)
         self.proc.stdin.close()
         self.proc.stdout.close()
+
+
+@pytest.fixture(autouse=True)
+def isolate_launch_decision(monkeypatch):
+    launches = {}
+    monkeypatch.setattr(scriptlock, '_launches', launches)
+    yield
+    for lock in launches.values():
+        if lock is not None:
+            atexit.unregister(lock.close)
+            lock.close()
 
 
 @pytest.fixture
@@ -151,6 +166,42 @@ def test_relative_and_absolute_launch_paths_share_a_lock(launch, tmp_path):
     other.wait()
 
 
+@pytest.mark.skipif(os.name != 'nt', reason='Windows paths ignore letter case')
+def test_windows_case_alias_shares_a_lock(launch, tmp_path):
+    launch().until('READY')
+    other = launch(path=Path(str(tmp_path / 'runCycle.py').swapcase()))
+    other.until('Another instance')
+    other.send('e')
+    other.wait()
+
+
+def test_symlink_alias_shares_a_lock(launch, tmp_path):
+    alias = tmp_path / 'alias.py'
+    try:
+        alias.symlink_to(tmp_path / 'runCycle.py')
+    except OSError as exc:
+        pytest.skip(f'Symlinks unavailable on this host: {exc}')
+    launch().until('READY')
+    other = launch(path=alias)
+    other.until('Another instance')
+    other.send('e')
+    other.wait()
+
+
+def test_batches_keep_the_initial_lock_after_changing_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, 'argv', ['runCycle.py'])
+    monkeypatch.setattr(scriptlock, 'LOCK_DIR', tmp_path / 'locks')
+    scriptlock.ensure_script_lock()
+    initial = dict(scriptlock._launches)
+    other_directory = tmp_path / 'other'
+    other_directory.mkdir()
+    monkeypatch.chdir(other_directory)
+    scriptlock.ensure_script_lock()
+    assert scriptlock._launches == initial
+    assert len(list(scriptlock.LOCK_DIR.glob('*.lock'))) == 1
+
+
 def test_eof_cannot_silently_start_a_duplicate(launch):
     launch().until('READY')
     other = launch()
@@ -191,7 +242,12 @@ def test_both_runners_lock_before_any_startup_side_effect(runner, monkeypatch):
     def guard():
         raise ReachedGuard
 
+    def unexpected(*args, **kwargs):
+        pytest.fail('Startup logging ran before acquiring the script lock')
+
     monkeypatch.setattr(runlifecycle, 'ensure_script_lock', guard)
+    monkeypatch.setattr(runlifecycle.console, 'setup_file_logging', unexpected)
+    monkeypatch.setattr(runlifecycle.exitlog, 'begin', unexpected)
     # Incomplete inputs deliberately fail if anything reads them before locking.
     with pytest.raises(ReachedGuard):
         runner(object(), SimpleNamespace(dry_run=False))

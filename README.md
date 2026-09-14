@@ -184,6 +184,7 @@ src/
                      read the same event by the same name
     runlifecycle.py  the prologue and epilogue every run has, and the live
                      knobs (RunSettings) both runners read
+    scriptlock.py    ScriptLock / ensure_script_lock
     agentwork.py     what one unit of work is, and the Driver protocol a
                      wrapper subclasses to produce them
     console.py       what a run prints, and the rotating mirror log that is the
