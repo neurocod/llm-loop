@@ -51,6 +51,7 @@ from .gitpush import (
 )
 from .providers import provider_spec, set_live_messages
 from .stopchannel import RunResult
+from .scriptlock import ensure_script_lock
 
 
 class RunSettings:
@@ -152,6 +153,9 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     `setup_logging=False` is the wrapper's hook: a host script that already tees
     its own output must not have a second tee stacked on top of the first.
     """
+    if not getattr(args, "dry_run", False):
+        ensure_script_lock()
+
     provider = getattr(args, "provider", None) or driver.provider
     spec = provider_spec(provider)
     driver.provider = provider
