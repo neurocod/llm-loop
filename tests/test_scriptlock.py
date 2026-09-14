@@ -1,6 +1,5 @@
 """Exercise contention across real processes, including a forcibly killed owner."""
 
-import atexit
 import os
 from pathlib import Path
 import queue
@@ -72,17 +71,6 @@ class Child:
         self.reader.join(timeout=PROCESS_TIMEOUT)
         self.proc.stdin.close()
         self.proc.stdout.close()
-
-
-@pytest.fixture(autouse=True)
-def isolate_launch_decision(monkeypatch):
-    launches = {}
-    monkeypatch.setattr(scriptlock, '_launches', launches)
-    yield
-    for lock in launches.values():
-        if lock is not None:
-            atexit.unregister(lock.close)
-            lock.close()
 
 
 @pytest.fixture
