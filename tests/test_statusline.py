@@ -1418,8 +1418,13 @@ def test_sequential_weekly_key_changes_the_driver_policy(monkeypatch, tmp_path):
 
     def run(*args, **kwargs):
         app = made[0]
-        for key in ("w", "up", "\r"):
-            app.handle_event(tio.Key(key))
+        def unexpected_query(*args, **kwargs):
+            pytest.fail("editing the weekly limit must not query usage")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_CountingSource, "get_usage", unexpected_query)
+            for key in ("w", "up", "\r"):
+                app.handle_event(tio.Key(key))
         assert app.mode.editor.buffer == "99"
         assert "99%" in " ".join(app.render(200))
         return 0

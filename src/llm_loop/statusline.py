@@ -440,6 +440,21 @@ class LoopStatus:
             for name, value in fields.items():
                 setattr(self, name, value)
 
+    def refresh_quota_policy(self, rule) -> None:
+        """Redraw an edited ceiling without querying usage on the input thread.
+
+        Even get_usage(cache_value=True) can fetch once its cache expires.
+        Preserve the displayed provider figures while replacing only our rule.
+        """
+        from .usage import QUOTA_BY_FIELD, UsageReading
+
+        label = QUOTA_BY_FIELD[rule.quota].short
+        with self._lock:
+            self.quotas = [
+                row._replace(policy=_policy_part(
+                    rule, UsageReading(row.percent, row.reset_ts), time.time()))
+                if row.label == label else row for row in self.quotas]
+
     def job(self, job_id: int = 1) -> Job:
         """The Job with this id, created on first use (ids are 1-based)."""
         with self._lock:
@@ -1546,7 +1561,9 @@ class WeeklyLimitMode(Mode):
     """Edit the active all-models weekly rule, committing only on Enter.
 
     Like MessageMode, Enter stays in the field so a multiline paste cannot
-    dispatch normal-mode shortcuts. Esc discards pending edits and leaves.
+    dispatch normal-mode shortcuts. Esc clears; Esc on an empty field leaves,
+    so Alt+key (reported as Esc then key) cannot dispatch a normal-mode action
+    from a nonempty draft either.
     A provider switch invalidates the draft rather than editing another account.
     """
 
@@ -1563,23 +1580,27 @@ class WeeklyLimitMode(Mode):
 
     def legend(self):
         return [("0-9", "limit"), ("↑/↓", "+1 / -1"),
-                ("Enter", "apply"), ("Esc", "cancel / leave"),
+                ("Enter", "apply"), ("Esc", "clear / leave"),
                 ("←/→", "move"), ("^U", "erase")]
 
     def handle(self, event):
         if not isinstance(event, termio.Key):
             return False
         if event.char == "\x1b":
-            self.app.pop_mode()
+            if self.editor.buffer:
+                self.editor.clear()
+                self.app.note("weekly limit edit discarded — Esc again to leave")
+            else:
+                self.app.pop_mode()
         elif event.char in ("\r", "\n"):
             if self.action.rule() is not self.rule:
-                self.app.note("usage policy changed — Esc, then w to reopen")
+                self.app.note("usage policy changed — close editor, then w to reopen")
             elif self.editor.value is None:
                 self.app.note("enter a weekly limit from 0 to 100")
             else:
                 self.rule.limit = float(self.editor.value)
-                self.action.refresh()
-                self.app.note(f"weekly limit set to {self.rule.limit:.0f}% — Esc leaves")
+                self.app.status.refresh_quota_policy(self.rule)
+                self.app.note(f"weekly limit set to {self.rule.limit:.0f}% — Esc clears / leaves")
         else:
             self.editor.handle(event.char)
         return True
@@ -1591,9 +1612,8 @@ class WeeklyLimitAction(Action):
     key = "w"
     help = "edit weekly limits"
 
-    def __init__(self, policy: Callable, refresh: Callable):
+    def __init__(self, policy: Callable):
         self.policy = policy
-        self.refresh = refresh
 
     def rule(self):
         from .limits import WeeklyLimit
