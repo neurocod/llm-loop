@@ -1402,7 +1402,9 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
     return made["app"], source
 
 
-def test_sequential_weekly_key_changes_the_driver_policy(monkeypatch, tmp_path):
+@pytest.mark.parametrize("max_runs", [None, 1])
+def test_sequential_weekly_key_changes_the_driver_policy(monkeypatch, tmp_path,
+                                                        max_runs):
     from llm_loop import cyclecore
     from llm_loop.agentwork import AgentCommand, Driver
     from llm_loop.limits import LimitPolicy, WeeklyLimit
@@ -1410,14 +1412,20 @@ def test_sequential_weekly_key_changes_the_driver_policy(monkeypatch, tmp_path):
     class _OneShot(Driver):
         limit_policy = LimitPolicy([WeeklyLimit(98)])
         provider = "codex"
+        calls = 0
 
         def next_command(self):
-            return AgentCommand("work", "", "item")
+            self.calls += 1
+            return AgentCommand("work", "", "item") if self.calls == 1 else None
 
     made = []
 
     def run(*args, **kwargs):
         app = made[0]
+        if max_runs is not None:
+            assert app.action_for("w") is None
+            return 0
+
         def unexpected_query(*args, **kwargs):
             pytest.fail("editing the weekly limit must not query usage")
 
@@ -1432,8 +1440,8 @@ def test_sequential_weekly_key_changes_the_driver_policy(monkeypatch, tmp_path):
     monkeypatch.setattr(cyclecore, "run_agent_streaming", run)
     driver = _OneShot()
     _run_with_status(monkeypatch, tmp_path, driver, on_app=made.append,
-                     provider="codex")
-    assert driver.limit_policy.rules[0].limit == 99
+                     provider="codex", max=max_runs)
+    assert driver.limit_policy.rules[0].limit == (99 if max_runs is None else 98)
 
 
 def test_a_bounded_run_shows_the_quotas_and_never_polls_for_them(monkeypatch,

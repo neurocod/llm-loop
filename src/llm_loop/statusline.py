@@ -279,7 +279,7 @@ def colorize(line: str) -> str:
     """
     # Editor text is literal: its pipe is the insertion caret (or typed text),
     # never muted toolbar chrome, and a typed percentage is not a quota reading.
-    if line.startswith(" ✉ "):
+    if line.startswith((" ✉ ", WeeklyLimitRow.prefix)):
         return line
     out = []
     last = 0
@@ -1546,15 +1546,16 @@ class MessageAction(Action):
 
 
 class WeeklyLimitRow(Row):
+    prefix = " Weekly limit (%) "
+
     def __init__(self, mode: "WeeklyLimitMode"):
         self.mode = mode
 
     def render(self, status, width, now=None):
-        prefix = " Weekly limit (%) "
         editor = self.mode.editor
         body = fit_edit_line(editor.head + "|", editor.tail,
-                             max(0, width - textwidth.cell_width(prefix)))
-        return textwidth.fit(prefix + body, width)
+                             max(0, width - textwidth.cell_width(self.prefix)))
+        return textwidth.fit(self.prefix + body, width)
 
 
 class WeeklyLimitMode(Mode):

@@ -55,6 +55,7 @@ def test_open_cancel_apply_and_reopen_edit_the_real_gate():
     press(app, "w")
     assert app.mode.editor.buffer == "98"
     assert "98|" in app.render(120)[-1]
+    assert sl.colorize(app.render(120)[-1]) == app.render(120)[-1]
     press(app, "down", "\x1b", "\x1b")
     assert rule.limit == 98
     press(app, "w", "up", "\r")

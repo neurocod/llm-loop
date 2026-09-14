@@ -504,7 +504,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         messages=mailbox,
         enabled=not dry_run and not getattr(args, "no_statusline", False))
     app.register_action(statusline.WeeklyLimitAction(
-        lambda: limit_policy))
+        lambda: None if ignore_usage_limits else limit_policy))
     app.update(
         provider=provider,
         **progress.summary_fields(),
