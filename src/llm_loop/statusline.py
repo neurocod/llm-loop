@@ -96,6 +96,10 @@ __all__ = [
 # enough to be invisible next to the agent's own output.
 REFRESH_SECONDS = 0.5
 
+# Coalesce a typing/paste burst into at most 30 frames per second. This is a UI
+# cadence, not a readiness timeout: terminal writes must not pace the key reader.
+INPUT_REFRESH_SECONDS = 1 / 30
+
 # How long a key-feedback note stays on screen before the row goes quiet again.
 NOTE_TTL = 8.0
 
@@ -273,6 +277,10 @@ def colorize(line: str) -> str:
     is what "this is the value, and nothing is wrong" already looks like
     everywhere else on the row.
     """
+    # Editor text is literal: its pipe is the insertion caret (or typed text),
+    # never muted toolbar chrome, and a typed percentage is not a quota reading.
+    if line.startswith(" ✉ "):
+        return line
     out = []
     last = 0
     reading_style = None    # style of the last provider figure, for its policy half
@@ -1281,7 +1289,7 @@ class MessagePromptRow(Row):
     anything having to push updates into a row object.
     """
 
-    caret = "▏"
+    caret = "|"
     # Shown while the line is empty — which is also the state the editor returns
     # to after Enter, so it doubles as "you are still in here".
     hint = "  Enter sends · Esc leaves"
@@ -1379,7 +1387,7 @@ class MessageTargetRow(Row):
     """The job-id field shown before a fleet note gets its line editor."""
 
     prefix = " ✉ send to job "
-    caret = "▏"
+    caret = "|"
 
     def __init__(self, mode: "MessageTargetMode"):
         self.mode = mode
@@ -1908,6 +1916,8 @@ class StatusApp:
         self._stop_file = stop_file
         self._input = input_source
         self._paint_stop = threading.Event()
+        self._paint_requested = threading.Event()
+        self._input_dispatch = threading.local()
         self._paint_thread: Optional[threading.Thread] = None
         self._note_at = 0.0
         self._reserved = 0
@@ -1971,10 +1981,10 @@ class StatusApp:
             if self._input is None:
                 self._input = (termio.TerminalInput() if self.terminal.active
                                else termio.NullInputSource())
-            self._input.start(self.handle_event)
             self._paint_thread = threading.Thread(
                 target=self._repaint_loop, name="statusline-paint", daemon=True)
             self._paint_thread.start()
+            self._input.start(self._handle_input)
             self._install_emergency_restore()
         except Exception:
             self.disable()
@@ -2064,6 +2074,7 @@ class StatusApp:
             except Exception:
                 pass
         self._paint_stop.set()
+        self._paint_requested.set()
         thread, self._paint_thread = self._paint_thread, None
         if thread is not None:
             thread.join(timeout=1.0)
@@ -2238,6 +2249,15 @@ class StatusApp:
         except Exception:
             self.disable()
 
+    def _handle_input(self, event: termio.InputEvent) -> None:
+        """Read keys without waiting for a terminal write, including paints
+        requested indirectly by a mode change or a delivery notification."""
+        self._input_dispatch.active = True
+        try:
+            self.handle_event(event)
+        finally:
+            self._input_dispatch.active = False
+
     # --- rendering ---------------------------------------------------------
 
     def rows(self) -> List[Row]:
@@ -2263,6 +2283,9 @@ class StatusApp:
         return False
 
     def _paint(self, *, reassert: bool = False) -> None:
+        if getattr(self._input_dispatch, "active", False):
+            self._paint_requested.set()
+            return
         # Before the `active` gate, and on the same path as the rows: the title
         # is what a person sees while the terminal is behind another window, so
         # it must follow every state change the rows follow — including the ones
@@ -2278,7 +2301,9 @@ class StatusApp:
             return
         try:
             columns, _lines = self.terminal.size()
-            rows = self.render(columns)
+            # The bottom-right cell can immediately scroll a Windows console.
+            # Budget the margin BEFORE windowing the editor, or its caret is cut.
+            rows = self.render(max(0, columns - textwidth.LINE_RIGHT_MARGIN))
             if len(rows) != self._reserved:
                 # A Mode added or dropped a row: resize the region rather than
                 # painting into lines the terminal is still scrolling.
@@ -2292,8 +2317,21 @@ class StatusApp:
     def _repaint_loop(self) -> None:
         last_size = self.terminal.size()
         ticks = 0
-        while not self._paint_stop.wait(self.refresh):
+        next_refresh = time.monotonic() + self.refresh
+        while not self._paint_stop.is_set():
+            requested = self._paint_requested.wait(
+                max(0, next_refresh - time.monotonic()))
+            if requested and self._paint_stop.wait(INPUT_REFRESH_SECONDS):
+                return
+            self._paint_requested.clear()
+            if self._paint_stop.is_set():
+                return
             try:
+                periodic = time.monotonic() >= next_refresh
+                if not periodic:
+                    self._paint()
+                    continue
+                next_refresh = time.monotonic() + self.refresh
                 ticks += 1
                 size = self.terminal.size()
                 if size != last_size:
