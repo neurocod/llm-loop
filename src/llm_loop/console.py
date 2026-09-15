@@ -284,7 +284,7 @@ class MarkdownStream:
         self._buf = ""
         if RICH_AVAILABLE:
             self._console = _RichConsole(file=real_stream())
-            self._console.print("\n[dim]  💬[/dim]")
+            self._console.print("\n[dim]💬[/dim]")
             self._live = _RichLive(
                 _RichMarkdown(""),
                 console=self._console,
@@ -297,7 +297,7 @@ class MarkdownStream:
             )
             self._live.start()
         else:
-            print("\n  💬 ", end="", flush=True)
+            print("\n💬 ", end="", flush=True)
 
     def feed(self, text: str) -> None:
         self._buf += text
@@ -333,11 +333,11 @@ def render_markdown_block(text: str) -> None:
         return
     if RICH_AVAILABLE:
         console = _RichConsole(file=real_stream())
-        console.print("[dim]  💬[/dim]")
+        console.print("[dim]💬[/dim]")
         console.print(_RichMarkdown(text))
         _log_plain(text)
     else:
-        print(f"\n  💬 {text}")
+        print(f"\n💬 {text}")
 
 
 def print_markup(plain: str, markup: str) -> None:
