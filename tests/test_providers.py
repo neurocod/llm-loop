@@ -899,6 +899,10 @@ def test_the_claude_bash_tool_line_uses_the_helper():
 
 
 @pytest.mark.parametrize("command,expected", [
+    (r"'C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe' "
+     "-NoProfile -Command 'Get-Date'", "Get-Date"),
+    (r"'C:\Program Files\PowerShell\7\pwsh.exe' -Command "
+     r"'Get-Item C:\\data\\file'", r"Get-Item C:\\data\\file"),
     (r'"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
      r'-Command "some text"', "some text"),
     ('pwsh -NoLogo -NoProfile -NonInteractive -c "Get-Date"', "Get-Date"),
