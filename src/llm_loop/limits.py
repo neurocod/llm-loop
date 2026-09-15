@@ -78,6 +78,11 @@ def _dynamic_ceiling(base: float, reset_ts: Optional[float], now: float,
     return min(100.0, max(float(base), 100.0 - rate * minutes))
 
 
+def _format_ceiling(value: float) -> str:
+    """An infinite policy ceiling means this quota does not limit the run."""
+    return "N/A" if value == float("inf") else f"{value:.0f}%"
+
+
 class LimitRule:
     """One quota + its ceiling policy. Subclass and override; set `quota` to the
     Usage field this rule watches and `label` to its human name.
@@ -115,7 +120,7 @@ class LimitRule:
         (which for DayNightLimit moves as the window winds down). Override to say
         more; return "" to add nothing.
         """
-        return f"ceil {self.ceiling(reading, now):.0f}%"
+        return f"ceil {_format_ceiling(self.ceiling(reading, now))}"
 
     def describe(self) -> str:
         """One-line human summary of this rule's quota and ceiling policy, shown
@@ -200,6 +205,8 @@ class WeeklyLimit(LimitRule):
     near-reset climb (the last few minutes of a week are negligible): pause at
     `limit`% and wait out the window. In a composite this guards against the
     weekly cap killing a run while the session still has budget.
+    Zero disables this ceiling, including at 100% reported usage; the provider's
+    own rate limits and any other policy rules still apply.
     """
 
     def __init__(self, limit: float = WEEKLY_USAGE_LIMIT, *,
@@ -209,9 +216,11 @@ class WeeklyLimit(LimitRule):
         self.label = QUOTA_BY_FIELD[self.quota].label
 
     def ceiling(self, reading: UsageReading, now: float) -> float:
-        return self.limit
+        return float("inf") if self.limit == 0 else self.limit
 
     def describe(self) -> str:
+        if self.limit == 0:
+            return f"{self.label}: no ceiling"
         return f"{self.label}: flat ceiling {self.limit:.0f}%"
 
 
@@ -296,7 +305,7 @@ class LimitPolicy:
                 left = (f", {fmt_left(rd.reset_ts - now)} left"
                         if rd.reset_ts is not None else " now")
                 print_percents(f"  · {r.label} usage: {rd.percent:.0f}% "
-                               f"(ceiling {c:.0f}%{left}){note}")
+                               f"(ceiling {_format_ceiling(c)}{left}){note}")
 
         if not self._violations(status):
             return False, session_start

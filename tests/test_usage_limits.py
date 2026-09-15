@@ -210,6 +210,18 @@ def test_a_reading_without_a_reset_time_still_prints(capsys):
     assert "Current session usage: 9% (ceiling 95% now)" in out
 
 
+@pytest.mark.parametrize("sonnet_only", [False, True])
+def test_zero_weekly_limit_does_not_wait_at_full_usage(monkeypatch, capsys, sonnet_only):
+    field = "seven_day_sonnet" if sonnet_only else "seven_day"
+    source = _StubSource({field: {"utilization": 100}})
+    rule = WeeklyLimit(0, sonnet_only=sonnet_only)
+    policy = LimitPolicy([rule])
+    monkeypatch.setattr(policy, "_wait", lambda *args: pytest.fail("disabled weekly limit waited"))
+    assert policy.check_and_wait(source, 123) == (False, 123)
+    assert "ceiling N/A" in capsys.readouterr().out
+    assert "no ceiling" in policy.describe()
+
+
 # -- the rate_limit_event backstop ---------------------------------------------
 
 def test_event_parse():
