@@ -65,7 +65,7 @@ def test_one_job_renders_rule_summary_job_legend_and_note_rows():
     summary, job_row = rows[1], rows[2]
     assert "iter 12/40" in summary
     assert "claude/opus" in summary
-    assert "session 43% (2h11m) / ceil 95%" in summary
+    assert "session 43% (2:11:00) / ceil 95%" in summary
     assert "week 61% / ceil 95%" in summary
     assert "max-runs 40" in summary
     assert "job 1" in job_row and "bmx-bike.md" in job_row
@@ -100,7 +100,7 @@ def test_each_job_gets_its_own_row_and_an_idle_one_has_no_clock():
     assert "3 jobs" in rows[1]
     assert [f"job {i}" in rows[i + 1] for i in (1, 2, 3)] == [True] * 3
     assert "item-3.md" not in rows[4] and "idle" in rows[4]
-    assert "0m00s" not in rows[4]
+    assert "0:00" not in rows[4]
 
 
 def test_rows_never_exceed_the_terminal_width():
@@ -202,8 +202,8 @@ def test_the_two_clocks_are_different_clocks():
     """The job row times the CURRENT iteration; the summary times the whole run."""
     rows = sl.render_rows(sequential_status(), 200, now=NOW)
 
-    assert "1h00m" in rows[1] and "1h00m" not in rows[2]
-    assert "4m12s" in rows[2] and "4m12s" not in rows[1]
+    assert "1:00:00" in rows[1] and "1:00:00" not in rows[2]
+    assert "4:12" in rows[2] and "4:12" not in rows[1]
 
 
 def test_quota_without_a_figure_reads_as_not_available():
@@ -213,13 +213,18 @@ def test_quota_without_a_figure_reads_as_not_available():
     assert "session n/a / ceil 95%" in sl.render_rows(status, 200, now=NOW)[1]
 
 
-def test_a_quota_nobody_gates_on_shows_the_providers_half_alone():
+@pytest.mark.parametrize("seconds,expected", [
+    (7860, "2:11:00"), (7303, "2:01:43"), (18000, "5h"),
+    (18043, "5h"), (190800, "2d5h"), (172800, "2d"),
+    (1303, "21m"), (43, "<1m"), (0, "<1m"),
+])
+def test_a_quota_nobody_gates_on_shows_the_providers_half_alone(seconds, expected):
     """The policy owns only the right-hand half; a window with no rule keeps its
     figures and simply says nothing about a ceiling."""
-    status = sequential_status(quotas=[sl.QuotaRow("week", 61.0, NOW + 7860)])
+    status = sequential_status(quotas=[sl.QuotaRow("week", 61.0, NOW + seconds)])
 
     summary = sl.render_rows(status, 200, now=NOW)[1]
-    assert "week 61% (2h11m)" in summary
+    assert f"week 61% ({expected})" in summary
     assert sl.POLICY_SEPARATOR not in summary
 
 
@@ -1084,8 +1089,8 @@ def test_quota_rows_never_raise():
 
 
 @pytest.mark.parametrize("seconds,expected", [
-    (0, "0m00s"), (72, "1m12s"), (252, "4m12s"), (3600, "1h00m"),
-    (3720, "1h02m"), (None, ""),
+    (0, "0:00"), (72, "1:12"), (252, "4:12"), (3600, "1:00:00"),
+    (3720, "1:02:00"), (1303, "21:43"), (7303, "2:01:43"), (None, ""),
 ])
 def test_format_elapsed(seconds, expected):
     assert sl.format_elapsed(seconds) == expected

@@ -139,7 +139,7 @@ CLI_DEFAULT_MODEL = "cli default"
 SEPARATOR = " | "
 # Sub-separator INSIDE one field, currently only a quota's: to its left the
 # provider's own figures, to its right what our policy says about them
-# ("week 63% (17h27m) / ceil 95%"). A quieter mark than the field separator on
+# ("week 63% (17:27:00) / ceil 95%"). A quieter mark than the field separator on
 # purpose — the two halves are one subject seen from two sides, not two fields.
 POLICY_SEPARATOR = " / "
 # U+2500, not an underscore: the box-drawing glyph is designed to touch both
@@ -170,15 +170,21 @@ _TITLE_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def format_elapsed(seconds: Optional[float]) -> str:
-    """"4m12s" / "1h02m" — two units, the larger one first; "" for None."""
+    """Elapsed time as M:SS or H:MM:SS, retaining seconds; "" for None."""
     if seconds is None:
         return ""
     total = max(0, int(seconds))
     hours, rest = divmod(total, 3600)
     minutes, secs = divmod(rest, 60)
     if hours:
-        return f"{hours}h{minutes:02d}m"
-    return f"{minutes}m{secs:02d}s"
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _format_quota_left(seconds: float) -> str:
+    """Use a clock for h+m countdowns; preserve day and single-unit formats."""
+    left = console.fmt_left(seconds)
+    return format_elapsed(seconds) if re.fullmatch(r"\d+h\d+m", left) else left
 
 
 def format_prompt_block(*, job_id: int, label: str, prompt: str,
@@ -707,7 +713,7 @@ class ElapsedSegment(Segment):
 
 
 class QuotaSegment(Segment):
-    """One quota window: "session 43% (2h11m) / ceil 95%".
+    """One quota window: "session 43% (2:11:00) / ceil 95%".
 
     Left of the slash is the provider's report — the figure and how long the
     window still has to run, which together are what a percentage actually means
@@ -731,7 +737,7 @@ class QuotaSegment(Segment):
             # that stops being reported is visible instead of invisible.
             provider = f"{row.label} n/a"
         else:
-            left = (console.fmt_left(
+            left = (_format_quota_left(
                 row.reset_ts - (time.time() if now is None else now))
                 if row.reset_ts else "")
             provider = f"{row.label} {row.percent:.0f}%" + (f" ({left})" if left else "")
@@ -843,7 +849,7 @@ class SegmentRow(Row):
 
 
 class JobRow(Row):
-    """One Job: " job 1 ▶ opus | iter 3 | 3m01s | garlic.md".
+    """One Job: " job 1 ▶ opus | iter 3 | 3:01 | garlic.md".
 
     Keeps `job_id` rather than the Job object so a mouse click on this screen row
     maps back to the live Job (wave 4) even after the job list was rebuilt.

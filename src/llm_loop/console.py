@@ -459,10 +459,8 @@ def print_note(text: str) -> None:
 # --- time formatting -------------------------------------------------------
 #
 # Here rather than in a runner because a duration is READ, not computed: the
-# same "3h24m" has to appear on a pinned status row, in a countdown line, and in
-# a limit rule's own sentence, and three modules formatting it themselves is how
-# the three drift. Everything that speaks to the person watching the run lives
-# in this module, and that includes how long it says something will take.
+# same "3h24m" appears in countdown lines and limit rules' own sentences.
+# The pinned status area adapts compound hour/minute durations to clock notation.
 
 def fmt_clock(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
