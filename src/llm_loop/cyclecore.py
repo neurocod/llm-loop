@@ -781,9 +781,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # capture printed lines replace `console.print_markup`. A binding of
             # our own here would be a third address none of them reaches, so the
             # header would sail past every one of them uncaptured.
+            separator = "_" * max(1, min(65, textwidth.terminal_columns()
+                                         - textwidth.LINE_RIGHT_MARGIN))
             console.print_markup(
-                f"\n=== Iteration {iteration} === [{state_label} · {model_label}]",
-                f"\n[bold cyan]=== Iteration {iteration} ===[/] "
+                f"{separator}\n=== Iteration {iteration} === [{state_label} · {model_label}]",
+                f"[dim]{separator}[/]\n[bold cyan]=== Iteration {iteration} ===[/] "
                 f"[dim]\\[{state_label} · {model_label}][/]",
             )
 

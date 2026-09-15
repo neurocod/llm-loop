@@ -189,7 +189,7 @@ def tool_line_head(name: str) -> str:
     measured somewhere else cannot drift from the head printed; a worker's writer
     prepends its `[job k] ` tag to both (see `LineWriter`).
     """
-    return f"  ⚙ {name}{TOOL_DETAIL_SEP}"
+    return f" ⚙ {name}{TOOL_DETAIL_SEP}"
 
 
 def mark_line_head(mark: str) -> str:
@@ -201,7 +201,7 @@ def mark_line_head(mark: str) -> str:
     two spellings drift silently — the printed line then overflows the row by the
     difference, which is what the width measurement exists to prevent.
     """
-    return f"    {mark} "
+    return f"   {mark} "
 
 
 def describe_tool(name: str, ti: dict, limit: Optional[int] = None) -> str:
@@ -317,7 +317,7 @@ class LineWriter:
         forms.
         """
         head_plain = self.tag_plain + tool_line_head(name)
-        head_markup = (f"{self.tag_markup}  [yellow]⚙[/] "
+        head_markup = (f"{self.tag_markup} [yellow]⚙[/] "
                        f"[bold yellow]{esc(name)}[/]{TOOL_DETAIL_SEP}")
         if detail:
             # Joined by f-string, not `+`: a detail is whatever a provider's JSON
@@ -360,4 +360,4 @@ class LineWriter:
         once here.
         """
         self.emit(f"{self.tag_plain}{mark_line_head(mark)}{body}",
-                  f"{self.tag_markup}    [{style}]{mark}[/] {esc(body)}")
+                  f"{self.tag_markup}   [{style}]{mark}[/] {esc(body)}")

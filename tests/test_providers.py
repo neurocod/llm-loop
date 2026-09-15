@@ -969,7 +969,7 @@ def test_powershell_wrapper_is_removed_before_width_truncation(monkeypatch, plai
     streamrender._render_codex_event({"type": "item.started", "item": {
         "type": "command_execution", "command": command}})
     line = plain_lines[-1]
-    assert line.startswith("  ⚙ PowerShell: xxx")
+    assert line.startswith(" ⚙ PowerShell: xxx")
     assert textwidth.cell_width(line) == budget
 
 
@@ -1078,7 +1078,7 @@ def test_a_worker_tool_line_leaves_room_for_its_job_tag(
     parallel.run_job(4, AgentCommand("p", "opus", "job", "claude"))
 
     line, = plain_lines
-    assert line.startswith("[job 4]   ⚙ Bash: $ ")
+    assert line.startswith("[job 4]  ⚙ Bash: $ ")
     assert textwidth.cell_width(line) == fits
 
 
@@ -1104,7 +1104,8 @@ def test_a_wide_glyph_body_is_cut_by_cells_not_characters(
     streamrender._render_claude_event(_bash_tool_use("漢" * 500), True)
 
     line, = plain_lines
-    assert textwidth.cell_width(line) == fits
+    # A two-cell glyph can leave one unused column after the shorter prefix.
+    assert fits - 1 <= textwidth.cell_width(line) <= fits
     assert len(line) < 200          # half as many characters as columns
 
 
@@ -1115,14 +1116,14 @@ def test_a_printer_coerces_a_detail_that_is_not_a_string(plain_lines):
     console.LINES.tool("Read", 123)
     parallel.job_lines(4).tool("Read", 123)
 
-    assert plain_lines == ["  ⚙ Read: 123", "[job 4]   ⚙ Read: 123"]
+    assert plain_lines == [" ⚙ Read: 123", "[job 4]  ⚙ Read: 123"]
 
 
 @pytest.mark.parametrize("name,tool_input,expected", [
-    ("Read", {"file_path": 123}, "  ⚙ Read: 123"),
-    ("Skill", {"skill": ["deploy"]}, "  ⚙ Skill: ['deploy']"),
-    ("Grep", {"pattern": 7}, "  ⚙ Grep: 7"),
-    ("Write", {"file_path": None}, "  ⚙ Write"),      # nothing to say, no ': '
+    ("Read", {"file_path": 123}, " ⚙ Read: 123"),
+    ("Skill", {"skill": ["deploy"]}, " ⚙ Skill: ['deploy']"),
+    ("Grep", {"pattern": 7}, " ⚙ Grep: 7"),
+    ("Write", {"file_path": None}, " ⚙ Write"),      # nothing to say, no ': '
 ])
 def test_a_tool_input_that_is_not_a_string_still_prints(
         monkeypatch, plain_lines, name, tool_input, expected):
