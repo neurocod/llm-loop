@@ -147,7 +147,12 @@ def command_tool(command: str) -> tuple[str, str]:
     visible rather than silently losing part of the invocation.
     """
     try:
-        argv = shlex.split(command)
+        # Claude's Bash input is raw shell text: adjacent redirections and
+        # separators must stay separate from the quoted PowerShell script.
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        argv = list(lexer)
     except ValueError:
         argv = []
     if argv and re.split(r"[\\/]", argv[0])[-1].lower() in (

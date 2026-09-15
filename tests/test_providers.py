@@ -909,6 +909,7 @@ def test_the_claude_bash_tool_line_uses_the_helper():
     (r'''pwsh -Command "Write-Output \"hello\""''', 'Write-Output "hello"'),
     ("pwsh -Command 'Write-Output one\nWrite-Output two'",
      "Write-Output one\nWrite-Output two"),
+    ("pwsh -Command 'Get-Date; whoami >out.txt'", "Get-Date; whoami >out.txt"),
 ])
 def test_powershell_display_decodes_the_argv_wrapper(command, expected):
     assert compactline.command_tool(command) == ("PowerShell", expected)
@@ -926,6 +927,9 @@ def test_powershell_display_decodes_the_argv_wrapper(command, expected):
     "echo pwsh -Command 'Get-Date'",
     '''bash -lc 'pwsh -Command "Get-Date"' ''',
     "mypowershell.exe -Command 'Get-Date'",
+    "pwsh -Command 'Get-Date'>out.txt",
+    "pwsh -Command 'Get-Date';whoami",
+    "pwsh -Command 'Get-Date'|cat",
 ])
 def test_powershell_display_preserves_unrecognized_invocations(command):
     assert compactline.command_tool(command) == ("Shell", command)
