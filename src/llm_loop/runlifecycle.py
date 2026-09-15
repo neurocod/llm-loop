@@ -209,6 +209,7 @@ def begin_run(driver, args, app_name: str, progress=None, *,
         print(f"  · logging to {console.log_file_path(app_name)}")
     print(f"  · provider: {spec.display_name}")
     print(f"  · git push policy: {settings.git_push.value}")
+    console.warn_missing_dependencies()
     return RunContext(provider=provider, spec=spec,
                       dry_run=dry_run, progress=progress,
                       owns_progress=owns_progress, settings=settings)

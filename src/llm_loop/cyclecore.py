@@ -447,10 +447,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     dry_run = ctx.dry_run
     raw = args.raw
     start_in = args.start_in      # e.g. "29m" — delay before the loop starts
-    if not console.RICH_AVAILABLE:
-        print("  · Markdown rendering is off (the 'rich' library is missing). "
-              "Enable it with:")
-        print(f"      {sys.executable} -m pip install rich")
 
     # A stop request pending from another run: wait it out rather than consume
     # it, so this launch starts on a clean sentinel instead of stopping on its

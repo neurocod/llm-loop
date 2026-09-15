@@ -48,7 +48,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
-from . import compactline
+from . import cmdline, compactline
 from . import projectroot
 
 
@@ -212,6 +212,24 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
+
+
+_DEPENDENCY_WARNING_SHOWN = False
+
+
+def warn_missing_dependencies() -> None:
+    """Warn after the log tee is ready, once even across a wrapper's batches."""
+    global _DEPENDENCY_WARNING_SHOWN
+    if RICH_AVAILABLE or _DEPENDENCY_WARNING_SHOWN:
+        return
+    _DEPENDENCY_WARNING_SHOWN = True
+    print("  WARNING: Not all dependencies are installed: 'rich' is missing. "
+          "Some functionality is unavailable: Markdown formatting, colored "
+          "output, and accurate Unicode display widths. Continuing in plain text.")
+    install = cmdline.quote([sys.executable, "-m", "pip", "install", "rich"])
+    if os.name == "nt":
+        install = "& " + install
+    print(f"  Install with: {install}")
 
 
 def real_stream():
@@ -471,5 +489,4 @@ def fmt_moment(ts: float) -> str:
     if ts - time.time() < 18 * 3600:
         return fmt_clock(ts)
     return datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
-
 
