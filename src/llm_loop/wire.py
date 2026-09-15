@@ -199,7 +199,7 @@ def tool_result_text(block: dict) -> str:
     content = block.get("content", "")
     if isinstance(content, list):
         return "\n".join(part.get(BLOCK_TEXT, "") for part in content
-                        if isinstance(part, dict))
+                        if isinstance(part, dict) and BLOCK_TEXT in part)
     return content
 
 

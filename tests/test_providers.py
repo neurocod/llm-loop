@@ -1274,10 +1274,12 @@ def test_tool_output_keeps_lines_indentation_and_full_text(
     _terminal(monkeypatch, 40)
     lines = ["diff --git a/test.py b/test.py", "@@ -1 +1 @@",
              "-    old()", "+    new('[bold]literal[/bold]')", "",
-             "    " + "x" * 500, "last line"]
+             "    " + "x" * 500, "last line", ""]
     body = "\n".join(lines)
     content = ([{"type": "text", "text": line} for line in lines]
                if as_parts else body)
+    if as_parts:
+        content.insert(1, {"type": "image", "source": {}})
     if provider == "claude":
         streamrender._render_claude_event({"type": "user", "message": {
             "content": [{"type": "tool_result", "content": content,
