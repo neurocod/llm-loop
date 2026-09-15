@@ -155,7 +155,8 @@ def command_tool(command: str) -> tuple[str, str]:
         argv = list(lexer)
     except ValueError:
         argv = []
-    if argv and re.split(r"[\\/]", argv[0])[-1].lower() in (
+    executable = re.split(r"[\\/]", argv[0])[-1].lower() if argv else ""
+    if executable in (
             "powershell", "powershell.exe", "pwsh", "pwsh.exe"):
         index = 1
         while index < len(argv) and argv[index].lower() in (
@@ -163,7 +164,10 @@ def command_tool(command: str) -> tuple[str, str]:
             index += 1
         if (index + 2 == len(argv)
                 and argv[index].lower() in ("-command", "-c")):
-            return "PowerShell", argv[index + 1]
+            # Keep the host visible: pwsh and Windows PowerShell support
+            # different syntax and switches even when their scripts match.
+            name = "pwsh" if executable in ("pwsh", "pwsh.exe") else "PowerShell"
+            return name, argv[index + 1]
     return "Shell", undouble_backslashes(command)
 
 
@@ -340,9 +344,9 @@ class LineWriter:
             return
         if name == "Bash":
             shell, command = command_tool(str(tool_input.get("command", "")))
-            if shell == "PowerShell":
-                self.tool("PowerShell", short(
-                    command, self.budget(tool_line_head("PowerShell"))))
+            if shell != "Shell":
+                self.tool(shell, short(
+                    command, self.budget(tool_line_head(shell))))
                 return
         self.tool(name, describe_tool(name, tool_input,
                                       self.budget(tool_line_head(name))))

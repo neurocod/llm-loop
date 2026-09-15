@@ -333,7 +333,7 @@ def codex_user_message_text(item: dict) -> str:
 def codex_command(item: dict) -> str:
     """A command summary shared by both runners' outcome lines."""
     name, command = codex_command_tool(item)
-    return f"{name}: {command}" if name == "PowerShell" else command
+    return f"{name}: {command}" if name != "Shell" else command
 
 
 def codex_command_tool(item: dict) -> tuple[str, str]:

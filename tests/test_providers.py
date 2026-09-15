@@ -898,25 +898,25 @@ def test_the_claude_bash_tool_line_uses_the_helper():
         == r"$ type C:\a\b.txt"
 
 
-@pytest.mark.parametrize("command,expected", [
+@pytest.mark.parametrize("command,name,expected", [
     (r"'C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe' "
-     "-NoProfile -Command 'Get-Date'", "Get-Date"),
+     "-NoProfile -Command 'Get-Date'", "PowerShell", "Get-Date"),
     (r"'C:\Program Files\PowerShell\7\pwsh.exe' -Command "
-     r"'Get-Item C:\\data\\file'", r"Get-Item C:\\data\\file"),
+     r"'Get-Item C:\\data\\file'", "pwsh", r"Get-Item C:\\data\\file"),
     (r'"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
-     r'-Command "some text"', "some text"),
-    ('pwsh -NoLogo -NoProfile -NonInteractive -c "Get-Date"', "Get-Date"),
-    ('"C:/Program Files/PowerShell/7/pwsh.exe" -Command "Get-Date"', "Get-Date"),
-    ("PowerShell.EXE -COMMAND 'Get-Date'", "Get-Date"),
+     r'-Command "some text"', "PowerShell", "some text"),
+    ('pwsh -NoLogo -NoProfile -NonInteractive -c "Get-Date"', "pwsh", "Get-Date"),
+    ('"C:/Program Files/PowerShell/7/pwsh.exe" -Command "Get-Date"', "pwsh", "Get-Date"),
+    ("PowerShell.EXE -COMMAND 'Get-Date'", "PowerShell", "Get-Date"),
     (r'''pwsh -Command 'Get-Item "\\server\share\file"' ''',
-     r'Get-Item "\\server\share\file"'),
-    (r'''pwsh -Command "Write-Output \"hello\""''', 'Write-Output "hello"'),
+     "pwsh", r'Get-Item "\\server\share\file"'),
+    (r'''pwsh -Command "Write-Output \"hello\""''', "pwsh", 'Write-Output "hello"'),
     ("pwsh -Command 'Write-Output one\nWrite-Output two'",
-     "Write-Output one\nWrite-Output two"),
-    ("pwsh -Command 'Get-Date; whoami >out.txt'", "Get-Date; whoami >out.txt"),
+     "pwsh", "Write-Output one\nWrite-Output two"),
+    ("pwsh -Command 'Get-Date; whoami >out.txt'", "pwsh", "Get-Date; whoami >out.txt"),
 ])
-def test_powershell_display_decodes_the_argv_wrapper(command, expected):
-    assert compactline.command_tool(command) == ("PowerShell", expected)
+def test_powershell_display_decodes_the_argv_wrapper(command, name, expected):
+    assert compactline.command_tool(command) == (name, expected)
 
 
 @pytest.mark.parametrize("command", [
@@ -939,10 +939,13 @@ def test_powershell_display_preserves_unrecognized_invocations(command):
     assert compactline.command_tool(command) == ("Shell", command)
 
 
+@pytest.mark.parametrize("command,name", [
+    (r'"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+     r'-Command "Get-Date"', "PowerShell"),
+    ('pwsh -Command "Get-Date"', "pwsh"),
+])
 def test_powershell_commands_are_compact_in_both_providers_and_runners(
-        monkeypatch, plain_lines):
-    command = (r'"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
-               r'-Command "Get-Date"')
+        monkeypatch, plain_lines, command, name):
     item = {"type": "command_execution", "command": command, "exit_code": 0}
     events = [{"type": event, "item": item}
               for event in ("item.started", "item.completed")]
@@ -953,17 +956,16 @@ def test_powershell_commands_are_compact_in_both_providers_and_runners(
     writer = compactline.LineWriter(lambda plain, markup: plain_lines.append(plain),
                                     "[job 4] ")
     writer.tool_use("Bash", {"command": command})
-    writer.tool_use("PowerShell", {"command": "Get-Date"})
     lines = [line for line in plain_lines if "Get-Date" in line]
-    assert len(lines) == 7
-    assert all("PowerShell: Get-Date" in line for line in lines)
+    assert len(lines) == 6
+    assert all(f"{name}: Get-Date" in line for line in lines)
     assert all("Bash:" not in line and "powershell.exe" not in line for line in lines)
     assert item["command"] == command
 
 
 def test_powershell_wrapper_is_removed_before_width_truncation(monkeypatch, plain_lines):
     budget = _terminal(monkeypatch, 240)
-    command = 'pwsh -NoProfile -Command "' + "x" * 500 + '"'
+    command = 'powershell -NoProfile -Command "' + "x" * 500 + '"'
     streamrender._render_codex_event({"type": "item.started", "item": {
         "type": "command_execution", "command": command}})
     line = plain_lines[-1]
