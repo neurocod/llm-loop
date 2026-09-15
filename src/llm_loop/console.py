@@ -48,7 +48,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
-from . import cmdline, compactline
+from . import compactline
 from . import projectroot
 
 
@@ -222,6 +222,10 @@ def warn_missing_dependencies() -> None:
     global _DEPENDENCY_WARNING_SHOWN
     if RICH_AVAILABLE or _DEPENDENCY_WARNING_SHOWN:
         return
+    # cmdline imports clispec -> termio -> console; defer this edge until the
+    # modules are initialized rather than closing an import-time cycle.
+    from . import cmdline
+
     _DEPENDENCY_WARNING_SHOWN = True
     print("  WARNING: Not all dependencies are installed: 'rich' is missing. "
           "Some functionality is unavailable: Markdown formatting, colored "
@@ -229,7 +233,8 @@ def warn_missing_dependencies() -> None:
     install = cmdline.quote([sys.executable, "-m", "pip", "install", "rich"])
     if os.name == "nt":
         install = "& " + install
-    print(f"  Install with: {install}")
+    shell_hint = " (PowerShell)" if os.name == "nt" else ""
+    print(f"  Install with{shell_hint}: {install}")
 
 
 def real_stream():
@@ -489,4 +494,3 @@ def fmt_moment(ts: float) -> str:
     if ts - time.time() < 18 * 3600:
         return fmt_clock(ts)
     return datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
-
