@@ -159,10 +159,10 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
                 continue
             is_err = wire.tool_result_failed(block)
             mark = "✗" if is_err else "✓"
-            line = compactline.short(
-                wire.tool_result_text(block),
-                LINES.budget(compactline.mark_line_head(mark)))
-            if line:
+            # Tool output contains source, diffs and diagnostics: keep its
+            # line breaks and indentation, and let the terminal wrap long lines.
+            line = wire.tool_result_text(block)
+            if line and line.strip():
                 LINES.mark(mark, "red" if is_err else "green", line)
         return
 
@@ -222,21 +222,16 @@ def _render_codex_event(ev: dict, mailbox=None) -> None:
     if event_type == wire.ITEM_COMPLETED and item_type == wire.COMMAND_EXECUTION:
         exit_code = wire.codex_exit_code(item)
         mark = "✓" if exit_code in (None, 0) else "✗"
-        # The head is measured from what this line will actually print: there is
-        # no "exit N: " when the provider reported no code, and no " — " when
-        # there is no output to put after it. Measuring both unconditionally
-        # left the line eleven columns short of the width it had been given.
+        # Keep the command summary compact, but preserve the output below it:
+        # source, diffs and diagnostics need their whitespace and complete text.
         code_head = f"exit {exit_code}: " if exit_code is not None else ""
-        separator = (" — " if compactline.collapse(
-            wire.codex_output(item)) else "")
-        command, output = compactline.fit_two(
-            LINES.budget(f"{compactline.mark_line_head(mark)}"
-                         f"{code_head}{separator}"),
+        command = compactline.short(
             wire.codex_command(item),
-            wire.codex_output(item))
+            LINES.budget(f"{compactline.mark_line_head(mark)}{code_head}"))
         detail = f"{code_head}{command}"
+        output = wire.codex_output(item)
         if output:
-            detail += f"{separator}{output}"
+            detail += f"\n{output}"
         LINES.mark(mark, "green" if exit_code in (None, 0) else "red", detail)
         return
 

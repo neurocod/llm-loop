@@ -1158,11 +1158,7 @@ def test_every_tool_argument_is_cut_like_a_long_command(
     assert textwidth.cell_width(line) == fits
 
 
-# --- the codex line that carries TWO variable fields --------------------------
-#
-# `✗ exit 1: <command> — <output>` has to fit both in one budget. Capping the
-# command at half of it and giving the output the rest left half the row blank
-# whenever there was no output — the very defect the width change is about.
+# --- compact command summaries followed by complete output ------------------
 
 def _codex_completed(command, output="", exit_code=1):
     item = {"type": "command_execution", "command": command,
@@ -1181,28 +1177,29 @@ def test_a_command_with_no_output_gets_the_whole_line(monkeypatch, plain_lines):
     assert textwidth.cell_width(line) == fits
 
 
-def test_a_short_output_lends_its_room_to_the_command(monkeypatch, plain_lines):
+def test_codex_output_does_not_shrink_the_command_summary(monkeypatch, plain_lines):
     fits = _terminal(monkeypatch, 300)
 
     streamrender._render_codex_event(_codex_completed(LONG_COMMAND, "not found"))
 
-    line, = plain_lines
-    assert textwidth.cell_width(line) == fits
-    assert line.endswith(" — not found")     # kept whole, and the command took
-    assert "…" in line                       # the rest of the row
+    block, = plain_lines
+    summary, output = block.split("\n", 1)
+    assert textwidth.cell_width(summary) == fits
+    assert summary.endswith("…")
+    assert output == "not found"
 
 
-def test_two_long_fields_share_the_line_evenly(monkeypatch, plain_lines):
+def test_codex_long_output_is_not_cut_to_terminal_width(monkeypatch, plain_lines):
     fits = _terminal(monkeypatch, 300)
 
     streamrender._render_codex_event(
         _codex_completed(LONG_COMMAND, "y" * 500))
 
-    line, = plain_lines
-    command, output = line.split(" — ")
-    assert textwidth.cell_width(line) == fits
-    assert command.endswith("…") and output.endswith("…")   # both were cut
-    assert abs(len(command) - len(output)) < 30             # ...about evenly
+    block, = plain_lines
+    command, output = block.split("\n", 1)
+    assert textwidth.cell_width(command) == fits
+    assert command.endswith("…")
+    assert output == "y" * 500
 
 
 def test_a_missing_exit_code_does_not_shrink_the_line(monkeypatch, plain_lines):
@@ -1267,6 +1264,35 @@ def test_a_tool_line_keeps_its_coloured_glyph_and_bold_name(line_pairs):
     assert _style_over(markup, "⚙")                  # the glyph is coloured
     assert "bold" in _style_over(markup, "Bash")     # the name is picked out
     assert _style_over(markup, "$ pytest -q") == ""  # the detail is not
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+@pytest.mark.parametrize("as_parts", [False, True])
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_tool_output_keeps_lines_indentation_and_full_text(
+        monkeypatch, line_pairs, is_error, as_parts, provider):
+    _terminal(monkeypatch, 40)
+    lines = ["diff --git a/test.py b/test.py", "@@ -1 +1 @@",
+             "-    old()", "+    new('[bold]literal[/bold]')", "",
+             "    " + "x" * 500, "last line"]
+    body = "\n".join(lines)
+    content = ([{"type": "text", "text": line} for line in lines]
+               if as_parts else body)
+    if provider == "claude":
+        streamrender._render_claude_event({"type": "user", "message": {
+            "content": [{"type": "tool_result", "content": content,
+                         "is_error": is_error}]}}, True)
+    else:
+        streamrender._render_codex_event(
+            _codex_completed("git diff", body, exit_code=1 if is_error else 0))
+
+    plain, markup = line_pairs[0]
+    mark = "✗" if is_error else "✓"
+    header = ("" if provider == "claude"
+              else f"exit {1 if is_error else 0}: git diff\n")
+    assert plain == f"   {mark} {header}{body}"
+    rich_markup = pytest.importorskip("rich.markup")
+    assert rich_markup.render(markup).plain == plain
 
 
 def test_a_mark_line_styles_the_glyph_and_not_the_body(line_pairs):

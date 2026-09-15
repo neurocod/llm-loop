@@ -198,7 +198,7 @@ def tool_result_text(block: dict) -> str:
     """
     content = block.get("content", "")
     if isinstance(content, list):
-        return " ".join(part.get(BLOCK_TEXT, "") for part in content
+        return "\n".join(part.get(BLOCK_TEXT, "") for part in content
                         if isinstance(part, dict))
     return content
 
