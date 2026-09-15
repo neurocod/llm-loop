@@ -1443,7 +1443,7 @@ def test_sequential_weekly_key_changes_the_driver_policy(monkeypatch, tmp_path,
             patch.setattr(_CountingSource, "get_usage", unexpected_query)
             for key in ("w", "up", "\r"):
                 app.handle_event(tio.Key(key))
-        assert app.mode.editor.buffer == "99"
+        assert isinstance(app.mode, sl.NormalMode)
         assert "99%" in " ".join(app.render(200))
         return 0
 

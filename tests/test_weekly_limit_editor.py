@@ -47,7 +47,8 @@ def make_app(policy):
     return app, policies
 
 
-def test_open_cancel_apply_and_reopen_edit_the_real_gate():
+@pytest.mark.parametrize("enter", ["\r", "\n"])
+def test_open_cancel_apply_and_reopen_edit_the_real_gate(enter):
     rule = WeeklyLimit(98)
     policy = LimitPolicy([SessionLimit(80), rule])
     app, _ = make_app(policy)
@@ -58,16 +59,20 @@ def test_open_cancel_apply_and_reopen_edit_the_real_gate():
     assert sl.colorize(app.render(120)[-1]) == app.render(120)[-1]
     press(app, "down", "\x1b", "\x1b")
     assert rule.limit == 98
-    press(app, "w", "up", "\r")
+    press(app, "w", "up", enter)
     assert rule.limit == 99
+    assert isinstance(app.mode, sl.NormalMode)
+    assert len(app.modes) == 1
+    assert not any(row.startswith(sl.WeeklyLimitRow.prefix) for row in app.render(120))
     assert "99%" in app.status.quotas[0].policy
     assert app.status.quotas[0].percent == 98
     usage = Usage(UsageReading(0, None), UsageReading(98, None),
                   UsageReading(None, None), [])
     assert not policy._violations(policy._status(usage, 0))
-    press(app, "down", "\r")
+    press(app, "w", "down", enter)
+    assert isinstance(app.mode, sl.NormalMode)
     assert policy._violations(policy._status(usage, 0))[0][0] is rule
-    press(app, "\x1b", "\x1b", "w")
+    press(app, "w")
     assert app.mode.editor.buffer == "98"
 
 
@@ -81,13 +86,16 @@ def test_invalid_submission_stays_in_editor_without_changing_limit(text):
     assert "0 to 100" in app.status.note
 
 
-def test_pasted_newlines_and_shortcuts_cannot_stop_or_pause_the_loop():
+def test_shortcuts_are_ignored_until_the_weekly_edit_is_submitted():
     rule = WeeklyLimit(98)
     app, _ = make_app(LimitPolicy([rule]))
-    press(app, "w", "\x15", *"90\nstop\npause\nmessage")
-    assert rule.limit == 90
+    press(app, "w", "\x15", *"90stop pause message")
+    assert rule.limit == 98
     assert not app.stop_requested_here and not app.paused
     assert isinstance(app.mode, sl.WeeklyLimitMode)
+    press(app, "\r")
+    assert rule.limit == 90
+    assert isinstance(app.mode, sl.NormalMode)
 
 
 def test_policy_switch_rejects_stale_draft_and_reopens_current_limit():

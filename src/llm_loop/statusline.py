@@ -1568,8 +1568,8 @@ class WeeklyLimitRow(Row):
 class WeeklyLimitMode(Mode):
     """Edit the active all-models weekly rule, committing only on Enter.
 
-    Like MessageMode, Enter stays in the field so a multiline paste cannot
-    dispatch normal-mode shortcuts. Esc clears; Esc on an empty field leaves,
+    A successful Enter applies the value and returns to normal mode.
+    Esc clears; Esc on an empty field leaves,
     so Alt+key (reported as Esc then key) cannot dispatch a normal-mode action
     from a nonempty draft either.
     A provider switch invalidates the draft rather than editing another account.
@@ -1588,7 +1588,7 @@ class WeeklyLimitMode(Mode):
 
     def legend(self):
         return [("0-9", "limit"), ("↑/↓", "+1 / -1"),
-                ("Enter", "apply"), ("Esc", "clear / leave"),
+                ("Enter", "apply / close"), ("Esc", "clear / leave"),
                 ("←/→", "move"), ("^U", "erase")]
 
     def handle(self, event):
@@ -1608,7 +1608,8 @@ class WeeklyLimitMode(Mode):
             else:
                 self.rule.limit = float(self.editor.value)
                 self.app.status.refresh_quota_policy(self.rule)
-                self.app.note(f"weekly limit set to {self.rule.limit:.0f}% — Esc clears / leaves")
+                self.app.note(f"weekly limit set to {self.rule.limit:.0f}%")
+                self.app.pop_mode()
         else:
             self.editor.handle(event.char)
         return True
