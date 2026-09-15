@@ -144,7 +144,7 @@ def test_parallel_weekly_key_changes_the_shared_policy(tmp_path, monkeypatch):
         app = made["app"]
         for key in ("w", "down", "\r"):
             app.handle_event(tio.Key(key))
-        assert app.mode.editor.buffer == "97"
+        assert isinstance(app.mode, sl.NormalMode)
         assert "97%" in " ".join(app.render(200))
         return 0, 0.0, 0.01
 
