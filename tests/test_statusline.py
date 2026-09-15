@@ -198,12 +198,17 @@ def test_a_rate_limit_hold_wears_the_glyph_without_claiming_to_be_the_p_key():
     assert "PAUSED" not in row
 
 
-def test_the_two_clocks_are_different_clocks():
+@pytest.mark.parametrize("seconds,expected", [
+    (252, "4:12"), (7303, "2:01:43"), (90043, "25:00:43"),
+])
+def test_the_two_clocks_are_different_clocks(seconds, expected):
     """The job row times the CURRENT iteration; the summary times the whole run."""
-    rows = sl.render_rows(sequential_status(), 200, now=NOW)
+    status = sequential_status()
+    status.jobs[0].started_at = NOW - seconds
+    rows = sl.render_rows(status, 200, now=NOW)
 
     assert "1:00:00" in rows[1] and "1:00:00" not in rows[2]
-    assert "4:12" in rows[2] and "4:12" not in rows[1]
+    assert expected in rows[2] and expected not in rows[1]
 
 
 def test_quota_without_a_figure_reads_as_not_available():

@@ -861,7 +861,8 @@ class JobRow(Row):
     starts at the same offset on every row and the names stay scannable.
     """
 
-    elapsed_width = 6
+    # Reserve HH:MM:SS so hour-long jobs retain their seconds and rows align.
+    elapsed_width = 8
     # The model column is sized from the data instead of pinned, because a model
     # name is an identifier the reader may want to recognise or copy, and
     # "gpt-5.6-ter…" says less than the two extra columns cost. Still bounded, so
