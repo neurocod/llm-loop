@@ -898,6 +898,71 @@ def test_the_claude_bash_tool_line_uses_the_helper():
         == r"$ type C:\a\b.txt"
 
 
+@pytest.mark.parametrize("command,expected", [
+    (r'"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+     r'-Command "some text"', "some text"),
+    ('pwsh -NoLogo -NoProfile -NonInteractive -c "Get-Date"', "Get-Date"),
+    ('"C:/Program Files/PowerShell/7/pwsh.exe" -Command "Get-Date"', "Get-Date"),
+    ("PowerShell.EXE -COMMAND 'Get-Date'", "Get-Date"),
+    (r'''pwsh -Command 'Get-Item "\\server\share\file"' ''',
+     r'Get-Item "\\server\share\file"'),
+    (r'''pwsh -Command "Write-Output \"hello\""''', 'Write-Output "hello"'),
+    ("pwsh -Command 'Write-Output one\nWrite-Output two'",
+     "Write-Output one\nWrite-Output two"),
+])
+def test_powershell_display_decodes_the_argv_wrapper(command, expected):
+    assert compactline.command_tool(command) == ("PowerShell", expected)
+
+
+@pytest.mark.parametrize("command", [
+    "pytest -q",
+    "pwsh -File task.ps1",
+    "pwsh -EncodedCommand Zm9v",
+    "pwsh -ExecutionPolicy Bypass -Command 'Get-Date'",
+    "pwsh -Command 'Get-Date' extra",
+    "pwsh -Command 'unterminated",
+    "pwsh -NoProfile",
+    "pwsh",
+    "echo pwsh -Command 'Get-Date'",
+    '''bash -lc 'pwsh -Command "Get-Date"' ''',
+    "mypowershell.exe -Command 'Get-Date'",
+])
+def test_powershell_display_preserves_unrecognized_invocations(command):
+    assert compactline.command_tool(command) == ("Shell", command)
+
+
+def test_powershell_commands_are_compact_in_both_providers_and_runners(
+        monkeypatch, plain_lines):
+    command = (r'"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+               r'-Command "Get-Date"')
+    item = {"type": "command_execution", "command": command, "exit_code": 0}
+    events = [{"type": event, "item": item}
+              for event in ("item.started", "item.completed")]
+    for event in events:
+        streamrender._render_codex_event(event)
+    _codex_job(monkeypatch, "".join(json.dumps(e) + "\n" for e in events), 0)
+    streamrender._render_claude_event(_bash_tool_use(command), True)
+    writer = compactline.LineWriter(lambda plain, markup: plain_lines.append(plain),
+                                    "[job 4] ")
+    writer.tool_use("Bash", {"command": command})
+    writer.tool_use("PowerShell", {"command": "Get-Date"})
+    lines = [line for line in plain_lines if "Get-Date" in line]
+    assert len(lines) == 7
+    assert all("PowerShell: Get-Date" in line for line in lines)
+    assert all("Bash:" not in line and "powershell.exe" not in line for line in lines)
+    assert item["command"] == command
+
+
+def test_powershell_wrapper_is_removed_before_width_truncation(monkeypatch, plain_lines):
+    budget = _terminal(monkeypatch, 240)
+    command = 'pwsh -NoProfile -Command "' + "x" * 500 + '"'
+    streamrender._render_codex_event({"type": "item.started", "item": {
+        "type": "command_execution", "command": command}})
+    line = plain_lines[-1]
+    assert line.startswith("  ⚙ PowerShell: xxx")
+    assert textwidth.cell_width(line) == budget
+
+
 # --- one event, one line, the width of the terminal ---------------------------
 #
 # Each renderer used to cut its variable field at a figure of its own: 200

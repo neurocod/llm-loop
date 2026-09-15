@@ -331,13 +331,14 @@ def codex_user_message_text(item: dict) -> str:
 
 
 def codex_command(item: dict) -> str:
-    """A `command_execution` item's command line, ready to print.
+    """A command summary shared by both runners' outcome lines."""
+    name, command = codex_command_tool(item)
+    return f"{name}: {command}" if name == "PowerShell" else command
 
-    Un-doubling the backslashes is part of reading the field rather than of
-    printing it: the provider escapes them into the JSON string, and every
-    consumer wanted them back.
-    """
-    return compactline.undouble_backslashes(str(item.get("command", "")))
+
+def codex_command_tool(item: dict) -> tuple[str, str]:
+    """The actual shell's display name and command, before width truncation."""
+    return compactline.command_tool(str(item.get("command", "")))
 
 
 def codex_exit_code(item: dict, default: Any = None) -> Any:

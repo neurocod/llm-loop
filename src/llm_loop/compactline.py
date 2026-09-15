@@ -25,6 +25,7 @@ Two kinds of thing live here, and they are not the same question:
 
 import json
 import re
+import shlex
 from typing import Optional
 
 from . import textwidth
@@ -34,6 +35,7 @@ __all__ = [
     "LineWriter",
     "TOOL_DETAIL_SEP",
     "collapse",
+    "command_tool",
     "describe_tool",
     "esc",
     "fit_two",
@@ -133,6 +135,31 @@ def undouble_backslashes(text: str) -> str:
     if not runs or any(len(run) % 2 for run in runs):
         return text
     return _BACKSLASH_RUN_RE.sub(lambda m: "\\" * (len(m.group(0)) // 2), text)
+
+
+def command_tool(command: str) -> tuple[str, str]:
+    """Recognize a PowerShell argv wrapper for display, never for execution.
+
+    Codex serializes argv with Rust shlex::try_join, including on Windows.
+    Decode BEFORE the legacy backslash cleanup: doing it afterwards destroys
+    escaped quotes and UNC paths. Only unwrap a single -Command argument with
+    known startup flags; other options, extra arguments and outer shells stay
+    visible rather than silently losing part of the invocation.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = []
+    if argv and re.split(r"[\\/]", argv[0])[-1].lower() in (
+            "powershell", "powershell.exe", "pwsh", "pwsh.exe"):
+        index = 1
+        while index < len(argv) and argv[index].lower() in (
+                "-noprofile", "-nologo", "-noninteractive"):
+            index += 1
+        if (index + 2 == len(argv)
+                and argv[index].lower() in ("-command", "-c")):
+            return "PowerShell", argv[index + 1]
+    return "Shell", undouble_backslashes(command)
 
 
 # What a Bash tool call's detail puts in front of the command, so the line reads
@@ -302,6 +329,16 @@ class LineWriter:
         the line prints is the head its detail was sized against, by
         construction.
         """
+        if name == "PowerShell":
+            self.tool(name, short(tool_input.get("command", ""),
+                                  self.budget(tool_line_head(name))))
+            return
+        if name == "Bash":
+            shell, command = command_tool(str(tool_input.get("command", "")))
+            if shell == "PowerShell":
+                self.tool("PowerShell", short(
+                    command, self.budget(tool_line_head("PowerShell"))))
+                return
         self.tool(name, describe_tool(name, tool_input,
                                       self.budget(tool_line_head(name))))
 

@@ -214,10 +214,9 @@ def _render_codex_event(ev: dict, mailbox=None) -> None:
         return
 
     if event_type == wire.ITEM_STARTED and item_type == wire.COMMAND_EXECUTION:
-        command = compactline.short(
-            wire.codex_command(item),
-            LINES.budget(compactline.tool_line_head("Bash")))
-        LINES.tool("Bash", command)
+        name, command = wire.codex_command_tool(item)
+        LINES.tool(name, compactline.short(
+            command, LINES.budget(compactline.tool_line_head(name))))
         return
 
     if event_type == wire.ITEM_COMPLETED and item_type == wire.COMMAND_EXECUTION:
