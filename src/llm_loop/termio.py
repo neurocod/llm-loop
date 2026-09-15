@@ -355,6 +355,10 @@ def decode_escape(sequence: str) -> Optional[InputEvent]:
 class InputSource:
     """Produces InputEvents on a daemon thread."""
 
+    def discard_pending(self) -> None:
+        """Discard the rest of the current input burst, if this source buffers it."""
+        return None
+
     def start(self, handler: Callable[[InputEvent], None]) -> None:
         raise NotImplementedError
 
@@ -463,6 +467,7 @@ class TerminalInput(InputSource):
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._decoder = _EscapeDecoder()
+        self._discarding = False
         # (fd, saved termios attrs) while the tty is in cbreak, else None.
         self._tty_state: Optional[Tuple[int, object]] = None
 
@@ -507,13 +512,34 @@ class TerminalInput(InputSource):
         except Exception:
             return  # a broken reader costs the keys, never the run
 
+    def discard_pending(self) -> None:
+        """Called by an input handler when Enter closes an editor.
+
+        Drain until the reader observes no pending input, including the rest of
+        a POSIX read chunk. Otherwise a pasted newline followed by 's' would
+        close the editor and stop the run. No delay is added to normal input.
+        """
+        self._discarding = True
+
+    def _idle(self, handler) -> None:
+        if self._discarding:
+            self._decoder = _EscapeDecoder(scan_codes=self._decoder.scan_codes)
+            self._discarding = False
+        else:
+            for event in self._decoder.flush():
+                handler(event)
+
     def _emit(self, handler, char: str) -> None:
         if char == "\x03":  # Ctrl+C on the Windows path: keep the usual meaning
             import _thread
 
             _thread.interrupt_main()
             return
+        if self._discarding:
+            return
         for event in self._decoder.feed(char):
+            if self._discarding:
+                break
             handler(event)
 
     def _run_windows(self, handler):
@@ -523,8 +549,7 @@ class TerminalInput(InputSource):
             if msvcrt.kbhit():
                 self._emit(handler, msvcrt.getwch())
                 continue
-            for event in self._decoder.flush():
-                handler(event)
+            self._idle(handler)
             self._stop.wait(self.poll_seconds)
 
     def _run_posix(self, handler):
@@ -549,8 +574,7 @@ class TerminalInput(InputSource):
             while not self._stop.is_set():
                 ready, _, _ = select.select([fd], [], [], self.poll_seconds)
                 if not ready:
-                    for event in self._decoder.flush():
-                        handler(event)
+                    self._idle(handler)
                     continue
                 for char in utf8.decode(os.read(fd, 1024)):
                     self._emit(handler, char)

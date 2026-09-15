@@ -1609,7 +1609,7 @@ class WeeklyLimitMode(Mode):
                 self.rule.limit = float(self.editor.value)
                 self.app.status.refresh_quota_policy(self.rule)
                 self.app.note(f"weekly limit set to {self.rule.limit:.0f}%")
-                self.app.pop_mode()
+                self.app.pop_mode(discard_pending=True)
         else:
             self.editor.handle(event.char)
         return True
@@ -2370,8 +2370,10 @@ class StatusApp:
         self.modes.append(mode)
         self._paint()
 
-    def pop_mode(self) -> None:
+    def pop_mode(self, *, discard_pending: bool = False) -> None:
         if len(self.modes) > 1:
+            if discard_pending and self._input is not None:
+                self._input.discard_pending()
             self.modes.pop()
             self._paint()
 

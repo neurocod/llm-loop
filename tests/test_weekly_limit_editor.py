@@ -112,6 +112,25 @@ def test_policy_switch_rejects_stale_draft_and_reopens_current_limit():
     assert app.action_for("w") is None
 
 
+@pytest.mark.parametrize("enter", ["\r", "\n", "\r\n"])
+@pytest.mark.parametrize("shortcut", ["s", "p", "m", "w"])
+def test_submit_discards_pending_paste_but_accepts_the_next_key(enter, shortcut):
+    rule = WeeklyLimit(98)
+    app, _ = make_app(LimitPolicy([rule]))
+    source = termio.TerminalInput()
+    app._input = source
+    press(app, "w", "\x15")
+    for char in "90" + enter + shortcut:
+        source._emit(app.handle_event, char)
+    assert rule.limit == 90
+    assert isinstance(app.mode, sl.NormalMode)
+    assert not app.stop_requested_here and not app.paused
+    source._idle(app.handle_event)
+    source._emit(app.handle_event, "w")
+    assert isinstance(app.mode, sl.WeeklyLimitMode)
+    assert app.mode.editor.buffer == "90"
+
+
 def test_alt_shortcut_clears_draft_without_stopping():
     app, _ = make_app(LimitPolicy([WeeklyLimit(98)]))
     press(app, "w", "\x1b", "s")
