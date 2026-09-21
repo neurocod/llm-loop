@@ -499,6 +499,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         settings=settings,
         messages=mailbox,
         enabled=not dry_run and not getattr(args, "no_statusline", False))
+    # Only state-driven loops can name a breakpoint. Keep the collection local
+    # to this invocation so a later runner call starts without old console input.
+    from .breakpoints import Breakpoints
+    state_name = getattr(driver, "state_name", None)
+    breakpoints = Breakpoints(state_name) if callable(state_name) else None
+    if breakpoints is not None:
+        app.register_action(statusline.BreakpointAction(breakpoints))
     app.register_action(statusline.WeeklyLimitAction(
         lambda: None if ignore_usage_limits else limit_policy))
     app.update(
@@ -525,13 +532,14 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     refresh_pending_command = False
 
     def stop_pending() -> bool:
-        """Is either stop channel asking for this run right now?
+        """Is a stop channel or state breakpoint asking for this run right now?
 
         Handed to every hold that can outlast an iteration (the usage gate, the
         post-refusal wait). It only reports — the loop head is the single place
         that decides what a request means, cancel grace included.
         """
-        return stopchannel.pending_stop(app) is not None
+        return (stopchannel.pending_stop(app) is not None
+                or (breakpoints is not None and breakpoints.reached() is not None))
 
     with app:
         while True:
@@ -581,6 +589,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 app.update(phase="stopping")
                 break
             # Cancelled inside the interactive grace — carry on with no trace.
+
+            reached = breakpoints.reached() if breakpoints is not None else None
+            if reached is not None:
+                stop_reason = stopchannel.RunStopReason.BREAKPOINT
+                print(f"Breakpoint reached: '{reached}'. Stopping cleanly.")
+                app.update(phase="stopping")
+                break
 
             # Git push policy: evaluated at the start of every iteration.
             if not dry_run:
@@ -741,6 +756,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     consecutive_errors = 0
                 if stop_pending() or stopchannel.pause_requested(app):
                     continue
+
+            # A breakpoint may have been entered after selecting the command,
+            # including during a quota wait. Return to the boundary before launch.
+            if breakpoints is not None and breakpoints.reached() is not None:
+                continue
 
             # Notes typed while nothing was running (or while the transport was
             # off) ride this prompt — see Mailbox.splice for the ordering.

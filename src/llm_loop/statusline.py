@@ -1552,6 +1552,70 @@ class MessageAction(Action):
         app.push_mode(MessageMode(app))
 
 
+class BreakpointRow(Row):
+    prefix = " Breakpoint states (| separates) "
+
+    def __init__(self, mode):
+        self.mode = mode
+
+    def render(self, status, width, now=None):
+        editor = self.mode.editor
+        body = fit_edit_line(editor.head + "▏", editor.tail,
+                             max(0, width - textwidth.cell_width(self.prefix)))
+        return textwidth.fit(self.prefix + body, width)
+
+
+class BreakpointMode(Mode):
+    """Collect state names without dispatching the letters as shortcuts."""
+
+    name = "breakpoint"
+
+    def __init__(self, app, breakpoints):
+        super().__init__(app)
+        self.breakpoints = breakpoints
+        self.editor = LineEditor()
+
+    def rows(self, status):
+        return [BreakpointRow(self)]
+
+    def legend(self):
+        return [("Enter", "add / close"), ("|", "separate states"),
+                ("Esc", "clear / leave"), ("←/→", "move"), ("^U", "erase")]
+
+    def handle(self, event):
+        if not isinstance(event, termio.Key):
+            return False
+        if event.char == "\x1b":
+            if self.editor.buffer:
+                self.editor.clear()
+                self.app.note("breakpoint edit discarded — Esc again to leave")
+            else:
+                self.app.pop_mode()
+        elif event.char in ("\r", "\n"):
+            names = self.breakpoints.add(self.editor.buffer)
+            self.app.note("breakpoints: " + " | ".join(names)
+                          if names else "no breakpoints set")
+            self.app.pop_mode(discard_pending=True)
+        else:
+            self.editor.handle(event.char)
+        return True
+
+
+class BreakpointAction(Action):
+    key = "b"
+    help = "breakpoint"
+
+    def __init__(self, breakpoints):
+        self.breakpoints = breakpoints
+
+    def help_text(self, app):
+        count = len(self.breakpoints.names)
+        return f"breakpoint ({count})" if count else self.help
+
+    def run(self, app):
+        app.push_mode(BreakpointMode(app, self.breakpoints))
+
+
 class WeeklyLimitRow(Row):
     prefix = " Weekly limit (%) "
 

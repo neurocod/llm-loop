@@ -39,6 +39,7 @@ class RunStopReason(Enum):
 
     STOP_FILE = "stop_file"
     STOP_KEY = "stop_key"
+    BREAKPOINT = "breakpoint"
     LIMIT_REACHED = "limit_reached"
     NO_WORK = "no_work"
     DRIVER_STOP = "driver_stop"
@@ -93,6 +94,7 @@ class RunResult(NamedTuple):
 STOP_REASON_TEXT = {
     RunStopReason.STOP_FILE: "stop file requested",
     RunStopReason.STOP_KEY: "stop requested with the s key",
+    RunStopReason.BREAKPOINT: "state breakpoint reached",
     RunStopReason.LIMIT_REACHED: "iteration limit reached (--max-runs)",
     RunStopReason.NO_WORK: "no more work in the queue",
     RunStopReason.DRIVER_STOP: "the driver stopped the run",
@@ -109,7 +111,7 @@ STOP_REASON_TEXT = {
 # batch after batch. Membership, never `== STOP_FILE`, so a new channel here
 # reaches those wrappers by itself.
 REQUESTED_STOP_REASONS = frozenset(
-    {RunStopReason.STOP_FILE, RunStopReason.STOP_KEY})
+    {RunStopReason.STOP_FILE, RunStopReason.STOP_KEY, RunStopReason.BREAKPOINT})
 
 
 def stop_file_path() -> str:
