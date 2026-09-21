@@ -190,6 +190,7 @@ src/
     console.py       what a run prints, and the rotating mirror log that is the
                      second copy of every line of it
     stopchannel.py   how a run is asked to stop or hold, and what it reports
+    breakpoints.py   run-local state breakpoint names and matching
     projectroot.py   where the project being driven is, and the one place that
                      answers it
     gitpush.py       when a run pushes what it has committed, and where
@@ -540,7 +541,7 @@ the countdown cancels it), `p` holds it at the next iteration boundary and `p`
 again lets it go (see below), `m` sends the agent a note (see below), and in a
 parallel run `+` starts one more worker immediately. An increased worker count
 also carries into later batches of the same invocation. `h` or `?` shows the
-full key list.
+full key list. State-driven loops also expose `b`: `BreakpointAction`.
 
 `s` sets an in-process flag and writes nothing to disk, so several loops
 launched in one project root are stopped one at a time — the terminal you type
