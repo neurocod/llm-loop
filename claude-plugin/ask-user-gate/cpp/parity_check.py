@@ -107,6 +107,25 @@ EXTRA_CASES = [
     ("sed 's/a/b/' f | sed -i 's/c/d/' g", "bash", "Bash"),
     ("sed -i 's/a/b/ f", "bash", "Bash"),
     ("sed -i 's/a/b/' f", "powershell", "PowerShell"),
+    # tail -f on a task's output: the word boundary, the flag forms, the path
+    # test, the simple-command end, quoting, and a mixed refusal whose header
+    # must stay the prompt one.
+    ("/usr/bin/tail -f /t/tasks/a.output", "bash", "Bash"),
+    ("mytail -f /t/tasks/a.output", "bash", "Bash"),
+    ("timeout 400 tail -f /t/tasks/a.output | grep -m1 x", "bash", "Bash"),
+    ("tail -qf /t/tasks/a.output", "bash", "Bash"),
+    ("tail --follow=name /t/tasks/a.output", "bash", "Bash"),
+    ("tail -f -n +1 /t/tasks/a.output", "bash", "Bash"),
+    ("tail -f /t/tasks/.output", "bash", "Bash"),
+    ("tail -f tasks/a.output", "bash", "Bash"),
+    ("tail -f /t/tasks/a.output.bak", "bash", "Bash"),
+    ("tail -n 5 /t/tasks/a.output | tail -f", "bash", "Bash"),
+    ("tail -f /t/x.log; cat /t/tasks/a.output", "bash", "Bash"),
+    ("tail -f '/t/my tasks/tasks/a b.output'", "bash", "Bash"),
+    ("tail\t-f /t/tasks/a.output", "bash", "Bash"),
+    ("tail -f /t/tasks/a.output", "powershell", "PowerShell"),
+    ("cd x && tail -f /t/tasks/a.output", "bash", "Bash"),
+    ("echo яя; tail -f /t/tasks/a.output", "bash", "Monitor"),
     # Backgrounding vs the redirections that share the character.
     ("npm run dev & echo started", "bash", "Bash"),
     ("cmd |& tee log", "bash", "Bash"),
@@ -286,11 +305,15 @@ def normalise(text: str) -> str:
     case or on being relative. Only the path is erased, never the sentence --
     a port that dropped the rest of that line should still fail here.
     """
-    marker = ": this command would stop the session"
+    # One marker per header render() can print.
+    markers = (": this command would stop the session",
+               ": this command would outlive the job")
     lines = text.strip("\n").split("\n")
     for index, line in enumerate(lines):
-        if line.startswith("Blocked by ") and marker in line:
-            lines[index] = "Blocked by <gate>" + line[line.index(marker):]
+        for marker in markers:
+            if line.startswith("Blocked by ") and marker in line:
+                lines[index] = "Blocked by <gate>" + line[line.index(marker):]
+                break
     return "\n".join(lines)
 
 

@@ -8,7 +8,9 @@ refuses the ones that also move the working directory (see CD_COMMAND for why
 the rest are let through). To those it adds a quote inside unquoted braces,
 which the analyser reads as expansion obfuscation -- observed in a refusal, not
 guessed, and waiting by the clock (`sleep`, usually inside a `while` loop),
-which no allow-rule matches and which the tools make unnecessary anyway.
+which no allow-rule matches and which the tools make unnecessary anyway. One more shape is refused for a
+different reason -- not a prompt but a run that cannot end: `tail -f` on a
+background task's output file (see TASK_FOLLOW_FIX).
 Prose only reminds; this gate is the mechanism. It runs before every call that
 carries a shell command -- Bash, PowerShell and Monitor, which has its own
 `command` field and runs it in the same local shell -- and a command that
@@ -225,6 +227,37 @@ MONITOR_SLEEP_FIX = (
     "cover Monitor, so its command asks the human even when the same text "
     "would have been allowed as a Bash call.")
 
+# The one refusal that is not about a prompt. A background task's output file
+# (`<session>/tasks/<id>.output`, what `run_in_background` hands back) stops
+# growing when the task ends, but `tail -f` on it never ends -- so a Monitor
+# armed on it outlives the job, and a headless `claude -p` does not exit while
+# a Monitor of its own is alive. The loop that started the run then sits after
+# the turn's `done` line until the monitor times out. Measured, not guessed:
+# 5 of the 7 `tail -f` Monitors in this machine's transcripts (2026-09-23)
+# followed such a file, and one of them parked `refactor/runCycle.py` for 13+
+# minutes after its job had exited 0.
+#
+# Deliberately narrow: `tail -f` on a log that never ends (the dev log) is the
+# per-occurrence watch Monitor documents, and stays allowed. What is refused is
+# the pairing of a FOLLOW flag with a file whose writer is known to be finite.
+TASK_FOLLOW_FIX = (
+    "a background task's output file stops growing when the task ends, but "
+    "`tail -f` on it never ends: the watcher outlives the job, and a headless "
+    "`claude -p` run does not exit while its own Monitor or background shell is "
+    "alive, so the loop that started it stalls after `done` until the timeout.\n"
+    "       (1) you already get the task's completion notification: wait for it, "
+    "then Read the output file;\n"
+    "       (2) if you need the lines as they come, run the work in the "
+    "FOREGROUND with the tool's `timeout` parameter instead of detaching it and "
+    "following its file;\n"
+    "       (3) a SUBAGENT gets no notification from its own background job, so "
+    "for it only (2) applies.")
+
+# Where a `tail` command word may start and what ends its simple command. Kept
+# as plain character sets rather than regexes so the C++ port is a transcription.
+TAIL_WORD_BREAK = " \t\n;&|(){}"
+TAIL_COMMAND_END = "|;&\n"
+
 
 def is_windows() -> bool:
     return os.name == "nt"
@@ -305,6 +338,9 @@ class Finding:
     # Chain findings survive only when the command also moves the working
     # directory; everything else is refused on its own.
     chain: bool = False
+    # Refused because the command would outlive its job, not because it would
+    # ask. render() words the refusal for this case when it is the only one.
+    hang: bool = False
 
 
 def scan_shell_syntax(command: str, shell: str, windows: bool,
@@ -478,6 +514,83 @@ def scan_sed_in_place(command: str) -> list[Finding]:
     return []
 
 
+def is_follow_flag(token: str) -> bool:
+    """`-f`, `-F`, a short cluster carrying one (`-qf`), or `--follow[=...]`."""
+    if token == "--follow" or token.startswith("--follow="):
+        return True
+    return (len(token) > 1 and token[0] == "-" and token[1] != "-"
+            and all(c in string.ascii_letters + string.digits for c in token[1:])
+            and ("f" in token[1:] or "F" in token[1:]))
+
+
+def is_task_output(token: str) -> bool:
+    """Does the path end in `tasks/<name>.output`, either slash?"""
+    parts = token.replace("\\", "/").split("/")
+    return (len(parts) >= 2 and parts[-2] == "tasks"
+            and parts[-1].endswith(".output") and len(parts[-1]) > len(".output"))
+
+
+def tail_arguments(command: str, start: int) -> list[str]:
+    """The words of the simple command after a `tail` at `start`, unquoted.
+
+    Quotes are stripped and backslashes kept literally: the path being looked
+    for is a Windows one as often as not, and `"C:\\...\\tasks\\x.output"`
+    must reach is_task_output() with its separators.
+    """
+    tokens: list[str] = []
+    token: list[str] = []
+    started = False
+    quote = None
+    i, n = start, len(command)
+    while i < n:
+        c = command[i]
+        if quote is not None:
+            if c == quote:
+                quote = None
+            else:
+                token.append(c)
+        elif c in "'\"":
+            quote = c
+            started = True
+        elif c in TAIL_COMMAND_END:
+            break
+        elif c in " \t":
+            if started:
+                tokens.append("".join(token))
+                token, started = [], False
+        else:
+            token.append(c)
+            started = True
+        i += 1
+    if started:
+        tokens.append("".join(token))
+    return tokens
+
+
+def scan_task_follow(command: str) -> list[Finding]:
+    """`tail -f` on a background task's output file. See TASK_FOLLOW_FIX."""
+    quote = None
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote is not None:
+            if c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        elif ((i == 0 or command[i - 1] in TAIL_WORD_BREAK)
+              and command.startswith("tail", i)
+              and i + 4 < n and command[i + 4] in " \t"):
+            words = tail_arguments(command, i + 4)
+            if (any(is_follow_flag(word) for word in words)
+                    and any(is_task_output(word) for word in words)):
+                return [Finding(
+                    f"following a background task's output file with "
+                    f"`tail -f` (at offset {i})", TASK_FOLLOW_FIX, hang=True)]
+        i += 1
+    return []
+
+
 def scan(command: str, shell: str, windows: "bool | None" = None,
          tool: str = "Bash") -> list[Finding]:
     """All reasons this command would stop for a human, or an empty list."""
@@ -510,6 +623,7 @@ def scan(command: str, shell: str, windows: "bool | None" = None,
     findings.extend(scan_shell_syntax(command, shell, windows, sleep_fix))
     if shell == "bash":
         findings.extend(scan_sed_in_place(command))
+        findings.extend(scan_task_follow(command))
     return findings
 
 
@@ -519,8 +633,15 @@ def render(findings: list[Finding]) -> str:
     # loose hook on another, so a literal path lies on half of them -- and the
     # bare basename, while greppable, does not tell a reader who has never seen
     # this plugin where the thing refusing their command lives.
-    lines = [f"Blocked by {SELF}: this command would stop "
-             f"the session on a permission prompt, so it was not run.", ""]
+    # A refusal made only of `hang` findings is not about a prompt, and saying
+    # it is sends the reader after the wrong cause.
+    hang_only = all(finding.hang for finding in findings)
+    if hang_only:
+        lines = [f"Blocked by {SELF}: this command would outlive "
+                 f"the job it watches, so it was not run.", ""]
+    else:
+        lines = [f"Blocked by {SELF}: this command would stop "
+                 f"the session on a permission prompt, so it was not run.", ""]
     said: set[str] = set()  # several findings usually share one remedy
     for finding in findings:
         lines.append(f"  - {finding.reason}")
@@ -528,10 +649,15 @@ def render(findings: list[Finding]) -> str:
             said.add(finding.fix)
             lines.append(f"    -> {finding.fix}")
     lines.append("")
-    lines.append("If you want this exact command anyway and accept that the "
-                 "user will be asked, add the marker `allowAskUser` to it "
-                 "(e.g. append ` # allowAskUser`) and it will be passed "
-                 "through unchanged.")
+    if hang_only:
+        lines.append("If you want this exact command anyway, add the marker "
+                     "`allowAskUser` to it (e.g. append ` # allowAskUser`) and "
+                     "it will be passed through unchanged.")
+    else:
+        lines.append("If you want this exact command anyway and accept that "
+                     "the user will be asked, add the marker `allowAskUser` to "
+                     "it (e.g. append ` # allowAskUser`) and it will be passed "
+                     "through unchanged.")
     return "\n".join(lines)
 
 
@@ -596,6 +722,18 @@ SELF_TEST_CASES = [
      "Monitor"),
     ("tail -f webgame/.devlogs/latest.log | grep --line-buffered ERROR",
      "bash", False, "Monitor"),
+    # ... but following a background TASK's output outlives the task. The first
+    # case is the one that parked refactor/runCycle.py (2026-09-23).
+    ("tail -n +1 -f \"C:/Users/u/AppData/Local/Temp/claude/p/s/tasks/"
+     "b4w56u3jv.output\" | grep --line-buffered -E \"^=== |FAIL|Error\"",
+     "bash", True, "Monitor"),
+    ("tail -f \"C:\\Users\\u\\Temp\\claude\\p\\s\\tasks\\bx0m50hmb.output\" "
+     "| grep -E --line-buffered PASS", "bash", True, "Monitor"),
+    ("tail -F /tmp/claude/s/tasks/br3nn9dju.output", "bash", True),
+    ("tail -n 40 /tmp/claude/s/tasks/br3nn9dju.output", "bash", False),
+    ("tail -f webgame/tasks/notes.md", "bash", False, "Monitor"),
+    ("echo 'tail -f /tmp/s/tasks/x.output'", "bash", False),
+    ("tail -f /tmp/s/tasks/x.output # allowAskUser", "bash", False, "Monitor"),
 ]
 
 

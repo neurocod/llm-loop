@@ -9,6 +9,9 @@ missing it: a chain that also moves the working directory, backgrounding `&`,
 a command over the analyser's 10 000-character limit, a heredoc or PowerShell
 here-string (a file written by the command body), `sed -i`, a quote inside
 unquoted `{ }`, and waiting by the clock (`sleep`, usually inside a `while`).
+An eighth is refused for a different reason -- not a prompt but a run that
+cannot end: `tail -f` on a background task's output file, which outlives the
+task and keeps a headless `claude -p` from exiting.
 Why each one is on the list — and why the list is deliberately short — is in the
 module docstring of `hooks/ask_user_gate.py`.
 

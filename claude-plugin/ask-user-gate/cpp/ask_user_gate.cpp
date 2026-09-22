@@ -239,6 +239,17 @@ constexpr std::string_view kMonitorSleepFix = R"GATE(a one-shot wait (`break` wh
        (2) if you are a SUBAGENT, this is the only option: background events do not re-invoke you, so a Monitor armed by a subagent notifies nobody and only burns its timeout. A wait longer than the foreground cap is the orchestrator's work -- report and hand it back.
        Note also that allow-rules are written `Bash(...)` and do not cover Monitor, so its command asks the human even when the same text would have been allowed as a Bash call.)GATE";
 
+// TASK_FOLLOW_FIX: the refusal that is not about a prompt -- `tail -f` on a
+// background task's output file outlives the task. Rationale in the reference.
+constexpr std::string_view kTaskFollowFix = R"GATE(a background task's output file stops growing when the task ends, but `tail -f` on it never ends: the watcher outlives the job, and a headless `claude -p` run does not exit while its own Monitor or background shell is alive, so the loop that started it stalls after `done` until the timeout.
+       (1) you already get the task's completion notification: wait for it, then Read the output file;
+       (2) if you need the lines as they come, run the work in the FOREGROUND with the tool's `timeout` parameter instead of detaching it and following its file;
+       (3) a SUBAGENT gets no notification from its own background job, so for it only (2) applies.)GATE";
+
+// TAIL_WORD_BREAK / TAIL_COMMAND_END.
+constexpr std::string_view kTailWordBreak = " \t\n;&|(){}";
+constexpr std::string_view kTailCommandEnd = "|;&\n";
+
 constexpr std::string_view kChainFix = R"GATE(this chain also moves the working directory, so where the rest of it runs stops being a static fact and no relative path in it can be resolved. Name the directory with the tool's own flag (--cwd / --prefix / -C) or an absolute path instead of `cd X && ...`, and keep one command per call.)GATE";
 
 constexpr std::string_view kChainFixWindowsNote = R"GATE( On Windows this one is unappealable: the write target is relative, and under Git Bash the working directory a chain ends in cannot be determined statically, so the analyser cannot check that target and refuses to delegate the decision at all.)GATE";
@@ -448,6 +459,9 @@ struct Finding {
 	// Chain findings survive only when the command also moves the working
 	// directory; everything else is refused on its own.
 	bool chain = false;
+	// Refused because the command would outlive its job, not because it would
+	// ask. render() words the refusal for this case when it is the only one.
+	bool hang = false;
 };
 
 // Walk the command outside quotes, reporting separators and heredocs. Quote
@@ -735,6 +749,105 @@ std::vector<Finding> scanSedInPlace(const std::string& command) {
 	return {};
 }
 
+// is_follow_flag: `-f`, `-F`, a short cluster carrying one, or `--follow[=...]`.
+bool isFollowFlag(std::string_view token) {
+	if (token == "--follow" || startsWith(token, "--follow="))
+		return true;
+	if (token.size() < 2 || token[0] != '-' || token[1] == '-')
+		return false;
+	bool follow = false;
+	for (size_t i = 1; i < token.size(); ++i) {
+		const char c = token[i];
+		const bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+		if (!alnum)
+			return false;
+		if (c == 'f' || c == 'F')
+			follow = true;
+	}
+	return follow;
+}
+
+// is_task_output: does the path end in `tasks/<name>.output`, either slash?
+bool isTaskOutput(std::string_view token) {
+	std::string path(token);
+	std::replace(path.begin(), path.end(), '\\', '/');
+	const size_t last = path.rfind('/');
+	if (last == std::string::npos)
+		return false;
+	const std::string_view name = std::string_view(path).substr(last + 1);
+	const std::string_view parent = std::string_view(path).substr(0, last);
+	const size_t before = parent.rfind('/');
+	const std::string_view dir = before == std::string_view::npos ? parent : parent.substr(before + 1);
+	static constexpr std::string_view suffix = ".output";
+	return dir == "tasks" && name.size() > suffix.size() && endsWith(name, suffix);
+}
+
+// tail_arguments: the words of the simple command after a `tail` at `start`,
+// quotes stripped and backslashes kept literally.
+std::vector<std::string> tailArguments(const std::string& command, size_t start) {
+	std::vector<std::string> tokens;
+	std::string token;
+	bool started = false;
+	char quote = '\0';
+	for (size_t i = start; i < command.size(); ++i) {
+		const char c = command[i];
+		if (quote != '\0') {
+			if (c == quote)
+				quote = '\0';
+			else
+				token.push_back(c);
+		} else if (c == '\'' || c == '"') {
+			quote = c;
+			started = true;
+		} else if (kTailCommandEnd.find(c) != std::string_view::npos) {
+			break;
+		} else if (c == ' ' || c == '\t') {
+			if (started) {
+				tokens.push_back(token);
+				token.clear();
+				started = false;
+			}
+		} else {
+			token.push_back(c);
+			started = true;
+		}
+	}
+	if (started)
+		tokens.push_back(token);
+	return tokens;
+}
+
+// scan_task_follow: `tail -f` on a background task's output file.
+std::vector<Finding> scanTaskFollow(const std::string& command) {
+	char quote = '\0';
+	const size_t n = command.size();
+	for (size_t i = 0; i < n; ++i) {
+		const char c = command[i];
+		if (quote != '\0') {
+			if (c == quote)
+				quote = '\0';
+		} else if (c == '\'' || c == '"') {
+			quote = c;
+		} else if ((i == 0 || kTailWordBreak.find(command[i - 1]) != std::string_view::npos)
+				&& command.compare(i, 4, "tail") == 0
+				&& i + 4 < n && (command[i + 4] == ' ' || command[i + 4] == '\t')) {
+			const std::vector<std::string> words = tailArguments(command, i + 4);
+			const bool follow = std::any_of(words.begin(), words.end(),
+				[](const std::string& word) { return isFollowFlag(word); });
+			const bool task = std::any_of(words.begin(), words.end(),
+				[](const std::string& word) { return isTaskOutput(word); });
+			if (follow && task) {
+				Finding finding{"following a background task's output file with `tail -f` (at offset "
+					+ std::to_string(codePointCount(std::string_view(command).substr(0, i))) + ")",
+					std::string(kTaskFollowFix), false};
+				finding.hang = true;
+				return {finding};
+			}
+		}
+	}
+	return {};
+}
+
 // All reasons this command would stop for a human, or an empty list.
 std::vector<Finding> scan(const std::string& command, std::string_view shell,
 		std::optional<bool> windows = std::nullopt, std::string_view tool = "Bash") {
@@ -755,6 +868,8 @@ std::vector<Finding> scan(const std::string& command, std::string_view shell,
 	if (shell == "bash") {
 		const std::vector<Finding> sed = scanSedInPlace(command);
 		findings.insert(findings.end(), sed.begin(), sed.end());
+		const std::vector<Finding> follow = scanTaskFollow(command);
+		findings.insert(findings.end(), follow.begin(), follow.end());
 	}
 	return findings;
 }
@@ -764,8 +879,14 @@ std::string render(const std::vector<Finding>& findings) {
 	// Resolved, not hardcoded: the same gate is a plugin on one machine and a
 	// loose hook on another, and a reader who has never seen this plugin needs
 	// to know where the thing refusing their command lives.
-	std::string out = "Blocked by " + kSelf + ": this command would stop the session on a "
-		"permission prompt, so it was not run.\n\n";
+	// A refusal made only of `hang` findings is not about a prompt.
+	const bool hangOnly = std::all_of(findings.begin(), findings.end(),
+		[](const Finding& finding) { return finding.hang; });
+	std::string out = hangOnly
+		? "Blocked by " + kSelf + ": this command would outlive the job it watches, so it was "
+			"not run.\n\n"
+		: "Blocked by " + kSelf + ": this command would stop the session on a permission prompt, "
+			"so it was not run.\n\n";
 	std::vector<std::string> said;  // several findings usually share one remedy
 	for (const Finding& finding : findings) {
 		out += "  - " + finding.reason + "\n";
@@ -774,9 +895,12 @@ std::string render(const std::vector<Finding>& findings) {
 			out += "    -> " + finding.fix + "\n";
 		}
 	}
-	out += "\nIf you want this exact command anyway and accept that the user will be asked, add "
-		"the marker `allowAskUser` to it (e.g. append ` # allowAskUser`) and it will be passed "
-		"through unchanged.";
+	out += hangOnly
+		? "\nIf you want this exact command anyway, add the marker `allowAskUser` to it (e.g. "
+			"append ` # allowAskUser`) and it will be passed through unchanged."
+		: "\nIf you want this exact command anyway and accept that the user will be asked, add "
+			"the marker `allowAskUser` to it (e.g. append ` # allowAskUser`) and it will be passed "
+			"through unchanged.";
 	return out;
 }
 
@@ -1167,6 +1291,16 @@ std::vector<SelfTestCase> selfTestCases() {
 		{"while true; do if ! tasklist //FI \"IMAGENAME eq node.exe\" | grep -qi node.exe; then "
 			"echo done; break; fi; sleep 10; done", "bash", true, "Monitor"},
 		{"tail -f webgame/.devlogs/latest.log | grep --line-buffered ERROR", "bash", false, "Monitor"},
+		// ... but following a background TASK's output outlives the task.
+		{"tail -n +1 -f \"C:/Users/u/AppData/Local/Temp/claude/p/s/tasks/b4w56u3jv.output\" | grep "
+			"--line-buffered -E \"^=== |FAIL|Error\"", "bash", true, "Monitor"},
+		{"tail -f \"C:\\Users\\u\\Temp\\claude\\p\\s\\tasks\\bx0m50hmb.output\" | grep -E "
+			"--line-buffered PASS", "bash", true, "Monitor"},
+		{"tail -F /tmp/claude/s/tasks/br3nn9dju.output", "bash", true},
+		{"tail -n 40 /tmp/claude/s/tasks/br3nn9dju.output", "bash", false},
+		{"tail -f webgame/tasks/notes.md", "bash", false, "Monitor"},
+		{"echo 'tail -f /tmp/s/tasks/x.output'", "bash", false},
+		{"tail -f /tmp/s/tasks/x.output # allowAskUser", "bash", false, "Monitor"},
 	};
 }
 
