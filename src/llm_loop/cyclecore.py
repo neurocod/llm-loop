@@ -840,14 +840,15 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # reason returned here is latched and this turn still runs.
             handback_reason = handback_reason or driver.item_started(command)
 
-            if provider == "claude":
-                returncode = run_claude_streaming(
-                    cmd, raw, partial=True, prompt=command.prompt,
-                    mailbox=mailbox)
-            else:
-                returncode = run_agent_streaming(
-                    cmd, provider, raw, partial=False, prompt=command.prompt,
-                    mailbox=mailbox)
+            with statusline.describing(app.job(1)):
+                if provider == "claude":
+                    returncode = run_claude_streaming(
+                        cmd, raw, partial=True, prompt=command.prompt,
+                        mailbox=mailbox)
+                else:
+                    returncode = run_agent_streaming(
+                        cmd, provider, raw, partial=False, prompt=command.prompt,
+                        mailbox=mailbox)
             app.job(1).finish()
             app.update(phase="idle")
 

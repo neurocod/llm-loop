@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import cmdline, console, gitpush, stopchannel, termio, textwidth
+from . import cmdline, console, gitpush, stopchannel, termio, textwidth, wire
 
 __all__ = [
     "Action",
@@ -82,8 +82,11 @@ __all__ = [
     "StopAction",
     "StopSegment",
     "colorize",
+    "describing",
     "format_elapsed",
     "format_prompt_block",
+    "format_token_count",
+    "observe_claude_event",
     "pause_state",
     "push_quotas",
     "quota_rows",
@@ -345,9 +348,27 @@ class Job:
     model: str = ""             # model ID after resolving the step's provider
     prompt: str = ""            # full prompt in flight (wave 4 shows it)
     started_at: float = 0.0     # start of the CURRENT iteration, 0.0 when idle
+    # What the CLI says it actually runs: `model` is the selector the script
+    # asked for (`opus`), this is the ID its init event resolves it to
+    # (`claude-opus-5-5`). Empty until that event arrives.
+    resolved_model: str = ""
+    # Tokens, from the first `result` event — the stream states it nowhere
+    # earlier, so the row gains it only after the first turn has ended.
+    context_window: Optional[int] = None
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
+
+    def model_label(self) -> str:
+        """The model as the rows show it: `claude-opus-5-5 · 1M`.
+
+        The window is left off an ID that already carries the CLI's tag for it
+        (`claude-opus-5-5[1m]`), since it would say the same thing twice.
+        """
+        name = self.resolved_model or self.model or CLI_DEFAULT_MODEL
+        if self.context_window and "[" not in name:
+            name = f"{name} · {format_token_count(self.context_window)}"
+        return name
 
     def elapsed(self, now: Optional[float] = None) -> Optional[float]:
         """Duration of the iteration running RIGHT NOW (None when idle).
@@ -367,6 +388,8 @@ class Job:
             self.iteration = (self.iteration + 1) if iteration is None else iteration
             self.item = item
             self.model = model or ""
+            self.resolved_model = ""
+            self.context_window = None
             self.prompt = prompt
             self.started_at = time.time() if now is None else now
             self.running = True
@@ -379,14 +402,80 @@ class Job:
 
     def update(self, **fields) -> None:
         with self._lock:
+            # A new selector makes the resolved ID describe the wrong model: the
+            # sequential loop names the next step's model while the row is idle,
+            # before `start` would clear it.
+            if "model" in fields and fields["model"] != self.model:
+                self.resolved_model = ""
+                self.context_window = None
             for name, value in fields.items():
                 setattr(self, name, value)
+
+    def observe_claude_event(self, ev: dict) -> None:
+        """Take the resolved model and its window from Claude's own stream."""
+        if wire.is_session_start(ev):
+            model = wire.session_model(ev)
+            if model != "?":
+                with self._lock:
+                    self.resolved_model = model
+        elif wire.event_type(ev) == wire.RESULT:
+            with self._lock:
+                window = wire.result_context_window(
+                    ev, self.resolved_model or self.model)
+                if window is not None:
+                    self.context_window = window
 
     def snapshot(self) -> "Job":
         """A detached copy, so one painted row cannot mix two iterations."""
         with self._lock:
             return Job(self.job_id, self.running, self.iteration, self.item,
-                       self.model, self.prompt, self.started_at)
+                       self.model, self.prompt, self.started_at,
+                       self.resolved_model, self.context_window)
+
+
+# The Job whose row describes the stream THIS thread is reading. Both renderers
+# know only the stream, not the row: the sequential one is a module with one run
+# in flight, the parallel one is `run_job(job_id, command, mailbox)` on a worker
+# thread. The Job travels by binding rather than by argument because two dozen
+# test doubles of those two functions pin their exact signatures, and a keyword
+# added to every call would break each of them for a cosmetic feature. The
+# caller that starts the Job binds it around the render (`describing`).
+_stream_job = threading.local()
+
+
+@contextmanager
+def describing(job: "Job"):
+    """Route `observe_claude_event` on this thread to `job` for the block."""
+    previous = getattr(_stream_job, "job", None)
+    _stream_job.job = job
+    try:
+        yield job
+    finally:
+        _stream_job.job = previous
+
+
+def observe_claude_event(ev: dict) -> None:
+    """Feed one Claude stream event to the Job bound on this thread, if any.
+
+    Never raises: this is the status line's read of a stream the run needs, and
+    a cosmetic feature must not be able to end it (see the module docstring).
+    """
+    job = getattr(_stream_job, "job", None)
+    if job is None:
+        return
+    try:
+        job.observe_claude_event(ev)
+    except Exception:
+        pass
+
+
+def format_token_count(tokens: int) -> str:
+    """1000000 -> "1M", 200000 -> "200k": a context window at a glance."""
+    if tokens >= 1_000_000 and tokens % 100_000 == 0:
+        return f"{tokens / 1_000_000:g}M"
+    if tokens >= 1_000:
+        return f"{tokens // 1_000}k"
+    return str(tokens)
 
 
 class QuotaRow(NamedTuple):
@@ -671,8 +760,7 @@ class ProviderSegment(Segment):
 
     def text(self, status, now=None):
         if len(status.jobs) == 1:
-            model = status.jobs[0].model or CLI_DEFAULT_MODEL
-            return f"{status.provider}/{model}"
+            return f"{status.provider}/{status.jobs[0].model_label()}"
         return status.provider
 
 
@@ -874,7 +962,7 @@ class JobRow(Row):
         self.job_id = job_id
 
     def model_width(self, status: LoopStatus) -> int:
-        widths = [textwidth.cell_width(job.model or CLI_DEFAULT_MODEL)
+        widths = [textwidth.cell_width(job.model_label())
                   for job in status.jobs]
         return min(self.model_width_max, max(widths, default=0))
 
@@ -890,7 +978,7 @@ class JobRow(Row):
             return ""
         glyph = "▶" if job.running else "·"
         item = job.item if (job.running and job.item) else "idle"
-        model = job.model or CLI_DEFAULT_MODEL
+        model = job.model_label()
         elapsed = format_elapsed(job.elapsed(now))
         # Same separator as every other row (the leading columns stay padded, so
         # the job rows still line up under each other with -j N).

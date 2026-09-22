@@ -213,6 +213,37 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
     assert app.status.iteration == 3     # the run's own counter, not a job's
 
 
+def test_each_worker_row_learns_the_model_its_own_stream_resolved(tmp_path,
+                                                                  monkeypatch):
+    """The worker binds its Job around `run_job`, so a stream's init event lands
+    on THAT worker's row — never on a neighbour's, with three streams at once."""
+    made = _live_statusline(monkeypatch, {})
+    running = threading.Barrier(2, timeout=5)
+
+    def stream(job_id, command, mailbox=None):
+        sl.observe_claude_event({"type": "system", "subtype": "init",
+                                 "model": f"claude-test-{job_id}"})
+        running.wait()          # both streams in flight before either reports
+        sl.observe_claude_event({"type": "result", "modelUsage": {
+            f"claude-test-{job_id}": {"contextWindow": 200_000 * job_id}}})
+        frozen = made["app"].status.snapshot()
+        labels[job_id] = [j for j in frozen.jobs
+                          if j.job_id == job_id][0].model_label()
+        return 0, 0.0, 0.01
+
+    labels = {}
+    monkeypatch.setattr(parallel, "run_job", stream)
+    previous = projectroot.project_dir()
+    try:
+        parallel.run_parallel(_MemDriver(["products/a.md", "products/b.md"]),
+                              _args(str(tmp_path), jobs=2),
+                              app_name="pytest-parallel-statusline")
+    finally:
+        projectroot.set_project_root(previous)
+
+    assert labels == {1: "claude-test-1 · 200k", 2: "claude-test-2 · 400k"}
+
+
 def test_plus_starts_another_worker_and_adds_its_live_surfaces(tmp_path,
                                                                monkeypatch):
     """`+` widens the running pool, status rows and message addresses together."""

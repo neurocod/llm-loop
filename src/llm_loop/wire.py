@@ -139,6 +139,25 @@ def session_model(ev: dict) -> str:
     return ev.get("model", "?")
 
 
+def result_context_window(ev: dict, model: str) -> Optional[int]:
+    """`model`'s context window as a `result` event's `modelUsage` reports it.
+
+    The init event names the model with the CLI's `[1m]` tag when that alias was
+    asked for (`claude-opus-5-5[1m]`), while `modelUsage` keys the same model
+    bare (`claude-opus-5-5`) — measured 2026-09-22 — so the tag is stripped for
+    the second lookup. A lone entry is taken as is: an init event can be missed
+    (a stream joined late), and one model is then the only candidate anyway.
+    """
+    usage = ev.get("modelUsage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+    entry = usage.get(model) or usage.get(model.split("[", 1)[0])
+    if entry is None and len(usage) == 1:
+        entry = next(iter(usage.values()))
+    window = entry.get("contextWindow") if isinstance(entry, dict) else None
+    return window if isinstance(window, int) and window > 0 else None
+
+
 def is_session_start(ev: dict) -> bool:
     """True for the one event that opens a Claude session."""
     return event_type(ev) == SYSTEM and ev.get("subtype") == SUBTYPE_INIT

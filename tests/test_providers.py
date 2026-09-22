@@ -7,7 +7,8 @@ import sys
 import pytest
 
 from llm_loop import (codex_usage, compactline, console, cyclecore, limits,
-                      parallel, providers, streamrender, textwidth, wire)
+                      parallel, providers, statusline, streamrender, textwidth,
+                      wire)
 from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
@@ -445,6 +446,36 @@ def test_parallel_runner_ignores_non_object_json(monkeypatch, line):
 
     command = AgentCommand("parallel prompt", "gpt-test", "job", "codex")
     assert parallel.run_job(1, command) == (0, None, None)
+
+
+# Both lines as the CLI writes them (shape measured 2026-09-22), trimmed.
+_CLAUDE_MODEL_STREAM = "".join(json.dumps(ev) + "\n" for ev in [
+    {"type": "system", "subtype": "init", "model": "claude-opus-5-5"},
+    {"type": "result", "subtype": "success", "is_error": False,
+     "total_cost_usd": 0.01, "duration_ms": 1000,
+     "modelUsage": {"claude-opus-5-5": {"contextWindow": 1000000}}},
+])
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_both_renderers_tell_the_bound_job_what_the_cli_runs(
+        monkeypatch, no_live_messages, capsys, runner):
+    """The init and result events reach the row the caller bound — through the
+    real stream loop of each runner, not a stub of it."""
+    def fake_start(*args):
+        return _FakeAgentProcess(has_stdin=False, stdout=_CLAUDE_MODEL_STREAM)
+
+    job = statusline.Job(model="opus")
+    with statusline.describing(job):
+        if runner == "sequential":
+            monkeypatch.setattr(streamrender, "start_agent_process", fake_start)
+            assert streamrender.run_agent_streaming(["claude"], "claude",
+                                                    raw=True) == 0
+        else:
+            monkeypatch.setattr(parallel, "start_agent_process", fake_start)
+            assert parallel.run_job(1, AgentCommand("p", "opus", "j"))[0] == 0
+
+    assert job.model_label() == "claude-opus-5-5 · 1M"
 
 
 # --- the sequential runner owes its child an ending too --------------------------

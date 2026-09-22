@@ -2007,3 +2007,100 @@ def test_capture_only_diverts_the_thread_that_asked_for_it(capsys):
     assert "".join(chunks) == "mine\n"
     assert capsys.readouterr().out == "from another thread\n"
     assert not isinstance(sys.stdout, sl._ThreadScopedCapture)   # uninstalled
+
+
+# --- the model the CLI actually runs ------------------------------------------
+
+_INIT_OPUS = {"type": "system", "subtype": "init", "model": "claude-opus-5-5"}
+# Shape measured 2026-09-22 from `claude -p --model opus --output-format stream-json`.
+_RESULT_1M = {"type": "result", "modelUsage": {
+    "claude-opus-5-5": {"contextWindow": 1_000_000, "maxOutputTokens": 128_000}}}
+
+
+def test_a_job_shows_the_resolved_model_then_its_window():
+    job = sl.Job(model="opus")
+    assert job.model_label() == "opus"            # before the stream says more
+
+    job.observe_claude_event(_INIT_OPUS)
+    assert job.model_label() == "claude-opus-5-5"
+
+    job.observe_claude_event(_RESULT_1M)
+    assert job.model_label() == "claude-opus-5-5 · 1M"
+    assert job.snapshot().model_label() == "claude-opus-5-5 · 1M"
+
+
+def test_a_tagged_id_finds_its_bare_usage_entry_and_does_not_repeat_it():
+    """`opus[1m]` resolves to `claude-opus-5-5[1m]`, but `modelUsage` keys it
+    bare; the tag already says the window, so it is not printed twice."""
+    job = sl.Job(model="opus[1m]")
+    job.observe_claude_event(dict(_INIT_OPUS, model="claude-opus-5-5[1m]"))
+    job.observe_claude_event(_RESULT_1M)
+
+    assert job.context_window == 1_000_000
+    assert job.model_label() == "claude-opus-5-5[1m]"
+
+
+def test_a_new_selector_or_iteration_forgets_the_resolved_model():
+    job = sl.Job(model="opus")
+    job.observe_claude_event(_INIT_OPUS)
+    job.observe_claude_event(_RESULT_1M)
+
+    job.update(model="opus")                      # same selector: kept
+    assert job.model_label() == "claude-opus-5-5 · 1M"
+    job.update(model="sonnet")
+    assert job.model_label() == "sonnet"
+
+    job.observe_claude_event(_INIT_OPUS)
+    job.start(model="opus")
+    assert job.model_label() == "opus"
+
+
+@pytest.mark.parametrize("tokens,text", [
+    (1_000_000, "1M"), (1_500_000, "1.5M"), (200_000, "200k"), (512, "512")])
+def test_token_counts_read_at_a_glance(tokens, text):
+    assert sl.format_token_count(tokens) == text
+
+
+def test_an_unbound_thread_or_a_malformed_event_changes_nothing():
+    sl.observe_claude_event(_INIT_OPUS)           # no Job bound: a no-op
+    job = sl.Job(model="opus")
+    with sl.describing(job):
+        sl.observe_claude_event({"type": "result", "modelUsage": "garbage"})
+        sl.observe_claude_event({"type": "system", "subtype": "init"})
+    sl.observe_claude_event(_INIT_OPUS)           # unbound again after the block
+
+    assert job.model_label() == "opus"
+
+
+def test_the_sequential_row_shows_what_the_stream_resolved(monkeypatch, tmp_path):
+    """run_loop binds its one Job around the stream it renders."""
+    from llm_loop import cyclecore
+    from llm_loop.agentwork import AgentCommand, Driver
+
+    class _OneShot(Driver):
+        calls = 0
+
+        def next_command(self):
+            self.calls += 1
+            return AgentCommand("work", "opus", "item") if self.calls == 1 else None
+
+    rendered = []
+
+    def stream(cmd, raw, partial, prompt="", mailbox=None):
+        sl.observe_claude_event(_INIT_OPUS)
+        sl.observe_claude_event(_RESULT_1M)
+        rendered.append(" ".join(apps[0].render(200)))
+        return 0
+
+    apps = []
+
+    def on_app(app):
+        # Here rather than before the call: `_run_with_status` installs its own
+        # stream stub first, and this one has to replace it.
+        apps.append(app)
+        monkeypatch.setattr(cyclecore, "run_claude_streaming", stream)
+
+    _run_with_status(monkeypatch, tmp_path, _OneShot(), on_app=on_app)
+
+    assert len(rendered) == 1
+    assert "claude/claude-opus-5-5 · 1M" in rendered[0]

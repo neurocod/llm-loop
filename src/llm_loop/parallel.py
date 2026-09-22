@@ -423,6 +423,9 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                 if not isinstance(ev, dict):
                     continue  # valid JSON can still be a diagnostic, not an event
                 et = wire.event_type(ev)
+                if provider != "codex":
+                    # The row's resolved model and window (see `statusline.describing`).
+                    statusline.observe_claude_event(ev)
                 if provider == "codex":
                     codex_outcome.observe(ev)
                     if et in (wire.TURN_COMPLETED, wire.TURN_FAILED):
@@ -1140,7 +1143,8 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # spliced in, the row already announced.
             note_driver_handback(job_id, shared,
                                  shared.driver.item_started(command))
-            rc, cost_usd, dur = run_job(job_id, command, mailbox)
+            with statusline.describing(job):
+                rc, cost_usd, dur = run_job(job_id, command, mailbox)
         except BaseException:
             # Hand the claim back (see `Shared.abandon` for which way and why),
             # then let the exception go on ending the thread it was always going

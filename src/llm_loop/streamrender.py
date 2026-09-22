@@ -28,7 +28,7 @@ import json
 import sys
 from typing import Optional
 
-from . import compactline, projectroot, wire
+from . import compactline, projectroot, statusline, wire
 from .console import (
     LINES,
     MarkdownStream,
@@ -313,6 +313,9 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                     print(line)
                     continue
                 event_type = wire.event_type(ev)
+                if provider == "claude":
+                    # Before `raw`, so a raw run's row learns the model too.
+                    statusline.observe_claude_event(ev)
                 if provider == "codex":
                     codex_outcome.observe(ev)
                 if (provider == "claude" and event_type == wire.RESULT
