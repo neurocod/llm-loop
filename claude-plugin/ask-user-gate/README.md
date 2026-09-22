@@ -92,7 +92,8 @@ regular expressions, v3.11.0), is vendored as `cpp/third_party/ctre.hpp`, so
 the port spells the reference's regexes as the reference does instead of
 transcribing them by hand. What it cost, measured 2026-09-23 on one machine
 (hook mode, one payload, 200 interleaved runs each): image 293 → 326 KiB,
-start median 3.05 → 3.14 ms.
+start median 3.05 → 3.14 ms; after the JSON reader also dropped `strtod`,
+316 KiB and 2.98 ms — the start moves within noise.
 
 The JSON reader stays hand-written, by measurement rather than taste. A
 drop-in has to reject what `json.load` rejects, or a malformed payload is

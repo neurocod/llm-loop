@@ -111,7 +111,6 @@ bool isSpaceChar(char c) {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }
 
-bool isDigitChar(char c) { return c >= '0' && c <= '9'; }
 
 // `len(command)` in Python counts code points; std::string counts bytes. The
 // two only differ above the analyser's limit and in reported offsets, but an
@@ -831,7 +830,6 @@ struct Json {
 	enum class Type { Null, Bool, Number, String, Array, Object };
 	Type type = Type::Null;
 	bool boolean = false;
-	double number = 0;
 	std::string text;
 	std::vector<Json> items;
 	std::vector<std::pair<std::string, Json>> members;
@@ -967,6 +965,10 @@ private:
 				++index_;
 				return true;
 			}
+			// json.load is strict by default: a raw control character inside a
+			// string is an error there, so it must be one here.
+			if (static_cast<unsigned char>(c) < 0x20)
+				return false;
 			if (c != '\\') {
 				out.push_back(c);
 				++index_;
@@ -1094,21 +1096,23 @@ private:
 			out.type = Json::Type::Null;
 			return literal("null");
 		}
-		// The number's extent is measured and copied before strtod sees it.
-		// strtod reads to a NUL, and a string_view carries no promise of one --
-		// true today only because both callers hand in a std::string.
+		// Numbers are accepted exactly as json.load accepts them: its NUMBER_RE,
+		// plus the three constants it takes by default. A laxer reader (strtod
+		// took `+1`, `01`, `1.`) denied payloads the reference fails open on,
+		// and refusing NaN passed ones it denies. The value itself is never read.
 		out.type = Json::Type::Number;
-		size_t end = index_;
-		while (end < source_.size() && (isDigitChar(source_[end]) || source_[end] == '-'
-				|| source_[end] == '+' || source_[end] == '.' || source_[end] == 'e'
-				|| source_[end] == 'E'))
-			++end;
-		const std::string token(source_.substr(index_, end - index_));
-		char* stopped = nullptr;
-		out.number = std::strtod(token.c_str(), &stopped);
-		if (!stopped || stopped == token.c_str())
+		const std::string_view rest = source_.substr(index_);
+		for (std::string_view constant : {std::string_view("NaN"), std::string_view("Infinity"),
+				std::string_view("-Infinity")}) {
+			if (startsWith(rest, constant)) {
+				index_ += constant.size();
+				return true;
+			}
+		}
+		const auto number = ctre::starts_with<R"(-?(?:0|[1-9]\d*+)(?:\.\d++)?+(?:[eE][+\-]?\d++)?+)">(rest);
+		if (!number)
 			return false;
-		index_ += static_cast<size_t>(stopped - token.c_str());
+		index_ += number.size();
 		return true;
 	}
 };

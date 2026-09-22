@@ -245,6 +245,22 @@ HOOK_CASES = [
      b'{\x0b"tool_name":"Bash","tool_input":{"command":"cd x && ls"}}'),
     ("form feed as json whitespace",
      b'{\x0c"tool_name":"Bash","tool_input":{"command":"cd x && ls"}}'),
+    # json.load is strict about control characters in strings and about the
+    # number grammar, yet takes NaN and +-Infinity. The port's first reader got
+    # all seven of these backwards: a strtod-shaped number scan took `+1`, `01`
+    # and `1.`, and a raw tab went into the string.
+    ("raw tab in command",
+     b'{"tool_name":"Bash","tool_input":{"command":"cd x\t&& ls"}}'),
+    ("raw tab in another value",
+     b'{"tool_name":"Bash","x":"a\tb","tool_input":{"command":"cd x && ls"}}'),
+    ("NaN", b'{"tool_name":"Bash","x":NaN,"tool_input":{"command":"cd x && ls"}}'),
+    ("-Infinity", b'{"tool_name":"Bash","x":-Infinity,'
+                  b'"tool_input":{"command":"cd x && ls"}}'),
+    ("leading zero", b'{"tool_name":"Bash","x":01,"tool_input":{"command":"cd x && ls"}}'),
+    ("trailing dot", b'{"tool_name":"Bash","x":1.,"tool_input":{"command":"cd x && ls"}}'),
+    ("plus sign", b'{"tool_name":"Bash","x":+1,"tool_input":{"command":"cd x && ls"}}'),
+    ("full number grammar", b'{"tool_name":"Bash","x":[-0.5e+3,0,10E-2,-0],'
+                            b'"tool_input":{"command":"cd x && ls"}}'),
 ]
 
 
