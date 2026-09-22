@@ -394,6 +394,18 @@ class Job:
             self.started_at = time.time() if now is None else now
             self.running = True
 
+    def select(self, model: str) -> None:
+        """Name the NEXT step's model while the row is still idle.
+
+        The previous turn's resolved ID goes with it: it describes a model this
+        step may not run — another selector, or the same "" on another provider
+        — and the quota waits before `start` can hold this row for hours.
+        """
+        with self._lock:
+            self.model = model or ""
+            self.resolved_model = ""
+            self.context_window = None
+
     def finish(self) -> None:
         """Release the iteration; the row goes idle and its clock stops."""
         with self._lock:
@@ -402,12 +414,6 @@ class Job:
 
     def update(self, **fields) -> None:
         with self._lock:
-            # A new selector makes the resolved ID describe the wrong model: the
-            # sequential loop names the next step's model while the row is idle,
-            # before `start` would clear it.
-            if "model" in fields and fields["model"] != self.model:
-                self.resolved_model = ""
-                self.context_window = None
             for name, value in fields.items():
                 setattr(self, name, value)
 
@@ -415,7 +421,9 @@ class Job:
         """Take the resolved model and its window from Claude's own stream."""
         if wire.is_session_start(ev):
             model = wire.session_model(ev)
-            if model != "?":
+            # A non-string would raise in `model_label` on the repaint thread,
+            # outside the guard that keeps a stream event from ending the run.
+            if isinstance(model, str) and model != "?":
                 with self._lock:
                     self.resolved_model = model
         elif wire.event_type(ev) == wire.RESULT:

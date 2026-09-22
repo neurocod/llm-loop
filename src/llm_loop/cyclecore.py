@@ -694,7 +694,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 stop_reason = stopchannel.RunStopReason.NO_WORK
                 break
 
-            app.job(1).update(model=command.model)
+            app.job(1).select(command.model)
             selected_provider = command.provider or ctx.provider
             if selected_provider != provider or provider not in usage_states:
                 if provider in usage_states:

@@ -2040,19 +2040,31 @@ def test_a_tagged_id_finds_its_bare_usage_entry_and_does_not_repeat_it():
     assert job.model_label() == "claude-opus-5-5[1m]"
 
 
-def test_a_new_selector_or_iteration_forgets_the_resolved_model():
+def test_a_new_iteration_forgets_the_resolved_model():
     job = sl.Job(model="opus")
     job.observe_claude_event(_INIT_OPUS)
     job.observe_claude_event(_RESULT_1M)
 
-    job.update(model="opus")                      # same selector: kept
-    assert job.model_label() == "claude-opus-5-5 · 1M"
-    job.update(model="sonnet")
-    assert job.model_label() == "sonnet"
-
-    job.observe_claude_event(_INIT_OPUS)
     job.start(model="opus")
     assert job.model_label() == "opus"
+
+
+def test_a_malformed_init_model_is_ignored_and_the_row_still_paints():
+    job = sl.Job(model="opus")
+    job.observe_claude_event(dict(_INIT_OPUS, model=42))
+    assert job.model_label() == "opus"
+
+
+def test_selecting_the_next_step_forgets_the_last_turn_even_on_the_same_selector():
+    """A claude step then a codex step, both on the CLI default (""): the idle
+    header between them must not read `codex/claude-opus-5-5 · 1M`."""
+    job = sl.Job(model="")
+    job.observe_claude_event(_INIT_OPUS)
+    job.observe_claude_event(_RESULT_1M)
+
+    job.select("")
+
+    assert job.model_label() == sl.CLI_DEFAULT_MODEL
 
 
 @pytest.mark.parametrize("tokens,text", [
