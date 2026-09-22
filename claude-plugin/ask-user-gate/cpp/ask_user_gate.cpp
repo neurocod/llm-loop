@@ -16,11 +16,12 @@
 // month spent starting Python. Nothing else about the gate changes.
 //
 // Consequences of that budget, both visible in the code below:
-//   * no <regex>. The five patterns of the reference are hand-written matchers
-//     (each one quotes the pattern it mirrors, so the pair can be diffed).
-//     std::regex would cost construction time on the hot path, and MSVC's
-//     backtracking matcher recurses -- a 10 000-character command is exactly
-//     the input this gate must survive, not crash on.
+//   * no <regex>. std::regex would cost construction time on the hot path, and
+//     MSVC's backtracking matcher recurses -- a 10 000-character command is
+//     exactly the input this gate must survive, not crash on. The reference's
+//     patterns are compiled at build time by CTRE (third_party/ctre.hpp)
+//     instead, in the reference's own spelling; see the matchers for the one
+//     change that spelling needed.
 //   * a hand-written JSON reader, for the same reason plus dependency-freedom:
 //     the payload only ever needs three strings out of it.
 //
@@ -64,6 +65,8 @@
 #include <utility>
 #include <vector>
 
+#include "third_party/ctre.hpp"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -101,16 +104,11 @@ std::string toLowerAscii(std::string_view text) {
 	return out;
 }
 
-// Python's `\s`, and shlex's whitespace, over the bytes this scanner sees. A
-// UTF-8 continuation byte is never one of these, so byte-wise scanning of a
-// UTF-8 command is safe.
+// Python's `\s` under re.ASCII, over the bytes this scanner sees. A UTF-8
+// continuation byte is never one of these, so byte-wise scanning of a UTF-8
+// command is safe.
 bool isSpaceChar(char c) {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
-}
-
-bool isWordChar(char c) {
-	const unsigned char u = static_cast<unsigned char>(c);
-	return (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') || u == '_';
 }
 
 bool isDigitChar(char c) { return c >= '0' && c <= '9'; }
@@ -303,150 +301,61 @@ std::string toolPath(std::string_view name, std::optional<std::string> base = st
 }
 
 // ---------------------------------------------------------------------------
-// The five patterns of the reference, hand-written
+// The four patterns of the reference, compiled by CTRE
 //
-// Each function names the Python regex it mirrors and repeats its source, so
-// the pair can be diffed by eye; parity_check.py diffs them by running both.
-// None of them backtracks: every `\s*` here is followed by something that
-// cannot be whitespace, so max-munch is the only viable split.
+// Each pattern is the reference's source verbatim, save for one character:
+// every `\s*` is written possessive, `\s*+`. That is what makes CTRE usable on
+// this input at all. Its greedy repeat backtracks by RECURSION, one frame per
+// character consumed, so a long run of whitespace blows the stack -- an SEH
+// exception `catch (...)` in main() never sees, i.e. a dead hook instead of one
+// that fails open. CTRE makes a greedy repeat possessive on its own when it can
+// prove nothing after it starts the same way, but it cannot see through a
+// lookahead: with a plain `\s*`, `echo >` plus 1M spaces exited 0xC00000FD in
+// RELATIVE_REDIRECT (measured 2026-09-23; parity_check.py has the case). A
+// possessive repeat is a loop, and it matches exactly what the greedy one does
+// here, because every `\s*` is followed by something that cannot be
+// whitespace, so max-munch is the only viable split.
+//
+// Python's `\s`, `\d`, `\b` and `\w` are what re.ASCII makes them, and so are
+// CTRE's over `char`: `\s` is [ \t\n\v\f\r], `\d` is [0-9], `\b` borders
+// [A-Za-z0-9_], and a UTF-8 byte of a non-ASCII character is none of these --
+// NBSP stays a word character's neighbour, not a separator, and `sleep ٣٠` is
+// not a duration. CTRE's `^` and `$` outside multiline mode are the subject's
+// ends; Python's `$` also matches before a final `\n`, which cannot differ in
+// CD_COMMAND because its `$` sits in `(?:\s|$)` and `\s` takes that `\n` anyway.
+// re.IGNORECASE becomes ctre::case_insensitive, which folds ASCII letters only,
+// as re.ASCII makes Python do (the Kelvin sign is not a `k`).
 // ---------------------------------------------------------------------------
 
-size_t skipSpaces(std::string_view text, size_t index) {
-	while (index < text.size() && isSpaceChar(text[index]))
-		++index;
-	return index;
-}
-
-// The `(?:^|[;&|(){}\n])` alternative shared by CD_COMMAND and the sleep
-// patterns: does a top-level separator end right before `index`?
-bool afterSeparator(std::string_view text, size_t index) {
-	if (index == 0)
-		return true;
-	const char previous = text[index - 1];
-	return previous == ';' || previous == '&' || previous == '|' || previous == '('
-		|| previous == ')' || previous == '{' || previous == '}' || previous == '\n';
-}
-
-// The extra `|\b(?:do|then|else)\s` alternative of the sleep patterns. It
-// CONSUMES the whitespace, so the anchor ends just past it -- which is how
-// `; do sleep 30` is caught, the shape that smuggles a foreground `sleep` past
-// the Bash tool's own block on it.
-//
-// `ignoreCase` is not a nicety: re.IGNORECASE covers a WHOLE pattern, so
-// START_SLEEP_COMMAND accepts `THEN Start-Sleep` while SLEEP_COMMAND, which
-// carries no flag, requires a lowercase `then`. Sharing one case-sensitive
-// helper between them let `Get-Job; THEN Start-Sleep -Seconds 5` through here
-// and not there.
-bool afterLoopKeyword(std::string_view text, size_t index, bool ignoreCase = false) {
-	if (index == 0 || !isSpaceChar(text[index - 1]))
-		return false;
-	const size_t wordEnd = index - 1;
-	for (std::string_view keyword : {std::string_view("do"), std::string_view("then"),
-			std::string_view("else")}) {
-		if (wordEnd < keyword.size())
-			continue;
-		const size_t wordStart = wordEnd - keyword.size();
-		const std::string_view found = text.substr(wordStart, keyword.size());
-		if (ignoreCase ? toLowerAscii(found) != keyword : found != keyword)
-			continue;
-		if (wordStart > 0 && isWordChar(text[wordStart - 1]))
-			continue;  // the `\b` before the keyword
-		return true;
-	}
-	return false;
-}
-
-// CD_COMMAND:
-//   (?:^|[;&|(){}\n])\s*(?:cd|pushd|popd|chdir|[Ss]et-[Ll]ocation|sl)(?:\s|$)
+// CD_COMMAND
 bool matchesCdCommand(std::string_view text) {
-	static constexpr std::string_view words[] = {"cd", "pushd", "popd", "chdir",
-		"Set-Location", "Set-location", "set-Location", "set-location", "sl"};
-	for (size_t index = 0; index <= text.size(); ++index) {
-		if (!afterSeparator(text, index))
-			continue;
-		const size_t start = skipSpaces(text, index);
-		for (std::string_view word : words) {
-			if (text.size() - start < word.size())
-				continue;
-			if (text.compare(start, word.size(), word) != 0)
-				continue;
-			const size_t after = start + word.size();
-			if (after == text.size() || isSpaceChar(text[after]))
-				return true;
-		}
-	}
-	return false;
+	return static_cast<bool>(ctre::search<
+		R"((?:^|[;&|(){}\n])\s*+(?:cd|pushd|popd|chdir|[Ss]et-[Ll]ocation|sl)(?:\s|$))">(text));
 }
 
-// SLEEP_COMMAND:
-//   (?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*sleep\b\s*[\d$]
+// SLEEP_COMMAND. The `\b(?:do|then|else)\s` alternative CONSUMES the
+// whitespace, which is how `; do sleep 30` is caught -- the shape that smuggles
+// a foreground `sleep` past the Bash tool's own block on it.
 bool matchesSleepCommand(std::string_view text) {
-	for (size_t index = 0; index <= text.size(); ++index) {
-		if (!afterSeparator(text, index) && !afterLoopKeyword(text, index))
-			continue;
-		const size_t start = skipSpaces(text, index);
-		if (text.size() - start < 5 || text.compare(start, 5, "sleep") != 0)
-			continue;
-		const size_t after = start + 5;
-		if (after < text.size() && isWordChar(text[after]))
-			continue;  // the `\b` after the word
-		const size_t argument = skipSpaces(text, after);
-		if (argument < text.size() && (isDigitChar(text[argument]) || text[argument] == '$'))
-			return true;
-	}
-	return false;
+	return static_cast<bool>(ctre::search<
+		R"((?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*+sleep\b\s*+[\d$])">(text));
 }
 
-// START_SLEEP_COMMAND (case-insensitive):
-//   (?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*start-sleep\b
+// START_SLEEP_COMMAND, re.IGNORECASE. The flag covers the WHOLE pattern, so
+// `THEN Start-Sleep` is caught here while SLEEP_COMMAND, which carries no
+// flag, requires a lowercase `then`.
 bool matchesStartSleepCommand(std::string_view text) {
-	static constexpr std::string_view word = "start-sleep";
-	for (size_t index = 0; index <= text.size(); ++index) {
-		if (!afterSeparator(text, index) && !afterLoopKeyword(text, index, true))
-			continue;
-		const size_t start = skipSpaces(text, index);
-		if (text.size() - start < word.size())
-			continue;
-		if (toLowerAscii(text.substr(start, word.size())) != word)
-			continue;
-		const size_t after = start + word.size();
-		if (after < text.size() && isWordChar(text[after]))
-			continue;
-		return true;
-	}
-	return false;
+	return static_cast<bool>(ctre::search<
+		R"((?:^|[;&|(){}\n]|\b(?:do|then|else)\s)\s*+start-sleep\b)",
+		ctre::case_insensitive>(text));
 }
 
-// RELATIVE_REDIRECT:
-//   >>?\s*(?!/|[A-Za-z]:[\\/]|&)([^\s|;&<>()]+)
-// Only used to explain the chain finding better on Windows.
+// RELATIVE_REDIRECT. Only used to explain the chain finding better on Windows.
+// The trailing `+` is possessive too: only whether a match exists is asked, and
+// the class it repeats has nothing after it to give characters back to.
 bool matchesRelativeRedirect(std::string_view text) {
-	auto excluded = [](char c) {
-		return isSpaceChar(c) || c == '|' || c == ';' || c == '&' || c == '<' || c == '>'
-			|| c == '(' || c == ')';
-	};
-	for (size_t index = 0; index < text.size(); ++index) {
-		if (text[index] != '>')
-			continue;
-		// `>>?` is greedy, so the two-character form is tried first.
-		for (size_t arrow : {size_t(2), size_t(1)}) {
-			if (arrow == 2 && (index + 1 >= text.size() || text[index + 1] != '>'))
-				continue;
-			const size_t target = skipSpaces(text, index + arrow);
-			if (target >= text.size())
-				continue;
-			if (text[target] == '/' || text[target] == '&')
-				continue;  // absolute, or `2>&1`
-			const bool driveLetter = target + 2 < text.size()
-				&& isWordChar(text[target]) && !isDigitChar(text[target]) && text[target] != '_'
-				&& text[target + 1] == ':' && (text[target + 2] == '\\' || text[target + 2] == '/');
-			if (driveLetter)
-				continue;
-			if (!excluded(text[target]))
-				return true;
-		}
-	}
-	return false;
+	return static_cast<bool>(ctre::search<
+		R"(>>?\s*+(?!/|[A-Za-z]:[\\/]|&)([^\s|;&<>()]++))">(text));
 }
 
 // ---------------------------------------------------------------------------

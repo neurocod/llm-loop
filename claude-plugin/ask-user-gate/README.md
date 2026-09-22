@@ -87,7 +87,22 @@ python cpp/parity_check.py     # the two halves must answer identically
 ```
 
 The build needs CMake and a C++23 compiler (Visual Studio 2022 or newer brings
-both). The binary lands in `hooks/`, next to `hooks.json`, and that is load-
+both), and nothing from the network: the one dependency, CTRE (compile-time
+regular expressions, v3.11.0), is vendored as `cpp/third_party/ctre.hpp`, so
+the port spells the reference's regexes as the reference does instead of
+transcribing them by hand. What it cost, measured 2026-09-23 on one machine
+(hook mode, one payload, 200 interleaved runs each): image 293 → 326 KiB,
+start median 3.05 → 3.14 ms.
+
+The JSON reader stays hand-written, by measurement rather than taste. A
+drop-in has to reject what `json.load` rejects, or a malformed payload is
+denied by one half and passed by the other. jsmn (the smallest non-recursive
+header-only candidate, tried 2026-09-23 with `JSMN_STRICT` and
+`JSMN_PARENT_LINKS`) accepted 12 of 13 such inputs — `[1 2]`, `{"a":tru}`,
+`{"a":01}`, trailing commas, a raw tab inside a string — so the validation
+would have to be written again on top of it, and the code it saves is gone.
+nlohmann/json was ruled out on size, and it overflowed the stack on deep
+nesting as well. The binary lands in `hooks/`, next to `hooks.json`, and that is load-
 bearing rather than tidy: `HERE` is the binary's own directory, and the
 `../bin/<tool>` paths the refusals name — and the wiring self-test — resolve
 from it. Then point the hook at the `.exe` instead of `python …/ask_user_gate.py`

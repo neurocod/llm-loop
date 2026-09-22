@@ -139,6 +139,13 @@ EXTRA_CASES = [
     ("\u044f" * (reference.MAX_COMMAND_LENGTH - 1), "bash", "Bash"),
     ("\u044f" * (reference.MAX_COMMAND_LENGTH + 1), "bash", "Bash"),
     ("echo \u044f\u044f\u044f; cd x", "bash", "Bash"),
+    # A long whitespace run where each pattern repeats `\s`. The port's regex
+    # engine recurses once per character of a greedy repeat, and a blown stack
+    # is a dead hook, not a verdict: the redirect one exited 0xC00000FD.
+    ("cd x && echo >" + " " * 200000 + "out.txt", "bash", "Bash"),
+    (";" + " " * 200000 + "cd x && ls", "bash", "Bash"),
+    ("do" + " " * 200000 + "sleep" + " " * 200000 + "5", "bash", "Bash"),
+    (";" + " " * 200000 + "Start-Sleep 5", "powershell", "PowerShell"),
     # A LEADING `&` is PowerShell's call operator, not backgrounding, and the
     # reference exempts it through `"" in "><|"` being True in Python.
     ("& \"C:\\Program Files\\App\\app.exe\" arg", "powershell", "PowerShell"),
