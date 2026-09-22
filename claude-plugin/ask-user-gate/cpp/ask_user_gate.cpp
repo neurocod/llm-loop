@@ -106,7 +106,9 @@ std::string toLowerAscii(std::string_view text) {
 
 // Python's `\s` under re.ASCII, over the bytes this scanner sees. A UTF-8
 // continuation byte is never one of these, so byte-wise scanning of a UTF-8
-// command is safe.
+// command is safe. whitespaceSplit() also uses it for the reference's
+// `str.split()`, which splits on Unicode whitespace too (\x1c-\x1f, NBSP,
+// U+2003 ...) -- a known gap: `sed<NBSP>-i x '` is refused there, allowed here.
 bool isSpaceChar(char c) {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }
@@ -312,8 +314,9 @@ std::string toolPath(std::string_view name, std::optional<std::string> base = st
 // lookahead: with a plain `\s*`, `echo >` plus 1M spaces exited 0xC00000FD in
 // RELATIVE_REDIRECT (measured 2026-09-23; parity_check.py has the case). A
 // possessive repeat is a loop, and it matches exactly what the greedy one does
-// here, because every `\s*` is followed by something that cannot be
-// whitespace, so max-munch is the only viable split.
+// here, because what must match after every `\s*` cannot start with
+// whitespace (in RELATIVE_REDIRECT that is the class after the lookahead), so
+// max-munch is the only viable split.
 //
 // Python's `\s`, `\d`, `\b` and `\w` are what re.ASCII makes them, and so are
 // CTRE's over `char`: `\s` is [ \t\n\v\f\r], `\d` is [0-9], `\b` borders
@@ -1096,10 +1099,12 @@ private:
 			out.type = Json::Type::Null;
 			return literal("null");
 		}
-		// Numbers are accepted exactly as json.load accepts them: its NUMBER_RE,
-		// plus the three constants it takes by default. A laxer reader (strtod
-		// took `+1`, `01`, `1.`) denied payloads the reference fails open on,
-		// and refusing NaN passed ones it denies. The value itself is never read.
+		// Numbers are accepted as json.load accepts them: JSON's number grammar
+		// (json.scanner's NUMBER_RE spells it), the three constants it takes by
+		// default, and Python's cap on integer literals below. A laxer reader
+		// (strtod took `+1`, `01`, `1.`) denied payloads the reference fails
+		// open on, and refusing NaN passed ones it denies. The value itself is
+		// never read.
 		out.type = Json::Type::Number;
 		const std::string_view rest = source_.substr(index_);
 		for (std::string_view constant : {std::string_view("NaN"), std::string_view("Infinity"),
@@ -1109,11 +1114,50 @@ private:
 				return true;
 			}
 		}
-		const auto number = ctre::starts_with<R"(-?(?:0|[1-9]\d*+)(?:\.\d++)?+(?:[eE][+\-]?\d++)?+)">(rest);
+		const auto number = ctre::starts_with<
+			R"((-?(?:0|[1-9]\d*+))(\.\d++)?+([eE][+\-]?\d++)?+)">(rest);
 		if (!number)
 			return false;
+		// A number with no fraction and no exponent becomes a Python int, and
+		// int() refuses a string of more digits than sys.get_int_max_str_digits()
+		// -- a ValueError the reference's bare `except` turns into fail-open.
+		// Floats have no such cap, so `1…1.5` of any length parses on both sides.
+		if (!number.get<2>() && !number.get<3>()) {
+			const std::string_view integer = number.get<1>().to_view();
+			const size_t digits = integer.size() - (startsWith(integer, "-") ? 1 : 0);
+			const size_t limit = intMaxStrDigits();
+			if (limit != 0 && digits > limit)
+				return false;
+		}
 		index_ += number.size();
 		return true;
+	}
+
+	// CPython's default for sys.get_int_max_str_digits(), or the environment's
+	// override, which the reference inherits: the hook command starts it with
+	// no -X option, so PYTHONINTMAXSTRDIGITS is the only other knob. 0 lifts
+	// the cap. Read lazily: only an integer over 640 digits (Python's floor for
+	// the setting) can get here with a question worth asking.
+	static size_t intMaxStrDigits() {
+		constexpr size_t kDefault = 4300;
+		char value[32] = {};
+#ifdef _WIN32
+		const DWORD length = GetEnvironmentVariableA("PYTHONINTMAXSTRDIGITS", value, sizeof(value));
+		if (length == 0 || length >= sizeof(value))
+			return kDefault;
+#else
+		const char* found = std::getenv("PYTHONINTMAXSTRDIGITS");
+		if (!found || std::strlen(found) >= sizeof(value))
+			return kDefault;
+		std::strcpy(value, found);
+#endif
+		size_t parsed = 0;
+		for (const char* c = value; *c; ++c) {
+			if (*c < '0' || *c > '9')
+				return kDefault;
+			parsed = parsed * 10 + static_cast<size_t>(*c - '0');
+		}
+		return value[0] ? parsed : kDefault;
 	}
 };
 

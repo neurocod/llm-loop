@@ -261,6 +261,14 @@ HOOK_CASES = [
     ("plus sign", b'{"tool_name":"Bash","x":+1,"tool_input":{"command":"cd x && ls"}}'),
     ("full number grammar", b'{"tool_name":"Bash","x":[-0.5e+3,0,10E-2,-0],'
                             b'"tool_input":{"command":"cd x && ls"}}'),
+    # An integer literal becomes a Python int, and int() refuses more digits
+    # than sys.get_int_max_str_digits() (4300 by default); a float does not.
+    ("int at the digit cap", b'{"tool_name":"Bash","x":' + b"1" * 4300
+                             + b',"tool_input":{"command":"cd x && ls"}}'),
+    ("int over the digit cap", b'{"tool_name":"Bash","x":-' + b"1" * 4301
+                               + b',"tool_input":{"command":"cd x && ls"}}'),
+    ("long float", b'{"tool_name":"Bash","x":' + b"1" * 5000
+                   + b'.5,"tool_input":{"command":"cd x && ls"}}'),
 ]
 
 
