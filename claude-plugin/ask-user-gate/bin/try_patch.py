@@ -148,8 +148,25 @@ def main() -> int:
     # names the script the way the caller reached it (the stand-in sets argv[0]
     # to the real file). Examples below reuse it via %(prog)s rather than
     # hard-coding a directory -- see the header for why there is no right one.
+    # The description, not the epilog, carries the traps: argparse prints it
+    # right under the usage, and --help is how most callers meet this script
+    # (185 of 404 transcripts that used it started with --help, often through
+    # `| head -25`, which never reaches an epilog).
     parser = argparse.ArgumentParser(
-        description="Apply edits, run a command, always restore the files.",
+        description=(
+            "Apply edits, run a command, always restore the files.\n"
+            "\n"
+            "While a run is live, do NOT edit its --file files: the restore "
+            "writes the\n"
+            "whole pre-run text back, and your edit is lost with only a \"was "
+            "changed by\n"
+            "the command\" line in THIS run's output to say so.\n"
+            "Do not pipe a run into `head` / `Select-Object -First`: closing "
+            "the pipe\n"
+            "kills this process before its restore.\n"
+            "A killed run is undone by the next run or --recover, from the "
+            "journal at\n"
+            f"the tree root: {JOURNAL_DIR_NAME}/"),
         epilog="examples:\n"
                "  python %(prog)s --file src/player.ts \\\n"
                "      --old 'const SPEED = 1e-4;' --new 'const SPEED = 0;' \\\n"
