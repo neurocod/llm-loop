@@ -199,12 +199,24 @@ def main() -> int:
         print(f"try_patch: {exc}", file=sys.stderr)
         return 2
 
-    # Before any original is snapshotted: a killed run's mutation recovered
-    # AFTER this run read the file would become this run's "original".
-    targets = {path.resolve() for path, _, _ in edits}
-    for folder in dict.fromkeys(journal_dir(path) for path, _, _ in edits):
-        if not preflight(folder, targets):
-            return 4
+    # Claim, then scan (RunJournal.claim says why), and both before any original
+    # is snapshotted: a killed run's mutation recovered AFTER this run read the
+    # file would become this run's "original".
+    journal = RunJournal(command, options.cwd)
+    try:
+        journal.claim([path for path, _, _ in edits])
+        targets = {path.resolve() for path, _, _ in edits}
+        for folder in journal.folders():
+            if not preflight(folder, targets, journal.own_entries()):
+                journal.finish(remove=True)
+                return 4
+    except EditError as exc:
+        print(f"try_patch: {exc}", file=sys.stderr)
+        journal.finish(remove=True)
+        return 2
+    except BaseException:
+        journal.finish(remove=True)
+        raise
 
     # Apply every edit before running anything: a half-applied mutation would
     # test a state that neither branch of the comparison describes.
@@ -212,7 +224,6 @@ def main() -> int:
     # of its pre-run bytes; insertion-ordered, so restore reports files in the
     # order the caller named them.
     touched: dict[Path, Touched] = {}
-    journal = RunJournal(command, options.cwd)
     try:
         for path, old, new in edits:
             # `before` is the file as it is NOW -- already carrying any earlier
@@ -449,11 +460,17 @@ SELFTEST_DIE_CODE = 86
 # a lock over the content would stop every other process from READING the entry.
 LOCK_OFFSET = 1 << 30
 
-# An unreadable entry of a dead owner is one that died before its first record,
-# so nothing was mutated and it can go -- unless it is younger than this, when it
-# may be a run that has created the file and not yet locked it (POSIX lets us
-# unlink it from under that run; Windows does not).
+# An entry with no complete line is one whose owner died before its first line
+# landed -- before any mutation, since every line precedes the write it
+# describes -- so it can go. Unless it is this young: then it may be a run
+# between creating the file and locking it (POSIX would let us unlink it from
+# under that run; Windows would not).
 UNREADABLE_GRACE_S = 60.0
+
+# Scans hold each entry locked for a moment too (a neighbour's preflight,
+# commit.py), so a refused lock is retried this long before the entry is called
+# live. A live run holds its lock for the whole run.
+SCAN_LOCK_PATIENCE_S = 0.5
 
 
 def journal_dir(path: Path) -> Path:
@@ -513,76 +530,139 @@ def _remove_entry(entry: Path) -> None:
         pass
 
 
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 @dataclass
 class _OpenEntry:
     path: Path
     handle: object
-    data: dict
+    state: dict
 
 
 class RunJournal:
-    """This run's entries: one per working tree its files belong to."""
+    """This run's entries: one per working tree its files belong to.
+
+    An entry is JSON Lines, append-only, every line the WHOLE state, and the
+    last complete line is the truth. Appending is what makes a death at any
+    moment safe: a torn line leaves the previous state standing, and each state
+    is written before the mutation it describes. A rewrite in place had an
+    instant -- between truncate and write -- when the entry said nothing while a
+    mutation sat on disk.
+    """
 
     def __init__(self, command: list[str], cwd: "Path | None"):
         self.command = command
         self.cwd = str((cwd or Path.cwd()).resolve())
         self.entries: dict[Path, _OpenEntry] = {}
 
+    def claim(self, targets: "list[Path]") -> None:
+        """Name every target in a locked entry, BEFORE the neighbours are scanned.
+
+        Scanning first let two runs started together both find the journal
+        empty and mutate one file (reproduced: 30 pairs of 30) -- each then
+        tested without its own mutation, and the tree ended clean, so nothing
+        said so. Claimed first, such a pair sees each other and both refuse:
+        loud, and a retry settles it.
+        """
+        for path in targets:
+            folder = journal_dir(path)
+            entry = self.entries.get(folder) or self._open(folder, path)
+            key = str(path.resolve())
+            if key not in entry.state["targets"]:
+                entry.state["targets"].append(key)
+        for entry in self.entries.values():
+            self._append(entry)
+
+    def folders(self) -> "list[Path]":
+        return list(self.entries)
+
+    def own_entries(self) -> "set[Path]":
+        return {entry.path for entry in self.entries.values()}
+
     def record(self, path: Path, original: str, mutated: str) -> None:
-        folder = journal_dir(path)
-        entry = self.entries.get(folder) or self._open(folder, path)
+        entry = self.entries[journal_dir(path)]  # claimed in claim()
         key = str(path.resolve())
-        for item in entry.data["files"]:
+        for item in entry.state["files"]:
             if item["path"] == key:
                 item["mutated"] = mutated
                 break
         else:
-            entry.data["files"].append(
+            entry.state["files"].append(
                 {"path": key, "original": original, "mutated": mutated})
-        blob = json.dumps(entry.data, ensure_ascii=False, indent=1).encode("utf-8")
-        entry.handle.seek(0)
-        entry.handle.truncate()
-        entry.handle.write(blob)
+        self._append(entry)
+
+    def _append(self, entry: _OpenEntry) -> None:
+        line = json.dumps(entry.state, ensure_ascii=False).encode("utf-8")
+        # The lock seek left the position far past EOF: seek back to the end.
+        entry.handle.seek(0, os.SEEK_END)
+        entry.handle.write(line + b"\n")
         os.fsync(entry.handle.fileno())
 
     def _open(self, folder: Path, first: Path) -> _OpenEntry:
-        folder.mkdir(exist_ok=True)
         # Named after the first victim, so `git status -uall` already says which
         # file is in trouble.
         for attempt in range(100):
-            suffix = f".{attempt}" if attempt else ""
-            path = folder / f"{first.name}.{os.getpid()}{suffix}.json"
+            path = folder / f"{first.name}.{os.getpid()}.{attempt}.jsonl"
             try:
+                folder.mkdir(exist_ok=True)
                 handle = open(path, "x+b", buffering=0)
-                break
             except FileExistsError:
                 continue
+            except OSError:
+                # A neighbour's last entry took the folder away between mkdir
+                # and open (Windows answers PermissionError while it is pending
+                # delete): make it again.
+                time.sleep(0.02 * (attempt + 1))
+                continue
+            if _try_lock(handle):
+                break
+            # A scan opened it between our open and our lock. Leave it the
+            # empty file (it is debris to the next scan) and take another name.
+            handle.close()
+            _unlink_quietly(path)
         else:
             raise EditError(f"cannot create a journal entry in {folder}")
-        if not _try_lock(handle):
-            handle.close()
-            raise EditError(f"cannot lock the journal entry {path}")
-        data = {
+        state = {
             "what_this_is": (
-                "A try_patch run mutated the files below and has not restored "
-                "them yet. If its pid is still running, wait for it. If it was "
-                "killed, `python try_patch.py --recover` run inside this tree "
-                "puts back every file that still holds exactly `mutated` and "
-                "deletes this entry. A file edited since is left alone: repair "
-                "it by hand against `original`, then delete this entry."),
+                "A try_patch run is mutating `targets` and has not restored "
+                "`files` yet; each line is the whole state, the last complete "
+                "line counts. If its pid is still running, wait for it. If it "
+                "was killed, `python try_patch.py --recover` run inside this "
+                "tree puts back every file that still holds exactly `mutated` "
+                "and deletes this entry. A file edited since is left alone: "
+                "repair it by hand against `original`, then delete this entry."),
             "pid": os.getpid(),
             "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "cwd": self.cwd,
             "command": self.command,
+            "targets": [],
             "files": [],
         }
-        entry = _OpenEntry(path, handle, data)
+        entry = _OpenEntry(path, handle, state)
         self.entries[folder] = entry
         return entry
 
     def finish(self, remove: bool) -> None:
-        """Release every entry; delete them only if the tree is known good."""
+        """Release every entry; `remove` when the tree is known good.
+
+        Known good -- restored, or left mutated because --keep asked for it --
+        is written into the entry BEFORE the lock goes. Otherwise a scan landing
+        between unlock and unlink would take it for a killed run's entry and
+        "recover" the very mutation --keep was asked to keep.
+        """
         for entry in self.entries.values():
+            if remove:
+                entry.state["targets"] = []
+                entry.state["files"] = []
+                try:
+                    self._append(entry)
+                except OSError:
+                    pass
             _unlock(entry.handle)
             entry.handle.close()
             if remove:
@@ -595,54 +675,87 @@ class Finding:
     """One journal entry as another process sees it."""
 
     entry: Path
-    live: bool
+    live: bool = False
     readable: bool = False
+    # Why the entry could not even be opened; its run is then assumed live.
+    error: "str | None" = None
     pid: "int | None" = None
     command: str = "?"
-    files: list[Path] = field(default_factory=list)
+    # Files that may carry this run's mutation right now: for a live run all it
+    # claimed, for a dead one those not back to their original.
+    pending: list[Path] = field(default_factory=list)
     recovered: list[Path] = field(default_factory=list)
     unresolved: list[str] = field(default_factory=list)
 
 
-def scan_journal(folder: Path, recover: bool) -> list[Finding]:
-    """Read every entry in `folder`; with `recover`, undo the dead ones.
+def scan_journal(folder: Path, recover: bool,
+                 skip: "set[Path]" = frozenset()) -> list[Finding]:
+    """Read every entry in `folder` but `skip`; with `recover`, undo dead ones.
 
-    Read-only without `recover`, which is how `commit.py` asks.
+    Changes nothing without `recover`, which is how `commit.py` asks.
     """
     findings: list[Finding] = []
     if not folder.is_dir():
         return findings
-    for path in sorted(folder.glob("*.json")):
+    for path in sorted(folder.glob("*.jsonl")):
+        if path in skip:
+            continue
         try:
-            handle = open(path, "r+b", buffering=0)
-        except OSError:
+            handle = open(path, "rb", buffering=0)
+        except FileNotFoundError:
             continue  # finished and deleted between the glob and the open
-        finding = Finding(path, live=False)
+        except OSError as exc:
+            findings.append(Finding(path, live=True, error=str(exc)))
+            continue
+        finding = Finding(path)
         remove = False
         with handle:
-            finding.live = not _try_lock(handle)
-            try:
-                handle.seek(0)
-                data = json.loads(handle.read().decode("utf-8"))
-                files = data["files"]
-                finding.files = [Path(item["path"]) for item in files]
-                finding.pid = data["pid"]
-                finding.command = " ".join(data["command"])
-            except (OSError, ValueError, KeyError, TypeError):
-                files = None
-            finding.readable = files is not None
+            finding.live = not _lock_patiently(handle)
+            handle.seek(0)
+            state = _last_state(handle.read())
+            if state is not None:
+                finding.readable = True
+                finding.pid = state.get("pid")
+                finding.command = " ".join(map(str, state.get("command") or ["?"]))
+            if finding.live:
+                if state is not None:
+                    claimed = [*state["targets"], *(i["path"] for i in state["files"])]
+                    finding.pending = [Path(p) for p in dict.fromkeys(claimed)]
+            elif state is None:
+                remove = recover and _older_than(path, UNREADABLE_GRACE_S)
+            else:
+                for item in state["files"]:
+                    _settle_file(item, finding, recover)
+                remove = recover and not finding.pending
             if not finding.live:
-                if files is None:
-                    remove = recover and _older_than(path, UNREADABLE_GRACE_S)
-                elif recover:
-                    for item in files:
-                        _recover_file(item, finding)
-                    remove = not finding.unresolved
                 _unlock(handle)
         if remove:
             _remove_entry(path)
         findings.append(finding)
     return findings
+
+
+def _lock_patiently(handle) -> bool:
+    deadline = time.monotonic() + SCAN_LOCK_PATIENCE_S
+    while not _try_lock(handle):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def _last_state(blob: bytes) -> "dict | None":
+    """The last complete, well-formed line of an entry; None if there is none."""
+    for line in reversed(blob.split(b"\n")):
+        try:
+            state = json.loads(line.decode("utf-8"))
+            if all(isinstance(p, str) for p in state["targets"]) and all(
+                    isinstance(i[k], str) for i in state["files"]
+                    for k in ("path", "original", "mutated")):
+                return state
+        except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+            continue  # a torn last line: the one before it stands
+    return None
 
 
 def _older_than(path: Path, seconds: float) -> bool:
@@ -652,21 +765,26 @@ def _older_than(path: Path, seconds: float) -> bool:
         return False
 
 
-def _recover_file(item: dict, finding: Finding) -> None:
+def _settle_file(item: dict, finding: Finding, recover: bool) -> None:
+    """Judge one file of a dead run; with `recover`, put it back if that is safe."""
     victim = Path(item["path"])
     original = item["original"].encode("utf-8")
     mutated = item["mutated"].encode("utf-8")
     try:
         current = victim.read_bytes()
     except OSError as exc:
+        finding.pending.append(victim)
         finding.unresolved.append(f"{victim}: cannot read it ({exc})")
         return
     if current == original:
         return  # restored after all, or killed before the mutation landed
+    finding.pending.append(victim)
     if current != mutated:
         finding.unresolved.append(
             f"{victim}: holds neither its original nor the mutation -- edited "
             f"after the run died, so the mutation cannot be told from the edit")
+        return
+    if not recover:
         return
     try:
         victim.write_bytes(original)
@@ -677,48 +795,54 @@ def _recover_file(item: dict, finding: Finding) -> None:
     if victim.read_bytes() != original:
         finding.unresolved.append(f"{victim}: the write did not read back")
         return
+    finding.pending.remove(victim)
     finding.recovered.append(victim)
 
 
-def preflight(folder: Path, targets: "set[Path]",
+def preflight(folder: Path, targets: "set[Path]", own: "set[Path]" = frozenset(),
               quiet_when_clean: bool = True) -> bool:
     """Undo killed runs in `folder`; False when this run must not go ahead.
 
-    It must not when a killed run left something it cannot undo -- whatever the
-    file, since this is the moment somebody is looking -- or when a live run is
-    mutating one of `targets`: each run would snapshot the other's mutation as
-    its original, and the later restore would put a mutation back.
+    Refused only over this run's own `targets`: a live run claiming one (each
+    run would snapshot the other's mutation as its original, and a restore
+    would put a mutation back), or a killed run's mutation on one that cannot
+    be undone. Anything else is reported and let be -- `git status` and
+    commit.py keep showing it -- so one stuck file does not stop every run in
+    the tree. With no targets (--recover) anything left undone is a refusal.
     """
     go = True
-    findings = scan_journal(folder, recover=True)
+    findings = scan_journal(folder, recover=True, skip=own)
     for finding in findings:
         who = f"pid {finding.pid}: {finding.command}"
         for victim in finding.recovered:
             print(f"try_patch: RECOVERED {victim}: a try_patch run ({who}) was "
                   f"killed before its restore; its mutation is undone",
                   file=sys.stderr)
+        if finding.error:
+            print(f"try_patch: cannot open journal entry {finding.entry} "
+                  f"({finding.error}); taking its run for live",
+                  file=sys.stderr)
+            continue
+        clash = [p for p in finding.pending if p.resolve() in targets]
         if finding.live:
-            clash = [p for p in finding.files if p.resolve() in targets]
             for victim in clash:
                 go = False
-                print(f"try_patch: {victim} is being mutated right now by "
-                      f"another try_patch run ({who}); two runs on one file "
-                      f"restore each other's mutations -- wait for it",
-                      file=sys.stderr)
+                print(f"try_patch: {victim} is claimed by a live try_patch run "
+                      f"({who}); two runs on one file restore each other's "
+                      f"mutations -- wait for it", file=sys.stderr)
             if not quiet_when_clean and not clash:
                 print(f"try_patch: live run ({who}), left alone: {finding.entry}")
             continue
+        if finding.unresolved and (clash or not targets):
+            go = False
         for problem in finding.unresolved:
-            go = False
-            print(f"try_patch: a killed run ({who}) left a mutation that "
-                  f"cannot be undone automatically -- {problem}. Repair the "
-                  f"file against `original` in {finding.entry}, then delete "
-                  f"that entry.", file=sys.stderr)
-        if not finding.readable and finding.entry.exists():
-            go = False
-            print(f"try_patch: unreadable journal entry {finding.entry}; if no "
-                  f"try_patch run is going, it is debris of one that died before "
-                  f"mutating anything -- delete it", file=sys.stderr)
+            verdict = ("refusing, it is a target of this run" if clash else
+                       "not a target of this run, going ahead" if targets else
+                       "left as it is")
+            print(f"try_patch: a killed run ({who}) left a mutation that cannot "
+                  f"be undone automatically -- {problem}. Repair the file "
+                  f"against `original` in {finding.entry}, then delete that "
+                  f"entry ({verdict}).", file=sys.stderr)
     if not quiet_when_clean and not findings:
         print(f"try_patch: nothing to recover in {folder}")
     return go
@@ -992,7 +1116,7 @@ def _kill_mid_run(work: Path, *edits: str) -> None:
     killed = _run(work, *edits, *CMD_OK, env=env)
     _expect(killed.returncode == SELFTEST_DIE_CODE,
             f"fixture broken: exit {killed.returncode}\n{killed.stderr}")
-    _expect(any((work / JOURNAL_DIR_NAME).glob("*.json")),
+    _expect(any((work / JOURNAL_DIR_NAME).glob("*.jsonl")),
             "a killed run left no journal entry")
 
 
@@ -1023,7 +1147,7 @@ def _case_killed_run_edited_since_is_refused(work: Path) -> None:
     _expect("try_patch: running" not in result.stdout,
             "ran on top of an unrecoverable mutation")
     _expect_bytes(victim, edited, result)
-    _expect(any((work / JOURNAL_DIR_NAME).glob("*.json")),
+    _expect(any((work / JOURNAL_DIR_NAME).glob("*.jsonl")),
             "the evidence was deleted with nothing undone")
 
 
@@ -1053,7 +1177,7 @@ def _case_live_run_blocks_a_second_run_of_the_same_file(work: Path) -> None:
         cwd=work, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         for _ in range(600):
-            if any((work / JOURNAL_DIR_NAME).glob("*.json")):
+            if victim.read_bytes() != GUARDS:
                 break
             time.sleep(0.05)
         second = _run(work, *_flip("guardB"), *CMD_OK)
@@ -1068,6 +1192,50 @@ def _case_live_run_blocks_a_second_run_of_the_same_file(work: Path) -> None:
     _expect(first.returncode == 0, f"first run: exit {first.returncode}\n{out}{err}")
     _expect(victim.read_bytes() == GUARDS, f"not restored: {victim.read_bytes()!r}")
     _expect_no_journal(work)
+
+
+def _case_a_claim_blocks_before_any_mutation(work: Path) -> None:
+    """Two runs started together: the neighbour has claimed, not yet mutated.
+
+    Scanning before claiming let both such runs through (30 pairs of 30, each
+    testing without its own mutation). The neighbour here is this process,
+    holding a claimed entry the way a live run does between claim and write.
+    """
+    victim = _victim(work)
+    folder = work / JOURNAL_DIR_NAME
+    folder.mkdir()
+    entry = folder / "victim.cpp.1.0.jsonl"
+    with open(entry, "x+b", buffering=0) as handle:
+        _expect(_try_lock(handle), "fixture broken: cannot lock")
+        handle.seek(0)
+        handle.write(json.dumps({"pid": 1, "command": ["neighbour"],
+                                 "targets": [str(victim.resolve())],
+                                 "files": []}).encode("utf-8") + b"\n")
+        result = _run(work, *_flip("guardA"), *CMD_OK)
+        _unlock(handle)
+    _expect(result.returncode == 4,
+            f"a claimed file was mutated (exit {result.returncode})\n"
+            f"{result.stdout}{result.stderr}")
+    _expect_bytes(victim, GUARDS, result)
+    _expect(sorted(p.name for p in folder.iterdir()) == [entry.name],
+            "the refused run left its own entry behind")
+
+
+def _case_a_stuck_file_does_not_block_other_files(work: Path) -> None:
+    """One unrecoverable leftover must not stop every run in the tree."""
+    victim = _victim(work)
+    stuck = work / "stuck.cpp"
+    stuck.write_bytes(b"flag = on;\n")
+    _kill_mid_run(work, "--file", "stuck.cpp", "--old", "on", "--new", "off")
+    stuck.write_bytes(stuck.read_bytes() + b"edited = true;\n")
+    result = _run(work, *_flip("guardA"), *CMD_OK)
+    _expect(result.returncode == 0,
+            f"exit {result.returncode}\n{result.stdout}{result.stderr}")
+    _expect("not a target of this run" in result.stderr,
+            f"the stuck file was not reported\n{result.stderr}")
+    _expect_bytes(victim, GUARDS, result)
+    _expect(any((work / JOURNAL_DIR_NAME).glob("*.jsonl")),
+            "the stuck file's entry was dropped")
 
 
 SELFTEST_CASES = (
@@ -1089,6 +1257,8 @@ SELFTEST_CASES = (
     _case_killed_run_edited_since_is_refused,
     _case_recover_flag_undoes_a_killed_run,
     _case_live_run_blocks_a_second_run_of_the_same_file,
+    _case_a_claim_blocks_before_any_mutation,
+    _case_a_stuck_file_does_not_block_other_files,
 )
 
 
