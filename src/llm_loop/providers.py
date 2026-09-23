@@ -183,7 +183,6 @@ class _CodexEventStream:
             usage = wire.codex_app_token_usage(message)
             if usage is not None:
                 self._latest_usage = usage
-                continue
             event = wire.codex_app_event(message, self._latest_usage)
             if event is not None:
                 return json.dumps(event, ensure_ascii=True) + "\n"

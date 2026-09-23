@@ -71,6 +71,19 @@ def test_one_job_renders_rule_summary_job_legend_and_note_rows():
     assert "job 1" in job_row and "bmx-bike.md" in job_row
 
 
+@pytest.mark.parametrize("count", [1, 3])
+def test_codex_context_cell_is_visible_and_parallel_items_stay_aligned(count):
+    status = parallel_status(count)
+    status.jobs[0].update(model="gpt-5.6-terra", context_tokens=88_764,
+                          context_window=258_400)
+    rows = [sl.JobRow(job.job_id).render(status, 140, now=NOW)
+            for job in status.jobs]
+    assert "ctx 88k/258k (34%)" in rows[0]
+    assert "gpt-5.6-terra" in rows[0]
+    assert len({row.rindex(sl.SEPARATOR) for row in rows}) == 1
+    assert all(textwidth.cell_width(row) <= 140 for row in rows)
+
+
 def test_the_item_comes_last_and_keeps_the_rest_of_the_line():
     """The one unbounded field goes where the space is, and is not truncated
     while the line has room — a cut config path is the least useful thing to

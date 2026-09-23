@@ -87,6 +87,7 @@ __all__ = [
     "format_prompt_block",
     "format_token_count",
     "observe_claude_event",
+    "observe_codex_event",
     "pause_state",
     "push_quotas",
     "quota_rows",
@@ -352,9 +353,9 @@ class Job:
     # asked for (`opus`), this is the ID its init event resolves it to
     # (`claude-opus-5-5`). Empty until that event arrives.
     resolved_model: str = ""
-    # Tokens, from the first `result` event — the stream states it nowhere
-    # earlier, so the row gains it only after the first turn has ended.
+    # Claude reports the window in `result`; Codex reports it with live usage.
     context_window: Optional[int] = None
+    context_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
@@ -366,9 +367,20 @@ class Job:
         (`claude-opus-5-5[1m]`), since it would say the same thing twice.
         """
         name = self.resolved_model or self.model or CLI_DEFAULT_MODEL
-        if self.context_window and "[" not in name:
+        if (self.context_tokens is None and self.context_window
+                and "[" not in name):
             name = f"{name} · {format_token_count(self.context_window)}"
         return name
+
+    def context_label(self) -> str:
+        """Occupancy is a separate cell, outside the model-name width cap."""
+        if self.context_tokens is None:
+            return ""
+        context = format_token_count(self.context_tokens)
+        if self.context_window:
+            context += (f"/{format_token_count(self.context_window)}"
+                        f" ({self.context_tokens / self.context_window:.0%})")
+        return f"ctx {context}"
 
     def elapsed(self, now: Optional[float] = None) -> Optional[float]:
         """Duration of the iteration running RIGHT NOW (None when idle).
@@ -390,6 +402,7 @@ class Job:
             self.model = model or ""
             self.resolved_model = ""
             self.context_window = None
+            self.context_tokens = None
             self.prompt = prompt
             self.started_at = time.time() if now is None else now
             self.running = True
@@ -405,6 +418,7 @@ class Job:
             self.model = model or ""
             self.resolved_model = ""
             self.context_window = None
+            self.context_tokens = None
 
     def finish(self) -> None:
         """Release the iteration; the row goes idle and its clock stops."""
@@ -433,12 +447,20 @@ class Job:
                 if window is not None:
                     self.context_window = window
 
+    def observe_codex_event(self, ev: dict) -> None:
+        """Replace context occupancy with the latest root-thread reading."""
+        reading = wire.codex_context_usage(ev)
+        if reading is not None:
+            with self._lock:
+                self.context_tokens, self.context_window = reading
+
     def snapshot(self) -> "Job":
         """A detached copy, so one painted row cannot mix two iterations."""
         with self._lock:
             return Job(self.job_id, self.running, self.iteration, self.item,
                        self.model, self.prompt, self.started_at,
-                       self.resolved_model, self.context_window)
+                       self.resolved_model, self.context_window,
+                       self.context_tokens)
 
 
 # The Job whose row describes the stream THIS thread is reading. Both renderers
@@ -473,6 +495,17 @@ def observe_claude_event(ev: dict) -> None:
         return
     try:
         job.observe_claude_event(ev)
+    except Exception:
+        pass
+
+
+def observe_codex_event(ev: dict) -> None:
+    """Feed live Codex context to the bound Job without risking the run."""
+    job = getattr(_stream_job, "job", None)
+    if job is None:
+        return
+    try:
+        job.observe_codex_event(ev)
     except Exception:
         pass
 
@@ -994,8 +1027,12 @@ class JobRow(Row):
         model_cell = textwidth.pad(model, self.model_width(status))
         cells = [f" job {job.job_id} {glyph} {model_cell}",
                  f"iter {job.iteration:<4}",
-                 textwidth.pad(elapsed, self.elapsed_width),
-                 item]
+                 textwidth.pad(elapsed, self.elapsed_width)]
+        context_width = max((textwidth.cell_width(j.context_label())
+                             for j in status.jobs), default=0)
+        if context_width:
+            cells.append(textwidth.pad(job.context_label(), context_width))
+        cells.append(item)
         return textwidth.fit(SEPARATOR.join(cells), width)
 
 

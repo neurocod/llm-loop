@@ -219,7 +219,7 @@ class _FakeAgentProcess:
         self.stdout = io.StringIO(stdout)
         self.returncode = returncode
 
-    def wait(self):
+    def wait(self, timeout=None):
         return self.returncode
 
     def poll(self):
@@ -316,9 +316,12 @@ def test_codex_process_ignores_nested_agent_events():
     proc = providers._CodexAppProcess(
         raw, [], thread_id="root-thread", turn_id="root-turn")
 
+    context = json.loads(next(proc.stdout))
     item = json.loads(next(proc.stdout))
     completed = json.loads(next(proc.stdout))
 
+    assert context["type"] == "thread.token_usage.updated"
+    assert context["tokenUsage"]["last"]["inputTokens"] == 9
     assert item["type"] == "item.completed"
     assert item["item"]["text"] == "root finished"
     assert completed == {
@@ -476,6 +479,77 @@ def test_both_renderers_tell_the_bound_job_what_the_cli_runs(
             assert parallel.run_job(1, AgentCommand("p", "opus", "j"))[0] == 0
 
     assert job.model_label() == "claude-opus-5-5 · 1M"
+
+
+@pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
+def test_codex_context_reaches_status_before_turn_ends(monkeypatch, runner):
+    """Exercise app-server normalization and both real stream readers."""
+    job = statusline.Job(model="gpt-test")
+
+    def usage(tokens, thread="root", turn="turn"):
+        return json.dumps({"method": "thread/tokenUsage/updated", "params": {
+            "threadId": thread, "turnId": turn,
+            "tokenUsage": {"last": {"totalTokens": tokens},
+                           "total": {"totalTokens": 9_000_000},
+                           "modelContextWindow": 258_400}}}) + "\n"
+
+    def source():
+        yield usage(88_764)
+        assert job.snapshot().context_label() == "ctx 88k/258k (34%)"
+        yield usage(240_000, thread="child", turn="child-turn")
+        yield usage(240_000, turn="old-turn")
+        assert job.context_tokens == 88_764
+        yield usage(20_000)
+        assert job.snapshot().context_label() == "ctx 20k/258k (8%)"
+        yield json.dumps({"method": "turn/completed", "params": {
+            "threadId": "root", "turn": {"id": "turn", "status": "completed"}
+        }}) + "\n"
+
+    raw = _FakeAgentProcess(has_stdin=True)
+    raw.stdout = source()
+    proc = providers._CodexAppProcess(raw, [], "root", "turn")
+    monkeypatch.setattr(streamrender, "start_agent_process", lambda *a: proc)
+    monkeypatch.setattr(parallel, "start_agent_process", lambda *a: proc)
+    with statusline.describing(job):
+        if runner == "parallel":
+            assert parallel.run_job(
+                1, AgentCommand("p", "gpt-test", "j", "codex"))[0] == 0
+        else:
+            assert streamrender.run_agent_streaming(
+                ["codex"], "codex", raw=runner == "raw") == 0
+
+
+@pytest.mark.parametrize("tokens,window,expected", [
+    (0, 1000, "ctx 0/1k (0%)"),
+    (1234, None, "ctx 1k"),
+    (1234, 0, "ctx 1k"),
+    (1234, True, "ctx 1k"),
+    (None, None, ""),
+    (-1, None, ""),
+    ("1234", None, ""),
+    (True, None, ""),
+])
+def test_codex_context_unknowns_and_reset(tokens, window, expected):
+    job = statusline.Job(model="gpt-test")
+    event = {"type": "thread.token_usage.updated", "tokenUsage": {
+        "last": {"totalTokens": tokens}, "modelContextWindow": window}}
+    job.observe_codex_event(event)
+    assert job.snapshot().context_label() == expected
+    job.start(model="next")
+    assert job.model_label() == "next"
+    assert job.context_label() == ""
+    job.observe_codex_event(event)
+    job.select("other")
+    assert job.model_label() == "other"
+    assert job.context_label() == ""
+
+
+def test_exec_cumulative_usage_is_not_displayed_as_context():
+    job = statusline.Job(model="gpt-test")
+    job.observe_codex_event({"type": "turn.completed", "usage": {
+        "input_tokens": 9_000_000, "output_tokens": 1234}})
+    assert job.model_label() == "gpt-test"
+    assert job.context_label() == ""
 
 
 # --- the sequential runner owes its child an ending too --------------------------

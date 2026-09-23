@@ -317,6 +317,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                     # Before `raw`, so a raw run's row learns the model too.
                     statusline.observe_claude_event(ev)
                 if provider == "codex":
+                    statusline.observe_codex_event(ev)
                     codex_outcome.observe(ev)
                 if (provider == "claude" and event_type == wire.RESULT
                         and wire.result_failed(ev)):

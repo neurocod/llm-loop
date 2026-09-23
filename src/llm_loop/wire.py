@@ -68,6 +68,7 @@ ITEM_STARTED = "item.started"
 ITEM_COMPLETED = "item.completed"
 TURN_COMPLETED = "turn.completed"
 TURN_FAILED = "turn.failed"
+TOKEN_USAGE_UPDATED = "thread.token_usage.updated"
 ERROR = "error"
 
 # --- Codex: item types ----------------------------------------------------
@@ -397,6 +398,26 @@ def codex_token_counts(ev: dict) -> Optional[tuple]:
             usage.get(OUTPUT_TOKENS, 0))
 
 
+def codex_context_usage(ev: dict) -> Optional[tuple]:
+    """Latest request occupancy and reported window, never cumulative billing.
+
+    `last.totalTokens` includes cached input and output; `total.totalTokens`
+    sums requests and can exceed the window. Replace the reading even when it
+    decreases after compaction. Missing/invalid readings are unknown, not zero.
+    """
+    if event_type(ev) != TOKEN_USAGE_UPDATED:
+        return None
+    usage = ev.get("tokenUsage")
+    if not isinstance(usage, dict):
+        return None
+    last = usage.get("last")
+    tokens = last.get("totalTokens") if isinstance(last, dict) else None
+    window = usage.get("modelContextWindow")
+    tokens = tokens if type(tokens) is int and tokens >= 0 else None
+    window = window if type(window) is int and window > 0 else None
+    return tokens, window
+
+
 def codex_error(ev: dict) -> Any:
     """What an `error` / `turn.failed` event says went wrong.
 
@@ -585,6 +606,9 @@ def codex_app_event(message: dict, usage: Optional[dict] = None) -> Optional[dic
     """
     method = message.get("method")
     params = message.get("params") or {}
+    if method == APP_TOKEN_USAGE_UPDATED:
+        return {"type": TOKEN_USAGE_UPDATED,
+                "tokenUsage": params.get("tokenUsage")}
     if method == APP_THREAD_STARTED:
         thread = params.get("thread") or {}
         return {"type": THREAD_STARTED,

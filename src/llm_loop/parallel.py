@@ -427,6 +427,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     # The row's resolved model and window (see `statusline.describing`).
                     statusline.observe_claude_event(ev)
                 if provider == "codex":
+                    statusline.observe_codex_event(ev)
                     codex_outcome.observe(ev)
                     if et in (wire.TURN_COMPLETED, wire.TURN_FAILED):
                         channel.close()
