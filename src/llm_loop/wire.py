@@ -43,6 +43,7 @@ ASSISTANT = "assistant"
 USER = "user"
 RESULT = "result"
 STREAM_EVENT = "stream_event"
+MESSAGE_START = "message_start"
 RATE_LIMIT_EVENT = "rate_limit_event"
 SUBTYPE_SUCCESS = "success"
 
@@ -146,22 +147,72 @@ def result_context_window(ev: dict, model: str) -> Optional[int]:
     The init event names the model with the CLI's `[1m]` tag when that alias was
     asked for (`claude-opus-5-5[1m]`), while `modelUsage` keys the same model
     bare (`claude-opus-5-5`) — measured 2026-09-22 — so the tag is stripped for
-    the second lookup. A lone entry is taken as is: an init event can be missed
-    (a stream joined late), and one model is then the only candidate anyway.
+    the second lookup. Canonical matches must agree on capacity; a lone entry
+    for a different model can be an auxiliary call and is not our window.
     """
     usage = ev.get("modelUsage")
     if not isinstance(usage, dict) or not usage:
         return None
-    entry = usage.get(model) or usage.get(model.split("[", 1)[0])
-    if entry is None and len(usage) == 1:
+    base = model.split("[", 1)[0]
+    entry = usage.get(model) or usage.get(base)
+    if entry is None:
+        matches = [row for row in usage.values() if isinstance(row, dict)
+                   and row.get("canonicalModel") == base]
+        windows = [row.get("contextWindow") for row in matches]
+        if windows:
+            first = windows[0]
+            return (first if type(first) is int and first > 0
+                    and all(type(w) is int and w == first for w in windows)
+                    else None)
+    if entry is None and not model and len(usage) == 1:
         entry = next(iter(usage.values()))
     window = entry.get("contextWindow") if isinstance(entry, dict) else None
-    return window if isinstance(window, int) and window > 0 else None
+    return window if type(window) is int and window > 0 else None
 
 
 def is_session_start(ev: dict) -> bool:
     """True for the one event that opens a Claude session."""
     return event_type(ev) == SYSTEM and ev.get("subtype") == SUBTYPE_INIT
+
+
+def is_root_claude_event(ev: dict) -> bool:
+    """Subagent usage, init and compaction cannot change the main job's row."""
+    return not ev.get("parent_tool_use_id")
+
+
+def claude_context_compacting(ev: dict) -> bool:
+    return event_type(ev) == SYSTEM and (
+        ev.get("subtype") == "compact_boundary" or
+        (ev.get("subtype") == "status" and ev.get("status") == "compacting"))
+
+
+def claude_context_usage(ev: dict) -> Optional[tuple]:
+    """Latest request's (model, input occupancy), not result billing totals.
+
+    Claude's statusline formula is input + cache creation + cache reads, with
+    no output tokens: https://code.claude.com/docs/en/statusline#context-window-fields
+    Both message_start and repeated assistant blocks carry this snapshot, so
+    callers replace it rather than accumulating it. Missing cache fields are
+    zero; an invalid count makes occupancy unknown. Output-only deltas do not
+    replace the input reading. Capacity is only reported later in modelUsage.
+    """
+    kind = event_type(ev)
+    message = ev.get("message") if kind == ASSISTANT else None
+    if kind == STREAM_EVENT:
+        inner = ev.get("event")
+        if isinstance(inner, dict) and inner.get("type") == MESSAGE_START:
+            message = inner.get("message")
+    if not isinstance(message, dict):
+        return None
+    usage = message.get("usage")
+    if not isinstance(usage, dict) or INPUT_TOKENS not in usage:
+        return None
+    counts = [usage.get(key, 0) for key in (
+        INPUT_TOKENS, "cache_creation_input_tokens", "cache_read_input_tokens")]
+    tokens = (sum(counts) if all(type(n) is int and n >= 0 for n in counts)
+              else None)
+    model = message.get("model")
+    return model if isinstance(model, str) else "", tokens
 
 
 # --- assistant / user content blocks --------------------------------------

@@ -432,20 +432,29 @@ class Job:
                 setattr(self, name, value)
 
     def observe_claude_event(self, ev: dict) -> None:
-        """Take the resolved model and its window from Claude's own stream."""
-        if wire.is_session_start(ev):
-            model = wire.session_model(ev)
-            # A non-string would raise in `model_label` on the repaint thread,
-            # outside the guard that keeps a stream event from ending the run.
-            if isinstance(model, str) and model != "?":
-                with self._lock:
+        """Take main-request occupancy and capacity from Claude's own stream."""
+        if not wire.is_root_claude_event(ev):
+            return
+        reading = wire.claude_context_usage(ev)
+        with self._lock:
+            model = wire.session_model(ev) if wire.is_session_start(ev) else ""
+            if reading is not None:
+                message_model, _tokens = reading
+                # Assistant messages omit the init event's routing suffix.
+                if message_model != self.resolved_model.split("[", 1)[0]:
+                    model = message_model
+            if isinstance(model, str) and model and model != "?":
+                if model != self.resolved_model:
                     self.resolved_model = model
-        elif wire.event_type(ev) == wire.RESULT:
-            with self._lock:
-                window = wire.result_context_window(
+                    self.context_tokens = None
+                    self.context_window = None
+            if wire.claude_context_compacting(ev):
+                self.context_tokens = None
+            elif reading is not None:
+                self.context_tokens = reading[1]
+            elif wire.event_type(ev) == wire.RESULT:
+                self.context_window = wire.result_context_window(
                     ev, self.resolved_model or self.model)
-                if window is not None:
-                    self.context_window = window
 
     def observe_codex_event(self, ev: dict) -> None:
         """Replace context occupancy with the latest root-thread reading."""

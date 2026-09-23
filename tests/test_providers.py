@@ -482,6 +482,32 @@ def test_both_renderers_tell_the_bound_job_what_the_cli_runs(
 
 
 @pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
+def test_claude_context_reaches_status_while_streaming(monkeypatch, runner):
+    job = statusline.Job(model="opus")
+
+    def source():
+        yield json.dumps({"type": "stream_event", "event": {
+            "type": "message_start", "message": {
+                "model": "claude-opus-5-5", "usage": {"input_tokens": 2,
+                    "cache_creation_input_tokens": 8246,
+                    "cache_read_input_tokens": 32160}}}}) + "\n"
+        assert job.context_label() == "ctx 40k"
+        yield _CLAUDE_MODEL_STREAM.splitlines(keepends=True)[1]
+        assert job.snapshot().context_label() == "ctx 40k/1M (4%)"
+
+    proc = _FakeAgentProcess(has_stdin=False)
+    proc.stdout = source()
+    monkeypatch.setattr(streamrender, "start_agent_process", lambda *a: proc)
+    monkeypatch.setattr(parallel, "start_agent_process", lambda *a: proc)
+    with statusline.describing(job):
+        if runner == "parallel":
+            assert parallel.run_job(1, AgentCommand("p", "opus", "j"))[0] == 0
+        else:
+            assert streamrender.run_agent_streaming(
+                ["claude"], "claude", raw=runner == "raw") == 0
+
+
+@pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
 def test_codex_context_reaches_status_before_turn_ends(monkeypatch, runner):
     """Exercise app-server normalization and both real stream readers."""
     job = statusline.Job(model="gpt-test")
