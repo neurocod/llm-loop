@@ -204,6 +204,10 @@ def claude_context_usage(ev: dict) -> Optional[tuple]:
             message = inner.get("message")
     if not isinstance(message, dict):
         return None
+    # CLI-authored error/interruption messages have zero usage but did not
+    # make a model request. They must not erase the last real measurement.
+    if message.get("model") == "<synthetic>":
+        return None
     usage = message.get("usage")
     if not isinstance(usage, dict) or INPUT_TOKENS not in usage:
         return None

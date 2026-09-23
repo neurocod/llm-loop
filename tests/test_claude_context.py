@@ -59,6 +59,22 @@ def test_message_start_updates_but_output_deltas_do_not_change_occupancy():
     assert job.context_tokens == 40_408
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_cli_synthetic_errors_do_not_replace_the_real_model_or_usage(streaming):
+    job = job_with_usage()
+    job.observe_claude_event(capacity())
+    event = request(0, 0, 0, "<synthetic>")
+    event["isApiErrorMessage"] = True
+    if streaming:
+        event = {"type": "stream_event", "event": {
+            "type": "message_start", "message": event["message"]}}
+    job.observe_claude_event(event)
+    job.observe_claude_event(capacity())
+    assert job.model_label() == MODEL + "[1m]"
+    assert job.context_tokens == 40_408
+    assert job.context_label() == "ctx 40k/1M (4%)"
+
+
 @pytest.mark.parametrize("event", [
     request(900_000, 0, 0, "child-model"), capacity(),
     {"type": "system", "subtype": "init", "model": "child-model"},
