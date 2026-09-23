@@ -71,7 +71,8 @@ Both are useful on their own. `replace_in_file.py` is a checked stand-in for
 so a wrong pattern fails instead of silently editing nothing and exiting 0.
 `try_patch.py` mutates a file, runs a command and restores the file from a
 `finally` — with `--expect-fail` for the usual case, proving that a test really
-does fail without its fix.
+does fail without its fix. A run killed before its `finally` is undone by the
+next one (or `--recover`) from its journal, `JOURNAL_DIR_NAME` in the script.
 
 ## The C++ port, for machines that call it a lot
 
