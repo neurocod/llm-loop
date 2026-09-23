@@ -79,8 +79,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from replace_in_file import (  # noqa: E402  (needs the path line above)
-    EditError, apply_replacement, changed_lines, parse_count, read_text,
-    write_text,
+    EditError, apply_replacement, changed_lines, is_uniform_crlf, parse_count,
+    read_text, write_text,
 )
 
 
@@ -218,48 +218,66 @@ def main() -> int:
         journal.finish(remove=True)
         raise
 
-    # Apply every edit before running anything: a half-applied mutation would
-    # test a state that neither branch of the comparison describes.
+    # Every edit is worked out in memory first, and each file is written ONCE
+    # with its final text. Written edit by edit, a death between two edits of
+    # one file left an intermediate text that was neither the journalled
+    # original nor the journalled mutation, so recovery refused it; and a bad
+    # pattern now fails before anything is written at all.
     # Keyed by resolved path, so repeated edits of one file share one snapshot
     # of its pre-run bytes; insertion-ordered, so restore reports files in the
     # order the caller named them.
-    touched: dict[Path, Touched] = {}
+    plans: dict[Path, Touched] = {}
     try:
         for path, old, new in edits:
-            # `before` is the file as it is NOW -- already carrying any earlier
-            # edit of the same file, which is what makes stacked edits compose.
-            # It is the restore snapshot only when this path is new.
-            before, crlf = read_text(path)
-            after, hits = apply_replacement(before, old, new, options.regex,
-                                            options.count, crlf)
             key = path.resolve()
-            entry = touched.get(key)
-            # Journalled BEFORE the write: a death between the two leaves an
-            # entry for an unmutated file, which recovery shrugs off; the other
-            # order leaves a mutation nobody knows about.
-            journal.record(path, entry.original if entry else before, after)
-            write_text(path, after)
-            invalidate_bytecode(path)
-            if entry is None:
-                touched[key] = Touched(path, before, after)
-            else:
-                entry.expected = after
+            plan = plans.get(key)
+            if plan is None:
+                original, _ = read_text(path)
+                plan = plans[key] = Touched(path, original, original)
+            # `before` already carries any earlier edit of the same file, which
+            # is what makes stacked edits compose.
+            before = plan.expected
+            after, hits = apply_replacement(before, old, new, options.regex,
+                                            options.count, is_uniform_crlf(before))
+            plan.expected = after
             print(f"try_patch: {path}: {hits} occurrence(s) mutated")
             for line in changed_lines(before, after, limit=4):
                 print(line)
     except EditError as exc:
         print(f"try_patch: {exc}", file=sys.stderr)
+        journal.finish(remove=True)
+        return 2
+    except BaseException:
+        journal.finish(remove=True)
+        raise
+
+    # Apply every file before running anything: a half-applied mutation would
+    # test a state that neither branch of the comparison describes.
+    touched: dict[Path, Touched] = {}
+    try:
+        for key, plan in plans.items():
+            # Journalled, then registered, then written. A death after the
+            # journal line leaves an entry for a file still at its original,
+            # which recovery shrugs off; a Ctrl-C after registering restores a
+            # file that may or may not have been written -- both fine. Any other
+            # order leaves a mutation that one of the two does not know about.
+            journal.record(plan.display, plan.original, plan.expected)
+            touched[key] = plan
+            write_text(plan.display, plan.expected)
+            invalidate_bytecode(plan.display)
+            if os.environ.get(SELFTEST_DIE_ENV) == str(len(touched)):
+                # The selftest's stand-in for TaskStop: gone without a `finally`
+                # after that many files were written.
+                os._exit(SELFTEST_DIE_CODE)
+    except EditError as exc:
+        print(f"try_patch: {exc}", file=sys.stderr)
         journal.finish(remove=restore(touched))
         return 2
     except BaseException:
-        # Ctrl-C between two edits of a multi-edit run would otherwise leave the
-        # earlier ones applied: the `finally` below only covers the command.
+        # Ctrl-C between two files would otherwise leave the earlier ones
+        # mutated: the `finally` below only covers the command.
         journal.finish(remove=restore(touched))
         raise
-
-    if os.environ.get(SELFTEST_DIE_ENV):
-        # The selftest's stand-in for TaskStop: gone without a `finally`.
-        os._exit(SELFTEST_DIE_CODE)
 
     status = 1
     started = False
@@ -404,7 +422,8 @@ def restore(touched: "dict[Path, Touched]") -> bool:
         path = entry.display
         try:
             current, _ = read_text(path)
-            if current != entry.expected:
+            # Still the original: a Ctrl-C landed between registering and writing.
+            if current not in (entry.expected, entry.original):
                 print(f"try_patch: {path} was changed by the command; "
                       "those changes are being discarded with the mutation",
                       file=sys.stderr)
@@ -457,7 +476,8 @@ sits at, so `JOURNAL_DIR_NAME`, `scan_journal(folder, recover=False)` and the
 in the landing that bumps the submodule.
 """
 
-# Test-only: die right after mutating, the way TaskStop kills -- no `finally`.
+# Test-only: set to N, die after writing the N-th file, the way TaskStop kills
+# -- no `finally`. "1" on a one-file run is "after mutating".
 SELFTEST_DIE_ENV = "TRY_PATCH_SELFTEST_DIE_AFTER_MUTATION"
 SELFTEST_DIE_CODE = 86
 
@@ -549,6 +569,39 @@ class _OpenEntry:
     state: dict
 
 
+def _append_state(handle, state: dict, path: Path) -> None:
+    """Append one whole-state line, all of it, and fsync before returning.
+
+    Everything downstream trusts that a returned call means a complete line on
+    disk: the mutation is written next. An unbuffered write may take only part
+    of the buffer, and a torn line would leave the previous state standing --
+    one that does not name the mutation about to land.
+    """
+    data = memoryview(json.dumps(state, ensure_ascii=False).encode("utf-8") + b"\n")
+    try:
+        # The lock seek left the position far past EOF: seek back to the end.
+        handle.seek(0, os.SEEK_END)
+        while data:
+            written = handle.write(data)
+            if not written:
+                raise OSError("the write made no progress")
+            data = data[written:]
+        os.fsync(handle.fileno())
+    except OSError as exc:
+        raise EditError(f"cannot write the journal entry {path}: {exc}") from exc
+
+
+def _settled(state: dict) -> dict:
+    """`state` with nothing left to undo: the last line of a finished entry.
+
+    Written under the lock before it is released, by the owner and by a
+    recovery alike, so a reader that opened the entry earlier and gets the lock
+    later finds nothing to do -- rather than undoing a mutation somebody has
+    made since (POSIX lets a deleted entry stay readable through an old handle).
+    """
+    return {**state, "targets": [], "files": []}
+
+
 class RunJournal:
     """This run's entries: one per working tree its files belong to.
 
@@ -602,11 +655,7 @@ class RunJournal:
         self._append(entry)
 
     def _append(self, entry: _OpenEntry) -> None:
-        line = json.dumps(entry.state, ensure_ascii=False).encode("utf-8")
-        # The lock seek left the position far past EOF: seek back to the end.
-        entry.handle.seek(0, os.SEEK_END)
-        entry.handle.write(line + b"\n")
-        os.fsync(entry.handle.fileno())
+        _append_state(entry.handle, entry.state, entry.path)
 
     def _open(self, folder: Path, first: Path) -> _OpenEntry:
         # Named after the first victim, so `git status -uall` already says which
@@ -662,12 +711,13 @@ class RunJournal:
         """
         for entry in self.entries.values():
             if remove:
-                entry.state["targets"] = []
-                entry.state["files"] = []
                 try:
-                    self._append(entry)
-                except OSError:
-                    pass
+                    _append_state(entry.handle, _settled(entry.state), entry.path)
+                except EditError as exc:
+                    # Nothing better to do on the way out than say so: the
+                    # entry still names mutations that are no longer there.
+                    print(f"try_patch: {exc}; a neighbour scanning before the "
+                          f"entry is gone may undo a --keep", file=sys.stderr)
             _unlock(entry.handle)
             entry.handle.close()
             if remove:
@@ -689,7 +739,8 @@ class Finding:
     # claimed, for a dead one those not back to their original.
     pending: list[Path] = field(default_factory=list)
     recovered: list[Path] = field(default_factory=list)
-    unresolved: list[str] = field(default_factory=list)
+    # (file, why) for each dead-run file recovery could not put back.
+    unresolved: "list[tuple[Path, str]]" = field(default_factory=list)
 
 
 def scan_journal(folder: Path, recover: bool,
@@ -705,7 +756,8 @@ def scan_journal(folder: Path, recover: bool,
         if path in skip:
             continue
         try:
-            handle = open(path, "rb", buffering=0)
+            # Writable only to recover: that settles the entry (see _settled).
+            handle = open(path, "r+b" if recover else "rb", buffering=0)
         except FileNotFoundError:
             continue  # finished and deleted between the glob and the open
         except OSError as exc:
@@ -730,6 +782,13 @@ def scan_journal(folder: Path, recover: bool,
                 for item in state["files"]:
                     _settle_file(item, finding, recover)
                 remove = recover and not finding.pending
+                if remove and state["files"]:
+                    try:
+                        _append_state(handle, _settled(state), path)
+                    except EditError:
+                        # The files are back; a second recovery through an old
+                        # handle would find them equal to `original` and skip.
+                        pass
             if not finding.live:
                 _unlock(handle)
         if remove:
@@ -748,8 +807,13 @@ def _lock_patiently(handle) -> bool:
 
 
 def _last_state(blob: bytes) -> "dict | None":
-    """The last complete, well-formed line of an entry; None if there is none."""
-    for line in reversed(blob.split(b"\n")):
+    """The last complete, well-formed line of an entry; None if there is none.
+
+    Complete means newline-terminated: the unterminated tail is dropped even
+    when it parses, since only the newline -- written last -- says the whole
+    line landed, and a parsing tail proves nothing about the write.
+    """
+    for line in reversed(blob.split(b"\n")[:-1]):
         try:
             state = json.loads(line.decode("utf-8"))
             if all(isinstance(p, str) for p in state["targets"]) and all(
@@ -777,26 +841,27 @@ def _settle_file(item: dict, finding: Finding, recover: bool) -> None:
         current = victim.read_bytes()
     except OSError as exc:
         finding.pending.append(victim)
-        finding.unresolved.append(f"{victim}: cannot read it ({exc})")
+        finding.unresolved.append((victim, f"cannot read it ({exc})"))
         return
     if current == original:
         return  # restored after all, or killed before the mutation landed
     finding.pending.append(victim)
     if current != mutated:
-        finding.unresolved.append(
-            f"{victim}: holds neither its original nor the mutation -- edited "
-            f"after the run died, so the mutation cannot be told from the edit")
+        finding.unresolved.append((
+            victim, "holds neither its original nor the mutation -- edited "
+                    "after the run died, so the mutation cannot be told from "
+                    "the edit"))
         return
     if not recover:
         return
     try:
         victim.write_bytes(original)
     except OSError as exc:
-        finding.unresolved.append(f"{victim}: cannot write it ({exc})")
+        finding.unresolved.append((victim, f"cannot write it ({exc})"))
         return
     invalidate_bytecode(victim)
     if victim.read_bytes() != original:
-        finding.unresolved.append(f"{victim}: the write did not read back")
+        finding.unresolved.append((victim, "the write did not read back"))
         return
     finding.pending.remove(victim)
     finding.recovered.append(victim)
@@ -825,7 +890,7 @@ def preflight(folder: Path, targets: "set[Path]",
                   file=sys.stderr)
         if finding.error:
             print(f"try_patch: cannot open journal entry {finding.entry} "
-                  f"({finding.error}); taking its run for live",
+                  f"({finding.error}); what it holds is unknown, going ahead",
                   file=sys.stderr)
             continue
         clash = [p for p in finding.pending if p.resolve() in targets]
@@ -838,16 +903,17 @@ def preflight(folder: Path, targets: "set[Path]",
             if recovering:
                 print(f"try_patch: live run ({who}), left alone: {finding.entry}")
             continue
-        if finding.unresolved and (clash or recovering):
-            go = False
-        for problem in finding.unresolved:
+        for victim, problem in finding.unresolved:
+            targeted = victim.resolve() in targets
+            if recovering or targeted:
+                go = False
             verdict = ("left as it is" if recovering else
-                       "refusing, it is a target of this run" if clash else
+                       "refusing, it is a target of this run" if targeted else
                        "not a target of this run, going ahead")
             print(f"try_patch: a killed run ({who}) left a mutation that cannot "
-                  f"be undone automatically -- {problem}. Repair the file "
-                  f"against `original` in {finding.entry}, then delete that "
-                  f"entry ({verdict}).", file=sys.stderr)
+                  f"be undone automatically -- {victim}: {problem}. Repair the "
+                  f"file against `original` in {finding.entry}, then delete "
+                  f"that entry ({verdict}).", file=sys.stderr)
     if recovering and not findings:
         print(f"try_patch: nothing to recover in {folder}")
     return go
@@ -1115,9 +1181,9 @@ def _expect_no_journal(work: Path) -> None:
                               f"{sorted(p.name for p in folder.iterdir())}")
 
 
-def _kill_mid_run(work: Path, *edits: str) -> None:
-    """A run that dies after mutating, the way TaskStop kills: no `finally`."""
-    env = dict(os.environ, **{SELFTEST_DIE_ENV: "1"})
+def _kill_mid_run(work: Path, *edits: str, after_files: int = 1) -> None:
+    """A run that dies after writing `after_files` files: no `finally`."""
+    env = dict(os.environ, **{SELFTEST_DIE_ENV: str(after_files)})
     killed = _run(work, *edits, *CMD_OK, env=env)
     _expect(killed.returncode == SELFTEST_DIE_CODE,
             f"fixture broken: exit {killed.returncode}\n{killed.stderr}")
@@ -1243,6 +1309,57 @@ def _case_a_stuck_file_does_not_block_other_files(work: Path) -> None:
             "the stuck file's entry was dropped")
 
 
+def _case_killed_between_two_files(work: Path) -> None:
+    """Dead after the first file: it is undone, the second was never touched."""
+    victim = _victim(work)
+    other = work / "other.cpp"
+    other.write_bytes(GUARDS)
+    _kill_mid_run(work, *_flip("guardA"),
+                  "--file", "other.cpp", "--old", "guardB = true;",
+                  "--new", "guardB = false;", after_files=1)
+    _expect(victim.read_bytes() != GUARDS, "fixture broken: nothing mutated")
+    _expect(other.read_bytes() == GUARDS, "fixture broken: died too late")
+    result = _run(work, "--recover")
+    _expect(result.returncode == 0,
+            f"exit {result.returncode}\n{result.stdout}{result.stderr}")
+    _expect_bytes(victim, GUARDS, result)
+    _expect_bytes(other, GUARDS, result)
+    _expect_no_journal(work)
+
+
+def _case_an_unterminated_line_does_not_count(work: Path) -> None:
+    """Only the newline says a line landed, even when the tail parses."""
+    full = {"targets": ["a"], "files": [
+        {"path": "a", "original": "x", "mutated": "y"}]}
+    blob = (json.dumps(full) + "\n" + json.dumps(_settled(full))).encode("utf-8")
+    state = _last_state(blob)
+    _expect(state is not None and state["files"],
+            f"an unterminated tail was taken for the state: {state!r}")
+    _expect(_last_state(b"") is None, "an empty entry has a state")
+
+
+def _case_a_finished_entry_is_never_recovered(work: Path) -> None:
+    """--keep: a scan landing between unlock and unlink must find nothing.
+
+    In-process, with the unlink held back, so the window stays open.
+    """
+    victim = _victim(work)
+    mutated = GUARDS.replace(b"guardA = true", b"guardA = false").decode()
+    journal = RunJournal(["test"], work)
+    journal.claim([victim])
+    journal.record(victim, GUARDS.decode(), mutated)
+    victim.write_bytes(mutated.encode())
+    real_remove = globals()["_remove_entry"]
+    globals()["_remove_entry"] = lambda path: None
+    try:
+        journal.finish(remove=True)
+    finally:
+        globals()["_remove_entry"] = real_remove
+    scan_journal(journal_dir(victim), recover=True)
+    _expect(victim.read_bytes() == mutated.encode(),
+            "a finished entry was replayed and undid a --keep")
+
+
 SELFTEST_CASES = (
     _case_stacked_edits_of_one_file,
     _case_stacked_edits_all_reach_the_command,
@@ -1264,6 +1381,9 @@ SELFTEST_CASES = (
     _case_live_run_blocks_a_second_run_of_the_same_file,
     _case_a_claim_blocks_before_any_mutation,
     _case_a_stuck_file_does_not_block_other_files,
+    _case_killed_between_two_files,
+    _case_an_unterminated_line_does_not_count,
+    _case_a_finished_entry_is_never_recovered,
 )
 
 

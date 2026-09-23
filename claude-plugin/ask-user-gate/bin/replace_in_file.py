@@ -73,8 +73,11 @@ def read_text(path: Path) -> tuple[str, bool]:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise EditError(f"{path} is not UTF-8: {exc}") from exc
-    crlf = CRLF in text and text.count("\n") == text.count(CRLF)
-    return text, crlf
+    return text, is_uniform_crlf(text)
+
+
+def is_uniform_crlf(text: str) -> bool:
+    return CRLF in text and text.count("\n") == text.count(CRLF)
 
 
 def apply_replacement(text: str, old: str, new: str, regex: bool,
