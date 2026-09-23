@@ -185,7 +185,7 @@ def main() -> int:
 
     if options.recover:
         folder = journal_dir(Path.cwd() / "_")
-        return 0 if preflight(folder, set(), quiet_when_clean=False) else 4
+        return 0 if preflight(folder, set()) else 4
 
     command = options.command
     if command and command[0] == "--":
@@ -448,8 +448,13 @@ reuses and which `os.kill(pid, 0)` would deliver CTRL_C to -- is what tells a
 live run from a killed one. A killed run's entry is replayed by the next run in
 the same tree, or by --recover: a file that still holds exactly the mutated
 text gets its original back; one edited since is refused, because nothing can
-tell the mutation from the later edit. `tools/git/commit.py` (in the repository
-this grew up in) refuses to commit a journalled file, live or dead.
+tell the mutation from the later edit.
+
+Read from outside as well: `unrestored_mutations` in `tools/git/commit.py` (the
+repository this grew up in) loads this file from whatever commit its submodule
+sits at, so `JOURNAL_DIR_NAME`, `scan_journal(folder, recover=False)` and the
+`Finding` fields it reads are an interface: change them together with commit.py,
+in the landing that bumps the submodule.
 """
 
 # Test-only: die right after mutating, the way TaskStop kills -- no `finally`.
@@ -676,7 +681,6 @@ class Finding:
 
     entry: Path
     live: bool = False
-    readable: bool = False
     # Why the entry could not even be opened; its run is then assumed live.
     error: "str | None" = None
     pid: "int | None" = None
@@ -714,7 +718,6 @@ def scan_journal(folder: Path, recover: bool,
             handle.seek(0)
             state = _last_state(handle.read())
             if state is not None:
-                finding.readable = True
                 finding.pid = state.get("pid")
                 finding.command = " ".join(map(str, state.get("command") or ["?"]))
             if finding.live:
@@ -799,8 +802,8 @@ def _settle_file(item: dict, finding: Finding, recover: bool) -> None:
     finding.recovered.append(victim)
 
 
-def preflight(folder: Path, targets: "set[Path]", own: "set[Path]" = frozenset(),
-              quiet_when_clean: bool = True) -> bool:
+def preflight(folder: Path, targets: "set[Path]",
+              own: "set[Path]" = frozenset()) -> bool:
     """Undo killed runs in `folder`; False when this run must not go ahead.
 
     Refused only over this run's own `targets`: a live run claiming one (each
@@ -808,8 +811,10 @@ def preflight(folder: Path, targets: "set[Path]", own: "set[Path]" = frozenset()
     would put a mutation back), or a killed run's mutation on one that cannot
     be undone. Anything else is reported and let be -- `git status` and
     commit.py keep showing it -- so one stuck file does not stop every run in
-    the tree. With no targets (--recover) anything left undone is a refusal.
+    the tree. No targets means --recover: anything left undone is a refusal,
+    and a clean or live-only journal is said out loud.
     """
+    recovering = not targets
     go = True
     findings = scan_journal(folder, recover=True, skip=own)
     for finding in findings:
@@ -830,20 +835,20 @@ def preflight(folder: Path, targets: "set[Path]", own: "set[Path]" = frozenset()
                 print(f"try_patch: {victim} is claimed by a live try_patch run "
                       f"({who}); two runs on one file restore each other's "
                       f"mutations -- wait for it", file=sys.stderr)
-            if not quiet_when_clean and not clash:
+            if recovering:
                 print(f"try_patch: live run ({who}), left alone: {finding.entry}")
             continue
-        if finding.unresolved and (clash or not targets):
+        if finding.unresolved and (clash or recovering):
             go = False
         for problem in finding.unresolved:
-            verdict = ("refusing, it is a target of this run" if clash else
-                       "not a target of this run, going ahead" if targets else
-                       "left as it is")
+            verdict = ("left as it is" if recovering else
+                       "refusing, it is a target of this run" if clash else
+                       "not a target of this run, going ahead")
             print(f"try_patch: a killed run ({who}) left a mutation that cannot "
                   f"be undone automatically -- {problem}. Repair the file "
                   f"against `original` in {finding.entry}, then delete that "
                   f"entry ({verdict}).", file=sys.stderr)
-    if not quiet_when_clean and not findings:
+    if recovering and not findings:
         print(f"try_patch: nothing to recover in {folder}")
     return go
 
