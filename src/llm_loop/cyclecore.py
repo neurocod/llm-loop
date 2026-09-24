@@ -53,6 +53,7 @@ import math
 import os
 import queue
 import re
+import signal
 import sys
 import textwrap
 import time
@@ -404,8 +405,27 @@ def _interactive_start_wait(seconds: float, *, enabled: bool) -> bool:
     events = queue.Queue()
     started = time.monotonic()
     deadline = started + seconds
+    restore_signals = []
+
+    def terminate(signum, frame):
+        # Turn default termination into unwinding so the reader restores cbreak
+        # and the screen releases its rows. Custom/ignored signals stay owned
+        # by the embedder. SIGKILL cannot be handled by any terminal owner.
+        raise SystemExit(128 + signum)
+
     try:
-        if not reader.usable() or not terminal.reserve(3):
+        if not reader.usable() or isinstance(terminal, termio.NullTerminal):
+            return False
+        for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+            number = getattr(signal, name, None)
+            if number is None or signal.getsignal(number) != signal.SIG_DFL:
+                continue
+            try:
+                signal.signal(number, terminate)
+            except (ValueError, OSError, RuntimeError):
+                continue  # Only the main thread can install signal handlers.
+            restore_signals.append(number)
+        if not terminal.reserve(3):
             return False
         reader.start(events.put)
         geometry = None
@@ -429,7 +449,9 @@ def _interactive_start_wait(seconds: float, *, enabled: bool) -> bool:
             if remaining <= 0:
                 return True
             try:
-                event = events.get(timeout=min(1.0, remaining))
+                # Keypresses must not shift ticks away from second boundaries.
+                until_tick = 1.0 - ((time.monotonic() - started) % 1.0)
+                event = events.get(timeout=min(until_tick, remaining))
             except queue.Empty:
                 continue
             if not isinstance(event, termio.Key):
@@ -446,6 +468,8 @@ def _interactive_start_wait(seconds: float, *, enabled: bool) -> bool:
     finally:
         reader.stop()
         terminal.release()
+        for number in restore_signals:
+            signal.signal(number, signal.SIG_DFL)
 
 
 def wait_before_start(spec: str, *, interactive: bool = True) -> None:

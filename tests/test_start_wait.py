@@ -44,6 +44,8 @@ def waiting(monkeypatch):
                 action = state.actions.pop(0)
                 if isinstance(action, BaseException):
                     raise action
+                if callable(action):
+                    return action()
                 if isinstance(action, str):
                     return termio.Key(action)
             state.now += timeout
@@ -128,3 +130,28 @@ def test_fractional_wait_does_not_show_zero_early(waiting):
     cyclecore.wait_before_start("0.5s")
     assert waiting.frames[0][0].endswith("Remaining 00:01")
     assert waiting.now == 0.5
+
+
+def test_default_termination_unwinds_and_restores_signal(waiting, monkeypatch):
+    signal = cyclecore.signal
+    handlers = {signal.SIGTERM: signal.SIG_DFL}
+    monkeypatch.setattr(signal, "getsignal",
+                        lambda number: handlers.get(number, signal.SIG_IGN))
+    monkeypatch.setattr(signal, "signal", handlers.__setitem__)
+    waiting.actions = [lambda: handlers[signal.SIGTERM](signal.SIGTERM, None)]
+    with pytest.raises(SystemExit) as caught:
+        cyclecore.wait_before_start("2h")
+    assert caught.value.code == 128 + signal.SIGTERM
+    assert waiting.stopped and waiting.released
+    assert handlers[signal.SIGTERM] == signal.SIG_DFL
+
+
+def test_keypress_does_not_shift_second_boundary(waiting):
+    def press_plus_between_ticks():
+        waiting.now = 0.9
+        return termio.Key("+")
+
+    waiting.actions = [press_plus_between_ticks, None, " "]
+    cyclecore.wait_before_start("2s")
+    assert waiting.now == 1.0
+    assert waiting.frames[2][0] == "Elapsed 00:01  |  Remaining 01:01"
