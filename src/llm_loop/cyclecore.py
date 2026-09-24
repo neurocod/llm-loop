@@ -49,9 +49,12 @@ guessed from error counts, in two layers:
 """
 
 import argparse
+import math
 import os
+import queue
 import re
 import sys
+import textwrap
 import time
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -64,7 +67,7 @@ from typing import Callable, Optional, Union
 # really was for is gone too — neither module imports this one any more.
 from . import (clispec, console, exitlog, limits, operator,
                projectroot, providers, runlifecycle, statusline, stopchannel,
-               textwidth)
+               termio, textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
 # Driver protocol that produces them — is `agentwork`, for the same reason as the
 # rest of this list: both runners execute that contract and neither owns it.
@@ -380,16 +383,78 @@ def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
     return False
 
 
-def wait_before_start(spec: str) -> None:
+def _wait_clock(seconds: float) -> str:
+    """HH:MM:SS, omitting zero hours; callers choose elapsed/remaining rounding."""
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    return (f"{hours:02d}:" if hours else "") + f"{minutes:02d}:{seconds:02d}"
+
+
+def _interactive_start_wait(seconds: float, *, enabled: bool) -> bool:
+    """Own the terminal only until startup; False asks for the plain fallback.
+
+    The input thread only queues events. Deadline changes and painting belong
+    to this thread, so a key cannot race a timeout or leave a second reader
+    competing with the loop's status line. A monotonic deadline keeps clock
+    corrections from changing the requested delay. Repaints bypass the mirror
+    log through Terminal; redirected output only records the wait's start.
+    """
+    terminal = termio.terminal_for(enabled=enabled)
+    reader = termio.TerminalInput()
+    events = queue.Queue()
+    started = time.monotonic()
+    deadline = started + seconds
+    try:
+        if not reader.usable() or not terminal.reserve(3):
+            return False
+        reader.start(events.put)
+        geometry = None
+        while True:
+            now = time.monotonic()
+            remaining = max(0, deadline - now)
+            size = terminal.size()
+            width = max(1, size[0] - 1)
+            rows = textwrap.wrap(
+                f"Elapsed {_wait_clock(now - started)}  |  "
+                f"Remaining {_wait_clock(math.ceil(remaining))}", width)
+            rows += textwrap.wrap("Press a key (no Enter needed):", width)
+            rows += textwrap.wrap(
+                "[q] quit  [+] +1 min  [-] -1 min  [space] start now", width)
+            # Re-reserve on resize so long hints never wrap into the scroll area.
+            layout = (size, len(rows))
+            if layout != geometry and terminal.reserve(len(rows)):
+                geometry = layout
+            if layout == geometry:
+                terminal.paint(rows)
+            if remaining <= 0:
+                return True
+            try:
+                event = events.get(timeout=min(1.0, remaining))
+            except queue.Empty:
+                continue
+            if not isinstance(event, termio.Key):
+                continue
+            if event.char.lower() == "q":
+                print("Start cancelled by user (q).")
+                sys.exit(0)
+            if event.char == " ":
+                deadline = time.monotonic()
+            elif event.char == "+":
+                deadline += 60
+            elif event.char == "-":
+                deadline -= 60
+    finally:
+        reader.stop()
+        terminal.release()
+
+
+def wait_before_start(spec: str, *, interactive: bool = True) -> None:
     """Idle for the duration given by --start-in before the loop begins.
 
     Lets you launch the script and walk away; work kicks off after the delay.
-    Ctrl+C interrupts the wait and stops the script.
-
-    The only wait that runs its clock out (no `should_stop`), because there is
-    nothing here to stop yet: this is before the status line exists, so there is
-    no `s` key to press, and a sentinel that appears meanwhile was waited out
-    just above and is honoured at the first iteration boundary anyway.
+    Before the loop's status line exists, this wait owns its own keys: q exits,
+    +/- adjusts the deadline by a minute, and Space starts immediately. Ctrl+C
+    exits with code 130. Without a terminal, wait silently after the opening line.
     """
     try:
         seconds = parse_duration(spec)
@@ -399,8 +464,14 @@ def wait_before_start(spec: str) -> None:
     if seconds <= 0:
         return
     target_ts = time.time() + seconds
-    print(f"  ⏳ --start-in {spec}: waiting until {fmt_clock(target_ts)} before starting…")
-    _count_down_to(target_ts)
+    print(f"  ⏳ --start-in {spec}: waiting until {fmt_clock(target_ts)} before starting…",
+          flush=True)
+    try:
+        if not _interactive_start_wait(seconds, enabled=interactive):
+            time.sleep(max(0, target_ts - time.time()))
+    except KeyboardInterrupt:
+        print("\nWait interrupted by user (Ctrl+C).")
+        sys.exit(130)
     print("  ▶ Starting the loop.")
 
 
@@ -456,7 +527,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         stopchannel.wait_for_stop_file_clear()
 
     if start_in and not dry_run:
-        wait_before_start(start_in)
+        wait_before_start(start_in,
+                          interactive=not getattr(args, "no_statusline", False))
 
     session_start = time.time()   # start of the current 5-hour session window
     consecutive_errors = 0        # reset to 0 after any successful iteration
