@@ -425,7 +425,7 @@ def _interactive_start_wait(seconds: float, *, enabled: bool) -> bool:
             except (ValueError, OSError, RuntimeError):
                 continue  # Only the main thread can install signal handlers.
             restore_signals.append(number)
-        if not terminal.reserve(3):
+        if not terminal.reserve(4):
             return False
         reader.start(events.put)
         geometry = None
@@ -434,7 +434,8 @@ def _interactive_start_wait(seconds: float, *, enabled: bool) -> bool:
             remaining = max(0, deadline - now)
             size = terminal.size()
             width = max(1, size[0] - 1)
-            rows = textwrap.wrap(
+            rows = [statusline.RULE_CHAR * width]
+            rows += textwrap.wrap(
                 f"Elapsed {_wait_clock(now - started)}  |  "
                 f"Remaining {_wait_clock(math.ceil(remaining))}", width)
             rows += textwrap.wrap("Press a key (no Enter needed):", width)

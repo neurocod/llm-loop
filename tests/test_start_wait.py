@@ -78,9 +78,9 @@ def test_clock(seconds, expected):
 def test_countdown_repaints_without_logging_ticks(waiting, capsys):
     cyclecore.wait_before_start("2s")
     assert waiting.now == 2
-    assert waiting.frames[0][0] == "Elapsed 00:00  |  Remaining 00:02"
-    assert waiting.frames[1][0] == "Elapsed 00:01  |  Remaining 00:01"
-    assert waiting.frames[-1][0] == "Elapsed 00:02  |  Remaining 00:00"
+    assert waiting.frames[0][1] == "Elapsed 00:00  |  Remaining 00:02"
+    assert waiting.frames[1][1] == "Elapsed 00:01  |  Remaining 00:01"
+    assert waiting.frames[-1][1] == "Elapsed 00:02  |  Remaining 00:00"
     assert "[q] quit" in " ".join(waiting.frames[0])
     output = capsys.readouterr().out
     assert "waiting until" in output
@@ -128,7 +128,7 @@ def test_narrow_terminal_keeps_all_controls(waiting):
 
 def test_fractional_wait_does_not_show_zero_early(waiting):
     cyclecore.wait_before_start("0.5s")
-    assert waiting.frames[0][0].endswith("Remaining 00:01")
+    assert waiting.frames[0][1].endswith("Remaining 00:01")
     assert waiting.now == 0.5
 
 
@@ -154,4 +154,4 @@ def test_keypress_does_not_shift_second_boundary(waiting):
     waiting.actions = [press_plus_between_ticks, None, " "]
     cyclecore.wait_before_start("2s")
     assert waiting.now == 1.0
-    assert waiting.frames[2][0] == "Elapsed 00:01  |  Remaining 01:01"
+    assert waiting.frames[2][1] == "Elapsed 00:01  |  Remaining 01:01"
