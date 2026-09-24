@@ -213,13 +213,15 @@ class RunRecord:
             self._finished = True
         self._done.set()
         reason = reason or self._reason or "process exit (reason not recorded)"
-        started = self._fields.get("started") or time.time()
+        ended = time.time()
+        started = self._fields.get("started") or ended
         parts = [f"=== run ended: {reason}"]
         iterations = self._fields.get("iterations")
         if iterations is not None:
             parts.append(f"{iterations} iteration(s), "
                          f"{self._fields.get('completed', 0)} completed")
-        parts.append(_fmt_elapsed(time.time() - started))
+        parts.append(_fmt_elapsed(ended - started))
+        parts.append(_fmt_moment(ended))
         try:
             self._echo(" · ".join(parts) + " ===")
         except Exception:       # a closed/broken stream at exit is not our problem
