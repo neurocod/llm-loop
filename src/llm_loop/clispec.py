@@ -338,7 +338,7 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
     The contract of the `extra_options` / `Driver.add_cli_options` seam, published
     so every host can hold its own hook to it: `build_parser` is a loop over
     `OPTIONS`, so the hook is the only way a spelling the table has never heard
-    of reaches a parser. Two things break a rebuilt command line:
+    of reaches a parser. Three things break a rebuilt command line:
 
       * a VALUE-taking spelling the table does not declare. The rewriter copies
         an unknown flag through verbatim and then reads its value as a token of
@@ -346,7 +346,11 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
         together with whatever follows it;
       * a declared spelling whose arity argparse disagrees with. `takes_value`
         decides whether the NEXT token belongs to the flag: wrong, and removing
-        it either eats a neighbour or leaves an orphan value on the line.
+        it either eats a neighbour or leaves an orphan value on the line;
+      * a spelling of ANY arity but none or one token (`nargs` `'?'`, `'*'`,
+        `'+'`, `N > 1`), declared or not. The rewriter strips a flag plus at
+        most one token, so a bare `nargs='?'` flag eats its neighbour and an
+        `nargs=2` one leaves an orphan value behind.
 
     An undeclared switch (`nargs == 0`) is NOT reported: it has no value to
     misread and is copied through as it stands, which is how a wrapper's own
@@ -362,6 +366,11 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
     for action in parser._actions:
         if "--help" in action.option_strings:
             continue                # argparse's own; no table declares it
+        if action.option_strings and action.nargs not in (None, 0, 1):
+            problems.append(
+                f"{action.option_strings[0]}: nargs={action.nargs!r}, but a "
+                f"rebuilt argv strips a flag with at most one value token")
+            continue
         takes_value = action.nargs != 0
         for spelling in action.option_strings:
             canonical = owner.get(spelling)

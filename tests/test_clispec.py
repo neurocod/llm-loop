@@ -101,6 +101,19 @@ def test_a_declared_flag_with_the_wrong_arity_is_reported(mode, spelling, kwargs
 
 
 @pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("spelling,kwargs", [
+    # declared value flag whose value became optional: bare, it eats a neighbour
+    ("--finish", dict(nargs="?")),
+    # undeclared, two values: the second one is left behind as an orphan
+    ("--rogue", dict(nargs=2)),
+], ids=["declared-optional-value", "undeclared-two-values"])
+def test_a_flag_with_more_than_one_possible_value_is_reported(mode, spelling, kwargs):
+    problems = clispec.unstrippable_flags(_hooked(mode, ((spelling,), kwargs)))
+
+    assert len(problems) == 1 and problems[0].startswith(f"{spelling}: nargs="), problems
+
+
+@pytest.mark.parametrize("mode", MODES)
 def test_an_undeclared_switch_is_left_to_pass_through(mode):
     # The line the gate draws, and the reason it is allowed: the rewriter copies
     # a flag it does not know through verbatim, and a switch has no value that
