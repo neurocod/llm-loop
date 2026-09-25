@@ -199,6 +199,7 @@ src/
                      ending owed to a provider child
     drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)
     parallel.py      run_parallel: N concurrent LLM workers over a list file
+    ownership.py     one thread owns a shared resource, the rest post to it
     operator.py      notes typed at the console, on their way to the running agent
     usage.py         what is known about a quota: the queried figures
                      (UsageSource) and the verdict the wire streams back

@@ -322,8 +322,9 @@ def _refuse_the_stop_announcement(monkeypatch) -> list:
 
     The failure is not the run's and never was: a closed pipe (`llm-loop … |
     head`), a code page that cannot spell the em dash, rich itself. It is staged
-    on `print_markup` because that is where a real console write lands, and
-    `_emit_markup` re-reads the name per call for exactly this kind of pin.
+    on `print_markup` because that is where a real console write lands — on
+    `parallel._console`'s thread, which reads the name per call for exactly
+    this kind of pin.
     Every other line still goes through untouched, so a test that gets no
     attempt at all learns that from the empty list rather than from silence.
     """
@@ -412,12 +413,10 @@ def test_parallel_stop_file_is_reported_once_by_competing_workers(
                      "until the application exits.") == 1
 
 
-# The announcing worker's thread really does die on the refused write — that is
-# the unchanged half of the cost (a `worker` has no try/except, and had none
-# before the two tails were merged either), and pytest reports the dead thread as
-# a warning. Ignored here rather than left to a future `-W error` to turn into a
-# red test about the very thing this test arranges.
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+# An ERROR, not ignored: the refused write happens on the console's owner
+# thread, so no worker may die of it. The announcing worker used to — a
+# `worker` has no try/except — and this filter is what says it no longer does.
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
 def test_parallel_stop_file_latches_even_when_the_console_write_fails(
     tmp_path, monkeypatch
 ):
@@ -435,8 +434,10 @@ def test_parallel_stop_file_latches_even_when_the_console_write_fails(
     whether to start the next phase starts it.
 
     So the pin is on the REASON, not on the output — the whole point is that the
-    output failed. `print_markup` is where a real console write lands
-    (`_emit_markup` re-reads it per call for exactly this kind of pin).
+    output failed. `print_markup` is where a real console write lands (see
+    `_refuse_the_stop_announcement`). Since the console has its own thread the
+    refusal cannot reach the winner at all; the order inside `latch_stop` is
+    still what a caller writing on its own thread depends on.
 
     Run with a FLEET, on the same staging as the neighbouring election pin. The
     reason assertion bites at `jobs = 1` too (measured: restoring the
@@ -467,21 +468,25 @@ def test_parallel_stop_file_latches_even_when_the_console_write_fails(
         "anything")
 
 
-# Same dead announcing thread as above, and the same warning to ignore.
+# The winner's thread dies on purpose; that IS the fixture.
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_a_worker_that_dies_announcing_a_stop_hands_its_claim_back(
+def test_a_worker_that_dies_right_after_winning_a_stop_hands_its_claim_back(
     tmp_path, monkeypatch
 ):
-    """The winner may be holding a file when the write refuses it.
+    """The winner may be holding a file when what follows the latch raises.
 
     The stop check the fleet pin above stages runs at the loop head, where a
     worker holds nothing. The other one does not: a sentinel that appears
     between `Shared.claim` and the hold loop right after it parks the worker
     there WITH a claim, and that worker can be the one that wins the latch and
-    dies on the announcement. Every ordinary way out of that hold releases the
+    dies right after it. Every ordinary way out of that hold releases the
     line; an exception used to be the way that did not, and `claimed` counts a
     file no worker ever started — `RunResult.attempted` and the exit log's
     `iterations` both overstate the run by one.
+
+    Staged on the status-line update that follows the latch. It used to be
+    staged on the announcement's console write, which no longer runs on the
+    worker (see `parallel._console`) and so can no longer kill it.
 
     So the pin is on the COUNT. The queue is asserted too, but as a statement
     of what the run left behind, not as a second bite: a fix that "rescued" the
@@ -490,7 +495,16 @@ def test_a_worker_that_dies_announcing_a_stop_hands_its_claim_back(
     """
     stop = tmp_path / "stop"
     real_claim = parallel.Shared.claim
-    refusals = _refuse_the_stop_announcement(monkeypatch)
+    real_update = statusline.StatusApp.update
+    deaths = []
+
+    def die_after_the_latch(self, **fields):
+        if fields.get("phase") == "stopping":
+            deaths.append(threading.current_thread().name)
+            raise RuntimeError("the status line failed right after the latch")
+        real_update(self, **fields)
+
+    monkeypatch.setattr(statusline.StatusApp, "update", die_after_the_latch)
 
     def sentinel_appears_under_the_claim(self):
         line = real_claim(self)
@@ -511,7 +525,7 @@ def test_a_worker_that_dies_announcing_a_stop_hands_its_claim_back(
         result = parallel.run_parallel(driver, args,
                                        app_name="pytest-stop-parallel")
 
-    assert len(refusals) == 1, "the announcement was never even attempted"
+    assert deaths == ["job1"], "the winner never reached the staged failure"
     assert result.reason == stopchannel.RunStopReason.STOP_FILE
     assert result.completed == 0, "no worker ran a file — nothing may be completed"
     assert result.attempted == 0, (

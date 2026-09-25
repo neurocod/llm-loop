@@ -256,10 +256,10 @@ class LineWriter:
     `emit(plain, markup)` takes the two copies of a finished line: the plain one
     for the mirror log, the markup one for the screen. `console` owns one of
     these with no tag over `print_markup`; `parallel` builds one per worker,
-    tagged `[job k] ` and emitting under the output lock, so the lines of N
-    workers cannot interleave mid-line. Everything else about a line — where the
-    head ends, what the body is cut to, which half is escaped — is the same on
-    both sides and is decided here.
+    tagged `[job k] ` and posting to the one thread that writes them, so the
+    lines of N workers cannot interleave mid-line. Everything else about a
+    line — where the head ends, what the body is cut to, which half is
+    escaped — is the same on both sides and is decided here.
 
     Pass an emit that LOOKS ITS SINK UP rather than one bound to it. The width
     and markup pins replace `console.print_markup` / `parallel.print_markup`

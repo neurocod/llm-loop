@@ -323,16 +323,15 @@ def test_a_worker_dying_in_the_usage_gate_gives_the_file_back(
 # exit by itself — the question this pin asks is whether anything ENDED it.
 _ORPHAN_LIFETIME_S = 120
 
-# The tool name whose line the console refuses to print. `LineWriter.tool` puts
-# the name in the plain text, so this is what lets the stub writer fail on the
-# ONE line that run_job emits with a child running, and stay quiet for the
-# worker's own `▶`/verdict lines around it.
-_KILLS_THE_WRITER = "boom"
+# The tool name whose event run_job fails to read. It is the ONE event the fake
+# provider writes, so this is what makes run_job raise with a child running and
+# nowhere else.
+_KILLS_THE_READER = "boom"
 
 _FAKE_PROVIDER_SRC = "import sys, time\nsys.stdout.write(%r)\nsys.stdout.flush()\ntime.sleep(%d)\n" % (
     json.dumps({"type": "assistant",
                 "message": {"content": [{"type": "tool_use",
-                                         "name": _KILLS_THE_WRITER,
+                                         "name": _KILLS_THE_READER,
                                          "input": {}}]}}) + "\n",
     _ORPHAN_LIFETIME_S,
 )
@@ -363,12 +362,16 @@ def _outlived_the_run(proc, timeout=REAP_WAIT_S) -> bool:
 def test_a_dying_job_does_not_leave_the_provider_running(tmp_path, monkeypatch):
     """A `run_job` that raises must not walk away from a live child process.
 
-    `proc.wait()` at the bottom of run_job is its only reaping exit, and the
-    console write behind every `out.*` line sits above it — a real
-    BrokenPipeError there (the same one the fleet pin above is built on) used to
-    unwind straight past the child. The provider CLI then kept running: unreaped,
+    `proc.wait()` at the bottom of run_job is its only reaping exit, and every
+    event it reads is handled above it — an exception there used to unwind
+    straight past the child. The provider CLI then kept running: unreaped,
     still holding the stdout it inherited, printing over whatever the terminal
     did next.
+
+    Staged on reading the event, on the worker's own thread. It used to be
+    staged on the console write, and that no longer reaches the worker at all:
+    the write happens on `parallel._console`'s thread (see
+    `test_output_owner`).
 
     A real subprocess rather than a stub, because the defect is exactly the
     thing a stub does not have — an OS process that outlives the function that
@@ -384,12 +387,16 @@ def test_a_dying_job_does_not_leave_the_provider_running(tmp_path, monkeypatch):
         children.append(proc)
         return proc
 
-    def console_that_dies(plain, markup):
-        if _KILLS_THE_WRITER in plain:
-            raise BrokenPipeError("the terminal went away mid-line")
+    real_tool_use_name = parallel.wire.tool_use_name
+
+    def reader_that_dies(block):
+        name = real_tool_use_name(block)
+        if name == _KILLS_THE_READER:
+            raise ValueError("the event could not be read")
+        return name
 
     monkeypatch.setattr(parallel, "start_agent_process", fake_provider)
-    monkeypatch.setattr(parallel, "print_markup", console_that_dies)
+    monkeypatch.setattr(parallel.wire, "tool_use_name", reader_that_dies)
 
     driver = MemListDriver(["products/only.md"])
     # Every exit from here kills what was started, including the assertion

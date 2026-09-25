@@ -23,9 +23,10 @@ What this shares with the sequential runner, and what it deliberately drops:
     local in the other.
   * Dropped — the live token-by-token Markdown rendering. cyclecore's stream
     renderer keeps module-global state that cannot serve several concurrent
-    streams without garbling, so here each worker prints one compact, fully
-    formed line per event, prefixed `[job k]`, under a single output lock. You
-    trade the live view for throughput — the right call for mechanical bulk work.
+    streams without garbling, so here each worker posts one compact, fully
+    formed line per event, prefixed `[job k]`, to the one thread that writes
+    them (`_console`). You trade the live view for throughput — the right call
+    for mechanical bulk work.
 
 CLI mirrors the family (see `--help`) because both parsers are built from the
 same table, `clispec.OPTIONS`; what this mode adds there is `-j/--jobs N`
@@ -46,6 +47,7 @@ from . import clispec
 from . import compactline
 from . import exitlog
 from . import operator
+from . import ownership
 from . import projectroot
 from . import providers
 from . import runlifecycle
@@ -123,9 +125,14 @@ MAX_ATTEMPTS = 3
 # way, so the cap costs no information about the size of the queue.
 DRY_RUN_LIST_LIMIT = 10
 
-# Serialises every line printed by any worker so the compact per-job lines never
-# interleave mid-line (each print is atomic, the renderers are not thread-safe).
-_emit_lock = threading.Lock()
+# The one thread that writes the workers' lines while a run is open: workers
+# post, it prints, so `print_markup` (and rich under it) is never entered by two
+# threads and the per-job lines cannot interleave. `run_parallel` opens it for
+# the worker phase and closes it — having written everything posted — before its
+# own closing report. Outside that window there is no run to compete with and a
+# line is written by whoever emits it: a test driving `run_job` directly, or a
+# worker a Ctrl+C gave up joining.
+_console = ownership.OwnerThread("console-lines")
 
 
 def parse_args(argv=None, *, prog: str = "parallel",
@@ -152,16 +159,20 @@ def parse_args(argv=None, *, prog: str = "parallel",
                                 extra_options=extra_options).parse_args(argv)
 
 
-# --- output helpers: every emit goes through the shared lock --------------------
+# --- output helpers: every emit is posted to the console's owner ----------------
 
-def _emit_markup(plain: str, markup: str) -> None:
-    """The sink under every worker's line: one whole line written at a time.
+def _write_markup(plain: str, markup: str) -> None:
+    """One whole line to the console — on `_console`'s thread while a run is open.
 
     Reads `print_markup` off this module per call rather than closing over it —
     which is what lets the pins replace it (see `compactline.LineWriter`).
     """
-    with _emit_lock:
-        print_markup(plain, markup)
+    print_markup(plain, markup)
+
+
+def _emit_markup(plain: str, markup: str) -> None:
+    """The sink under every worker's line: post it, do not write it."""
+    _console.post(_write_markup, plain, markup)
 
 
 def _job_tag(job_id: int) -> tuple:
@@ -170,10 +181,10 @@ def _job_tag(job_id: int) -> tuple:
 
 
 def job_lines(job_id: int) -> compactline.LineWriter:
-    """The compact line shapes, tagged for one worker and emitted under the lock.
+    """The compact line shapes, tagged for one worker and posted to `_console`.
 
     The whole difference between this runner's output and the sequential one:
-    every line carries `[job k] ` and every write is serialised. Both are given
+    every line carries `[job k] ` and one thread writes them all. Both are given
     to `compactline.LineWriter` here, so the shapes themselves — a tool call, a
     head plus what the row leaves beside it, an outcome — exist once for both
     runners, and the tag counts against the width of each of them.
@@ -374,9 +385,9 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     """Run one provider command, rendering a compact per-job trace.
 
     Unlike cyclecore's streaming renderer this prints only the key events — each
-    tool call, any failed tool result, and the final cost line — one atomic line
-    at a time, so several of these can run at once without their output
-    colliding. Returns (returncode, cost_usd, duration_s).
+    tool call, any failed tool result, and the final cost line — one whole line
+    per post to `_console`, so several of these can run at once without their
+    output colliding. Returns (returncode, cost_usd, duration_s).
 
     `mailbox` belongs to this worker; it lends the console this turn's stdin,
     exactly as the sequential runner does.
@@ -403,10 +414,11 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # not be able to grow a worker's memory — and printed only if the job fails.
     diagnostics = collections.deque(maxlen=FAILURE_TAIL_LINES)
     # Everything from here down to `proc.wait()` runs with a child process
-    # alive, and every step of it can raise: the console write behind each
-    # `out.*` line, `note_channel`'s close, a decoder error on the child's own
-    # stream. `wait()` is the only exit that reaps, so an exception used to
-    # walk away from a running provider — see `providers.reap_agent_process`.
+    # alive, and every step of it can raise: formatting an `out.*` line (and,
+    # with no run open, the console write behind it), `note_channel`'s close, a
+    # decoder error on the child's own stream. `wait()` is the only exit that
+    # reaps, so an exception used to walk away from a running provider — see
+    # `providers.reap_agent_process`.
     try:
         with note_channel(proc, provider, mailbox) as channel:
             for line in proc.stdout:
@@ -1026,7 +1038,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
 
         # EVERYTHING from here down to `shared.finish` runs while this worker
         # holds a claim, and every step of it can raise: the usage gate does
-        # network I/O and prints, the console can refuse any of these lines,
+        # network I/O and prints, a status-line update can fail,
         # `command_for`/`splice` build the prompt, and `run_job` drives a child
         # process. An exception here ends one thread and latches no stop, so the
         # claim it walks away from keeps `_exhausted` (`not pending and not
@@ -1079,10 +1091,9 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # nothing" promises it will not do. Parked like this the worker is not
             # busy (no turn is running), so the verdict is not waiting on it either.
             # A max-items boundary only closes new claims, so already-claimed work
-            # deliberately continues past all of this. This is also the hold whose
-            # exception is EXPECTED by design: the worker parked here may be the one
-            # that wins the latch, and its console write can fail for reasons that
-            # have nothing to do with the run (see `Shared.latch_stop`).
+            # deliberately continues past all of this. The worker parked here may
+            # be the one that wins the latch, and whatever follows the latch can
+            # still raise (see `Shared.latch_stop`) with this claim held.
             while (stopchannel.pending_stop(app) is not None
                    and not shared.stop.is_set()):
                 # The one place that decides what a request means — the key keeps
@@ -1401,34 +1412,44 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # The region lives exactly as long as the workers do (run_loop releases it
     # the same way, before its final push): a batching wrapper alternates runs of
     # this runner with sequential ones, and two status areas pinned at
-    # once would fight over the same rows.
-    with app:
-        if source is not None:
-            # Inside `with`, not before it: push_quotas is silent until start()
-            # has marked the app enabled. The reading is already paid for by the
-            # start-of-run snapshot above, so this costs no round-trip. The
-            # refresher only runs for a run that talks to the usage endpoint at
-            # all — with --ignore-usage `source` is None and nothing polls.
-            statusline.push_quotas(app, source, policy)
-            app.add_service(statusline.QuotaRefresher(
-                app, source, policy, provider=provider))
-        threads.start_initial()
-        pusher.start()
+    # once would fight over the same rows. The console's owner lives as long as
+    # the region, and its `close` in the `finally` is what puts every line the
+    # workers posted on screen BEFORE the closing report below.
+    _console.start()
+    try:
+        with app:
+            if source is not None:
+                # Inside `with`, not before it: push_quotas is silent until
+                # start() has marked the app enabled. The reading is already
+                # paid for by the start-of-run snapshot above, so this costs no
+                # round-trip. The refresher only runs for a run that talks to
+                # the usage endpoint at all — with --ignore-usage `source` is
+                # None and nothing polls.
+                statusline.push_quotas(app, source, policy)
+                app.add_service(statusline.QuotaRefresher(
+                    app, source, policy, provider=provider))
+            threads.start_initial()
+            pusher.start()
 
-        try:
-            join_workers(threads)
-        except KeyboardInterrupt:
-            print("\nInterrupted by user (Ctrl+C) — signalling workers to stop…")
-            interrupted = True
-            threads.close()
-            shared.stop.set()
-            for t in threads:
-                t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
+            try:
+                join_workers(threads)
+            except KeyboardInterrupt:
+                # Posted, not printed: the workers are still writing, and this
+                # line belongs after what they had already said.
+                _console.post(print, "\nInterrupted by user (Ctrl+C) — "
+                                     "signalling workers to stop…")
+                interrupted = True
+                threads.close()
+                shared.stop.set()
+                for t in threads:
+                    t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
 
-        if not interrupted:
-            shared.stop.set()  # release the pusher's wait()
-            pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
-        app.update(phase="idle")
+            if not interrupted:
+                shared.stop.set()  # release the pusher's wait()
+                pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
+            app.update(phase="idle")
+    finally:
+        _console.close()
 
     # This run's own closing report, before the shared epilogue: the run talks
     # about its work first, and the housekeeping that closes it down follows.

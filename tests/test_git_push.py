@@ -407,9 +407,6 @@ class _LockWatchingThreading:
     on `gitpush.subprocess` and for the same reason: patching `threading.Lock`
     itself would instrument every lock in the process, including pytest's own.
     Everything else (`Event`, `Thread`, …) is forwarded untouched.
-
-    `_emit_lock` is not covered — it is built at import time, long before this
-    stands in — which is correct: it is the print lock, not this run's.
     """
 
     def __init__(self, real, log: _LockWaitLog):

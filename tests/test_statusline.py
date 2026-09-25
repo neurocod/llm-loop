@@ -728,8 +728,10 @@ def test_a_pinned_terminal_writes_its_rows_to_the_real_stream(monkeypatch):
     with app:
         assert app.enabled is True
         app.update(iteration=4, phase="running")
-        assert "iter 4" in stream.getvalue()
 
+    # Read after the `with`: the painter draws the update, and stop() is what
+    # waits for its last frame (see `StatusApp._repaint_loop`).
+    assert "iter 4" in stream.getvalue()
     assert app.enabled is False   # region released on the way out
 
 
@@ -802,10 +804,18 @@ def test_the_title_is_written_on_change_only_and_given_back_on_exit(monkeypatch)
         app.update(iteration=4, max_iterations=9, phase="running")
         app.job(1).start(item="garlic.md", model="opus", now=NOW)
         app.update(phase="running")             # the item reaches the title here
+        # The painter writes it, not this thread: wait for the frame.
+        deadline = time.time() + 5
+        while escape not in stream.getvalue() and time.time() < deadline:
+            time.sleep(0.01)
         mark = len(stream.getvalue())
         app.update(note="anything")             # state the title does not carry
-        assert "\x1b]0;" not in stream.getvalue()[mark:]   # so: no second write
-        assert stream.getvalue().count(escape) == 1
+    # stop() waits for the painter's last frame, which carries the note — so
+    # everything after `mark` is that frame and the teardown.
+    assert "anything" in stream.getvalue()[mark:], "the note was never painted"
+    # One title escape after the mark, and it is the empty one: no second write.
+    assert stream.getvalue()[mark:].count("\x1b]0;") == 1
+    assert stream.getvalue().count(escape) == 1
 
     # The empty title, which is the documented way back to the profile's own.
     assert "\x1b]0;\x07" in stream.getvalue()   # the window gets its name back
@@ -1202,6 +1212,7 @@ def test_the_pinned_rows_never_reach_the_mirror_log(monkeypatch):
         app.update(iteration=7, phase="running")
         print("ordinary output")                # still goes through the tee
 
+    # "iter 7" is the painter's last frame, which stop() waits for.
     assert "\x1b" in screen.getvalue() and "iter 7" in screen.getvalue()
     assert logged == ["ordinary output"]
     assert all("\x1b" not in line for line in logged)

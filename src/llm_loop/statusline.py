@@ -2269,9 +2269,15 @@ class StatusApp:
         self._stop_file = stop_file
         self._input = input_source
         self._paint_stop = threading.Event()
+        # The painter's mailbox. One slot is the whole queue because every
+        # request asks for the same thing — "draw the state as it is NOW" — so
+        # ten requests before the painter wakes are one frame, not ten.
         self._paint_requested = threading.Event()
-        self._input_dispatch = threading.local()
         self._paint_thread: Optional[threading.Thread] = None
+        # The thread that owns the terminal while the app is started: named by
+        # `start()` before the painter runs, handed back by the painter as its
+        # loop ends (see `_paint`, `_repaint_loop`).
+        self._painter: Optional[threading.Thread] = None
         self._note_at = 0.0
         self._reserved = 0
         self._started = False
@@ -2340,6 +2346,9 @@ class StatusApp:
                                else termio.NullInputSource())
             self._paint_thread = threading.Thread(
                 target=self._repaint_loop, name="statusline-paint", daemon=True)
+            # Owner from before its first instruction, so no paint in between
+            # runs on the caller's thread beside it.
+            self._painter = self._paint_thread
             self._paint_thread.start()
             self._input.start(self._handle_input)
             self._install_emergency_restore()
@@ -2609,13 +2618,9 @@ class StatusApp:
             self.disable()
 
     def _handle_input(self, event: termio.InputEvent) -> None:
-        """Read keys without waiting for a terminal write, including paints
-        requested indirectly by a mode change or a delivery notification."""
-        self._input_dispatch.active = True
-        try:
-            self.handle_event(event)
-        finally:
-            self._input_dispatch.active = False
+        """Read keys without waiting for a terminal write: the key reader is not
+        the painter, so every paint it causes is a request (see `_paint`)."""
+        self.handle_event(event)
 
     # --- rendering ---------------------------------------------------------
 
@@ -2642,7 +2647,17 @@ class StatusApp:
         return False
 
     def _paint(self, *, reassert: bool = False) -> None:
-        if getattr(self._input_dispatch, "active", False):
+        """Draw the rows and the title — on the painter, and only there.
+
+        While the painter runs it is the one thread that renders and writes the
+        terminal; a worker's `update`, a key, a quota poll only post a request
+        and return, so the renderers never run on two threads at once and no
+        caller waits for a slow terminal. Before `start()` and once the painter
+        has ended there is no owner, and the caller paints itself: that is how
+        a run names its window before the region is pinned.
+        """
+        painter = self._painter
+        if painter is not None and threading.current_thread() is not painter:
             self._paint_requested.set()
             return
         # Before the `active` gate, and on the same path as the rows: the title
@@ -2674,6 +2689,23 @@ class StatusApp:
             self.disable()
 
     def _repaint_loop(self) -> None:
+        try:
+            self._serve_paints()
+            # The last frame, drawn whether or not a request was pending: stop()
+            # sets the same event to wake the painter, so a real request cannot be
+            # told from the wake-up. Without it the state a caller set right
+            # before stop() — the run's final `phase="idle"` — never reaches the
+            # screen, because the painter was woken to exit rather than to draw.
+            self._paint()
+        finally:
+            # Handing the terminal back: a paint asked for after this is the
+            # caller's own again, so nothing waits on a painter that is gone.
+            # Only if it is still ours — a restarted app may already have a
+            # new painter while this one, past its join timeout, winds down.
+            if self._painter is threading.current_thread():
+                self._painter = None
+
+    def _serve_paints(self) -> None:
         last_size = self.terminal.size()
         ticks = 0
         next_refresh = time.monotonic() + self.refresh
