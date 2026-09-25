@@ -227,11 +227,13 @@ class OwnerThread:
                         self._finished += 1
                         self._changed.notify_all()
         finally:
-            # Only reachable with the state still open if something got past
-            # `_invoke` — the owner must never die silently with posters left
-            # queueing into it.
+            # Only reachable still owning if something got past `_invoke` — the
+            # owner must never die silently with posters left queueing into it.
+            # Asked by identity, not by state: after a normal hand-back a
+            # `start()` may already have opened a NEW owner, whose open state
+            # this thread must not close.
             with self._changed:
-                if self._state != _CLOSED:
+                if self._thread is threading.current_thread():
                     self._close_locked()
 
     def _close_locked(self) -> None:

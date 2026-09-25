@@ -243,6 +243,48 @@ def test_opening_again_during_a_timed_out_close_keeps_the_one_owner():
     assert owner.close(WAIT_S)
 
 
+def test_an_owner_that_handed_back_leaves_the_next_owner_open():
+    """A restart right after a normal hand-back keeps its new owner.
+
+    The old thread hands back in one locked step and re-checks in another on
+    its way out; a `start()` between the two opens a NEW owner, which the old
+    thread must not take for its own and close. Staged by releasing the lock
+    right after the hand-back (a `wait` on the condition does exactly that)
+    until the restart has happened.
+    """
+    owner = ownership.OwnerThread("pin-owner")
+    first_hand_back = [True]
+    real_close_locked = owner._close_locked
+
+    def hand_back_then_let_a_restart_in():
+        real_close_locked()
+        if first_hand_back[0] and threading.current_thread().name == "pin-owner":
+            first_hand_back[0] = False
+            restart_may_go.set()
+            owner._changed.wait_for(lambda: owner._state == ownership._OPEN,
+                                    WAIT_S)
+
+    restart_may_go = threading.Event()
+    owner._close_locked = hand_back_then_let_a_restart_in
+    owner.start()
+    owner.close(timeout=0)                    # the hand-back runs on the owner
+    assert restart_may_go.wait(WAIT_S)
+    owner.start()
+    with owner._changed:                      # a fresh start notifies nobody
+        owner._changed.notify_all()
+    old = [t for t in threading.enumerate() if t.name == "pin-owner"]
+    for thread in old:
+        if thread is not owner._thread:
+            thread.join(WAIT_S)
+
+    ran_on = []
+    owner.post(lambda: ran_on.append(threading.current_thread()))
+    assert owner.drain(WAIT_S)
+    assert ran_on and ran_on[0] is not threading.current_thread(), \
+        "the old owner's exit closed the new one: the post ran on its caller"
+    assert owner.close(WAIT_S)
+
+
 def test_close_asked_again_answers_for_the_thread_it_left_running():
     owner = ownership.OwnerThread("pin-owner").start()
     stall = _Stall()
