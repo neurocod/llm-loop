@@ -78,9 +78,10 @@ def test_slow_paint_does_not_block_input_and_eventually_shows_the_latest_note():
         reader = threading.Thread(target=type_note, daemon=True)
         try:
             reader.start()
+            # Read, not yet applied: the keys are the painter's to apply, and
+            # the painter is the thread stuck in the write. What a slow
+            # terminal may cost is WHEN a key takes effect, never the reading.
             assert read.wait(budget), "terminal painting stalled the key reader"
-            assert app.mode.buffer == text
-            assert mailbox.take_queued() == ["first"]
         finally:
             terminal._lock.release()
             reader.join(timeout=budget)
@@ -91,7 +92,10 @@ def test_slow_paint_does_not_block_input_and_eventually_shows_the_latest_note():
             if frame[-1].endswith("FINAL" + sl.MessagePromptRow.caret):
                 break
         assert all(textwidth.cell_width(row) < terminal.columns for row in frame)
-        source.handler(termio.Key("\r"))
+        # Every key read during the stall took effect once the terminal came back.
+        assert app.mode.buffer == text
+        assert mailbox.take_queued() == ["first"]
+        app.handle_event(termio.Key("\r"))      # waits for the painter to apply it
         assert mailbox.take_queued() == [text]
         assert not app.stop_requested_here
 

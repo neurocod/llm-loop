@@ -7,7 +7,8 @@ Three layers, pinned in that order:
   * the parallel runner's console lines — every write on the one owner thread,
     never two at once, all of them on screen before the run reports;
   * the status line — while the painter runs, nobody else renders or writes
-    the terminal; everybody else's paint is a request.
+    the terminal or touches the mode stack; everybody else's paint is a
+    request, and a key, a resize or a `disable` is a call posted to it.
 """
 
 import io
@@ -20,6 +21,7 @@ import pytest
 
 from llm_loop import ownership, parallel, projectroot, termio
 from llm_loop import statusline as sl
+from llm_loop.breakpoints import Breakpoints
 
 from _runfixtures import MemListDriver, par_args
 
@@ -487,15 +489,35 @@ def test_ctrl_c_over_a_stuck_console_still_stops_the_workers_and_reports(
 
 
 class _PaintLog(termio.Terminal):
-    """A terminal with no screen that remembers which thread wrote to it."""
+    """A terminal with no screen that remembers which thread wrote to it.
+
+    `arm_stall()` makes the painter's next frame hang until `unstall` is set:
+    a terminal write that does not come back.
+    """
 
     def __init__(self):
         super().__init__(io.StringIO())
         self.writers = []
+        self.releases = []
         self.frames = queue.Queue()
+        self._armed = threading.Event()
+        self.stalled = threading.Event()
+        self.unstall = threading.Event()
 
     def size(self):
         return (100, 30)
+
+    def arm_stall(self):
+        self._armed.set()
+
+    def reserve(self, rows):
+        self.writers.append(threading.current_thread().name)
+        return super().reserve(rows)
+
+    def release(self):
+        self.writers.append(threading.current_thread().name)
+        self.releases.append(threading.current_thread().name)
+        return super().release()
 
     def set_title(self, text, *, reassert=False):
         self.writers.append(threading.current_thread().name)
@@ -503,9 +525,33 @@ class _PaintLog(termio.Terminal):
 
     def paint(self, lines, *, reassert=False):
         self.writers.append(threading.current_thread().name)
+        if (self._armed.is_set()
+                and threading.current_thread().name == "statusline-paint"):
+            self._armed.clear()
+            self.stalled.set()
+            self.unstall.wait(WAIT_S)
         result = super().paint(lines, reassert=reassert)
         self.frames.put(" ".join(lines))
         return result
+
+
+class _KeysByHand(termio.NullInputSource):
+    """An input source whose handler the test calls: the key reader's seat."""
+
+    def start(self, handler):
+        self.handler = handler
+
+
+class _RecordingMode(sl.Mode):
+    """Consumes every key and remembers which thread handled it."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.handled_on = []
+
+    def handle(self, event):
+        self.handled_on.append((threading.current_thread().name, event))
+        return True
 
 
 def test_while_started_only_the_painter_writes_the_terminal():
@@ -544,3 +590,159 @@ def test_without_a_painter_the_caller_paints():
     app.update(phase="running")
 
     assert terminal.writers == [threading.current_thread().name]
+
+
+def test_while_started_keys_and_resizes_are_handled_on_the_painter():
+    """The mode stack and the region are the painter's, like the terminal.
+
+    A key used to be handled on the key reader's thread — mutating the modes
+    while the painter read them — and a Resize re-pinned the region from there.
+    """
+    terminal, keys = _PaintLog(), _KeysByHand()
+    app = sl.StatusApp(terminal=terminal, input_source=keys, refresh=60)
+    recorder = _RecordingMode(app)
+    app.push_mode(recorder)
+    with app:
+        del terminal.writers[:]       # start() pins and paints on its own thread
+        keys.handler(termio.Key("x"))
+        keys.handler(termio.Resize(100, 30))
+        # From this thread it is handed over too, and waited for — after the
+        # two posted before it, so everything above has run once it returns.
+        app.handle_event(termio.Key("y"))
+        handled = list(recorder.handled_on)
+        writers = set(terminal.writers)
+
+    assert handled == [("statusline-paint", termio.Key("x")),
+                       ("statusline-paint", termio.Key("y"))]
+    assert "statusline-paint" in writers and writers == {"statusline-paint"}, \
+        "a key or a resize wrote the terminal off the painter"
+
+
+def test_disabling_from_another_thread_is_carried_out_by_the_painter():
+    terminal = _PaintLog()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    with app:
+        app.disable()
+        released_by = list(terminal.releases)
+
+    assert released_by == ["statusline-paint"]
+    assert isinstance(app.terminal, termio.NullTerminal)
+
+
+def test_stop_leaves_the_release_to_a_painter_stuck_in_its_frame(monkeypatch):
+    """stop() gives up joining a stuck painter; it may not write beside it.
+
+    It used to release the terminal from its own thread right after the join
+    timed out — while the painter was still inside its frame, which then went
+    on writing into a region that no longer existed.
+    """
+    monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
+    terminal = _PaintLog()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    app.start()
+    painter = app._paint_thread
+    terminal.arm_stall()
+    app.update(iteration=1)
+    assert terminal.stalled.wait(WAIT_S)
+    try:
+        app.stop()
+        assert painter.is_alive()
+        assert terminal.releases == [], "stop() released under a live painter"
+    finally:
+        terminal.unstall.set()
+    painter.join(WAIT_S)
+    assert not painter.is_alive()
+    assert terminal.releases == ["statusline-paint"], \
+        "the painter did not release the terminal on its way out"
+
+
+def test_a_restart_after_a_timed_out_stop_does_not_revive_the_old_painter(
+        monkeypatch):
+    """Every start gets its own stop event; the old painter keeps its own.
+
+    start() used to CLEAR the one shared event, so a painter the last stop()
+    had given up on woke up running again next to the new one — stealing its
+    wake-ups and re-pinning the region from its periodic resize check.
+    """
+    monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
+    terminal = _PaintLog()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    app.start()
+    old = app._paint_thread
+    terminal.arm_stall()
+    app.update(iteration=1)
+    assert terminal.stalled.wait(WAIT_S)
+    try:
+        app.stop()
+        assert old.is_alive()
+        app.start()
+    finally:
+        terminal.unstall.set()
+    old.join(WAIT_S)
+    try:
+        assert not old.is_alive(), "the old painter was revived by the restart"
+        assert app._paint_thread is not old and app._paint_thread.is_alive()
+    finally:
+        app.stop()
+
+
+def test_a_note_is_stamped_and_expired_by_the_painter(monkeypatch):
+    """The note's clock has one writer: the painter, which is what expires it.
+
+    `note()` used to write the timestamp from whichever thread called it while
+    the painter read and reset it.
+    """
+    monkeypatch.setattr(sl, "NOTE_TTL", 0.05)
+    app = sl.StatusApp(terminal=_PaintLog(), input_source=termio.NullInputSource(),
+                       refresh=0.01)
+    stamped_on = []
+    real_stamp = app._stamp_note
+
+    def spy(stamp):
+        stamped_on.append(threading.current_thread().name)
+        real_stamp(stamp)
+
+    app._stamp_note = spy
+    with app:
+        app.note("short-lived")
+        deadline = time.monotonic() + WAIT_S
+        while app.status.note and time.monotonic() < deadline:
+            time.sleep(0.01)
+        left = app.status.note
+
+    assert left == "", "the note never expired"
+    assert stamped_on == ["statusline-paint"]
+
+
+def test_a_paste_tail_posted_behind_its_enter_is_discarded_with_it():
+    """Keys are posted, so the tail of a paste can be queued before its Enter
+    is handled — and must go the way the reader's own discard sends the rest.
+
+    The reader used to run the handler itself, so Enter's `discard_pending`
+    stopped it mid-chunk; now the keys it already read sit in the painter's
+    mailbox, and a pasted "…\\rs" would otherwise stop the run.
+    """
+    points = Breakpoints(lambda: "cleanup")
+    terminal = _PaintLog()
+    reader = termio.TerminalInput()     # never started: its feed is driven here
+    app = sl.StatusApp(terminal=terminal, input_source=reader, refresh=60)
+    app.register_action(sl.BreakpointAction(points))
+    with app:
+        app.handle_event(termio.Key("b"))
+        terminal.arm_stall()
+        app.update(iteration=1)
+        assert terminal.stalled.wait(WAIT_S)     # the painter is held in a frame
+        try:
+            for char in "cleanup\rspm":
+                reader._emit(app._handle_input, char)
+        finally:
+            terminal.unstall.set()
+        app.handle_event(termio.Resize(100, 30))  # after everything posted above
+        mode = app.mode
+
+    assert points.names == ("cleanup",)
+    assert isinstance(mode, sl.NormalMode)
+    assert not app.stop_requested_here and not app.paused
