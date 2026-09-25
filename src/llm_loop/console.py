@@ -15,10 +15,10 @@ runner that produces the lines:
   * so a runner that owned the log would own a file it never writes, while the
     module that writes it would have to ask permission to.
 
-What deliberately did NOT come along, and the test for it: `report_costs` READS
-this log back and parses the runner's own vocabulary out of it ("=== Iteration 1
-===", "· done (… c, $…)") — those lines are emitted by `run_loop` and the event
-renderers, so its patterns belong next to THEM, in `cyclecore`. `exitlog` is the
+What deliberately did NOT come along, and the test for it: reading this log
+back for `--cost` means knowing what two of the runners' lines MEAN ("=== Iteration
+1 ===", "· done (… c, $…)"), which is not a printing question — so the lines and
+their patterns are `costlog`'s, and it imports `log_file_path`. `exitlog` is the
 same shape from the other side: it is handed `LOG_DIR` and writes its own file
 beside the mirror, so it stays a module of its own and imports the constant.
 

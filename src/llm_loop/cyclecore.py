@@ -11,8 +11,9 @@ Reading a quota and pausing on it are `usage`/`limits`, and when a run
 pushes what it has committed is `gitpush` — both runners apply those and neither
 owns them. What the run PRINTS is `console` — with the rotating mirror log, which
 is the second copy of every printed line and therefore belongs to the printer;
-what `--cost` reads back OUT of that log is still here, because the lines it
-parses are emitted here. What is asked of a run from OUTSIDE it —
+what `--cost` reads back OUT of that log is `costlog`, together with the two
+lines it reads, which this loop and `streamrender` print through it. What is
+asked of a run from OUTSIDE it —
 the `s` key and the `stop` sentinel, the `p` key's hold, and the reason a
 runner reports on the way out — is `stopchannel`, a module of its own, because
 the parallel runner and a host wrapper speak that vocabulary too and neither
@@ -50,15 +51,13 @@ guessed from error counts, in two layers:
 
 import argparse
 import math
-import os
 import queue
 import re
 import signal
 import sys
 import textwrap
 import time
-from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Optional
 
 # `statusline` was imported inside `run_loop` for years, on the grounds that
 # hoisting it would change what a bare `import llm_loop.cyclecore` drags in.
@@ -66,7 +65,7 @@ from typing import Callable, Optional, Union
 # `__init__`, which imports it unconditionally, so it is already in
 # `sys.modules` before this line is reached. The cycle the local import really
 # was for is gone too — it does not import this module any more.
-from . import (clispec, console, exitlog, operator,
+from . import (clispec, console, costlog, exitlog, operator,
                projectroot, providers, runlifecycle, statusline, stopchannel,
                termio, textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
@@ -160,98 +159,6 @@ except (AttributeError, ValueError):
 # (see that module's header for the two mirrors it deleted). The package's front
 # door still spells them `llm_loop.project_dir` / `set_project_root` /
 # `find_project_root`, so an embedder's address is unchanged.
-
-
-# Per-run cost accounting parsed straight back out of the mirror log: every run's
-# first iteration logs a "=== Iteration 1 ===" header (see run_loop) and every
-# successful iteration logs a "done (… c, $…)" line. Summing the dollar figures
-# between headers reconstructs per-run spend with no extra bookkeeping.
-#
-# Only the FIRST of those two lines is emitted next to its pattern (run_loop,
-# below). The second is `streamrender._render_claude_event`'s "result" branch.
-# Two files, so they CAN drift: this pattern is what a re-worded "done" line has
-# to be checked against. `_render_codex_event` prints "· done (tokens: …)",
-# which this deliberately does not match — codex reports tokens, not dollars, so
-# a codex run has no per-session spend to total up.
-# Note "=== Iteration 1 ===" matches only
-# iteration 1 (the "1 ===" boundary rules out "11", "12", …), so each match is a
-# genuine run boundary.
-_SESSION_RE = re.compile(r"=== Iteration 1 ===")
-_COST_RE = re.compile(r"done \(\s*[\d.]+ c,\s*\$([\d.]+)\)")
-
-
-def report_costs(app_name: str = "runCycle",
-                 path: Optional[Union[str, Path]] = None) -> None:
-    """Print per-session (per-run) cost totals parsed from the mirror log, then
-    exit — the standalone counterpart reached via the --cost flag.
-
-    A "session" is one run of the loop, delimited by its "=== Iteration 1 ==="
-    header; within it every "done (… c, $…)" line contributes its dollar cost. We
-    print a line per session, a grand total, and how full the log is against the
-    rotation limit (LOG_MAX_BYTES). With no `path`, the log is resolved via
-    log_file_path(app_name), so --cost reports on the very log this entry point
-    writes — under the project root already chosen by --project-dir.
-
-    `path` (the --cost-log flag) names a log this entry point does NOT write:
-    a rotated backup (`<app>-<project>.log.1`) or a copy taken elsewhere. It is
-    the one case app_name cannot reach, since rotation renames files out from
-    under log_file_path.
-    """
-    path = Path(path) if path else console.log_file_path(app_name)
-    # Always name the log we are reading, so an empty report is unambiguous
-    # (right file, no data) rather than looking like a silent failure.
-    print(f"Reading mirror log: {path}")
-    sessions = []  # list of (header, total_cost, count)
-    header = None
-    total = 0.0
-    count = 0
-
-    def flush():
-        if header is not None:
-            sessions.append((header, total, count))
-
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if _SESSION_RE.search(line):
-                    flush()
-                    header = line.strip()
-                    total = 0.0
-                    count = 0
-                else:
-                    m = _COST_RE.search(line)
-                    if m and header is not None:
-                        total += float(m.group(1))
-                        count += 1
-    except FileNotFoundError:
-        print(f"No mirror log at {path} yet — nothing to report.")
-        return
-    flush()
-
-    grand = 0.0
-    grand_count = 0
-    for i, (h, t, c) in enumerate(sessions, 1):
-        print(f"Session {i}: {c} costs, ${t:.4f}  | {h}")
-        grand += t
-        grand_count += c
-
-    print("-" * 60)
-    print(f"TOTAL: {len(sessions)} sessions, {grand_count} costs, ${grand:.4f}")
-    if not sessions:
-        # The log exists but held no run boundaries / cost lines. Point at the
-        # likely cause rather than leaving a bare zero.
-        print("  (log has no '=== Iteration 1 ===' / '· done (… c, $…)' lines — "
-              "no completed billed iterations recorded here)")
-
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        size = 0
-    limit = console.LOG_MAX_BYTES
-    pct = size / limit * 100 if limit else 0.0
-    print(f"LOG: {size / 1024 / 1024:.2f} / {limit / 1024 / 1024:.0f} MB "
-          f"({pct:.1f}% full, rotates at 100%)")
-    print(f"     {path}")
 
 
 class ConsumedByWrapperAction(argparse.Action):
@@ -525,7 +432,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     projectroot.set_project_root(getattr(args, "project_dir", None))
     cost_log = getattr(args, "cost_log", None)
     if getattr(args, "cost", False) or cost_log:
-        report_costs(app_name, cost_log)
+        costlog.report_costs(app_name, cost_log)
         return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
 
     # `runlifecycle.begin_run` is the prologue both runners share.
@@ -858,16 +765,18 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             exitlog.note(phase=f"iteration {iteration} — {state_label}",
                          iterations=iteration, completed=completed)
             # Through the module, unlike the line helpers above: this is the one
-            # printed line the run must be able to READ BACK (`report_costs`
-            # parses "=== Iteration 1 ===" as a run boundary), and the pins that
-            # capture printed lines replace `console.print_markup`. A binding of
-            # our own here would be a third address none of them reaches, so the
-            # header would sail past every one of them uncaptured.
+            # printed line the run must be able to READ BACK (`costlog` parses
+            # iteration 1's header as a run boundary, hence its wording comes
+            # from there), and the pins that capture printed lines replace
+            # `console.print_markup`. A binding of our own here would be a third
+            # address none of them reaches, so the header would sail past every
+            # one of them uncaptured.
             separator = "_" * max(1, min(65, textwidth.terminal_columns()
                                          - textwidth.LINE_RIGHT_MARGIN))
+            header = costlog.iteration_header(iteration)
             console.print_markup(
-                f"{separator}\n=== Iteration {iteration} === [{state_label} · {model_label}]",
-                f"[dim]{separator}[/]\n[bold cyan]=== Iteration {iteration} ===[/] "
+                f"{separator}\n{header} [{state_label} · {model_label}]",
+                f"[dim]{separator}[/]\n[bold cyan]{header}[/] "
                 f"[dim]\\[{state_label} · {model_label}][/]",
             )
 

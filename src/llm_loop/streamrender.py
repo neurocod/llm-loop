@@ -28,7 +28,7 @@ import json
 import sys
 from typing import Optional
 
-from . import compactline, projectroot, statusline, wire
+from . import compactline, costlog, projectroot, statusline, wire
 from .console import (
     LINES,
     MarkdownStream,
@@ -175,20 +175,16 @@ def _render_claude_event(ev: dict, partial: bool, mailbox=None) -> None:
             # $0.2204, while their durations were 2243 ms and 1991 ms — the
             # second figure is the first plus $0.019, not a second $0.2). A
             # process emits more than one `result` whenever a note typed late is
-            # answered as its own turn, and `report_costs` sums these lines, so
-            # each line shows what its turn ADDED.
+            # answered as its own turn, and `costlog.report_costs` sums these
+            # lines, so each line shows what its turn ADDED.
             cost, _turn_cost_base = cost - _turn_cost_base, cost
         dur = wire.result_duration_ms(ev)
-        bits = []
-        if dur is not None:
-            bits.append(f"{dur / 1000:.1f} c")
-        if cost is not None:
-            bits.append(f"${cost:.4f}")
-        suffix = f" ({', '.join(bits)})" if bits else ""
+        # Both lines are worded by `costlog`, which reads the "done" one back.
         if wire.result_failed(ev):
-            print_error(f"  ⚠ result: {wire.result_subtype(ev)}{suffix}")
+            print_error(f"  ⚠ result: {wire.result_subtype(ev)}"
+                        f"{costlog.result_suffix(dur, cost)}")
         else:
-            print_done(f"  · done{suffix}")
+            print_done(costlog.done_line(dur, cost))
         return
 
 

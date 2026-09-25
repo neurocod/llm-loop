@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from llm_loop import console, cyclecore, exitlog, parallel, projectroot
+from llm_loop import console, costlog, cyclecore, exitlog, parallel, projectroot
 
 from _runfixtures import (MemListDriver, NoWorkDriver, OneShotDriver,
                           drop_logger, par_args, root_named_unlike_cwd,
@@ -249,7 +249,7 @@ def test_a_named_log_is_read_instead_of_this_entry_points_own(
     backup = tmp_path / "runCycle-elsewhere.log.1"
     backup.write_text(_TWO_SESSIONS, encoding="utf-8")
 
-    cyclecore.report_costs("pytest-costs", backup)
+    costlog.report_costs("pytest-costs", backup)
 
     out = capsys.readouterr().out
     assert str(backup) in out

@@ -189,6 +189,7 @@ src/
                      wrapper subclasses to produce them
     console.py       what a run prints, and the rotating mirror log that is the
                      second copy of every line of it
+    costlog.py       --cost: the two logged lines a run's spend is read back from
     stopchannel.py   how a run is asked to stop or hold, and what it reports
     breakpoints.py   run-local state breakpoint names and matching
     projectroot.py   where the project being driven is, and the one place that

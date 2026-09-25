@@ -55,9 +55,12 @@ from .cyclecore import (
     ConsumedByWrapperAction,
     parse_args,
     parse_duration,
-    report_costs,
     run_loop,
 )
+# Same story again: reading a run's cost back out of the mirror log moved from
+# cyclecore into `costlog`, with the two lines it reads, and the front door is
+# unchanged on purpose.
+from .costlog import report_costs
 # Same story as every move below: rendering one provider stream — and the
 # single-stream latch that goes with it — left cyclecore for `streamrender`, and
 # the front door is unchanged on purpose. An embedder driving its own turn asks
