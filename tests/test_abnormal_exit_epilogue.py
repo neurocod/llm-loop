@@ -24,16 +24,17 @@ these runs are launched `--git-push none` so that stays true of them, which it
 was not at first (see `_seq_args`).
 """
 
-import logging
 import sys
-import threading
 
 import pytest
 
 from llm_loop import (console, cyclecore, exitlog, operator, parallel,
                       projectroot, runlifecycle)
 from llm_loop.agentwork import ClaudeCommand, Driver, LoopStop
-from llm_loop.drivers import ListFileDriver, StateFileDriver
+from llm_loop.drivers import StateFileDriver
+
+from _runfixtures import (MemListDriver, StubPolicy, drop_logger, par_args,
+                          seq_args)
 
 # What the operator typed and never got delivered. One string, asserted by
 # identity, so a run that printed SOME note would not satisfy a pin about THIS
@@ -41,33 +42,11 @@ from llm_loop.drivers import ListFileDriver, StateFileDriver
 NOTE = "please look at the third file"
 
 
-class _StubPolicy:
-    """A LimitPolicy that never reads the usage report and never pauses.
-
-    `log_snapshot` RECORDS instead of doing nothing: the closing snapshot is one
-    of the three steps these pins are about, and a stub that swallowed it would
-    leave that third unpinned while looking pinned.
-    """
-
-    def __init__(self):
-        self.snapshots = []
-
-    def describe(self):
-        return "stub"
-
-    def log_snapshot(self, source, label, cache_value=True):
-        self.snapshots.append(label)
-
-    def check_and_wait(self, source, session_start, note="",
-                       cache_value=True, should_stop=None):
-        return False, session_start
-
-
 class _AlwaysWorkDriver(Driver):
     """Hands out the same command forever — the loop has to decide when to stop."""
 
     def __init__(self):
-        self.limit_policy = _StubPolicy()
+        self.limit_policy = StubPolicy()
 
     def next_command(self):
         return ClaudeCommand("do the thing", "", "the-thing")
@@ -77,7 +56,7 @@ class _StoppingDriver(Driver):
     """Raises LoopStop with an exit code, the way a bad state file does."""
 
     def __init__(self, commands=0):
-        self.limit_policy = _StubPolicy()
+        self.limit_policy = StubPolicy()
         self.commands = commands
 
     def next_command(self):
@@ -87,66 +66,24 @@ class _StoppingDriver(Driver):
         raise LoopStop("state file says: error\nsecond line", exit_code=3)
 
 
-class _OneItemListDriver(ListFileDriver):
-    """A one-item in-memory queue: enough for the parallel runner to open a run."""
-
-    target_suffix = ".out.md"
-
-    def __init__(self):
-        super().__init__()
-        self._items = ["products/only.md"]
-        self._lock = threading.Lock()
-        self.limit_policy = _StubPolicy()
-
-    def prompt(self, source, target):
-        return "do it"
-
-    def model(self):
-        return ""
-
-    def pending_lines(self):
-        with self._lock:
-            return list(self._items)
-
-    def strike(self, line):
-        with self._lock:
-            if line in self._items:
-                self._items.remove(line)
-                return True
-            return False
-
-
 def _seq_args(project_dir):
-    ns = type("NS", (), {})()
-    ns.max = None
-    ns.dry_run = False
-    ns.raw = False
-    ns.start_in = None
-    # NONE, and that is not laziness. `exit_pushes` replaces the EXIT push only;
-    # the sequential loop's per-pass `maybe_git_push` stays real, so under
-    # `after_new_commits` these pins ran `git push` as a subprocess six times
-    # against a pytest tmp_path (measured). Harmless there and a real push the
-    # day a tmp dir sits inside a repo with an upstream. The policy is not what
-    # is being pinned — `exit_pushes` records the call and its project whatever
-    # the policy says, and which repository a real push goes to is
-    # `test_git_push`'s question.
-    ns.git_push = "none"
-    ns.project_dir = project_dir
-    ns.cost = False
-    ns.no_statusline = True
-    return ns
+    # `git_push` stays the fixtures' "none", and that is not laziness.
+    # `exit_pushes` replaces the EXIT push only; the sequential loop's per-pass
+    # `maybe_git_push` stays real, so under `after_new_commits` these pins ran
+    # `git push` as a subprocess six times against a pytest tmp_path (measured).
+    # The policy is not what is being pinned — `exit_pushes` records the call and
+    # its project whatever the policy says, and which repository a real push goes
+    # to is `test_git_push`'s question.
+    return seq_args(project_dir, no_statusline=True)
 
 
 def _par_args(project_dir):
-    ns = _seq_args(project_dir)
     # One worker keeps the closing report focused on one staged mailbox. Parallel
     # runs expose a MailboxSet at every width so `+` can add addresses in place.
-    ns.jobs = 1
     # And a usage source, so the closing snapshot has something to be taken from:
     # `--ignore-usage` leaves `usage` unopened and `close_run` correctly skips
     # the snapshot, which would leave another third of the pin measuring nothing.
-    ns.ignore_usage = False
-    return ns
+    return par_args(project_dir, jobs=1, ignore_usage=False, no_statusline=True)
 
 
 class _StubSource:
@@ -174,11 +111,7 @@ def _isolated_run(tmp_path, monkeypatch):
     exitlog.finish()
     sys.stdout, sys.stderr = streams
     projectroot.set_project_root(root)
-    for name in ("pytest-abnormal",):
-        logger = logging.getLogger(f"runCycle.{name}")
-        for handler in list(logger.handlers):
-            handler.close()
-        logger.handlers = []
+    drop_logger("pytest-abnormal")
 
 
 @pytest.fixture
@@ -297,7 +230,7 @@ def test_invalid_state_model_still_closes_the_run_down(
             return "work"
 
     driver = InvalidSelection()
-    driver.limit_policy = _StubPolicy()
+    driver.limit_policy = StubPolicy()
     monkeypatch.setattr(runlifecycle, "usage_source_for",
                         lambda p: pytest.fail("opened account for invalid selector"))
     with pytest.raises(SystemExit) as stopped:
@@ -330,7 +263,7 @@ def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: _StubSource())
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, command, mailbox=None: (0, None, None))
-    driver = _OneItemListDriver()
+    driver = MemListDriver(["products/only.md"])
 
     with pytest.raises(SystemExit) as exit_info:
         parallel.run_parallel(driver, _par_args(str(tmp_path)),

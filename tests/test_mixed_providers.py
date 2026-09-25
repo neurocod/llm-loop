@@ -11,6 +11,8 @@ from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.drivers import StateFileDriver
 from llm_loop.usage import RateLimitEvent
 
+from _runfixtures import seq_args
+
 
 class Source:
     def __init__(self, provider):
@@ -72,9 +74,7 @@ def runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(statusline, "StatusApp", make_app)
     monkeypatch.setattr(statusline, "QuotaRefresher", Refresher)
     monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
-    args = SimpleNamespace(max=None, dry_run=False, raw=False, start_in=None,
-                           git_push="none", project_dir=str(tmp_path), cost=False,
-                           no_statusline=True, provider="claude")
+    args = seq_args(tmp_path, no_statusline=True, provider="claude")
     yield SimpleNamespace(args=args, events=events, sources=sources, apps=apps,
                           refreshers=refreshers)
     projectroot.set_project_root(previous_root)

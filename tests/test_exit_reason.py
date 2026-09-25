@@ -8,78 +8,15 @@ one thing it cannot.
 """
 
 import json
-import logging
 import os
 import sys
 
 import pytest
 
 from llm_loop import console, cyclecore, exitlog, parallel, projectroot
-from llm_loop.agentwork import ClaudeCommand, Driver
-from llm_loop.drivers import ListFileDriver
 
-
-class _StubPolicy:
-    def describe(self):
-        return "stub"
-
-    def log_snapshot(self, *args, **kwargs):
-        pass
-
-    def check_and_wait(self, source, session_start, note="",
-                       cache_value=True, should_stop=None):
-        return False, session_start
-
-
-class _NoWorkDriver(Driver):
-    def __init__(self):
-        self.limit_policy = _StubPolicy()
-
-    def next_command(self):
-        return None
-
-
-class _OneItemListDriver(ListFileDriver):
-    """A one-item in-memory queue: enough for the parallel runner to open a run.
-
-    One item and not none, because a parallel run with an empty list reports
-    "nothing to do" and returns before it has done anything a pin can look at.
-    """
-
-    target_suffix = ".out.md"
-
-    def __init__(self):
-        super().__init__()
-        self._items = ["products/only.md"]
-        self.limit_policy = _StubPolicy()
-
-    def prompt(self, source, target):
-        return "do it"
-
-    def model(self):
-        return ""
-
-    def pending_lines(self):
-        return list(self._items)
-
-    def strike(self, line):
-        if line in self._items:
-            self._items.remove(line)
-            return True
-        return False
-
-
-def _seq_args(project_dir):
-    ns = type("NS", (), {})()
-    ns.max = None
-    ns.dry_run = False
-    ns.raw = False
-    ns.start_in = None
-    ns.git_push = "none"
-    ns.project_dir = project_dir
-    ns.cost = False
-    ns.no_statusline = True
-    return ns
+from _runfixtures import (MemListDriver, NoWorkDriver, drop_logger, par_args,
+                          seq_args)
 
 
 @pytest.fixture(autouse=True)
@@ -93,19 +30,11 @@ def _isolated_record(tmp_path, monkeypatch):
     exitlog.finish()
     sys.stdout, sys.stderr = streams
     projectroot.set_project_root(root)
-    _drop_logger("pytest-exit")
-
-
-def _drop_logger(app_name):
-    """Close and forget whatever mirror handler this logger currently holds."""
-    logger = logging.getLogger(f"runCycle.{app_name}")
-    for handler in list(logger.handlers):
-        handler.close()
-    logger.handlers = []
+    drop_logger("pytest-exit")
 
 
 def _run_once(tmp_path):
-    cyclecore.run_loop(_NoWorkDriver(), _seq_args(str(tmp_path)),
+    cyclecore.run_loop(NoWorkDriver(), seq_args(tmp_path, no_statusline=True),
                        app_name="pytest-exit", wait_on_start=False)
 
 
@@ -198,8 +127,8 @@ def test_the_report_of_a_vanished_run_lands_in_the_log(
     # that has none, so a handler another test left on this name would keep this
     # run's output going to THAT test's file while this one's path is merely
     # printed — which reads exactly like the defect below and is not it.
-    _drop_logger(app_name)
-    dead = exitlog.record_path(logs, app_name, project, 424242)
+    drop_logger(app_name)
+    dead =exitlog.record_path(logs, app_name, project, 424242)
     dead.write_text(json.dumps({
         "pid": 424242, "app": app_name, "project": project,
         "argv": "runGenerateModels.py --codex --random",
@@ -213,11 +142,9 @@ def test_the_report_of_a_vanished_run_lands_in_the_log(
     else:
         monkeypatch.setattr(parallel, "run_job",
                             lambda job_id, command, mailbox=None: (0, None, None))
-        args = _seq_args(str(tmp_path))
-        args.jobs = 1
-        args.ignore_usage = True
-        parallel.run_parallel(_OneItemListDriver(), args, app_name=app_name,
-                              wait_on_start=False)
+        parallel.run_parallel(MemListDriver(["products/only.md"]),
+                              par_args(tmp_path, jobs=1, no_statusline=True),
+                              app_name=app_name, wait_on_start=False)
     exitlog.finish()
 
     written = console.log_file_path(app_name).read_text(

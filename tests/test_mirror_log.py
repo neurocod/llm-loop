@@ -17,8 +17,10 @@ import sys
 import pytest
 
 from llm_loop import console, cyclecore, exitlog, parallel, projectroot
-from llm_loop.agentwork import ClaudeCommand, Driver
-from llm_loop.drivers import ListFileDriver
+
+from _runfixtures import (MemListDriver, NoWorkDriver, OneShotDriver,
+                          drop_logger, par_args, root_named_unlike_cwd,
+                          seq_args)
 
 
 @pytest.fixture(autouse=True)
@@ -122,89 +124,6 @@ def test_the_tee_still_logs_normally_after_a_guarded_call(tmp_path):
 # --- a dry run is a preview, and stays out of the shared record ----------------
 
 
-class _StubPolicy:
-    """A LimitPolicy that never reads the usage report and never pauses."""
-
-    def describe(self):
-        return "stub"
-
-    def log_snapshot(self, *args, **kwargs):
-        pass
-
-    def check_and_wait(self, source, session_start, note="",
-                       cache_value=True, should_stop=None):
-        return False, session_start
-
-
-class _MemListDriver(ListFileDriver):
-    """ListFileDriver backed by an in-memory list (no files, no real provider)."""
-
-    target_suffix = ".out.md"
-    pick_order = "list"          # deterministic: the tests name the first item
-
-    def __init__(self, items):
-        super().__init__()
-        self._items = list(items)
-        self.limit_policy = _StubPolicy()
-
-    def prompt(self, source, target):
-        return f"do {os.path.basename(source)}"
-
-    def pending_lines(self):
-        return list(self._items)
-
-    def strike(self, line):
-        if line in self._items:
-            self._items.remove(line)
-            return True
-        return False
-
-
-class _NoWorkDriver(Driver):
-    def __init__(self):
-        self.limit_policy = _StubPolicy()
-
-    def next_command(self):
-        return None
-
-
-class _OneShotDriver(_NoWorkDriver):
-    def __init__(self):
-        super().__init__()
-        self.served = 0
-
-    def next_command(self):
-        if self.served:
-            return None
-        self.served += 1
-        return ClaudeCommand("do the thing", "", "the-thing")
-
-
-def _seq_args(project_dir, *, dry_run, max_runs=None):
-    ns = type("NS", (), {})()
-    ns.max = max_runs
-    ns.dry_run = dry_run
-    ns.raw = False
-    ns.start_in = None
-    ns.git_push = "none"
-    ns.project_dir = project_dir
-    ns.cost = False
-    ns.no_statusline = True
-    return ns
-
-
-def _par_args(project_dir, *, dry_run, max_runs=None):
-    ns = type("NS", (), {})()
-    ns.jobs = 2
-    ns.max = max_runs
-    ns.dry_run = dry_run
-    ns.git_push = "none"
-    ns.project_dir = project_dir
-    ns.ignore_usage = True
-    ns.no_statusline = True
-    return ns
-
-
 @pytest.fixture
 def log_dir(tmp_path, monkeypatch):
     """Point the mirror log at the test's own directory, never the user's."""
@@ -220,38 +139,12 @@ def _restore_project_root():
     projectroot.set_project_root(previous)
 
 
-def _elsewhere(tmp_path) -> str:
-    """A project root whose FOLDER NAME is provably not this process's own.
-
-    The mirror log's file name carries the project folder, so that name is the
-    whole of what the two `--cost` pins below tell apart. On a machine where
-    pytest happened to run from a directory of the same name they would pass
-    while proving nothing — the same vacuity `test_git_push._elsewhere` guards
-    against, and for the same reason.
-    """
-    project = tmp_path / "some-project"
-    project.mkdir(exist_ok=True)
-    root = os.path.abspath(str(project))
-    assert os.path.normcase(os.path.basename(root)) != \
-        os.path.normcase(os.path.basename(os.getcwd())), \
-        "the project folder and the process cwd share a name, so this pin " \
-        "cannot tell an anchored root from an ambient one"
-    return root
-
-
-def _drop_logger(app_name):
-    """Release the handler's file so the tmp dir can be cleaned up."""
-    logger = logging.getLogger(f"runCycle.{app_name}")
-    for handler in list(logger.handlers):
-        handler.close()
-    logger.handlers = []
-
-
 def test_a_parallel_dry_run_writes_nothing_to_the_shared_log(
         tmp_path, log_dir, capsys):
     app_name = "pytest-dry-parallel"
-    parallel.run_parallel(_MemListDriver(["products/a.md"]),
-                          _par_args(str(tmp_path), dry_run=True),
+    parallel.run_parallel(MemListDriver(["products/a.md"]),
+                          par_args(tmp_path, jobs=2, dry_run=True,
+                                   no_statusline=True),
                           app_name=app_name)
 
     assert not console.log_file_path(app_name).exists()
@@ -264,7 +157,8 @@ def test_a_parallel_dry_run_writes_nothing_to_the_shared_log(
 def test_a_sequential_dry_run_writes_nothing_to_the_shared_log(
         tmp_path, log_dir, capsys):
     app_name = "pytest-dry-sequential"
-    cyclecore.run_loop(_OneShotDriver(), _seq_args(str(tmp_path), dry_run=True),
+    cyclecore.run_loop(OneShotDriver(),
+                       seq_args(tmp_path, dry_run=True, no_statusline=True),
                        app_name=app_name)
 
     assert not console.log_file_path(app_name).exists()
@@ -279,13 +173,13 @@ def test_a_real_run_still_mirrors_to_the_shared_log(tmp_path, log_dir):
     """The other half of the fix: only the dry run lost its mirror."""
     app_name = "pytest-real-mirror"
     try:
-        cyclecore.run_loop(_NoWorkDriver(),
-                           _seq_args(str(tmp_path), dry_run=False),
+        cyclecore.run_loop(NoWorkDriver(),
+                           seq_args(tmp_path, no_statusline=True),
                            app_name=app_name, wait_on_start=False)
         written = console.log_file_path(app_name).read_text(
             encoding="utf-8", errors="replace")
     finally:
-        _drop_logger(app_name)
+        drop_logger(app_name)
     assert "logging to" in written
 
 
@@ -312,8 +206,9 @@ def test_a_projects_log_is_named_after_that_project(tmp_path, log_dir):
 def test_an_uncapped_parallel_dry_run_caps_its_listing(tmp_path, log_dir, capsys):
     """1961 pending items is not a preview. The cap is reported, never silent."""
     pending = [f"products/p{i}.md" for i in range(25)]
-    parallel.run_parallel(_MemListDriver(pending),
-                          _par_args(str(tmp_path), dry_run=True),
+    parallel.run_parallel(MemListDriver(pending),
+                          par_args(tmp_path, jobs=2, dry_run=True,
+                                   no_statusline=True),
                           app_name="pytest-dry-cap")
 
     out = capsys.readouterr().out
@@ -326,8 +221,9 @@ def test_an_uncapped_parallel_dry_run_caps_its_listing(tmp_path, log_dir, capsys
 
 def test_an_explicit_max_runs_lists_exactly_that_many(tmp_path, log_dir, capsys):
     pending = [f"products/p{i}.md" for i in range(25)]
-    parallel.run_parallel(_MemListDriver(pending),
-                          _par_args(str(tmp_path), dry_run=True, max_runs=3),
+    parallel.run_parallel(MemListDriver(pending),
+                          par_args(tmp_path, jobs=2, dry_run=True, max=3,
+                                   no_statusline=True),
                           app_name="pytest-dry-cap")
 
     out = capsys.readouterr().out
@@ -374,14 +270,13 @@ def test_cost_reads_the_named_projects_log_not_the_launch_directorys(
     root unanchored reads the log of whatever directory the process happened to
     be launched from — and reports "no cost lines" about a project with plenty.
     """
-    project = _elsewhere(tmp_path)
+    project = root_named_unlike_cwd(tmp_path)
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "pytest-costs-some-project.log").write_text(
         _TWO_SESSIONS, encoding="utf-8")
-    args = _seq_args(project, dry_run=False)
-    args.cost = True
+    args = seq_args(project, cost=True, no_statusline=True)
 
-    driver = _OneShotDriver()
+    driver = OneShotDriver()
     cyclecore.run_loop(driver, args, app_name="pytest-costs",
                        wait_on_start=False)
 
@@ -404,19 +299,18 @@ def test_cost_neither_mirrors_its_report_nor_opens_an_exit_record(
     (that the report resolves its log against --project-dir), so the branch could
     have drifted back into the prologue unnoticed.
     """
-    project = _elsewhere(tmp_path)
+    project = root_named_unlike_cwd(tmp_path)
     log_dir.mkdir(parents=True, exist_ok=True)
     named = tmp_path / "named.log"
     named.write_text(_TWO_SESSIONS, encoding="utf-8")
     # No record of an earlier run to inherit: `exitlog.begin` is idempotent per
     # process, so a leftover one would make this pass whatever the branch did.
     monkeypatch.setattr(exitlog, "_record", None)
-    _drop_logger("pytest-costs-record")
-    args = _seq_args(project, dry_run=False)
-    args.cost_log = str(named)
+    drop_logger("pytest-costs-record")
+    args = seq_args(project, cost_log=str(named), no_statusline=True)
 
     try:
-        cyclecore.run_loop(_OneShotDriver(), args,
+        cyclecore.run_loop(OneShotDriver(), args,
                            app_name="pytest-costs-record", wait_on_start=False)
 
         assert "TOTAL: 2 sessions, 3 costs, $2.2500" in capsys.readouterr().out
@@ -425,7 +319,7 @@ def test_cost_neither_mirrors_its_report_nor_opens_an_exit_record(
         assert not console.log_file_path("pytest-costs-record").exists(), \
             "--cost mirrored its report into the shared rotating log"
     finally:
-        _drop_logger("pytest-costs-record")
+        drop_logger("pytest-costs-record")
         exitlog.finish()
 
 
@@ -442,10 +336,10 @@ def test_naming_a_log_reports_instead_of_running_the_loop(
     """
     named = tmp_path / "named.log"
     named.write_text(_TWO_SESSIONS, encoding="utf-8")
-    args = _seq_args(str(tmp_path), dry_run=True)
-    args.cost_log = str(named)
+    args = seq_args(tmp_path, dry_run=True, cost_log=str(named),
+                    no_statusline=True)
 
-    driver = _OneShotDriver()
+    driver = OneShotDriver()
     cyclecore.run_loop(driver, args, app_name="pytest-costs-flag",
                        wait_on_start=False)
 

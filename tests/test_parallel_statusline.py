@@ -14,7 +14,6 @@ Two things are pinned here, and only the first is cosmetic:
 """
 
 import io
-import os
 import sys
 import threading
 
@@ -24,22 +23,13 @@ from llm_loop import (cyclecore, parallel, projectroot, runlifecycle,
                       stopchannel)
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
-from llm_loop.drivers import ListFileDriver
+
+from _runfixtures import MemListDriver, par_args, seq_args
 
 
-class _MemDriver(ListFileDriver):
-    """ListFileDriver backed by an in-memory list (no files, no real provider)."""
-
-    target_suffix = ".out.md"
-    pick_order = "list"          # deterministic: the tests name the first item
-
-    def __init__(self, items):
-        super().__init__()
-        self._items = list(items)
-        self._lock = threading.Lock()
-
-    def prompt(self, source, target):
-        return f"do {os.path.basename(source)}"
+class _MemDriver(MemListDriver):
+    """The shared in-memory list, with a model for the job rows to show and a
+    way to grow the queue while a run is draining it."""
 
     def model(self):
         return "opus"
@@ -47,17 +37,6 @@ class _MemDriver(ListFileDriver):
     def add(self, item):
         with self._lock:
             self._items.append(item)
-
-    def pending_lines(self):
-        with self._lock:
-            return list(self._items)
-
-    def strike(self, line):
-        with self._lock:
-            if line in self._items:
-                self._items.remove(line)
-                return True
-            return False
 
 
 class _LiveTerminal(tio.Terminal):
@@ -88,19 +67,6 @@ class _LiveTerminal(tio.Terminal):
 
     def release(self):
         self._on = False
-
-
-def _args(project_dir, jobs, *, max_runs=None, dry_run=False,
-          no_statusline=False):
-    ns = type("NS", (), {})()
-    ns.jobs = jobs
-    ns.max = max_runs
-    ns.dry_run = dry_run
-    ns.git_push = "none"
-    ns.project_dir = project_dir
-    ns.ignore_usage = True
-    ns.no_statusline = no_statusline
-    return ns
 
 
 def _live_statusline(monkeypatch, made, *, live=True):
@@ -149,7 +115,7 @@ def test_parallel_weekly_key_changes_the_shared_policy(tmp_path, monkeypatch):
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", run)
-    args = _args(str(tmp_path), 1)
+    args = par_args(tmp_path, jobs=1)
     args.ignore_usage = False
     parallel.run_parallel(driver, args, setup_logging=False, wait_on_start=False)
     assert driver.limit_policy.rules[0].limit == 97
@@ -192,7 +158,7 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
     driver = _MemDriver([f"products/f{i}.md" for i in range(3)])
     previous = projectroot.project_dir()
     try:
-        parallel.run_parallel(driver, _args(str(tmp_path), jobs=3),
+        parallel.run_parallel(driver, par_args(tmp_path, jobs=3),
                               app_name="pytest-parallel-statusline")
     finally:
         projectroot.set_project_root(previous)
@@ -236,7 +202,7 @@ def test_each_worker_row_learns_the_model_its_own_stream_resolved(tmp_path,
     previous = projectroot.project_dir()
     try:
         parallel.run_parallel(_MemDriver(["products/a.md", "products/b.md"]),
-                              _args(str(tmp_path), jobs=2),
+                              par_args(tmp_path, jobs=2),
                               app_name="pytest-parallel-statusline")
     finally:
         projectroot.set_project_root(previous)
@@ -260,7 +226,7 @@ def test_plus_starts_another_worker_and_adds_its_live_surfaces(tmp_path,
     driver = _MemDriver([f"products/f{i}.md" for i in range(3)])
     previous = projectroot.project_dir()
     try:
-        done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=1))
+        done, result = _run_in_thread(driver, par_args(tmp_path, jobs=1))
         assert entered[1].wait(5), "the initial worker never started"
 
         app = made["app"]
@@ -307,7 +273,7 @@ def test_minus_retires_one_worker_after_its_current_file(tmp_path, monkeypatch):
         def go():
             try:
                 result["value"] = parallel.run_parallel(
-                    driver, _args(str(tmp_path), jobs=2),
+                    driver, par_args(tmp_path, jobs=2),
                     app_name="pytest-parallel-statusline", progress=progress)
             finally:
                 done.set()
@@ -432,7 +398,7 @@ def test_a_dead_worker_leaves_no_row_claiming_to_run(tmp_path, monkeypatch):
     try:
         # One worker and one file: nothing here depends on the fleet outliving
         # the death, only on the row the dead worker leaves behind.
-        parallel.run_parallel(driver, _args(str(tmp_path), jobs=1),
+        parallel.run_parallel(driver, par_args(tmp_path, jobs=1),
                               app_name="pytest-parallel-statusline")
     finally:
         projectroot.set_project_root(previous)
@@ -448,7 +414,7 @@ def test_the_summary_row_shows_the_run_counters(tmp_path, monkeypatch):
     driver = _MemDriver([f"products/f{i}.md" for i in range(5)])
     previous = projectroot.project_dir()
     try:
-        parallel.run_parallel(driver, _args(str(tmp_path), jobs=2, max_runs=2),
+        parallel.run_parallel(driver, par_args(tmp_path, jobs=2, max=2),
                               app_name="pytest-parallel-statusline")
     finally:
         projectroot.set_project_root(previous)
@@ -471,7 +437,7 @@ def test_no_statusline_reaches_the_parallel_runner(tmp_path, monkeypatch):
     previous = projectroot.project_dir()
     try:
         parallel.run_parallel(_MemDriver(["products/a.md"]),
-                              _args(str(tmp_path), jobs=1, no_statusline=True),
+                              par_args(tmp_path, jobs=1, no_statusline=True),
                               app_name="pytest-parallel-statusline")
     finally:
         projectroot.set_project_root(previous)
@@ -499,7 +465,7 @@ def test_cancelling_the_stop_reopens_claims_while_a_job_runs(tmp_path, monkeypat
     monkeypatch.setattr(parallel, "run_job", block_the_first_job)
     previous = projectroot.project_dir()
     try:
-        done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=2))
+        done, result = _run_in_thread(driver, par_args(tmp_path, jobs=2))
         assert in_flight.wait(5), "no worker ever started a file"
 
         app = made["app"]
@@ -542,7 +508,7 @@ def test_an_interactive_stop_left_alone_ends_the_run(tmp_path, monkeypatch):
     previous = projectroot.project_dir()
     try:
         with stopchannel.stop_file_lifecycle():
-            done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=1))
+            done, result = _run_in_thread(driver, par_args(tmp_path, jobs=1))
             assert in_flight.wait(5)
             made["app"].request_stop()
             assert not done.wait(0.3), "in-flight work was cut short"
@@ -580,7 +546,7 @@ def test_a_sentinel_this_run_did_not_write_is_not_reopenable(tmp_path, monkeypat
     previous = projectroot.project_dir()
     try:
         with stopchannel.stop_file_lifecycle():
-            done, result = _run_in_thread(driver, _args(str(tmp_path), jobs=2))
+            done, result = _run_in_thread(driver, par_args(tmp_path, jobs=2))
             assert in_flight.wait(5)
             (tmp_path / "stop").write_text("", encoding="utf-8")   # not the `s` key
             driver.add("products/b.md")     # offered only after the sentinel
@@ -675,21 +641,14 @@ def test_a_batching_wrapper_never_stacks_two_status_areas(tmp_path, monkeypatch)
         def next_command(self):
             return None
 
-    seq_args = type("NS", (), {})()
-    for name, value in dict(max=1, dry_run=False, raw=False, start_in=None,
-                            git_push="none", cost=False,
-                            no_statusline=False,
-                            project_dir=str(tmp_path)).items():
-        setattr(seq_args, name, value)
-
     previous = projectroot.project_dir()
     try:
         for _batch in range(2):
             parallel.run_parallel(
-                _MemDriver(["products/a.md"]), _args(str(tmp_path), jobs=2),
+                _MemDriver(["products/a.md"]), par_args(tmp_path, jobs=2),
                 app_name="pytest-parallel-statusline", setup_logging=False,
                 wait_on_start=False)
-            cyclecore.run_loop(_NoWork(), seq_args,
+            cyclecore.run_loop(_NoWork(), seq_args(tmp_path, max=1),
                                app_name="pytest-parallel-statusline",
                                setup_logging=False, wait_on_start=False)
     finally:
@@ -725,9 +684,7 @@ class _CodexDriver(_MemDriver):
 
 
 def _codex_args(project_dir, jobs, *, max_runs=None):
-    args = _args(project_dir, jobs, max_runs=max_runs)
-    args.provider = "codex"
-    return args
+    return par_args(project_dir, jobs=jobs, max=max_runs, provider="codex")
 
 
 def _batch(driver, args, progress):
@@ -782,7 +739,7 @@ def test_the_denominator_is_the_smaller_of_the_queue_and_the_cap(tmp_path,
         # Cap smaller than the queue: the run promises only what it will do.
         capped = _MemDriver([f"products/f{i}.md" for i in range(5)])
         progress = sl.InvocationProgress(max_items=2)
-        args = _args(str(tmp_path), jobs=2, max_runs=1)     # one file per batch
+        args = par_args(tmp_path, jobs=2, max=1)     # one file per batch
         _batch(capped, args, progress)
         first = (made["app"].status.iteration, made["app"].status.max_iterations)
         _batch(capped, args, progress)
@@ -791,7 +748,7 @@ def test_the_denominator_is_the_smaller_of_the_queue_and_the_cap(tmp_path,
         # Queue smaller than the cap: the queue is all there is to do.
         short = _MemDriver([f"products/g{i}.md" for i in range(3)])
         roomy = sl.InvocationProgress(max_items=10)
-        args = _args(str(tmp_path), jobs=2, max_runs=2)
+        args = par_args(tmp_path, jobs=2, max=2)
         _batch(short, args, roomy)
         third = (made["app"].status.iteration, made["app"].status.max_iterations)
         _batch(short, args, roomy)
@@ -859,7 +816,7 @@ def test_a_batchs_cap_edit_reaches_the_claim_loop(tmp_path, monkeypatch):
     invocation = sl.InvocationProgress(max_items=99)
     previous = projectroot.project_dir()
     try:
-        _batch(driver, _args(str(tmp_path), jobs=1, max_runs=1), invocation)
+        _batch(driver, par_args(tmp_path, jobs=1, max=1), invocation)
     finally:
         projectroot.set_project_root(previous)
 
@@ -904,7 +861,7 @@ def test_a_parallel_dry_run_prints_the_prompt_block_once(tmp_path, capsys):
     previous = projectroot.project_dir()
     streams = (sys.stdout, sys.stderr)
     try:
-        parallel.run_parallel(driver, _args(str(tmp_path), jobs=2, dry_run=True),
+        parallel.run_parallel(driver, par_args(tmp_path, jobs=2, dry_run=True),
                               app_name="pytest-parallel-statusline")
     finally:
         projectroot.set_project_root(previous)

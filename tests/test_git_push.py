@@ -15,7 +15,6 @@ that is provably not the directory pytest is standing in — and asserts the
 directory git was actually handed, never merely that a push happened.
 """
 
-import os
 import subprocess
 import sys
 import threading
@@ -23,8 +22,9 @@ import threading
 import pytest
 
 from llm_loop import cyclecore, gitpush, parallel, projectroot, statusline
-from llm_loop.agentwork import ClaudeCommand, Driver
-from llm_loop.drivers import ListFileDriver
+
+from _runfixtures import (MemListDriver, OneShotDriver, par_args, root_not_cwd,
+                          seq_args)
 
 
 @pytest.fixture(autouse=True)
@@ -103,108 +103,16 @@ class _FakeGitModule:
         return [call for call in self.calls if call[0][:2] == ("git", "push")]
 
 
-def _elsewhere(tmp_path) -> str:
-    """A project root that is provably not where this process stands.
-
-    The assertion is the point: on a machine where pytest happened to run from
-    tmp_path, every pin in this file would pass while proving nothing.
-    """
-    root = os.path.abspath(str(tmp_path))
-    assert os.path.normcase(root) != os.path.normcase(os.getcwd()), \
-        "the project root and the process cwd are the same directory, so these " \
-        "pins cannot tell a handed-over root from an ambient one"
-    return root
-
-
-class _OneShotDriver(Driver):
-    """Hands out a single command, then reports the work exhausted."""
-
-    def __init__(self):
-        self.served = 0
-        self.limit_policy = _StubPolicy()
-
-    def next_command(self):
-        if self.served:
-            return None
-        self.served += 1
-        return ClaudeCommand("do the thing", "", "the-thing")
-
-
-class _StubPolicy:
-    """A LimitPolicy that never reads the usage report and never pauses."""
-
-    def describe(self):
-        return "stub"
-
-    def log_snapshot(self, *args, **kwargs):
-        pass
-
-    def check_and_wait(self, source, session_start, note="",
-                       cache_value=True, should_stop=None):
-        return False, session_start
-
-
-class _MemListDriver(ListFileDriver):
-    """ListFileDriver backed by an in-memory list (no files, no real provider).
-
-    One item rather than none: a run with nothing pending reports "nothing to
-    do" and returns BEFORE its exit push, so an empty list would make this pin
-    green without ever reaching the code it is about.
-    """
-
-    target_suffix = ".ru.md"
-
-    def __init__(self, items):
-        super().__init__()
-        self._items = list(items)
-        self._lock = threading.Lock()
-
-    def prompt(self, source, target):
-        return "translate"
-
-    def model(self):
-        return ""
-
-    def pending_lines(self):
-        with self._lock:
-            return list(self._items)
-
-    def strike(self, line):
-        with self._lock:
-            if line in self._items:
-                self._items.remove(line)
-                return True
-            return False
-
-
-def _seq_args(project_dir):
-    ns = type("NS", (), {})()
-    ns.max = None
-    ns.dry_run = False
-    ns.raw = False
-    ns.start_in = None
-    ns.git_push = "after_new_commits"
-    ns.project_dir = project_dir
-    ns.cost = False
-    return ns
-
-
-def _par_args(project_dir):
-    ns = type("NS", (), {})()
-    ns.jobs = 1
-    ns.max = None
-    ns.dry_run = False
-    ns.git_push = "after_new_commits"
-    ns.project_dir = project_dir
-    ns.ignore_usage = True
-    return ns
+# The runs below push under this policy: every branch of it that runs git at all
+# is taken (see `_FakeGitModule`), where the fixtures' default `none` takes none.
+PUSHING = "after_new_commits"
 
 
 def test_git_runs_where_it_is_told_not_where_the_process_stands(tmp_path, monkeypatch):
     """The policy's own contract: the caller names the repository."""
     fake = _FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
-    root = _elsewhere(tmp_path)
+    root = root_not_cwd(tmp_path)
 
     gitpush.maybe_git_push(gitpush.GitPushPolicy.AFTER_NEW_COMMITS, 0.0, root)
 
@@ -230,9 +138,9 @@ def test_the_sequential_runner_pushes_the_project_it_was_pointed_at(
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda *args, **kwargs: 0)
-    root = _elsewhere(tmp_path)
+    root = root_not_cwd(tmp_path)
 
-    cyclecore.run_loop(_OneShotDriver(), _seq_args(root),
+    cyclecore.run_loop(OneShotDriver(), seq_args(root, git_push=PUSHING),
                        app_name="pytest-gitpush")
 
     assert len(fake.pushes) == 3, \
@@ -248,17 +156,18 @@ def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(
     Its periodic pusher wakes on a 60 s timer, so the exit push is the site a
     test can reach; both read the same `projectroot.project_dir()`. One pending
     item rather than none, because a run with an empty list reports "nothing to
-    do" and returns BEFORE the exit push — see `_MemListDriver`.
+    do" and returns BEFORE the exit push — see `MemListDriver`.
     """
     fake = _FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, command, mailbox=None: (0, None, None))
-    root = _elsewhere(tmp_path)
+    root = root_not_cwd(tmp_path)
 
     try:
-        parallel.run_parallel(_MemListDriver(["products/only.md"]),
-                              _par_args(root), app_name="pytest-gitpush")
+        parallel.run_parallel(MemListDriver(["products/only.md"]),
+                              par_args(root, jobs=1, git_push=PUSHING),
+                              app_name="pytest-gitpush")
     except SystemExit:
         pass
 
@@ -307,11 +216,12 @@ def test_the_parallel_pusher_pushes_the_project_it_was_pointed_at(
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
     monkeypatch.setattr(parallel, "run_job", held_job)
-    root = _elsewhere(tmp_path)
+    root = root_not_cwd(tmp_path)
 
     try:
-        parallel.run_parallel(_MemListDriver(["products/only.md"]),
-                              _par_args(root), app_name="pytest-gitpush")
+        parallel.run_parallel(MemListDriver(["products/only.md"]),
+                              par_args(root, jobs=1, git_push=PUSHING),
+                              app_name="pytest-gitpush")
     except SystemExit:
         pass
 
@@ -368,12 +278,11 @@ def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
         return 0, None, None
 
     monkeypatch.setattr(parallel, "run_job", edit_the_knob_then_wait)
-    root = _elsewhere(tmp_path)
-    args = _par_args(root)
-    args.git_push = "none"
+    root = root_not_cwd(tmp_path)
+    args = par_args(root, jobs=1, git_push="none")
 
     try:
-        parallel.run_parallel(_MemListDriver(["products/only.md"]), args,
+        parallel.run_parallel(MemListDriver(["products/only.md"]), args,
                               app_name="pytest-gitpush")
     except SystemExit:
         pass
@@ -545,7 +454,7 @@ def test_the_exit_push_never_runs_beside_the_background_pusher(
                         lambda job_id, command, mailbox=None:
                             (fake.pushed.wait(timeout=PUMP_WAIT_S),
                              (0, None, None))[1])
-    root = _elsewhere(tmp_path)
+    root = root_not_cwd(tmp_path)
 
     def stage_the_handover():
         # Bounded: if the main thread never waits for the pusher the run must
@@ -557,8 +466,9 @@ def test_the_exit_push_never_runs_beside_the_background_pusher(
                               daemon=True)
     stager.start()
     try:
-        parallel.run_parallel(_MemListDriver(["products/only.md"]),
-                              _par_args(root), app_name="pytest-gitpush")
+        parallel.run_parallel(MemListDriver(["products/only.md"]),
+                              par_args(root, jobs=1, git_push=PUSHING),
+                              app_name="pytest-gitpush")
     except SystemExit:
         pass
     finally:

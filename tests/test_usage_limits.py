@@ -23,6 +23,8 @@ from llm_loop.usage import RateLimitEvent
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
 
+from _runfixtures import seq_args
+
 
 # A response like the endpoint's, trimmed to the quotas the engine reads. The
 # Sonnet-only week is null: a quota the plan does not have is absent, not zero.
@@ -270,18 +272,6 @@ class _NeverPauses:
         return False, session_start
 
 
-def _args(project_dir):
-    ns = type("NS", (), {})()
-    ns.max = None          # None keeps the limit machinery on (a bounded run skips it)
-    ns.dry_run = False
-    ns.raw = False
-    ns.start_in = None
-    ns.git_push = "none"
-    ns.project_dir = project_dir
-    ns.cost = False
-    return ns
-
-
 def _run_with_verdict(tmp_path, monkeypatch, verdict):
     """Run two iterations whose first fake `claude` streams `verdict`; return the
     wait_until targets the loop asked for."""
@@ -297,7 +287,8 @@ def _run_with_verdict(tmp_path, monkeypatch, verdict):
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", fake_run)
     driver = _TwoShotDriver()
-    cyclecore.run_loop(driver, _args(str(tmp_path)), app_name="pytest-usage")
+    # No --max-runs: a bounded run skips the limit machinery this is about.
+    cyclecore.run_loop(driver, seq_args(tmp_path), app_name="pytest-usage")
     return driver, waits
 
 

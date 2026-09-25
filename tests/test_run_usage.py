@@ -16,9 +16,10 @@ from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.stopchannel import RunStopReason
 # The staged-run scaffolding of the abnormal endings; `_isolated_run` is autouse
 # there, and importing it makes it autouse here too (own log dir, exit record).
-from test_abnormal_exit_epilogue import (_isolated_run, _OneItemListDriver,  # noqa: F401
-                                         _par_args, _seq_args, _StubPolicy,
-                                         _StubSource, exit_pushes)
+from test_abnormal_exit_epilogue import (_isolated_run, _par_args,  # noqa: F401
+                                         _seq_args, _StubSource, exit_pushes)
+
+from _runfixtures import MemListDriver, StubPolicy
 
 
 class _RecordingPolicy:
@@ -94,7 +95,7 @@ class _OneCommandDriver(Driver):
     """One command, then no more work: the ending a sequential run RETURNS from."""
 
     def __init__(self):
-        self.limit_policy = _StubPolicy()
+        self.limit_policy = StubPolicy()
         self.commands = 1
 
     def next_command(self):
@@ -126,7 +127,7 @@ def test_a_parallel_run_that_returns_closes_the_usage_it_opened(
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: _StubSource())
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, command, mailbox=None: (0, None, None))
-    driver = _OneItemListDriver()
+    driver = MemListDriver(["products/only.md"])
 
     result = parallel.run_parallel(driver, _par_args(str(tmp_path)),
                                    app_name="pytest-abnormal", wait_on_start=False)

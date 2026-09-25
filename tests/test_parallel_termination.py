@@ -27,47 +27,9 @@ import time
 import pytest
 
 from llm_loop import parallel, runlifecycle, stopchannel
-from llm_loop.drivers import ListFileDriver
 from llm_loop.stopchannel import RunStopReason
 
-
-class _MemDriver(ListFileDriver):
-    """ListFileDriver backed by an in-memory list (no files, no real claude)."""
-
-    target_suffix = ".ru.md"
-
-    def __init__(self, items):
-        super().__init__()
-        self._items = list(items)
-        self._lock = threading.Lock()
-
-    def prompt(self, source, target):
-        return "translate"
-
-    def model(self):
-        return ""
-
-    def pending_lines(self):
-        with self._lock:
-            return list(self._items)
-
-    def strike(self, line):
-        with self._lock:
-            if line in self._items:
-                self._items.remove(line)
-                return True
-            return False
-
-
-def _args(project_dir, jobs, *, ignore_usage=True, max_runs=None):
-    ns = type("NS", (), {})()
-    ns.jobs = jobs
-    ns.max = max_runs
-    ns.dry_run = False
-    ns.git_push = "none"
-    ns.project_dir = project_dir
-    ns.ignore_usage = ignore_usage
-    return ns
+from _runfixtures import MemListDriver, par_args
 
 
 def _run_and_wait(driver, args, timeout=10.0, result_box=None):
@@ -112,8 +74,8 @@ def _result(result_box):
 def test_drain_terminates_with_more_workers_than_files(tmp_path, monkeypatch):
     """20 workers, a few files: everyone must exit once the list drains."""
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
-    driver = _MemDriver([f"products/f{i}.md" for i in range(3)])
-    assert _run_and_wait(driver, _args(str(tmp_path), jobs=20)), \
+    driver = MemListDriver([f"products/f{i}.md" for i in range(3)])
+    assert _run_and_wait(driver, par_args(tmp_path, jobs=20)), \
         "run_parallel did not terminate after the list drained"
     assert driver.pending_lines() == []
 
@@ -143,9 +105,9 @@ def test_worker_claims_before_touching_the_usage_gate(tmp_path, monkeypatch):
 
     # Non-empty list that drains immediately: run_parallel starts workers, they
     # drain the single item, then must exit — the spare workers never gate.
-    driver = _MemDriver(["products/only.md"])
+    driver = MemListDriver(["products/only.md"])
     driver.limit_policy = SpyPolicy()
-    assert _run_and_wait(driver, _args(str(tmp_path), jobs=20, ignore_usage=False))
+    assert _run_and_wait(driver, par_args(tmp_path, jobs=20, ignore_usage=False))
     assert driver.pending_lines() == []
     # At most one gate call (the single worker that claimed the one item); the 19
     # spare workers claimed nothing and so never touched the gate.
@@ -170,12 +132,12 @@ def test_a_paused_fleet_claims_nothing_until_it_is_let_go(tmp_path, monkeypatch)
     monkeypatch.setattr(parallel, "run_job", watched_job)
     monkeypatch.setattr(stopchannel, "pause_requested",
                         lambda app=None: paused.is_set())
-    driver = _MemDriver(["products/a.md", "products/b.md"])
+    driver = MemListDriver(["products/a.md", "products/b.md"])
     done = threading.Event()
 
     def go():
         try:
-            parallel.run_parallel(driver, _args(str(tmp_path), jobs=3),
+            parallel.run_parallel(driver, par_args(tmp_path, jobs=3),
                                   app_name="pytest-parallel")
         finally:
             done.set()
@@ -205,9 +167,9 @@ def test_a_paused_fleet_still_ends_when_the_queue_drains(tmp_path, monkeypatch):
     monkeypatch.setattr(parallel, "run_job", pause_while_it_runs)
     monkeypatch.setattr(stopchannel, "pause_requested",
                         lambda app=None: paused.is_set())
-    driver = _MemDriver(["products/only.md"])
+    driver = MemListDriver(["products/only.md"])
 
-    assert _run_and_wait(driver, _args(str(tmp_path), jobs=3)), \
+    assert _run_and_wait(driver, par_args(tmp_path, jobs=3)), \
         "a paused fleet with an empty queue never terminated"
     assert paused.is_set(), "the pause was released — the test proved nothing"
     assert driver.pending_lines() == []
@@ -225,9 +187,9 @@ def test_a_paused_fleet_still_ends_at_the_item_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(parallel, "run_job", pause_while_it_runs)
     monkeypatch.setattr(stopchannel, "pause_requested",
                         lambda app=None: paused.is_set())
-    driver = _MemDriver(["products/a.md", "products/b.md"])
+    driver = MemListDriver(["products/a.md", "products/b.md"])
 
-    assert _run_and_wait(driver, _args(str(tmp_path), jobs=3, max_runs=1)), \
+    assert _run_and_wait(driver, par_args(tmp_path, jobs=3, max=1)), \
         "a paused fleet at its item cap never terminated"
     assert paused.is_set(), "the pause was released — the test proved nothing"
     assert len(driver.pending_lines()) == 1
@@ -235,7 +197,7 @@ def test_a_paused_fleet_still_ends_at_the_item_cap(tmp_path, monkeypatch):
 
 def test_release_returns_claim_to_queue():
     """release() drops the line from in_progress and undoes its --max reservation."""
-    driver = _MemDriver(["a", "b"])
+    driver = MemListDriver(["a", "b"])
     shared = parallel.Shared(driver, runlifecycle.RunSettings(max_runs=5))
     line = shared.claim()
     assert line in ("a", "b")
@@ -286,14 +248,13 @@ def test_a_worker_dying_mid_turn_does_not_hang_the_run(tmp_path, monkeypatch):
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", exploding_job)
-    driver = _MemDriver(good + [poison])
-    # List order, so the poison line is only ever reached after the healthy
-    # ones: with the default random pick the same run could kill both workers
-    # early and the counts below would depend on the draw.
-    driver.pick_order = "list"
+    # `MemListDriver` walks in list order, so the poison line is only ever
+    # reached after the healthy ones: under a random pick the same run could
+    # kill both workers early and the counts below would depend on the draw.
+    driver = MemListDriver(good + [poison])
 
     box = []
-    assert _run_and_wait(driver, _args(str(tmp_path), jobs=2),
+    assert _run_and_wait(driver, par_args(tmp_path, jobs=2),
                          timeout=HANG_TIMEOUT_S, result_box=box), \
         "a worker died holding a claim and run_parallel never returned"
     assert driver.pending_lines() == [poison], \
@@ -341,12 +302,12 @@ def test_a_worker_dying_in_the_usage_gate_gives_the_file_back(
                 raise RuntimeError("usage endpoint blew up")
             return False, session_start
 
-    driver = _MemDriver(["products/only.md"])
+    driver = MemListDriver(["products/only.md"])
     driver.limit_policy = ExplodesOncePolicy()
 
     box = []
-    assert _run_and_wait(driver, _args(str(tmp_path), jobs=2,
-                                       ignore_usage=False),
+    assert _run_and_wait(driver, par_args(tmp_path, jobs=2,
+                                          ignore_usage=False),
                          timeout=HANG_TIMEOUT_S, result_box=box), \
         "a worker died in the usage gate and run_parallel never returned"
     assert len(calls) >= 2, "the second worker never reached the gate"
@@ -430,13 +391,13 @@ def test_a_dying_job_does_not_leave_the_provider_running(tmp_path, monkeypatch):
     monkeypatch.setattr(parallel, "start_agent_process", fake_provider)
     monkeypatch.setattr(parallel, "print_markup", console_that_dies)
 
-    driver = _MemDriver(["products/only.md"])
+    driver = MemListDriver(["products/only.md"])
     # Every exit from here kills what was started, including the assertion
     # failures: this pin's fixture is a real process that lives for two minutes,
     # and a FAILING pin that also leaked it would spend those two minutes
     # competing with the rest of the suite for the console it complains about.
     try:
-        assert _run_and_wait(driver, _args(str(tmp_path), jobs=1),
+        assert _run_and_wait(driver, par_args(tmp_path, jobs=1),
                              timeout=HANG_TIMEOUT_S), \
             "the worker died holding a claim and run_parallel never returned"
         assert children, \
@@ -469,13 +430,13 @@ def test_max_runs_closes_claims_without_cancelling_in_flight_work(
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", blocked_job)
-    driver = _MemDriver([f"products/f{i}.md" for i in range(6)])
+    driver = MemListDriver([f"products/f{i}.md" for i in range(6)])
     done = threading.Event()
 
     def go():
         try:
             parallel.run_parallel(
-                driver, _args(str(tmp_path), jobs=6, max_runs=3),
+                driver, par_args(tmp_path, jobs=6, max=3),
                 app_name="pytest-parallel")
         finally:
             done.set()

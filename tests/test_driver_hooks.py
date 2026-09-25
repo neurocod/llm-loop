@@ -21,54 +21,20 @@ import pytest
 
 from llm_loop import cyclecore, parallel, runlifecycle, stopchannel
 from llm_loop.agentwork import ClaudeCommand, Driver
-from llm_loop.drivers import ListFileDriver
 from llm_loop.stopchannel import RunStopReason
 
-
-class _StubPolicy:
-    def describe(self):
-        return "stub"
-
-    def log_snapshot(self, *args, **kwargs):
-        pass
-
-    def check_and_wait(self, source, session_start, note="",
-                       cache_value=True, should_stop=None):
-        return False, session_start
+from _runfixtures import MemListDriver, StubPolicy, par_args, seq_args
 
 
-class _HookedListDriver(ListFileDriver):
+class _HookedListDriver(MemListDriver):
     """An in-memory queue whose hooks are supplied per test."""
 
-    target_suffix = ".out.md"
-
     def __init__(self, items, *, on_started=None, on_finished=None):
-        super().__init__()
-        self.pick_order = "list"
-        self._items = list(items)
-        self._lock = threading.Lock()
+        super().__init__(items)
         self._on_started = on_started
         self._on_finished = on_finished
         self.started = []
         self.finished = []
-        self.limit_policy = _StubPolicy()
-
-    def prompt(self, source, target):
-        return "do it"
-
-    def model(self):
-        return ""
-
-    def pending_lines(self):
-        with self._lock:
-            return list(self._items)
-
-    def strike(self, line):
-        with self._lock:
-            if line in self._items:
-                self._items.remove(line)
-                return True
-            return False
 
     def item_started(self, command):
         with self._lock:
@@ -82,31 +48,10 @@ class _HookedListDriver(ListFileDriver):
                 if self._on_finished else None)
 
 
-def _parallel_args(project_dir, jobs):
-    ns = type("NS", (), {})()
-    ns.jobs = jobs
-    ns.max = None
-    ns.dry_run = False
-    ns.git_push = "none"
-    ns.project_dir = str(project_dir)
-    ns.ignore_usage = True
-    ns.no_statusline = True
-    return ns
-
-
-def _seq_args(project_dir, max_runs=5):
-    ns = type("NS", (), {})()
+def _seq_args(project_dir):
     # A finite cap turns the usage machinery off (see run_loop): these pins are
     # about the hooks, not about the quota gate.
-    ns.max = max_runs
-    ns.dry_run = False
-    ns.raw = False
-    ns.start_in = None
-    ns.git_push = "none"
-    ns.project_dir = str(project_dir)
-    ns.cost = False
-    ns.no_statusline = True
-    return ns
+    return seq_args(project_dir, max=5, no_statusline=True)
 
 
 def _run_parallel(driver, args, timeout=10.0):
@@ -151,7 +96,8 @@ def test_a_finished_item_can_end_the_parallel_run_without_losing_the_queue(
         [f"products/f{i}.md" for i in range(4)],
         on_finished=lambda command, rc: "a request was filed")
 
-    result = _run_parallel(driver, _parallel_args(tmp_path, jobs=1))
+    result = _run_parallel(driver,
+                           par_args(tmp_path, jobs=1, no_statusline=True))
 
     assert result.reason is RunStopReason.DRIVER_PAUSE
     # Exactly one item ran: the hook fired at its end, and nothing was claimed
@@ -175,7 +121,8 @@ def test_a_pause_asked_for_at_the_start_still_lets_that_item_finish(
         [f"products/f{i}.md" for i in range(3)],
         on_started=lambda command: "the kit needs promoting")
 
-    result = _run_parallel(driver, _parallel_args(tmp_path, jobs=1))
+    result = _run_parallel(driver,
+                           par_args(tmp_path, jobs=1, no_statusline=True))
 
     assert result.reason is RunStopReason.DRIVER_PAUSE
     assert driver.finished == [("f0.md", 0)], "the started item was cancelled"
@@ -212,7 +159,7 @@ def test_a_pause_lets_every_turn_already_in_flight_run_to_its_end(
     driver = _HookedListDriver(
         [f"products/f{i}.md" for i in range(6)],
         on_finished=lambda command, rc: "a request was filed")
-    args = _parallel_args(tmp_path, jobs=3)
+    args = par_args(tmp_path, jobs=3, no_statusline=True)
 
     box = []
     done = threading.Event()
@@ -252,7 +199,7 @@ def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatc
     """
     first_gate = threading.Event()
 
-    class BlockingPolicy(_StubPolicy):
+    class BlockingPolicy(StubPolicy):
         def check_and_wait(self, source, session_start, note="",
                            cache_value=True, should_stop=None):
             if not first_gate.is_set():
@@ -278,7 +225,7 @@ def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatc
         [f"products/f{i}.md" for i in range(3)],
         on_finished=lambda command, rc: "a request was filed")
     driver.limit_policy = BlockingPolicy()
-    args = _parallel_args(tmp_path, jobs=2)
+    args = par_args(tmp_path, jobs=2, no_statusline=True)
     args.ignore_usage = False
 
     box = []
@@ -328,7 +275,7 @@ class _SequentialHookDriver(Driver):
         self._pause_after = pause_after
         self.started = []
         self.finished = []
-        self.limit_policy = _StubPolicy()
+        self.limit_policy = StubPolicy()
 
     def next_command(self):
         if not self._items:

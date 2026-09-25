@@ -156,11 +156,17 @@ def begin_run(driver, args, app_name: str, progress=None, *,
 
     `setup_logging=False` is the wrapper's hook: a host script that already tees
     its own output must not have a second tee stacked on top of the first.
+
+    `args` is read strictly: `provider`, `dry_run`, `project_dir` and
+    `no_live_messages` are declared by `clispec` for BOTH modes, so a namespace
+    from either parser always has them, and a default here could only ever cover
+    for a caller that built its namespace by hand and left one out — the caller
+    that gets an AttributeError instead.
     """
-    if not getattr(args, "dry_run", False):
+    if not args.dry_run:
         ensure_script_lock()
 
-    provider = getattr(args, "provider", None) or driver.provider
+    provider = args.provider or driver.provider
     spec = provider_spec(provider)
     driver.provider = provider
 
@@ -173,11 +179,11 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     settings = RunSettings(max_runs=args.max,
                            git_push=GitPushPolicy(args.git_push))
     registry = script_settings(settings, progress if owns_progress else None)
-    dry_run = bool(getattr(args, "dry_run", False))
+    dry_run = bool(args.dry_run)
 
     # Anchor every project-relative operation (git/provider cwd, the stop file,
     # the log name, the Driver's paths) before anything reads the root.
-    projectroot.set_project_root(getattr(args, "project_dir", None))
+    projectroot.set_project_root(args.project_dir)
 
     # Decided per invocation, before the first argv is built: the transport is
     # what --no-live-messages turns off, and both the argv and the process's
@@ -186,7 +192,7 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     # alternates product batches with kit-promotion passes) would
     # otherwise have the first `--no-live-messages` phase decide the transport
     # for every phase after it.
-    set_live_messages(not getattr(args, "no_live_messages", False))
+    set_live_messages(not args.no_live_messages)
 
     # Mirror all screen output into a rotating log file under the home dir —
     # except for a dry run, which is a preview and not a run: its output would

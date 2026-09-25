@@ -108,19 +108,14 @@ state, but it holds figures, not requests. Not reachable from `runCycle.py`
 
 ## Structure worth doing when something takes you there anyway
 
-Two findings from the structural pass over the operator-note commits. Neither is
-worth its churn on its own; each has a trigger that makes it cheap.
+A finding from the structural pass over the operator-note commits. Not worth its
+churn on its own; it has a trigger that makes it cheap.
 
 - **`operator.py` vs `providers.py` could be split by ownership** — providers
   owns the pipe (open, wire format, channel, close), operator owns the policy
   (framing, queue, receipts). Today `user_message_line` (a stream-json fact)
   lives in operator because `AgentChannel` needs it. Trigger: a second transport
   with a different wire format.
-- **Test fixtures: three `_MemDriver` subclasses and seven args namespaces**
-  across `test_parallel_statusline`, `test_parallel_termination` and
-  `test_operator_messages`, with no `conftest.py` anywhere. The cost is three
-  copies of a driver that must stay behaviourally identical for the parallel
-  tests to mean the same thing. Trigger: the next test file that needs a fourth.
 
 One more from the structural pass over the line-width commits (8cb0cb8,
 9009a52, 629edab). The rest of that pass is done: a compact line's head named
@@ -128,14 +123,14 @@ once where it is both measured and printed (749d6e2), the width primitives put
 under the renderers instead of above them (080bdd5), and the line shapes
 themselves given their own module, `compactline.py`.
 
-- **Two fake terminals in the tests, and still no `conftest.py`.**
+- **Two fake terminals in the tests.**
   `test_providers._terminal` and `test_textwidth._columns` both patch
   `shutil.get_terminal_size`, with deliberately different contracts (one returns
   the width a line may fill and ignores the fallback; the other honours the
   fallback, which is the whole point of the no-terminal pins). Cheap while the
   two answer different questions. Trigger: the third test file that needs a fake
-  terminal — it lands in the `conftest.py` the `_MemDriver` copies above also
-  want.
+  terminal — it gets a shared, explicitly imported home the way the runner
+  fixtures got `tests/_runfixtures.py`.
 
 ## Known gaps
 

@@ -27,6 +27,8 @@ from llm_loop import (console, cyclecore, projectroot, runlifecycle,
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
+from _runfixtures import seq_args
+
 
 NOW = 1_700_000_000.0
 
@@ -1143,15 +1145,7 @@ def test_a_dry_run_prints_the_prompt_block_for_job_one(tmp_path, capsys):
         def next_command(self):
             return AgentCommand("do the thing, carefully", "", "the-thing")
 
-    args = type("NS", (), {})()
-    args.max = None
-    args.dry_run = True
-    args.raw = False
-    args.start_in = None
-    args.git_push = "none"
-    args.project_dir = str(tmp_path)
-    args.cost = False
-    args.no_statusline = False
+    args = seq_args(tmp_path, dry_run=True)
 
     previous = projectroot.project_dir()
     streams = (sys.stdout, sys.stderr)
@@ -1403,17 +1397,8 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
 
     monkeypatch.setattr(sl, "StatusApp", _app)
 
-    args = type("NS", (), {})()
-    args.max = 1
-    args.dry_run = False
-    args.raw = False
-    args.start_in = None
-    args.git_push = "none"
-    args.project_dir = str(tmp_path)
-    args.cost = False
-    args.no_statusline = False
-    for name, value in arg_fields.items():
-        setattr(args, name, value)
+    arg_fields.setdefault("max", 1)
+    args = seq_args(tmp_path, **arg_fields)
 
     previous = projectroot.project_dir()
     try:
@@ -1543,11 +1528,7 @@ class _QueueDriver:
 
 def _begin(tmp_path, progress=None):
     """`runlifecycle.begin_run` as a dry run: no lock, no tee, no exit record."""
-    from types import SimpleNamespace
-
-    args = SimpleNamespace(provider=None, max=1, git_push="none",
-                           project_dir=str(tmp_path), no_live_messages=False,
-                           dry_run=True)
+    args = seq_args(tmp_path, max=1, dry_run=True)
     previous = projectroot.project_dir()
     try:
         ctx = runlifecycle.begin_run(_QueueDriver(None), args, "pytest-statusline",
@@ -1864,12 +1845,7 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
 
     monkeypatch.setattr(sl, "StatusApp", _app)
 
-    args = type("NS", (), {})()
-    for name, value in dict(max=2, dry_run=False, raw=False, start_in=None,
-                            git_push="none", cost=False,
-                            no_statusline=False, provider="codex",
-                            project_dir=str(tmp_path)).items():
-        setattr(args, name, value)
+    args = seq_args(tmp_path, max=2, provider="codex")
 
     progress = sl.InvocationProgress()
     previous = projectroot.project_dir()

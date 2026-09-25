@@ -15,7 +15,6 @@ Two deliveries and one hazard, and every test here is about one of the three:
 
 import io
 import json
-import os
 import queue
 import threading
 
@@ -27,6 +26,8 @@ from llm_loop import statusline as sl
 from llm_loop import termio as tio
 from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.providers import build_agent_argv, start_agent_process
+
+from _runfixtures import MemListDriver, par_args, seq_args
 
 
 @pytest.fixture(autouse=True)
@@ -536,20 +537,10 @@ class _TwoIterationDriver(Driver):
         return AgentCommand("Do the task.", "", f"item-{self.served}")
 
 
-def _seq_args(project_dir):
-    ns = type("NS", (), {})()
+def _seq_args(project_dir, **fields):
     # A bounded run: the loop then skips the usage machinery entirely, which is
     # what keeps this test off the network and away from the quota policy.
-    ns.max = 3
-    ns.dry_run = False
-    ns.raw = False
-    ns.start_in = None
-    ns.git_push = "none"
-    ns.project_dir = project_dir
-    ns.cost = False
-    ns.no_statusline = True
-    ns.provider = None
-    return ns
+    return seq_args(project_dir, max=3, no_statusline=True, **fields)
 
 
 def test_a_queued_note_rides_the_next_iterations_prompt(tmp_path, monkeypatch):
@@ -575,7 +566,7 @@ def test_a_queued_note_rides_the_next_iterations_prompt(tmp_path, monkeypatch):
     # snapshot; a unit test has no business on the network for either.
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
 
-    cyclecore.run_loop(_TwoIterationDriver(), _seq_args(str(tmp_path)),
+    cyclecore.run_loop(_TwoIterationDriver(), _seq_args(tmp_path),
                        app_name="pytest-operator", setup_logging=False,
                        wait_on_start=False)
 
@@ -596,8 +587,7 @@ def test_no_live_messages_puts_the_prompt_back_in_argv(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", fake_run)
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
-    args = _seq_args(str(tmp_path))
-    args.no_live_messages = True
+    args = _seq_args(tmp_path, no_live_messages=True)
 
     cyclecore.run_loop(_TwoIterationDriver(), args, app_name="pytest-operator",
                        setup_logging=False, wait_on_start=False)
@@ -624,7 +614,7 @@ def test_a_note_the_run_never_delivered_is_reported(tmp_path, monkeypatch,
         def next_command(self):
             return super().next_command() if self.served < 1 else None
 
-    cyclecore.run_loop(_OneItem(), _seq_args(str(tmp_path)),
+    cyclecore.run_loop(_OneItem(), _seq_args(tmp_path),
                        app_name="pytest-operator", setup_logging=False,
                        wait_on_start=False)
 
@@ -641,7 +631,7 @@ def test_the_sequential_status_line_is_given_the_runs_mailbox(tmp_path,
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
 
-    cyclecore.run_loop(_TwoIterationDriver(), _seq_args(str(tmp_path)),
+    cyclecore.run_loop(_TwoIterationDriver(), _seq_args(tmp_path),
                        app_name="pytest-operator", setup_logging=False,
                        wait_on_start=False)
 
@@ -1116,50 +1106,14 @@ def test_concurrent_inflight_eviction_is_not_double_reported(capsys):
 # --- the parallel runner: one mailbox per worker -------------------------------
 
 
-class _MemDriver(parallel.ListFileDriver):
-    target_suffix = ".out.md"
-    pick_order = "list"
-
-    def __init__(self, items):
-        super().__init__()
-        self._items = list(items)
-        self._lock = threading.Lock()
-
-    def prompt(self, source, target):
-        return f"do {os.path.basename(source)}"
-
-    def pending_lines(self):
-        with self._lock:
-            return list(self._items)
-
-    def strike(self, line):
-        with self._lock:
-            if line in self._items:
-                self._items.remove(line)
-                return True
-            return False
-
-
-def _par_args(project_dir, jobs):
-    ns = type("NS", (), {})()
-    ns.jobs = jobs
-    ns.max = None
-    ns.dry_run = False
-    ns.git_push = "none"
-    ns.project_dir = project_dir
-    ns.ignore_usage = True
-    ns.no_statusline = True
-    return ns
-
-
 @pytest.mark.parametrize("jobs", [1, 2])
 def test_every_parallel_worker_run_is_addressable(tmp_path, monkeypatch, jobs):
     seen = _capture_status_app(monkeypatch)
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
 
-    parallel.run_parallel(_MemDriver(["a.md", "b.md"]),
-                          _par_args(str(tmp_path), jobs),
+    parallel.run_parallel(MemListDriver(["a.md", "b.md"]),
+                          par_args(tmp_path, jobs=jobs, no_statusline=True),
                           app_name="pytest-operator-parallel")
 
     messages = seen["messages"]
@@ -1188,8 +1142,8 @@ def test_a_queued_fleet_note_rides_only_its_workers_prompt(tmp_path, monkeypatch
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", record)
-    parallel.run_parallel(_MemDriver(["a.md", "b.md"]),
-                          _par_args(str(tmp_path), 2),
+    parallel.run_parallel(MemListDriver(["a.md", "b.md"]),
+                          par_args(tmp_path, jobs=2, no_statusline=True),
                           app_name="pytest-operator-parallel-routing")
 
     assert operator.QUEUED_NOTES_HEADER not in prompts[1]
