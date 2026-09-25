@@ -464,23 +464,16 @@ makes the loop wait out exactly the quota that refused it
 (`usage.RateLimitEvent`). A failed Codex turn forces a fresh app-server
 reading before the bounded retry path continues.
 
-## Common options
+## Command-line options
 
-| Option | Meaning |
-|---|---|
-| `--codex` | run Codex CLI instead of the Driver's default provider |
-| `-m, --max-runs N` | stop after N iterations (sequential) / N files total (parallel); `--max` is a deprecated alias |
-| `-d, --dry-run` | print the commands, run nothing |
-| `-g, --git-push none\|after_new_commits\|each_hour` | when to `git push` |
-| `-C, --project-dir DIR` | project root (default: cwd) |
-| `-s, --start-in 29m` | wait before starting (sequential only); alias `--startIn` |
-| `-j, --jobs N` | concurrent workers (parallel only; else the Driver's `jobs`, else 10) |
-| `-c, --cost` | print per-session cost totals from the mirror log and exit (sequential only) |
-| `--cost-log LOG` | report on this log instead of this entry point's own — a rotated backup or a copy; implies `--cost` (sequential only) |
-| `--ignore-usage` | don't pause on the session budget (parallel only) |
-| `--raw` | print raw JSON events, for debugging (sequential only) |
-| `--no-statusline` | do not pin the status rows (same as `LLM_LOOP_STATUSLINE=0`) |
-| `--no-live-messages` | notes typed with `m` wait for the next prompt instead of going into the running turn (same as `LLM_LOOP_LIVE_MESSAGES=0`) |
+The option list is your wrapper's `--help`. Both runners build their parsers
+from one table, `llm_loop.clispec.OPTIONS`, and the two accept different
+subsets of it (`clispec.OPTION_ORDER`), so ask the entry point you run:
+
+```
+python runFileList.py --help           # .main(): the sequential runner
+python runFileListParallel.py --help   # .main_parallel(): the parallel one
+```
 
 ## Why the run ended
 
