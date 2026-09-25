@@ -12,14 +12,13 @@ import inspect
 import pytest
 
 from llm_loop import cyclecore, limits, parallel, runlifecycle
-from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.stopchannel import RunStopReason
 # The staged-run scaffolding of the abnormal endings; `_isolated_run` is autouse
 # there, and importing it makes it autouse here too (own log dir, exit record).
 from test_abnormal_exit_epilogue import (_isolated_run, _par_args,  # noqa: F401
                                          _seq_args, _StubSource, exit_pushes)
 
-from _runfixtures import MemListDriver, StubPolicy
+from _runfixtures import MemListDriver, OneShotDriver
 
 
 class _RecordingPolicy:
@@ -91,20 +90,6 @@ def test_the_closing_snapshot_answers_the_opening_one():
     ]
 
 
-class _OneCommandDriver(Driver):
-    """One command, then no more work: the ending a sequential run RETURNS from."""
-
-    def __init__(self):
-        self.limit_policy = StubPolicy()
-        self.commands = 1
-
-    def next_command(self):
-        if self.commands:
-            self.commands -= 1
-            return ClaudeCommand("do the thing")
-        return None
-
-
 def test_a_sequential_run_that_returns_closes_the_usage_it_opened(
         tmp_path, monkeypatch, exit_pushes):
     """The normal ending is the common one; the abnormal three are pinned in
@@ -112,7 +97,8 @@ def test_a_sequential_run_that_returns_closes_the_usage_it_opened(
     monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **k: 0)
     monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: _StubSource())
-    driver = _OneCommandDriver()
+    # One command, then no more work: the ending a sequential run RETURNS from.
+    driver = OneShotDriver()
 
     result = cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
                                 app_name="pytest-abnormal", wait_on_start=False)

@@ -24,7 +24,7 @@ from llm_loop import (cyclecore, parallel, projectroot, runlifecycle,
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
-from _runfixtures import MemListDriver, par_args, seq_args
+from _runfixtures import MemListDriver, NoWorkDriver, par_args, seq_args
 
 
 class _MemDriver(MemListDriver):
@@ -621,8 +621,6 @@ class _RecordingTerminal(_LiveTerminal):
 def test_a_batching_wrapper_never_stacks_two_status_areas(tmp_path, monkeypatch):
     """A wrapper alternating parallel batches with sequential sweeps: two
     regions pinned at once would fight over the same screen rows."""
-    from llm_loop.agentwork import Driver
-
     log = []
     real_app_class = sl.StatusApp
 
@@ -636,10 +634,6 @@ def test_a_batching_wrapper_never_stacks_two_status_areas(tmp_path, monkeypatch)
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
 
-    class _NoWork(Driver):
-        def next_command(self):
-            return None
-
     previous = projectroot.project_dir()
     try:
         for _batch in range(2):
@@ -647,7 +641,7 @@ def test_a_batching_wrapper_never_stacks_two_status_areas(tmp_path, monkeypatch)
                 _MemDriver(["products/a.md"]), par_args(tmp_path, jobs=2),
                 app_name="pytest-parallel-statusline", setup_logging=False,
                 wait_on_start=False)
-            cyclecore.run_loop(_NoWork(), seq_args(tmp_path, max=1),
+            cyclecore.run_loop(NoWorkDriver(), seq_args(tmp_path, max=1),
                                app_name="pytest-parallel-statusline",
                                setup_logging=False, wait_on_start=False)
     finally:
