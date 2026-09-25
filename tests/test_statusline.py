@@ -1541,20 +1541,20 @@ class _QueueDriver:
         return self.pending
 
 
-def _begin(tmp_path, progress=None, **arg_fields):
+def _begin(tmp_path, progress=None):
     """`runlifecycle.begin_run` as a dry run: no lock, no tee, no exit record."""
     from types import SimpleNamespace
 
     args = SimpleNamespace(provider=None, max=1, git_push="none",
                            project_dir=str(tmp_path), no_live_messages=False,
-                           dry_run=True, **arg_fields)
+                           dry_run=True)
     previous = projectroot.project_dir()
     try:
         ctx = runlifecycle.begin_run(_QueueDriver(None), args, "pytest-statusline",
                                      progress, setup_logging=False)
     finally:
         projectroot.set_project_root(previous)
-    return ctx, args
+    return ctx
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -1571,7 +1571,7 @@ def test_only_the_invocation_moves_the_denominator_on_a_cap_edit(tmp_path,
     wrapped case would pass just as well with the knob broken.
     """
     invocation = sl.InvocationProgress(max_items=99) if wrapped else None
-    ctx, _args = _begin(tmp_path, invocation)
+    ctx = _begin(tmp_path, invocation)
 
     ctx.registry.get("max-runs").set(2)
 
@@ -1591,7 +1591,7 @@ def test_a_later_runner_call_opens_on_how_far_the_queue_got(tmp_path):
     """
     invocation = sl.InvocationProgress()
     invocation.track_total(5)
-    ctx, _args = _begin(tmp_path, invocation)
+    ctx = _begin(tmp_path, invocation)
 
     app = runlifecycle.open_status(ctx, _QueueDriver(3), job_count=1,
                                    messages=None)

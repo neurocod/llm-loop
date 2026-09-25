@@ -130,8 +130,7 @@ class RunContext(NamedTuple):
     dry_run: bool
     progress: Any
     settings: RunSettings
-    # The display and edit surface over `settings` (see script_settings), built
-    # here because only here is it known whether this call owns `progress`.
+    # The knob registry over `settings` (see script_settings).
     registry: Any
     # Whether the pinned status area is drawn: never for a dry run, and not
     # under `--no-statusline`. Off, open_status hands back the Null app.
@@ -164,9 +163,7 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     driver.provider = provider
 
     # No wrapper above us: this call is the whole invocation, so its own --max is
-    # the invocation cap and it owns the figures — which is what hands the
-    # registry the progress whose denominator a `--max-runs` edit moves. Under a
-    # wrapper the cap on screen is the wrapper's, and this call sizes one batch.
+    # the invocation cap and it owns the figures.
     owns_progress = progress is None
     if owns_progress:
         progress = statusline.InvocationProgress(max_items=args.max)
@@ -229,19 +226,14 @@ def open_status(ctx: RunContext, driver, *, job_count: int,
 
     A Job is the unit of display in both runners, so the sequential loop is a
     run with exactly one Job and the parallel one a run with N — no branch
-    anywhere in the status line separates them. The Jobs come from the
-    invocation's pool, so a wrapper's next runner call resumes these rows
-    instead of starting fresh ones at iteration 1. Disabled (a dry run, or
-    `--no-statusline`), the app is a Null object and every call on it is a
-    no-op. `messages` is the runner's own wiring: one Mailbox for the loop, a
-    MailboxSet for the workers, None for a dry run.
+    anywhere in the status line separates them. The Jobs come from
+    `progress.jobs`. Disabled (a dry run, or `--no-statusline`), the app is a
+    Null object and every call on it is a no-op. `messages` is the runner's own
+    wiring: one Mailbox for the loop, a MailboxSet for the workers, None for a
+    dry run.
 
-    A driver that knows how much work it has is the source of truth for it
-    (Driver.pending_total): the summary row then counts items FINISHED out of
-    that total, not iterations, so a retried item is not progress and a
-    preflight that strikes finished ones is. The first call of an invocation
-    latches the baseline, and every later one records how far the queue has
-    got, so a wrapper's next batch opens on the row the last one left.
+    Records the queue as it stands (Driver.pending_total →
+    InvocationProgress.track_total / note_remaining) before the first update.
 
     A runner registers its own actions on the returned app and enters it; the
     quota priming stays with the runner, because only the parallel one knows

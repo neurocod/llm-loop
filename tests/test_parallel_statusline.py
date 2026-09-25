@@ -835,16 +835,15 @@ def test_job_rows_resume_in_the_next_call_of_the_invocation(tmp_path, monkeypatc
     assert "iter 2   " in made["app"].render(width=200)[2]
 
 
-def test_a_batchs_cap_edit_leaves_the_invocations_denominator_alone(
-        tmp_path, monkeypatch):
+def test_a_batchs_cap_edit_reaches_the_claim_loop(tmp_path, monkeypatch):
     """Under a wrapper this batch's cap sizes THIS batch: the claim loop must
     obey the edit, and the invocation's denominator must not move with it.
 
     Who owns the denominator is pinned once, on the shared prologue
     (`test_statusline.test_only_the_invocation_moves_the_denominator_on_a_cap_edit`);
     this is the claim loop's half, run the way a batching wrapper runs it.
-    Both halves are asserted, because either one alone passes with the other
-    broken.
+    The invocation-cap assert guards that this runner uses the prologue's
+    registry, not one of its own.
     """
     made = _live_statusline(monkeypatch, {})
     edited = threading.Event()
