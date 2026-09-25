@@ -44,7 +44,7 @@ def test_no_usage_endpoint_opens_nothing(monkeypatch):
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
     policy = _RecordingPolicy()
 
-    assert runlifecycle.open_usage(_Driver(policy), "claude", "claude",
+    assert runlifecycle.open_usage(_Driver(policy), "claude",
                                    dry_run=False) is None
     assert policy.snapshots == []
 
@@ -54,7 +54,7 @@ def test_opening_pairs_the_drivers_policy_and_logs_the_start(monkeypatch):
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: source)
     policy = _RecordingPolicy()
 
-    usage = runlifecycle.open_usage(_Driver(policy), "claude", "parallel",
+    usage = runlifecycle.open_usage(_Driver(policy), "claude", name="parallel",
                                     dry_run=False)
 
     assert (usage.source, usage.policy) == (source, policy)
@@ -68,9 +68,9 @@ def test_opening_falls_back_to_the_providers_default_policy(monkeypatch):
     monkeypatch.setattr(limits, "default_policy",
                         lambda provider: default if provider == "codex" else None)
 
-    usage = runlifecycle.open_usage(_Driver(), "codex", "codex", dry_run=True)
+    usage = runlifecycle.open_usage(_Driver(), "codex", dry_run=True)
 
-    assert usage.policy is default
+    assert (usage.policy, usage.name) == (default, "codex")
     assert default.snapshots == [], "a dry run is not a run: no opening snapshot"
 
 

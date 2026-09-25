@@ -1293,8 +1293,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # every worker. --ignore-usage leaves it unopened, so there is no source to
     # gate on and no policy to gate with.
     usage = (None if args.ignore_usage
-             else runlifecycle.open_usage(driver, provider, "parallel",
-                                          dry_run=False))
+             else runlifecycle.open_usage(driver, provider, name="parallel",
+                                          dry_run=dry_run))
     source, policy = runlifecycle.usage_halves(usage)
     usage_lock = threading.Lock()
     session_start_box = [time.time()]  # shared, refreshed when a window resets

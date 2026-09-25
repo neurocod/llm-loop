@@ -40,7 +40,7 @@ rather than to tidy it:
 import contextlib
 import os
 import sys
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional, Tuple
 
 from . import (console, exitlog, limits, operator, projectroot, statusline,
                stopchannel)
@@ -53,6 +53,7 @@ from .gitpush import (
 from .providers import provider_spec, set_live_messages, usage_source_for
 from .stopchannel import RunResult
 from .scriptlock import ensure_script_lock
+from .usage import UsageSource
 
 
 class RunSettings:
@@ -303,28 +304,29 @@ class RunUsage:
                                  cache_value=False)
 
 
-def open_usage(driver, provider: str, name: str, *,
+def open_usage(driver, provider: str, *, name: Optional[str] = None,
                dry_run: bool) -> Optional[RunUsage]:
     """The provider's usage pair with its opening snapshot, or None without one.
 
     None when the provider has no usage endpoint (`usage_source_for`); whether
-    to open one at all is the runner's call — `--ignore-usage` skips this in the
-    parallel runner. The policy is the Driver's specialisation when it has one,
-    the provider's default otherwise. A dry run gets the pair (the gate and the
-    status line read it) but no snapshot, because it is not a run.
+    to open one at all is the runner's call. `name` labels the snapshots and
+    defaults to the provider. The policy is the Driver's specialisation when it
+    has one, the provider's default otherwise. A dry run gets the pair (the gate
+    and the status line read it) but no snapshot, because it is not a run.
     """
     source = usage_source_for(provider)
     if source is None:
         return None
     usage = RunUsage(source,
                      driver.limit_policy or limits.default_policy(provider),
-                     name)
+                     name or provider)
     if not dry_run:
         usage.open()
     return usage
 
 
-def usage_halves(usage: Optional[RunUsage]) -> tuple:
+def usage_halves(usage: Optional[RunUsage]
+                 ) -> Tuple[Optional[UsageSource], Optional[limits.LimitPolicy]]:
     """`(source, policy)` of a usage pair, or `(None, None)` without one.
 
     The gate, the status line and the parallel workers take the two halves
@@ -383,9 +385,8 @@ def end_run(ctx: RunContext, result: RunResult, *,
             push_lock=None) -> RunResult:
     """Everything both runners do when the work is over and they RETURN.
 
-    The housekeeping is `close_run`; this adds the two things only a normal
-    ending has — a `RunStopReason` to name it by, and the `RunResult` handed back
-    to whoever called the runner.
+    The housekeeping is `close_run`; this adds what only a normal ending has — a
+    `RunResult` — by recording the reason of the caller's and returning it.
 
     The reason is RECORDED rather than printed: a wrapper may call several
     runners, the `=== run ended: … ===` line belongs to the process, so the last

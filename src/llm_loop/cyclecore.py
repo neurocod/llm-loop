@@ -766,7 +766,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 spec = providers.provider_spec(provider)
                 if provider not in usage_states:
                     usage_states[provider] = (
-                        runlifecycle.open_usage(driver, provider, provider,
+                        runlifecycle.open_usage(driver, provider,
                                                 dry_run=dry_run),
                         time.time())
                 usage, session_start = usage_states[provider]

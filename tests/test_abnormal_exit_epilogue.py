@@ -143,8 +143,8 @@ def _par_args(project_dir):
     # runs expose a MailboxSet at every width so `+` can add addresses in place.
     ns.jobs = 1
     # And a usage source, so the closing snapshot has something to be taken from:
-    # `--ignore-usage` leaves `source` None and `close_run` correctly skips the
-    # snapshot, which would leave another third of the pin measuring nothing.
+    # `--ignore-usage` leaves `usage` unopened and `close_run` correctly skips
+    # the snapshot, which would leave another third of the pin measuring nothing.
     ns.ignore_usage = False
     return ns
 
