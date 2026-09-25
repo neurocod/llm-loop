@@ -115,8 +115,7 @@ def test_parallel_weekly_key_changes_the_shared_policy(tmp_path, monkeypatch):
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", run)
-    args = par_args(tmp_path, jobs=1)
-    args.ignore_usage = False
+    args = par_args(tmp_path, jobs=1, ignore_usage=False)
     parallel.run_parallel(driver, args, setup_logging=False, wait_on_start=False)
     assert driver.limit_policy.rules[0].limit == 97
 

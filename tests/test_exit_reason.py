@@ -128,7 +128,7 @@ def test_the_report_of_a_vanished_run_lands_in_the_log(
     # run's output going to THAT test's file while this one's path is merely
     # printed — which reads exactly like the defect below and is not it.
     drop_logger(app_name)
-    dead =exitlog.record_path(logs, app_name, project, 424242)
+    dead = exitlog.record_path(logs, app_name, project, 424242)
     dead.write_text(json.dumps({
         "pid": 424242, "app": app_name, "project": project,
         "argv": "runGenerateModels.py --codex --random",

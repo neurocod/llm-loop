@@ -23,7 +23,7 @@ from llm_loop.usage import RateLimitEvent
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
 
-from _runfixtures import seq_args
+from _runfixtures import StubPolicy, seq_args
 
 
 # A response like the endpoint's, trimmed to the quotas the engine reads. The
@@ -245,7 +245,9 @@ class _TwoShotDriver(Driver):
     def __init__(self):
         self.served = 0
         self.succeeded = 0
-        self.limit_policy = _NeverPauses()
+        # The proactive check always says "plenty left" — so a pause in these
+        # tests can only have come from the reactive backstop.
+        self.limit_policy = StubPolicy()
 
     def next_command(self):
         if self.served >= 2:
@@ -255,21 +257,6 @@ class _TwoShotDriver(Driver):
 
     def on_success(self, rc):
         self.succeeded += 1
-
-
-class _NeverPauses:
-    """A LimitPolicy whose proactive check always says "plenty left" — so a pause
-    in these tests can only have come from the reactive backstop."""
-
-    def describe(self):
-        return "stub"
-
-    def log_snapshot(self, *args, **kwargs):
-        pass
-
-    def check_and_wait(self, source, session_start, note="",
-                       cache_value=True, should_stop=None):
-        return False, session_start
 
 
 def _run_with_verdict(tmp_path, monkeypatch, verdict):

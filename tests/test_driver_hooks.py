@@ -225,8 +225,7 @@ def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatc
         [f"products/f{i}.md" for i in range(3)],
         on_finished=lambda command, rc: "a request was filed")
     driver.limit_policy = BlockingPolicy()
-    args = par_args(tmp_path, jobs=2, no_statusline=True)
-    args.ignore_usage = False
+    args = par_args(tmp_path, jobs=2, ignore_usage=False, no_statusline=True)
 
     box = []
     done = threading.Event()

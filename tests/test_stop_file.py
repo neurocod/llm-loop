@@ -730,8 +730,8 @@ def test_cancelling_the_stop_keeps_the_file_a_parked_worker_had_claimed(
     captured = _capture_disabled_app(monkeypatch)
     driver = MemListDriver(["products/a.md", "products/b.md"])
     driver.limit_policy = LimitPolicy([SessionLimit(80)])
-    args = par_args(tmp_path, jobs=2, ignore_usage=False)
-    args.max = 1               # claims shut the moment the one claim is made
+    # max=1: claims shut the moment the one claim is made.
+    args = par_args(tmp_path, jobs=2, ignore_usage=False, max=1)
 
     held = _Held(lambda: parallel.run_parallel(
         driver, args, app_name="pytest-stop-parallel"))
