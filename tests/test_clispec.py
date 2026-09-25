@@ -9,10 +9,12 @@ copies an unknown flag through verbatim, so an unknown VALUE-taking flag has its
 value read as a separate token, and an override lands next to the stale setting
 it was meant to replace. The rendered command line then looks right and is not.
 
-So the gate walks the parsers argparse actually built and demands every option
-string be a spelling the alias table knows, with the same arity. It is the check
-the previous shape could not express: while `parse_args` only ever built a
-parser, fed it argv and let it `sys.exit`, there was no parser object to walk.
+So the gate walks the parsers argparse actually built — `clispec.unstrippable_flags`,
+public because every host's own hook needs the same walk — and demands that
+every value-taking spelling be one the alias table knows, and every known
+spelling have the table's arity. It is the check the previous shape could not
+express: while `parse_args` only ever built a parser, fed it argv and let it
+`sys.exit`, there was no parser object to walk.
 """
 
 import argparse
@@ -20,7 +22,7 @@ import argparse
 import pytest
 
 from llm_loop import clispec, cyclecore, parallel
-from llm_loop.cmdline import FLAG_ALIASES
+from llm_loop.cmdline import FLAG_ALIASES, rebuild_argv
 
 
 MODES = [clispec.SEQUENTIAL, clispec.PARALLEL]
@@ -52,11 +54,12 @@ def _real_actions(parser):
     return [a for a in parser._actions if "--help" not in a.option_strings]
 
 
-def _spelling_owner():
-    """Which canonical flag each spelling belongs to."""
-    return {alias: canonical
-            for canonical, spec in FLAG_ALIASES.items()
-            for alias in spec.aliases}
+def _hooked(mode, *add_argument_calls):
+    """`mode`'s parser with a hook that makes exactly these `add_argument` calls."""
+    def hook(parser):
+        for args, kwargs in add_argument_calls:
+            parser.add_argument(*args, **kwargs)
+    return clispec.build_parser(mode, prog="runGate.py", extra_options=hook)
 
 
 # --- the gate ------------------------------------------------------------------
@@ -64,32 +67,49 @@ def _spelling_owner():
 @pytest.mark.parametrize("hooked", [False, True], ids=["bare", "wrapper-hook"])
 @pytest.mark.parametrize("mode", MODES)
 def test_every_spelling_a_parser_offers_is_strippable(mode, hooked):
-    owner = _spelling_owner()
-    unknown = [opt
-               for action in _real_actions(_built(mode, hooked=hooked))
-               for opt in action.option_strings
-               if opt not in owner]
+    problems = clispec.unstrippable_flags(_built(mode, hooked=hooked))
 
-    assert unknown == [], (
-        f"{mode} parser offers flags no argv rewriter knows: {unknown}. Declare "
-        f"them in clispec.OPTIONS instead of calling add_argument directly.")
+    assert problems == [], (
+        f"{mode} parser: {problems}. Declare the flag in clispec.OPTIONS instead "
+        f"of calling add_argument directly.")
 
 
-@pytest.mark.parametrize("hooked", [False, True], ids=["bare", "wrapper-hook"])
+# --- ...and it bites: each failure the gate exists for, at the hook ------------
+# Hosts run `unstrippable_flags` over their own hooks, where nothing in this
+# package can see them, so what it must refuse is pinned here once.
+
 @pytest.mark.parametrize("mode", MODES)
-def test_the_table_and_argparse_agree_on_arity(mode, hooked):
-    # `takes_value` decides whether the NEXT token is this flag's value. Wrong,
-    # and removing the flag either eats a neighbouring token or leaves an orphan
-    # value on the line.
-    owner = _spelling_owner()
-    for action in _real_actions(_built(mode, hooked=hooked)):
-        canonical = owner.get(action.option_strings[0])
-        if canonical is None:
-            continue            # the test above owns "the table has never heard of it"
-        assert FLAG_ALIASES[canonical].takes_value == (action.nargs != 0), (
-            f"{canonical}: table says takes_value="
-            f"{FLAG_ALIASES[canonical].takes_value}, argparse built nargs="
-            f"{action.nargs!r}")
+def test_an_undeclared_value_taking_flag_is_reported(mode):
+    parser = _hooked(mode, (("--rogue",), dict(metavar="X")))
+
+    problems = clispec.unstrippable_flags(parser)
+
+    assert len(problems) == 1 and problems[0].startswith("--rogue "), problems
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("spelling,kwargs", [
+    # boolean in the table, handed a value by the hook
+    ("--random", dict(nargs=1)),
+    # value-taking in the table, registered as a switch
+    ("--finish", dict(action="store_true")),
+], ids=["switch-given-a-value", "value-made-a-switch"])
+def test_a_declared_flag_with_the_wrong_arity_is_reported(mode, spelling, kwargs):
+    problems = clispec.unstrippable_flags(_hooked(mode, ((spelling,), kwargs)))
+
+    assert len(problems) == 1 and problems[0].startswith(f"{spelling}:"), problems
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_an_undeclared_switch_is_left_to_pass_through(mode):
+    # The line the gate draws, and the reason it is allowed: the rewriter copies
+    # a flag it does not know through verbatim, and a switch has no value that
+    # could be misread as the next token.
+    parser = _hooked(mode, (("--wrapper-only",), dict(action="store_true")))
+
+    assert clispec.unstrippable_flags(parser) == []
+    assert rebuild_argv(["--wrapper-only", "-m", "1"], {"--max-runs": 2}) == [
+        "--wrapper-only", "--max-runs", "2"]
 
 
 @pytest.mark.parametrize("mode", MODES)

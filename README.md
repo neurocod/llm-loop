@@ -382,6 +382,9 @@ ever reaches the parser, which means the wrapper's own scan missed a spelling
 would otherwise have gone ahead in the default mode. Anything the engine *should*
 parse is an ordinary `add_argument` here instead.
 
+Hold the hook to [`clispec.unstrippable_flags`](src/llm_loop/clispec.py) in a
+test of your own, over every parser your entry points build.
+
 ### Reacting to the world around a run
 
 `Driver.item_started(command)` and `Driver.item_finished(command, returncode)`

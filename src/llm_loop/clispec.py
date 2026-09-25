@@ -27,11 +27,13 @@ being misread as free-standing tokens.
 
 The mode's option list and `OPTIONS` are checked against each other, and against
 what argparse actually built, by `tests/test_clispec.py`. That gate is the
-reason this table can be trusted as the only copy.
+reason this table can be trusted as the only copy. What it cannot see is a host's
+own `extra_options` hook, so the parser half of it is `unstrippable_flags`,
+public for each host to run over the parsers it builds.
 """
 
 import argparse
-from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from . import providers
 from . import termio
@@ -47,6 +49,7 @@ __all__ = [
     "PARALLEL",
     "SEQUENTIAL",
     "build_parser",
+    "unstrippable_flags",
 ]
 
 # The two parsers this table serves. A mode picks BOTH the ordered option list
@@ -326,3 +329,50 @@ FLAG_ALIASES: Dict[str, Flag] = {
     name: Flag(option.aliases, option.takes_value)
     for name, option in OPTIONS.items()
 }
+
+
+def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
+    """What `cmdline.rebuild_argv` would get wrong about `parser`'s options, one
+    line per spelling; empty when nothing.
+
+    The contract of the `extra_options` / `Driver.add_cli_options` seam, published
+    so every host can hold its own hook to it: `build_parser` is a loop over
+    `OPTIONS`, so the hook is the only way a spelling the table has never heard
+    of reaches a parser. Two things break a rebuilt command line:
+
+      * a VALUE-taking spelling the table does not declare. The rewriter copies
+        an unknown flag through verbatim and then reads its value as a token of
+        its own, so a folder or a count that happens to spell `-m` is stripped
+        together with whatever follows it;
+      * a declared spelling whose arity argparse disagrees with. `takes_value`
+        decides whether the NEXT token belongs to the flag: wrong, and removing
+        it either eats a neighbour or leaves an orphan value on the line.
+
+    An undeclared switch (`nargs == 0`) is NOT reported: it has no value to
+    misread and is copied through as it stands, which is how a wrapper's own
+    booleans (runGenerateModels' `--prompt`) survive an override without the
+    engine's table carrying project detail.
+
+    Reads `parser._actions`: argparse offers no public walk of its options.
+    """
+    owner = {alias: canonical
+             for canonical, flag in FLAG_ALIASES.items()
+             for alias in flag.aliases}
+    problems = []
+    for action in parser._actions:
+        if "--help" in action.option_strings:
+            continue                # argparse's own; no table declares it
+        takes_value = action.nargs != 0
+        for spelling in action.option_strings:
+            canonical = owner.get(spelling)
+            if canonical is None:
+                if takes_value:
+                    problems.append(
+                        f"{spelling} takes a value but is not declared in "
+                        f"clispec.OPTIONS, so a rebuilt argv misreads its value")
+            elif FLAG_ALIASES[canonical].takes_value != takes_value:
+                problems.append(
+                    f"{spelling}: clispec.OPTIONS[{canonical!r}] says "
+                    f"takes_value={FLAG_ALIASES[canonical].takes_value}, "
+                    f"argparse built nargs={action.nargs!r}")
+    return problems
