@@ -273,7 +273,9 @@ class RunUsage:
     `name` is what the snapshots are labelled with, and it is what makes the
     opening snapshot and the closing one a pair in the log: `at start (name)` is
     answered by `at end (name)` unless the run ended somewhere worth naming
-    instead (see `close`).
+    instead (see `close`). Only the usage a run ENDS on is closed: a
+    mixed-provider sequential run opens one per provider it selects, and the
+    others' openings stay unanswered.
     """
 
     __slots__ = ("source", "policy", "name")
@@ -320,6 +322,16 @@ def open_usage(driver, provider: str, name: str, *,
     if not dry_run:
         usage.open()
     return usage
+
+
+def usage_halves(usage: Optional[RunUsage]) -> tuple:
+    """`(source, policy)` of a usage pair, or `(None, None)` without one.
+
+    The gate, the status line and the parallel workers take the two halves
+    separately; this is the one place they are split, so a runner never holds a
+    source and a policy that came from different pairs.
+    """
+    return (usage.source, usage.policy) if usage is not None else (None, None)
 
 
 def close_run(ctx: RunContext, *,

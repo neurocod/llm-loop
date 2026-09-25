@@ -557,10 +557,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     session_start = time.time()   # start of the current 5-hour session window
     consecutive_errors = 0        # reset to 0 after any successful iteration
     # The selected provider's RunUsage (None without a usage endpoint), and the
-    # two halves of it the gate below reads, unpacked where it is selected.
+    # two halves of it the gate below reads, split from it wherever it is set.
     usage = None
-    usage_source = None
-    limit_policy = None
+    usage_source, limit_policy = runlifecycle.usage_halves(usage)
     # Usage pairs and fallback session clocks belong to accounts, not the whole
     # mixed-provider run. Populate lazily: the launch default may never run.
     usage_states = {}
@@ -771,9 +770,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                                                 dry_run=dry_run),
                         time.time())
                 usage, session_start = usage_states[provider]
-                usage_source, limit_policy = ((usage.source, usage.policy)
-                                              if usage is not None
-                                              else (None, None))
+                usage_source, limit_policy = runlifecycle.usage_halves(usage)
                 ignore_usage_limits = (args.max is not None or usage_source is None
                                        or not spec.supports_usage_limits)
                 if quota_refresher is not None:

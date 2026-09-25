@@ -1295,8 +1295,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     usage = (None if args.ignore_usage
              else runlifecycle.open_usage(driver, provider, "parallel",
                                           dry_run=False))
-    source, policy = ((usage.source, usage.policy) if usage is not None
-                      else (None, None))
+    source, policy = runlifecycle.usage_halves(usage)
     usage_lock = threading.Lock()
     session_start_box = [time.time()]  # shared, refreshed when a window resets
 
