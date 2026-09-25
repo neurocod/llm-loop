@@ -1314,7 +1314,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # that sole address directly, while a later `+` can add another address
     # without replacing (and losing the contents of) worker 1's mailbox.
     mailboxes = operator.MailboxSet(range(1, jobs + 1))
-    app = runlifecycle.open_status(ctx, driver, args, job_count=jobs,
+    app = runlifecycle.open_status(ctx, driver, job_count=jobs,
                                    messages=mailboxes)
     app.register_action(statusline.WeeklyLimitAction(
         lambda: policy))

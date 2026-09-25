@@ -133,6 +133,9 @@ class RunContext(NamedTuple):
     # The display and edit surface over `settings` (see script_settings), built
     # here because only here is it known whether this call owns `progress`.
     registry: Any
+    # Whether the pinned status area is drawn: never for a dry run, and not
+    # under `--no-statusline`. Off, open_status hands back the Null app.
+    status_enabled: bool
 
 
 def begin_run(driver, args, app_name: str, progress=None, *,
@@ -215,10 +218,12 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     console.warn_missing_dependencies()
     return RunContext(provider=provider, spec=spec,
                       dry_run=dry_run, progress=progress,
-                      settings=settings, registry=registry)
+                      settings=settings, registry=registry,
+                      status_enabled=(not dry_run and
+                                      not getattr(args, "no_statusline", False)))
 
 
-def open_status(ctx: RunContext, driver, args, *, job_count: int,
+def open_status(ctx: RunContext, driver, *, job_count: int,
                 messages) -> "statusline.StatusApp":
     """The pinned status area, built the same way by both runners.
 
@@ -251,7 +256,7 @@ def open_status(ctx: RunContext, driver, args, *, job_count: int,
         status=statusline.LoopStatus(jobs=progress.jobs(job_count)),
         settings=ctx.registry,
         messages=messages,
-        enabled=not ctx.dry_run and not getattr(args, "no_statusline", False))
+        enabled=ctx.status_enabled)
     app.update(
         provider=ctx.provider,
         **progress.summary_fields(),

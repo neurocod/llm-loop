@@ -552,8 +552,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         stopchannel.wait_for_stop_file_clear()
 
     if start_in and not dry_run:
-        wait_before_start(start_in,
-                          interactive=not getattr(args, "no_statusline", False))
+        wait_before_start(start_in, interactive=ctx.status_enabled)
 
     session_start = time.time()   # start of the current 5-hour session window
     consecutive_errors = 0        # reset to 0 after any successful iteration
@@ -573,7 +572,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # empties it into the next prompt, and run_agent_streaming lends it the
     # running turn's stdin. A dry run gets none — there is no agent to talk to.
     mailbox = None if dry_run else operator.Mailbox()
-    app = runlifecycle.open_status(ctx, driver, args, job_count=1,
+    app = runlifecycle.open_status(ctx, driver, job_count=1,
                                    messages=mailbox)
     # Only state-driven loops can name a breakpoint. Keep the collection local
     # to this invocation so a later runner call starts without old console input.

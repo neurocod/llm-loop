@@ -1585,15 +1585,15 @@ def test_a_later_runner_call_opens_on_how_far_the_queue_got(tmp_path):
     """Opening the status area records the queue as it stands, in both runners.
 
     The first call of an invocation latches the baseline; a wrapper's later one
-    must open on what the earlier calls finished, not on the figure the last
-    one closed with — the sequential runner used to wait for its first success
-    to say so, while the parallel one said it at once.
+    must open on what the earlier calls finished. A call that does not record
+    the queue at open shows the previous call's closing figure until its own
+    first success — a whole agent turn of a wrong count.
     """
     invocation = sl.InvocationProgress()
     invocation.track_total(5)
-    ctx, args = _begin(tmp_path, invocation)
+    ctx, _args = _begin(tmp_path, invocation)
 
-    app = runlifecycle.open_status(ctx, _QueueDriver(3), args, job_count=1,
+    app = runlifecycle.open_status(ctx, _QueueDriver(3), job_count=1,
                                    messages=None)
 
     assert (app.status.iteration, app.status.max_iterations) == (2, 5)
