@@ -12,9 +12,10 @@ import sys
 
 import pytest
 
-from llm_loop import console, costlog, cyclecore, projectroot, streamrender
+from llm_loop import (console, costlog, cyclecore, exitlog, projectroot,
+                      runlifecycle, streamrender)
 
-from _runfixtures import OneShotDriver, seq_args
+from _runfixtures import OneShotDriver, drop_logger, seq_args
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +24,9 @@ def _isolated(tmp_path, monkeypatch):
     previous = projectroot.project_dir()
     monkeypatch.setattr(console, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(streamrender, "_turn_cost_base", 0.0)
+    monkeypatch.setattr(exitlog, "_record", None)
     yield
+    exitlog.finish()
     projectroot.set_project_root(previous)
     sys.stdout, sys.stderr = out, err
 
@@ -66,6 +69,38 @@ def test_the_printed_header_and_done_line_are_what_the_report_sums(
 
     assert "Session 1: 2 costs, $0.2204" in out
     assert "TOTAL: 1 sessions, 2 costs, $0.2204" in out
+
+
+def test_a_real_runs_mirror_log_is_what_the_report_sums(
+        tmp_path, monkeypatch, capsys):
+    """The pins above hand the printed text to a log they write themselves; this
+    one lets the run write its own, so the PATH into the mirror counts too — a
+    line printed to the screen but kept out of the file would go unnoticed above.
+    (Logging the markup copy instead is harmless: it still holds the plain text.)"""
+    def agent(*args, **kwargs):
+        streamrender._render_claude_event(
+            {"type": "result", "subtype": "success", "duration_ms": 2243,
+             "total_cost_usd": 0.2015}, True)
+        return 0
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", agent)
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
+    app_name = "pytest-cost-real"
+    out, err = sys.stdout, sys.stderr
+    try:
+        cyclecore.run_loop(OneShotDriver(),
+                           seq_args(tmp_path, no_statusline=True),
+                           app_name=app_name, wait_on_start=False)
+    finally:
+        # The run tees stdout into its log; the report must not append to it.
+        sys.stdout, sys.stderr = out, err
+        drop_logger(app_name)
+    capsys.readouterr()
+
+    costlog.report_costs(app_name, console.log_file_path(app_name))
+
+    assert "TOTAL: 1 sessions, 1 costs, $0.2015" in capsys.readouterr().out
 
 
 def test_a_later_iterations_header_is_not_a_run_boundary(tmp_path, capsys):
