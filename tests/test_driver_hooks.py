@@ -151,7 +151,9 @@ def test_a_pause_lets_every_turn_already_in_flight_run_to_its_end(
             inside.append(command.label)
             if len(inside) == 3:
                 all_started.set()
-        assert release.wait(5), "the test never released the in-flight turns"
+        # Outlives the test's `all_started.wait(5)` below, which the first turn
+        # in waits through before anything releases it.
+        assert release.wait(10), "the test never released the in-flight turns"
         completed.append(command.label)
         return 0, 0.0, 0.01
 
@@ -218,7 +220,8 @@ def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatc
 
     def blocked_job(job_id, command, mailbox=None):
         running.set()
-        assert release.wait(5), "the test never released the running turn"
+        # Outlives the test's `parked.wait(5)` below, spent before `release.set()`.
+        assert release.wait(10), "the test never released the running turn"
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", blocked_job)
@@ -244,6 +247,7 @@ def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatc
     # The second worker must be ON the gate before the hook fires: released
     # earlier, it finds claims already closed and never parks, and the pin
     # passes with the gate deaf to the hand-back (seen 2026-09-25).
+    # 1.1 ms max from `running` to `parked` over 20 runs, measured 2026-09-25.
     assert parked.wait(5), "the second worker never reached the usage gate"
     release.set()
     assert done.wait(10), "a worker parked on the usage gate never came back"
@@ -318,9 +322,11 @@ def test_the_handback_latch_answers_true_to_exactly_one_racing_thread():
     threads = [threading.Thread(target=race, args=(n,)) for n in range(8)]
     for thread in threads:
         thread.start()
+    # Start to last join: 0.9 ms max over 200 races, measured 2026-09-25.
     for thread in threads:
         thread.join(5)
 
+    assert not any(thread.is_alive() for thread in threads), "a racer hung"
     assert len(wins) == 1
     assert handback.reason == f"reason {wins[0]}"
 
@@ -379,7 +385,10 @@ def test_the_sequential_loop_announces_the_first_reason_it_was_given(
     """A reason from `item_started` survives the same item's `item_finished`.
 
     A later None must not withdraw the pause, and a later reason must not
-    rename it.
+    rename it. `item_finished` is still CALLED after a start-hook hand-back: the
+    Driver contract promises it for every outcome and the fleet already calls it
+    unconditionally, so a driver counting attempts there counts the same under
+    `--jobs 1` and `--jobs N` (the sequential runner skipped it before 1370).
     """
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda *args, **kwargs: 0)
@@ -437,13 +446,28 @@ def test_a_held_sequential_run_still_hands_control_back(tmp_path, monkeypatch):
     assert driver.finished == [("a", 0)]
 
 
+@pytest.mark.parametrize("answer", [None, ""])
 def test_hooks_that_ask_for_nothing_leave_the_run_exactly_as_it_was(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, answer
 ):
-    """The default hooks return None, so an unaware driver cannot be paused."""
+    """The default hooks return None, so an unaware driver cannot be paused.
+
+    An empty reason asks nothing either, as it already did in the fleet
+    (`note_driver_handback`); the sequential runner paused on it before 1370.
+    """
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda *args, **kwargs: 0)
-    driver = _SequentialHookDriver(["a", "b"])
+
+    class EmptyAnswerDriver(_SequentialHookDriver):
+        def item_started(self, command):
+            super().item_started(command)
+            return answer
+
+        def item_finished(self, command, returncode):
+            super().item_finished(command, returncode)
+            return answer
+
+    driver = EmptyAnswerDriver(["a", "b"])
 
     result = cyclecore.run_loop(driver, _seq_args(tmp_path),
                                 app_name="pytest-hooks", wait_on_start=False)

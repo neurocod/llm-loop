@@ -837,7 +837,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # The end-of-item hook: after on_success, so the driver's own queue
             # is up to date, and after the outcome either way — a failed
             # iteration is still an iteration whose side effects are on disk.
-            # The latch keeps the FIRST reason (see DriverHandback).
+            # Called even after `item_started` asked for a hand-back, as the
+            # fleet calls it; the latch keeps the FIRST reason (see
+            # DriverHandback).
             handback.latch(driver.item_finished(command, returncode))
 
             # Preserve the wire verdict even when the quota endpoint has no
