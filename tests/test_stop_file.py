@@ -413,40 +413,78 @@ def test_parallel_stop_file_is_reported_once_by_competing_workers(
                      "until the application exits.") == 1
 
 
+# The winner dies of its own announcement on purpose; that IS the fixture.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_parallel_stop_file_is_latched_before_the_winner_announces_it(
+    tmp_path, monkeypatch
+):
+    """An announcement that raises costs the line, never the reason.
+
+    The stop tail runs on the one worker that won the latch, and whatever the
+    announcement does on that worker can raise. Announced before the
+    transition, that exception unwinds the winner with nothing latched — no
+    reason, no `stop` event — the remaining workers find the run still going and
+    die on the same line in turn, and `run_parallel` falls back to a reason that
+    is not STOP_FILE. A run that obeyed a stop FILE then reports another
+    ending: the sentinel is consumed, the exit log names the wrong cause, and a
+    wrapper reading the reason to decide whether to start the next phase
+    starts it.
+
+    Staged on the WORKER's side of the announcement — `parallel._emit_markup`,
+    the post every worker line goes through — because that is the only side
+    whose failure still reaches `latch_stop`'s caller: the console write itself
+    now runs on `parallel._console`'s thread (see the neighbouring pin).
+
+    Run with a FLEET, on the same staging as the election pin: the half of the
+    story that COSTS the reason is the OTHER workers finding the run unlatched
+    and dying on the same line in turn. The attempt counter states the outcome
+    for them: exactly one thread may ever announce, however many stood.
+    """
+    stop = tmp_path / "stop"
+    _WorkersMeetAtTheSentinel(stop, 4, monkeypatch)
+    attempts = []
+    lock = threading.Lock()
+    real_emit = parallel._emit_markup
+
+    def refuse(plain, markup):
+        if "Stop file detected" in plain:
+            with lock:
+                attempts.append(threading.current_thread().name)
+            raise BrokenPipeError("the announcement failed on the worker")
+        real_emit(plain, markup)
+
+    monkeypatch.setattr(parallel, "_emit_markup", refuse)
+    args = par_args(tmp_path, jobs=4)
+
+    with stopchannel.stop_file_lifecycle():
+        result = parallel.run_parallel(
+            MemListDriver([f"products/{i}.md" for i in range(8)]), args,
+            app_name="pytest-stop-parallel")
+        assert result.reason == stopchannel.RunStopReason.STOP_FILE, (
+            "a failed announcement changed why the run ended")
+        assert stop.exists(), "workers removed the mutex before application cleanup"
+
+    assert not stop.exists(), "application exit left the stop mutex behind"
+    assert len(attempts) == 1 and attempts[0].startswith("job"), (
+        f"{attempts} announced the stop — the losers are supposed to find the "
+        "run already latched and leave without announcing anything")
+
+
 # An ERROR, not ignored: the refused write happens on the console's owner
 # thread, so no worker may die of it. The announcing worker used to — a
 # `worker` has no try/except — and this filter is what says it no longer does.
 @pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
-def test_parallel_stop_file_latches_even_when_the_console_write_fails(
+def test_parallel_stop_announcement_the_console_refuses_kills_no_worker(
     tmp_path, monkeypatch
 ):
-    """A refused announcement costs the line, never the reason.
+    """A console that refuses the stop line costs the line, and nothing else.
 
-    The stop tail runs on the one worker that won the latch, and its console
-    write can fail for reasons that have nothing to do with the run: a closed
-    pipe (`llm-loop … | head`), a code page that cannot spell the em dash, rich
-    itself. Written before the transition, that exception unwinds the winner
-    with nothing latched — no reason, no `stop` event — the remaining workers
-    find the run still going and die on the same line in turn, and `run_parallel`
-    falls back to `shared.stop_reason or NO_WORK`. A run that obeyed a stop FILE
-    then reports that it simply ran out of work: the sentinel is consumed, the
-    exit log names the wrong cause, and a wrapper reading the reason to decide
-    whether to start the next phase starts it.
-
-    So the pin is on the REASON, not on the output — the whole point is that the
-    output failed. `print_markup` is where a real console write lands (see
-    `_refuse_the_stop_announcement`). Since the console has its own thread the
-    refusal cannot reach the winner at all; the order inside `latch_stop` is
-    still what a caller writing on its own thread depends on.
-
-    Run with a FLEET, on the same staging as the neighbouring election pin. The
-    reason assertion bites at `jobs = 1` too (measured: restoring the
-    winner-election order fails it there as well, NO_WORK == STOP_FILE) — but the
-    half of the story that COSTS the reason is the OTHER workers finding the run
-    unlatched and dying on the same line in turn, and one worker has no others
-    for that to happen to. Four of them, all inside the stop check together, do;
-    and the refusal counter is what states the outcome for them: exactly one
-    thread may ever reach the write, however many stood in the election.
+    The refusal is the console's — a closed pipe (`llm-loop … | head`), a code
+    page that cannot spell the em dash, rich itself — and it happens on
+    `parallel._console`'s thread, so it can neither kill the winner nor change
+    the reason. The ORDER inside `latch_stop` is pinned by the worker-side pin
+    above; this one pins that the console's own failure stays the console's,
+    and that exactly one line ever reached it.
     """
     stop = tmp_path / "stop"
     _WorkersMeetAtTheSentinel(stop, 4, monkeypatch)

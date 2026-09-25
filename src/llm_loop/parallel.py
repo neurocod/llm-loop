@@ -126,13 +126,46 @@ MAX_ATTEMPTS = 3
 DRY_RUN_LIST_LIMIT = 10
 
 # The one thread that writes the workers' lines while a run is open: workers
-# post, it prints, so `print_markup` (and rich under it) is never entered by two
-# threads and the per-job lines cannot interleave. `run_parallel` opens it for
-# the worker phase and closes it — having written everything posted — before its
-# own closing report. Outside that window there is no run to compete with and a
-# line is written by whoever emits it: a test driving `run_job` directly, or a
-# worker a Ctrl+C gave up joining.
+# post, it prints, so the per-job lines cannot interleave and no two of them are
+# ever inside `print_markup` at once. `run_parallel` opens it for the worker
+# phase and closes it — having written everything posted — before its own
+# closing report. Outside that window a line is written by whoever emits it: a
+# test driving `run_job` directly, or a worker a Ctrl+C gave up joining that
+# outlives the owner too.
+#
+# NOT every console write of a run goes through it. Two writers still call
+# `console.print_markup` on their own threads while it is open: the usage gate
+# (`limits.LimitPolicy.check_and_wait` / `_wait`, on a worker under
+# `usage_lock`, through `console.print_percents`) and the background pusher
+# (`gitpush.git_push`, through `print_done` / `print_error` / `LINES`). Both
+# reach the console through module-level imports of their own, so routing them
+# here means giving `console` an owner hook — not done yet.
 _console = ownership.OwnerThread("console-lines")
+
+# How long `run_parallel` waits for `_console` to write what the workers posted
+# before it prints its own closing report. A healthy console never gets near it:
+# a FULL queue (`ownership.DEFAULT_MAXSIZE` compact lines) drains in 2.9 s into a
+# file (2.92 / 2.91 / 2.86 s, measured 2026-09-25), and a console is slower than
+# a file, hence ten times that. Past it the console is taken to be stuck (a
+# selection freezing a Windows console, a pipe nobody reads), and the policy for
+# what is still queued is: the owner keeps it and goes on writing it as a
+# daemon, the run reports and exits without waiting, and whatever is unwritten
+# when the process ends is lost. One stderr line says how much was left behind.
+CONSOLE_CLOSE_TIMEOUT_S = 30.0
+
+# What Ctrl+C prints. A constant because it can be printed from two places (see
+# the interrupt branch of `run_parallel`).
+INTERRUPT_ANNOUNCEMENT = ("\nInterrupted by user (Ctrl+C) — "
+                          "signalling workers to stop…")
+
+
+def _close_console() -> None:
+    """Close `_console` within CONSOLE_CLOSE_TIMEOUT_S, naming what it left."""
+    if _console.close(CONSOLE_CLOSE_TIMEOUT_S):
+        return
+    print(f"  ⚠ {_console.name}: {_console.backlog} line(s) still unwritten "
+          f"after {CONSOLE_CLOSE_TIMEOUT_S:g} s — reporting without them.",
+          file=sys.stderr)
 
 
 def parse_args(argv=None, *, prog: str = "parallel",
@@ -812,8 +845,12 @@ class Shared:
             self.stop_owner = None
             return True
 
-    def latch_stop(self, source, app=None, announce=None) -> bool:
+    def latch_stop(self, source, app, announce: Callable[[str], None]) -> bool:
         """End the run on a stop request, for good. True for the worker that did it.
+
+        `announce` writes the line, and has no default on purpose: a worker's
+        line goes to the console's owner (`job_lines(...).line`), and a
+        fallback to a bare `print` would be a worker writing the console itself.
 
         Returning True exactly once is what keeps the announcement (and the
         lifecycle latch) single when every worker sees the request at the same
@@ -845,7 +882,7 @@ class Shared:
             self.stop_reason, announcement = stopchannel.commit_stop(app, source)
             self.claims_closed.set()
             self.stop.set()
-        (announce or print)(announcement)
+        announce(announcement)
         return True
 
     def request_driver_handback(self, reason: str) -> bool:
@@ -1408,13 +1445,16 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # lines are what that area is already carrying. Here the workers' output is
     # the area, and this is the one moment it stops being written to.
     interrupted = False
+    # The Ctrl+C line when the console's queue had no room for it (see there).
+    announce_later: Optional[str] = None
 
     # The region lives exactly as long as the workers do (run_loop releases it
     # the same way, before its final push): a batching wrapper alternates runs of
     # this runner with sequential ones, and two status areas pinned at
     # once would fight over the same rows. The console's owner lives as long as
     # the region, and its `close` in the `finally` is what puts every line the
-    # workers posted on screen BEFORE the closing report below.
+    # workers posted on screen BEFORE the closing report below (within
+    # CONSOLE_CLOSE_TIMEOUT_S — see there for a console that never comes back).
     _console.start()
     try:
         with app:
@@ -1434,13 +1474,21 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             try:
                 join_workers(threads)
             except KeyboardInterrupt:
-                # Posted, not printed: the workers are still writing, and this
-                # line belongs after what they had already said.
-                _console.post(print, "\nInterrupted by user (Ctrl+C) — "
-                                     "signalling workers to stop…")
+                # Signal first, talk second: nothing about the console — a
+                # stalled one included — may stand between Ctrl+C and the
+                # workers hearing it.
                 interrupted = True
                 threads.close()
                 shared.stop.set()
+                # Queued, not printed, so the line lands after what the workers
+                # had already said — and never waited for: a queue that is full
+                # is a console that is not being written, and this line is then
+                # deferred to the closing report below rather than blocking the
+                # interrupt behind it.
+                if _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
+                    announce_later = None
+                else:
+                    announce_later = INTERRUPT_ANNOUNCEMENT
                 for t in threads:
                     t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
 
@@ -1449,7 +1497,10 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                 pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
             app.update(phase="idle")
     finally:
-        _console.close()
+        _close_console()
+
+    if announce_later is not None:
+        print(announce_later)
 
     # This run's own closing report, before the shared epilogue: the run talks
     # about its work first, and the housekeeping that closes it down follows.

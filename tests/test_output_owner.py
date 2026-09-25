@@ -144,6 +144,186 @@ def test_a_full_queue_makes_the_poster_wait_instead_of_growing():
     assert ran == [2, 3]
 
 
+class _Stall:
+    """A posted call that holds the owner until released: a console nobody reads.
+
+    Releases itself after WAIT_S, so a pin that fails by hanging still ends.
+    """
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.thread = None
+
+    def __call__(self, *_args):
+        self.thread = threading.current_thread()
+        self.entered.set()
+        self.release.wait(WAIT_S)
+
+
+def _returns_within(seconds, call):
+    """(returned in time, its answer) — for a call that may hang the old way."""
+    answer = []
+    thread = threading.Thread(target=lambda: answer.append(call()), daemon=True)
+    thread.start()
+    thread.join(seconds)
+    return not thread.is_alive(), (answer[0] if answer else None)
+
+
+# What a bounded close/drain may take past its own 0.1 s timeout before the pin
+# calls it unbounded. 0.10 s measured for both 2026-09-25; the unbounded version
+# waits the whole WAIT_S for the stall to give up, so the two cannot be confused.
+BOUND_SLACK_S = 2.0
+
+
+@pytest.mark.parametrize("api", ["close", "drain"])
+def test_close_and_drain_keep_their_timeout_over_a_full_queue_and_a_stuck_call(api):
+    """A stuck resource may keep its backlog; it may not keep the caller.
+
+    Both used to put their marker into the queue under the state lock and
+    before their timed wait, so with the queue full the put blocked until the
+    resource came back — `close(timeout=0.1)` waited as long as the console did.
+    """
+    owner = ownership.OwnerThread("pin-owner", maxsize=1).start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    owner.post(lambda: None)                  # fills the one slot
+    try:
+        returned, answer = _returns_within(
+            0.1 + BOUND_SLACK_S, lambda: getattr(owner, api)(timeout=0.1))
+        assert returned, f"{api}(timeout=0.1) waited for the stuck call"
+        assert answer is False
+    finally:
+        stall.release.set()
+    assert owner.close(WAIT_S)
+
+
+def test_a_post_during_close_joins_the_owner_instead_of_running_beside_it():
+    """Closing is not closed: the owner is still writing, so it still owns.
+
+    A post that found the owner "closed" used to run inline on its caller —
+    while the owner was still inside its backlog. A worker that outlives
+    `INTERRUPT_JOIN_TIMEOUT_S` is exactly such a late producer.
+    """
+    owner = ownership.OwnerThread("pin-owner").start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    assert not owner.close(timeout=0.05)
+    ran = []
+    late = threading.Thread(
+        target=lambda: owner.post(
+            lambda: ran.append(threading.current_thread().name)),
+        name="late-producer")
+    late.start()
+    late.join(WAIT_S)
+    assert ran == [], "a post during close ran on its own thread, beside the owner"
+    stall.release.set()
+    assert owner.close(WAIT_S)
+    assert ran == ["pin-owner"]
+
+
+def test_opening_again_during_a_timed_out_close_keeps_the_one_owner():
+    """A restart must not start a second owner over the same resource."""
+    owner = ownership.OwnerThread("pin-owner").start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    assert not owner.close(timeout=0.05)
+
+    owner.start()
+    ran_on = []
+    owner.post(lambda: ran_on.append(threading.current_thread()))
+    stall.release.set()
+    assert owner.drain(WAIT_S)
+    assert ran_on == [stall.thread], "the reopened owner is a second thread"
+    assert owner.close(WAIT_S)
+
+
+def test_close_asked_again_answers_for_the_thread_it_left_running():
+    owner = ownership.OwnerThread("pin-owner").start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+
+    assert not owner.close(timeout=0.05)
+    assert not owner.close(timeout=0.05), \
+        "a repeated close reported the owner gone while it was still running"
+    stall.release.set()
+    assert owner.close(WAIT_S)
+    assert owner.close(0)                     # and stays answered
+
+
+def test_a_call_that_raises_system_exit_does_not_end_the_owner(capsys):
+    """A dead owner is a queue nobody empties: posters would block for ever."""
+    owner = ownership.OwnerThread("pin-owner", maxsize=1).start()
+    ran = []
+    owner.post(sys.exit, 3)
+
+    def post_three():
+        for n in range(3):
+            owner.post(lambda n=n: ran.append((threading.current_thread().name, n)))
+
+    returned, _ = _returns_within(WAIT_S, post_three)
+    assert returned, "posting into the owner blocked after a call raised SystemExit"
+    assert owner.close(WAIT_S)
+    assert ran == [("pin-owner", n) for n in range(3)]
+    assert owner.failures == 1
+    assert "pin-owner: SystemExit: 3" in capsys.readouterr().err
+
+
+# The owner's death is staged on purpose; its traceback is the fixture's.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_an_owner_that_dies_anyway_hands_the_resource_back():
+    """The second net under the one above: whatever gets past `_invoke`.
+
+    Staged by replacing `_invoke` itself, since nothing a posted call can raise
+    gets past the real one any more.
+    """
+    owner = ownership.OwnerThread("pin-owner", maxsize=1)
+
+    def die(call, args):
+        raise SystemExit("the owner itself died")
+
+    owner._invoke = die
+    owner.start()
+    thread = owner._thread
+    owner.post(lambda: None)
+    thread.join(WAIT_S)
+    assert not thread.is_alive()
+    ran = []
+
+    def post_three():
+        for n in range(3):
+            owner.post(ran.append, n)
+
+    returned, _ = _returns_within(WAIT_S, post_three)
+    assert returned, "posts queued into an owner that had died"
+    assert ran == [0, 1, 2]
+
+
+def test_a_call_that_posts_from_the_owner_with_the_queue_full_runs_inline():
+    """The owner cannot wait for room in a queue only it empties."""
+    owner = ownership.OwnerThread("pin-owner", maxsize=1).start()
+    entered, full = threading.Event(), threading.Event()
+    ran = []
+
+    def nests():
+        entered.set()
+        full.wait(WAIT_S)
+        owner.post(ran.append, "nested")
+        ran.append("outer done")
+
+    owner.post(nests)
+    assert entered.wait(WAIT_S)
+    owner.post(ran.append, "queued")          # the one slot
+    full.set()
+    returned, closed = _returns_within(WAIT_S, lambda: owner.close(WAIT_S))
+    assert returned and closed, "the owner deadlocked on its own post"
+    assert ran == ["nested", "outer done", "queued"]
+
+
 # --- the parallel runner's console lines ----------------------------------------
 
 
@@ -233,6 +413,74 @@ def test_a_console_that_refuses_every_line_costs_the_lines_not_the_run(
     assert result.completed == 4
     assert capsys.readouterr().err.count(
         "console-lines: BrokenPipeError: stdout closed") == 1
+
+
+def test_ctrl_c_over_a_stuck_console_still_stops_the_workers_and_reports(
+        tmp_path, monkeypatch, capsys):
+    """The interrupt may not wait for the console — and neither may the report.
+
+    The Ctrl+C branch used to post its announcement BEFORE signalling anyone,
+    and `run_parallel` closed the console with no timeout: with the queue full
+    and the console stuck, Ctrl+C set nothing and the run never reached its
+    epilogue. Staged with a one-slot queue so "full" is one line away.
+    """
+    owner = ownership.OwnerThread("console-lines", maxsize=1)
+    monkeypatch.setattr(parallel, "_console", owner)
+    monkeypatch.setattr(parallel, "INTERRUPT_JOIN_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(parallel, "CONSOLE_CLOSE_TIMEOUT_S", 0.1)
+    stall = _Stall()
+    monkeypatch.setattr(parallel, "print_markup", lambda plain, markup: stall())
+
+    def run_job(job_id, command, mailbox=None):
+        # The worker's own lines may fill the queue first; these make sure.
+        out = parallel.job_lines(job_id)
+        for n in range(3):
+            out.line(f"line {n}")
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", run_job)
+    runs = []
+    real_shared = parallel.Shared
+
+    class _Recorded(real_shared):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            runs.append(self)
+
+    monkeypatch.setattr(parallel, "Shared", _Recorded)
+
+    def interrupt(threads):
+        # One line stuck in the console, one waiting in the one slot: full.
+        deadline = time.monotonic() + WAIT_S
+        while owner.backlog < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert owner.backlog == 2
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(parallel, "join_workers", interrupt)
+    exit_codes = []
+
+    def interrupted_run():
+        try:
+            _run(tmp_path, ["products/a.md"], jobs=1)
+        except SystemExit as exc:
+            exit_codes.append(exc.code)
+
+    runner = threading.Thread(target=interrupted_run, daemon=True)
+    try:
+        runner.start()
+        runner.join(WAIT_S)
+        assert not runner.is_alive(), "Ctrl+C waited for a stuck console"
+    finally:
+        stall.release.set()
+        owner.close(WAIT_S)
+
+    assert exit_codes == [130], "the interrupted run never reached its epilogue"
+    assert runs[0].stop.is_set(), "the workers were never told to stop"
+    captured = capsys.readouterr()
+    # No room in the queue: the line is deferred to the report, not dropped.
+    assert parallel.INTERRUPT_ANNOUNCEMENT.strip() in captured.out
+    assert "console-lines: 2 line(s) still unwritten" in captured.err
 
 
 # --- the status line's painter --------------------------------------------------

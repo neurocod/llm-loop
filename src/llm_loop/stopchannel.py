@@ -320,7 +320,7 @@ def commit_stop(app, source: StopSource) -> Tuple[RunStopReason, str]:
     Everything that decides the outcome therefore finishes before this returns,
     and nothing on the way to it can fail (see `parallel.Shared.latch_stop`,
     which is where the ordering is spent, and the pin
-    `test_parallel_stop_file_latches_even_when_the_console_write_fails`).
+    `test_parallel_stop_file_is_latched_before_the_winner_announces_it`).
 
     NOT `pending_stop`, and not the caller's `source` either: what may still be
     cancelled and what must be cleaned up are different questions once the run
