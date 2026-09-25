@@ -166,7 +166,7 @@ def test_a_sequential_dry_run_writes_nothing_to_the_shared_log(
     assert "dry run: nothing is mirrored" in out
     # The header --cost parses is printed by a dry run too; keeping it out of
     # the file is what stops previews from inventing zero-cost sessions.
-    assert "=== Iteration 1 ===" in out
+    assert costlog.iteration_header(1) in out
 
 
 def test_a_real_run_still_mirrors_to_the_shared_log(tmp_path, log_dir):
