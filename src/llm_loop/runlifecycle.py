@@ -129,10 +129,10 @@ class RunContext(NamedTuple):
     spec: Any
     dry_run: bool
     progress: Any
-    # Whether this call IS the invocation, or one batch inside a wrapper's. It
-    # decides who owns the summary row's figures, so it travels with them.
-    owns_progress: bool
     settings: RunSettings
+    # The display and edit surface over `settings` (see script_settings), built
+    # here because only here is it known whether this call owns `progress`.
+    registry: Any
 
 
 def begin_run(driver, args, app_name: str, progress=None, *,
@@ -161,13 +161,16 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     driver.provider = provider
 
     # No wrapper above us: this call is the whole invocation, so its own --max is
-    # the invocation cap and it owns the figures.
+    # the invocation cap and it owns the figures — which is what hands the
+    # registry the progress whose denominator a `--max-runs` edit moves. Under a
+    # wrapper the cap on screen is the wrapper's, and this call sizes one batch.
     owns_progress = progress is None
     if owns_progress:
         progress = statusline.InvocationProgress(max_items=args.max)
 
     settings = RunSettings(max_runs=args.max,
                            git_push=GitPushPolicy(args.git_push))
+    registry = script_settings(settings, progress if owns_progress else None)
     dry_run = bool(getattr(args, "dry_run", False))
 
     # Anchor every project-relative operation (git/provider cwd, the stop file,
@@ -212,7 +215,52 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     console.warn_missing_dependencies()
     return RunContext(provider=provider, spec=spec,
                       dry_run=dry_run, progress=progress,
-                      owns_progress=owns_progress, settings=settings)
+                      settings=settings, registry=registry)
+
+
+def open_status(ctx: RunContext, driver, args, *, job_count: int,
+                messages) -> "statusline.StatusApp":
+    """The pinned status area, built the same way by both runners.
+
+    A Job is the unit of display in both runners, so the sequential loop is a
+    run with exactly one Job and the parallel one a run with N — no branch
+    anywhere in the status line separates them. The Jobs come from the
+    invocation's pool, so a wrapper's next runner call resumes these rows
+    instead of starting fresh ones at iteration 1. Disabled (a dry run, or
+    `--no-statusline`), the app is a Null object and every call on it is a
+    no-op. `messages` is the runner's own wiring: one Mailbox for the loop, a
+    MailboxSet for the workers, None for a dry run.
+
+    A driver that knows how much work it has is the source of truth for it
+    (Driver.pending_total): the summary row then counts items FINISHED out of
+    that total, not iterations, so a retried item is not progress and a
+    preflight that strikes finished ones is. The first call of an invocation
+    latches the baseline, and every later one records how far the queue has
+    got, so a wrapper's next batch opens on the row the last one left.
+
+    A runner registers its own actions on the returned app and enters it; the
+    quota priming stays with the runner, because only the parallel one knows
+    its account before the first command.
+    """
+    progress = ctx.progress
+    total = driver.pending_total()
+    if total is not None:
+        progress.track_total(total)
+        progress.note_remaining(total)
+    app = statusline.StatusApp(
+        status=statusline.LoopStatus(jobs=progress.jobs(job_count)),
+        settings=ctx.registry,
+        messages=messages,
+        enabled=not ctx.dry_run and not getattr(args, "no_statusline", False))
+    app.update(
+        provider=ctx.provider,
+        **progress.summary_fields(),
+        # Only a list driver has a pick order; read it defensively so any other
+        # driver simply reports no `rand` marker.
+        random_order=str(getattr(driver, "pick_order", "")) == "random",
+        script_limits=ctx.registry.status_entries(),
+    )
+    return app
 
 
 def close_run(ctx: RunContext, *,

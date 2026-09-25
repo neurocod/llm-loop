@@ -1529,41 +1529,74 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
     assert "max-runs" not in dict(app.status.script_limits)
 
 
-def test_a_batchs_cap_edit_leaves_the_invocations_denominator_alone(
-        monkeypatch, tmp_path):
+class _QueueDriver:
+    """Just enough of a Driver for the shared prologue and the status area."""
+
+    provider = "claude"
+
+    def __init__(self, pending):
+        self.pending = pending
+
+    def pending_total(self):
+        return self.pending
+
+
+def _begin(tmp_path, progress=None, **arg_fields):
+    """`runlifecycle.begin_run` as a dry run: no lock, no tee, no exit record."""
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(provider=None, max=1, git_push="none",
+                           project_dir=str(tmp_path), no_live_messages=False,
+                           dry_run=True, **arg_fields)
+    previous = projectroot.project_dir()
+    try:
+        ctx = runlifecycle.begin_run(_QueueDriver(None), args, "pytest-statusline",
+                                     progress, setup_logging=False)
+    finally:
+        projectroot.set_project_root(previous)
+    return ctx, args
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_only_the_invocation_moves_the_denominator_on_a_cap_edit(tmp_path,
+                                                                 wrapped):
     """Under a wrapper, `--max-runs` sizes THIS batch and not the whole run.
 
-    The runner hands `runlifecycle.script_settings` its progress only when it
-    owns the figures (`progress if owns_progress else None`), and that gate is
-    the whole of what keeps a batch from rewriting the invocation's
-    denominator — a periodic wrapper slices one invocation into many runner
-    calls, each with its own `--max`, and the row must go on counting the
-    invocation. The cap itself must still move, or this would pass just as well
-    with the knob broken.
+    The prologue hands the knob registry the progress only when this call owns
+    the figures, and that is the whole of what keeps a batch from rewriting the
+    invocation's denominator — a batching wrapper slices one invocation into
+    many runner calls, each with its own `--max`, and the row must go on
+    counting the invocation. One pin for both runners, because both take their
+    registry from `begin_run`. The knob itself must move either way, or the
+    wrapped case would pass just as well with the knob broken.
     """
-    from llm_loop.agentwork import AgentCommand, Driver
+    invocation = sl.InvocationProgress(max_items=99) if wrapped else None
+    ctx, _args = _begin(tmp_path, invocation)
 
-    class _RaisesItsOwnCap(Driver):
-        app = None
-        calls = 0
+    ctx.registry.get("max-runs").set(2)
 
-        def next_command(self):
-            self.calls += 1
-            if self.calls == 1:
-                self.app.settings.get("max-runs").set(2)
-            return AgentCommand("do the thing", "", f"item-{self.calls}")
+    assert ctx.settings.max_runs == 2, "the cap edit did not reach the knob"
+    assert ctx.progress.max_items == (99 if wrapped else 2), \
+        "a batch rewrote the invocation's cap" if wrapped else \
+        "the invocation's own cap edit left its denominator behind"
 
-    driver = _RaisesItsOwnCap()
-    invocation = sl.InvocationProgress(max_items=99)
-    app, _source = _run_with_status(monkeypatch, tmp_path, driver,
-                                    progress=invocation,
-                                    on_app=lambda a: setattr(driver, "app", a))
 
-    assert driver.calls == 2, "the batch's own cap edit did not take effect"
-    assert invocation.max_items == 99, \
-        "a batch rewrote the invocation's cap — the owns_progress gate is gone"
-    assert app.status.max_iterations == 99
-    assert app.settings.get("max-runs").get() == 2     # still an editable knob
+def test_a_later_runner_call_opens_on_how_far_the_queue_got(tmp_path):
+    """Opening the status area records the queue as it stands, in both runners.
+
+    The first call of an invocation latches the baseline; a wrapper's later one
+    must open on what the earlier calls finished, not on the figure the last
+    one closed with — the sequential runner used to wait for its first success
+    to say so, while the parallel one said it at once.
+    """
+    invocation = sl.InvocationProgress()
+    invocation.track_total(5)
+    ctx, args = _begin(tmp_path, invocation)
+
+    app = runlifecycle.open_status(ctx, _QueueDriver(3), args, job_count=1,
+                                   messages=None)
+
+    assert (app.status.iteration, app.status.max_iterations) == (2, 5)
 
 
 def test_a_paused_loop_holds_before_it_asks_the_driver_for_work(monkeypatch,

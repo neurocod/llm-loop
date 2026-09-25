@@ -837,12 +837,12 @@ def test_job_rows_resume_in_the_next_call_of_the_invocation(tmp_path, monkeypatc
 
 def test_a_batchs_cap_edit_leaves_the_invocations_denominator_alone(
         tmp_path, monkeypatch):
-    """The parallel half of the same gate the sequential runner is pinned on.
+    """Under a wrapper this batch's cap sizes THIS batch: the claim loop must
+    obey the edit, and the invocation's denominator must not move with it.
 
-    `--max-runs` is a live knob in both modes now, and both hand
-    `runlifecycle.script_settings` their progress only when they own the
-    figures. Under a wrapper this batch's cap sizes THIS batch: the claim loop
-    must obey the edit, and the invocation's denominator must not move with it.
+    Who owns the denominator is pinned once, on the shared prologue
+    (`test_statusline.test_only_the_invocation_moves_the_denominator_on_a_cap_edit`);
+    this is the claim loop's half, run the way a batching wrapper runs it.
     Both halves are asserted, because either one alone passes with the other
     broken.
     """
@@ -868,7 +868,7 @@ def test_a_batchs_cap_edit_leaves_the_invocations_denominator_alone(
     assert len(driver.pending_lines()) == 2, \
         "the claim loop did not act on the edited cap (expected 3 of 5 claimed)"
     assert invocation.max_items == 99, \
-        "a batch rewrote the invocation's cap — the owns_progress gate is gone"
+        "a batch rewrote the invocation's cap"
 
 
 def test_a_capped_run_never_reports_more_than_it_promised():

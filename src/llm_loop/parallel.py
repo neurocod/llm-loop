@@ -1219,7 +1219,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     ctx = runlifecycle.begin_run(driver, args, app_name, progress,
                                  setup_logging=setup_logging)
     provider = ctx.provider
-    progress, owns_progress = ctx.progress, ctx.owns_progress
+    progress = ctx.progress
     run_settings = ctx.settings
     dry_run = ctx.dry_run
 
@@ -1302,54 +1302,22 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     if source is not None:
         policy.log_snapshot(source, "at start (parallel)")
 
+    # The live knobs reach the workers through the object, never a local:
+    # --max-runs reaches the claim loop through `Shared.max_items`, and
+    # --git-push the pusher and the exit push through `run_settings.git_push`.
+    # Copying the push policy into a local is what once made that knob do
+    # nothing in this mode.
     shared = Shared(driver, run_settings)
 
-    # What the queue holds right now: the baseline on the first call of the
-    # invocation, and how far it has got on every later one. Through the
-    # driver's own count, not `len(pending_now)`, so a driver that overrides
-    # `pending_total` cannot end up counted one way here and another way by the
-    # sequential runner — the same driver serves both.
-    pending_total = driver.pending_total()
-    progress.track_total(pending_total)
-    progress.note_remaining(pending_total)
-
-    # The pinned status area. A Job is the unit of display in BOTH runners, so
-    # this is the sequential loop's wiring with N Jobs instead of one — no branch
-    # anywhere in the status line separates them. Disabled it is a Null object,
-    # so every call below stays a no-op and the run behaves exactly as before.
-    #
-    # The same registry the sequential runner builds, from the same function, so
-    # both modes offer the same knobs under the same labels. --max-runs reaches
-    # the claim loop through `Shared.max_items`, and --git-push reaches the
-    # pusher and the exit push through `run_settings.git_push` — neither is
-    # copied into a local here, which is what the parallel runner used to do to
-    # the push policy and is why that knob did nothing in this mode.
-    settings = runlifecycle.script_settings(
-        run_settings, progress if owns_progress else None)
     # Each worker owns a mailbox for both live delivery and notes queued between
     # its turns. This is a growable set even at one worker: MessageAction opens
     # that sole address directly, while a later `+` can add another address
     # without replacing (and losing the contents of) worker 1's mailbox.
     mailboxes = operator.MailboxSet(range(1, jobs + 1))
-    app = statusline.StatusApp(
-        # Jobs come from the invocation's pool, so a second batch resumes the
-        # rows of the first instead of starting a fresh set at iteration 1.
-        status=statusline.LoopStatus(jobs=progress.jobs(jobs)),
-        settings=settings,
-        messages=mailboxes,
-        enabled=not getattr(args, "no_statusline", False))
+    app = runlifecycle.open_status(ctx, driver, args, job_count=jobs,
+                                   messages=mailboxes)
     app.register_action(statusline.WeeklyLimitAction(
         lambda: policy))
-    app.update(
-        provider=provider,
-        # Files COMPLETED out of the run's real work (see InvocationProgress) —
-        # not files claimed, and not the size of this batch.
-        **progress.summary_fields(),
-        # Only a list driver has a pick order; read defensively so any other
-        # driver simply reports no `rand` marker.
-        random_order=str(getattr(driver, "pick_order", "")) == "random",
-        script_limits=settings.status_entries(),
-    )
 
     # A background pusher applies the policy on its own cadence while the
     # workers run; the workers never push. git is not thread-safe to call

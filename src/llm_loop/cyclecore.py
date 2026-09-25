@@ -532,7 +532,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     ctx = runlifecycle.begin_run(driver, args, app_name, progress,
                                  setup_logging=setup_logging)
     provider, spec = ctx.provider, ctx.spec
-    progress, owns_progress = ctx.progress, ctx.owns_progress
+    progress = ctx.progress
     # The live knobs (see RunSettings): read where they are USED, never
     # snapshotted into locals, so the status line's editor can move them mid-run.
     run_settings = ctx.settings
@@ -569,33 +569,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         print(f"  · usage limit policy: disabled (bounded run, "
               f"--max {run_settings.max_runs})")
 
-    # The pinned status area. A Job is the unit of display in both runners, so
-    # the sequential loop is a run with exactly one Job — no branch anywhere in
-    # the status line separates it from `-j N`. Disabled it is a Null object, so
-    # every call below stays a no-op and the loop behaves exactly as before.
-    settings = runlifecycle.script_settings(
-        run_settings, progress if owns_progress else None)
-    # A driver that knows how much work it has is the source of truth for it:
-    # the summary row then counts items FINISHED out of that total, not
-    # iterations, so a retried item is not progress and a preflight that strikes
-    # finished ones is. Asked of the driver (Driver.pending_total) rather than
-    # read off a list file, so a queue that is not a list — the kit-promotion
-    # pass draining its requests folder — gets a denominator too instead of
-    # counting bare iterations into a row that reads "iter 1" forever.
-    tracked_total = driver.pending_total()
-    if tracked_total is not None:
-        progress.track_total(tracked_total)
     # One mailbox for the whole run: the console writes to it, the loop below
     # empties it into the next prompt, and run_agent_streaming lends it the
     # running turn's stdin. A dry run gets none — there is no agent to talk to.
     mailbox = None if dry_run else operator.Mailbox()
-    app = statusline.StatusApp(
-        # From the invocation's pool: a wrapper's next runner call resumes this
-        # row instead of starting a fresh Job at iteration 1.
-        status=statusline.LoopStatus(jobs=progress.jobs(1)),
-        settings=settings,
-        messages=mailbox,
-        enabled=not dry_run and not getattr(args, "no_statusline", False))
+    app = runlifecycle.open_status(ctx, driver, args, job_count=1,
+                                   messages=mailbox)
     # Only state-driven loops can name a breakpoint. Keep the collection local
     # to this invocation so a later runner call starts without old console input.
     from .breakpoints import Breakpoints
@@ -605,14 +584,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         app.register_action(statusline.BreakpointAction(breakpoints))
     app.register_action(statusline.WeeklyLimitAction(
         lambda: None if ignore_usage_limits else limit_policy))
-    app.update(
-        provider=provider,
-        **progress.summary_fields(),
-        # Only a list driver has a pick order; read it defensively so any other
-        # Driver simply reports no `rand` marker.
-        random_order=str(getattr(driver, "pick_order", "")) == "random",
-        script_limits=settings.status_entries(),
-    )
 
     iteration = 0
     completed = 0
@@ -643,13 +614,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # The caps are read LIVE (see RunSettings) and republished here, so an
             # edit made while the run is going is what the pinned row shows at
             # this boundary. Only republished: the edit itself already moved both
-            # the knob and the row's denominator, in the one setter both runners
-            # register (`runlifecycle.script_settings`). Re-assigning the
-            # denominator here as well would be a second writer for one number,
-            # and the parallel runner — which has no boundary to re-read at —
-            # could not have it.
+            # the knob and the row's denominator, in the one setter the shared
+            # prologue registers (`runlifecycle.script_settings`). Re-assigning
+            # the denominator here as well would be a second writer for one
+            # number, and the parallel runner — which has no boundary to re-read
+            # at — could not have it.
             app.update(**progress.summary_fields(),
-                       script_limits=settings.status_entries())
+                       script_limits=ctx.registry.status_entries())
             pending = stopchannel.pending_stop(app)
             if pending is stopchannel.StopSource.FILE and dry_run:
                 # The sentinel is removed only after the outer application has
@@ -885,8 +856,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # kept a periodic run's job rows at 1.
             app.job(1).start(item=state_label, model=command.model,
                              prompt=command.prompt, now=started_at)
-            if tracked_total is None:
-                progress.note_iteration()
+            # Read only by a row with no total (InvocationProgress.summary_fields).
+            progress.note_iteration()
             app.update(**progress.summary_fields(), phase="running")
             # What a post-mortem needs from a run that never got to write an
             # ending: which item it was on when it stopped existing.
@@ -953,13 +924,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 consecutive_errors = 0
                 completed += 1
                 driver.on_success(returncode)
-                if tracked_total is not None:
-                    # on_success recorded the item, so the driver's own count now
-                    # says how far the invocation has got.
-                    remaining = driver.pending_total()
-                    if remaining is not None:
-                        progress.note_remaining(remaining)
-                        app.update(**progress.summary_fields())
+                # on_success recorded the item, so the driver's own count now
+                # says how far the invocation has got.
+                remaining = driver.pending_total()
+                if remaining is not None:
+                    progress.note_remaining(remaining)
+                    app.update(**progress.summary_fields())
 
             # The end-of-item hook: after on_success, so the driver's own queue
             # is up to date, and after the outcome either way — a failed
