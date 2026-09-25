@@ -467,7 +467,7 @@ reading before the bounded retry path continues.
 ## Command-line options
 
 The option list is your wrapper's `--help`. Both runners build their parsers
-from one table, `llm_loop.clispec.OPTIONS`, and the two accept different
+from one table, [`llm_loop.clispec.OPTIONS`](src/llm_loop/clispec.py), and the two accept different
 subsets of it (`clispec.OPTION_ORDER`), so ask the entry point you run:
 
 ```
