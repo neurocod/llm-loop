@@ -138,8 +138,8 @@ DRY_RUN_LIST_LIMIT = 10
 # (`limits.LimitPolicy.check_and_wait` / `_wait`, on a worker under
 # `usage_lock`, through `console.print_percents`) and the background pusher
 # (`gitpush.git_push`, through `print_done` / `print_error` / `LINES`). Both
-# reach the console through module-level imports of their own, so routing them
-# here means giving `console` an owner hook — not done yet.
+# reach the console through module-level imports of their own, which `_console`
+# does not intercept.
 _console = ownership.OwnerThread("console-lines")
 
 # How long `run_parallel` waits for `_console` to write what the workers posted
@@ -1485,9 +1485,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                 # is a console that is not being written, and this line is then
                 # deferred to the closing report below rather than blocking the
                 # interrupt behind it.
-                if _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
-                    announce_later = None
-                else:
+                if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
                     announce_later = INTERRUPT_ANNOUNCEMENT
                 for t in threads:
                     t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)

@@ -2291,7 +2291,8 @@ class StatusApp:
         self._paint_stop = threading.Event()
         # The painter's paint request. One slot is the whole queue because every
         # request asks for the same thing — "draw the state as it is NOW" — so
-        # ten requests before the painter wakes are one frame, not ten.
+        # ten requests before the painter wakes are one frame, not ten. It is
+        # also the doorbell for `_posted` and stop()'s wake-up.
         self._paint_requested = threading.Event()
         self._paint_thread: Optional[threading.Thread] = None
         # A painter stop() gave up joining; start() gives it one more join.
@@ -2825,7 +2826,7 @@ class StatusApp:
         return False
 
     def _paint(self, *, reassert: bool = False) -> None:
-        """Draw the rows and the title — on the painter, and only there.
+        """Draw the rows and the title — on the painter while one runs.
 
         While the painter runs it is the one thread that renders and writes the
         terminal; a worker's `update`, a key, a quota poll only post a request

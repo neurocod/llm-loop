@@ -11,7 +11,8 @@ mutable state left to guard.
 `OwnerThread` is that owner and nothing more — FIFO order, a bounded queue,
 `drain` to wait for what was posted so far, `close` to hand the resource back.
 What the resource IS lives with its user (`parallel` owns the console's worker
-lines with one of these).
+lines with one of these). The status line's painter is a second owner built by
+hand, not on this class (`statusline.StatusApp._on_painter`).
 """
 
 import collections
@@ -176,6 +177,8 @@ class OwnerThread:
         the resource (CLOSING) while it finishes the backlog as a daemon; what
         it has not written by the time the process exits is lost with it. Asked
         again, `close` answers for the same thread — True only once it is gone.
+        Asked from the owner itself it only marks the close and returns False:
+        the thread cannot wait for its own exit.
         """
         deadline = _deadline(timeout)
         if not self._lock.acquire(timeout=_remaining(deadline)):
