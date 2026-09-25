@@ -21,8 +21,8 @@ import threading
 
 import pytest
 
-from llm_loop import (cyclecore, operator, parallel, providers, streamrender,
-                      textwidth, wire)
+from llm_loop import (cyclecore, operator, parallel, providers, runlifecycle,
+                      streamrender, textwidth, wire)
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 from llm_loop.agentwork import AgentCommand, Driver
@@ -573,7 +573,7 @@ def test_a_queued_note_rides_the_next_iterations_prompt(tmp_path, monkeypatch):
     monkeypatch.setattr(cyclecore, "run_claude_streaming", fake_run)
     # Bounded runs skip the quota GATE but still bookend themselves with a usage
     # snapshot; a unit test has no business on the network for either.
-    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
 
     cyclecore.run_loop(_TwoIterationDriver(), _seq_args(str(tmp_path)),
                        app_name="pytest-operator", setup_logging=False,
@@ -595,7 +595,7 @@ def test_no_live_messages_puts_the_prompt_back_in_argv(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", fake_run)
-    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
     args = _seq_args(str(tmp_path))
     args.no_live_messages = True
 
@@ -612,7 +612,7 @@ def test_no_live_messages_puts_the_prompt_back_in_argv(tmp_path, monkeypatch):
 def test_a_note_the_run_never_delivered_is_reported(tmp_path, monkeypatch,
                                                     capsys):
     """A queued note promises "the next iteration" — there is not always one."""
-    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
 
     def fake_run(cmd, raw, partial, prompt="", mailbox=None):
         mailbox.submit("typed while the last item was running")
@@ -639,7 +639,7 @@ def test_the_sequential_status_line_is_given_the_runs_mailbox(tmp_path,
     seen = _capture_status_app(monkeypatch)
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
-    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
 
     cyclecore.run_loop(_TwoIterationDriver(), _seq_args(str(tmp_path)),
                        app_name="pytest-operator", setup_logging=False,

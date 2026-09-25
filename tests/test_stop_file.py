@@ -27,7 +27,8 @@ from typing import Optional
 
 import pytest
 
-from llm_loop import cyclecore, parallel, projectroot, statusline, stopchannel
+from llm_loop import (cyclecore, parallel, projectroot, runlifecycle,
+                      statusline, stopchannel)
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 from llm_loop.limits import LimitPolicy, SessionLimit
@@ -739,7 +740,7 @@ def test_the_s_key_ends_a_sequential_run_parked_on_the_usage_limit(
 ):
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
-    monkeypatch.setattr(cyclecore, "usage_source_for",
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
                         lambda provider: _PeggedSource())
     captured = _capture_disabled_app(monkeypatch)
 
@@ -761,7 +762,7 @@ def test_the_s_key_ends_a_parallel_fleet_parked_on_the_usage_limit(
     did nothing at all — the one moment the key is most likely to be pressed."""
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
-    monkeypatch.setattr(parallel, "usage_source_for",
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
                         lambda provider: _PeggedSource())
     captured = _capture_disabled_app(monkeypatch)
     driver = _MemListDriver(["products/a.md", "products/b.md"])
@@ -802,7 +803,7 @@ def test_cancelling_the_stop_keeps_the_file_a_parked_worker_had_claimed(
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, cmd, mailbox=None: (
                             ran.append(cmd.label), (0, 0.0, 0.01))[1])
-    monkeypatch.setattr(parallel, "usage_source_for",
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
                         lambda provider: _PeggedSource())
     monkeypatch.setattr(stopchannel, "confirm_stop_request", cancel_it)
     leaving = _WorkersLeaving(monkeypatch)

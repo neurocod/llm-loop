@@ -42,14 +42,15 @@ import os
 import sys
 from typing import Any, NamedTuple, Optional
 
-from . import console, exitlog, operator, projectroot, statusline, stopchannel
+from . import (console, exitlog, limits, operator, projectroot, statusline,
+               stopchannel)
 from .gitpush import (
     GIT_PUSH_POLICY,
     GIT_PUSH_SETTING,
     GitPushPolicy,
     final_git_push,
 )
-from .providers import provider_spec, set_live_messages
+from .providers import provider_spec, set_live_messages, usage_source_for
 from .stopchannel import RunResult
 from .scriptlock import ensure_script_lock
 
@@ -260,9 +261,70 @@ def open_status(ctx: RunContext, driver, *, job_count: int,
     return app
 
 
+class RunUsage:
+    """One account's usage source and the policy that reads it — opened together.
+
+    The pair is the unit: a source with no policy has nobody to decide what its
+    figures mean, and a policy with no source has nothing to read. The runners
+    used to assemble the two separately and in different words, and the closing
+    snapshot relied on them having been set together without anything checking
+    it; a None here now fails where the pair is BUILT, not at the end of a run.
+
+    `name` is what the snapshots are labelled with, and it is what makes the
+    opening snapshot and the closing one a pair in the log: `at start (name)` is
+    answered by `at end (name)` unless the run ended somewhere worth naming
+    instead (see `close`).
+    """
+
+    __slots__ = ("source", "policy", "name")
+
+    def __init__(self, source, policy, name: str):
+        if source is None or policy is None:
+            raise ValueError(f"usage '{name}' needs both a source and a policy "
+                             f"(source={source!r}, policy={policy!r})")
+        self.source = source
+        self.policy = policy
+        self.name = name
+
+    def open(self) -> None:
+        """The start-of-run snapshot of the policy's watched quotas."""
+        self.policy.log_snapshot(self.source, f"at start ({self.name})")
+
+    def close(self, ending: Optional[str] = None) -> None:
+        """The end-of-run snapshot answering `open`'s.
+
+        Forced fresh (cache_value=False) so it reflects the true post-run state
+        rather than a possibly-recent cached reading from the last limit check.
+        `ending` names an abnormal ending in place of the usage's own name.
+        """
+        self.policy.log_snapshot(self.source, f"at end ({ending or self.name})",
+                                 cache_value=False)
+
+
+def open_usage(driver, provider: str, name: str, *,
+               dry_run: bool) -> Optional[RunUsage]:
+    """The provider's usage pair with its opening snapshot, or None without one.
+
+    None when the provider has no usage endpoint (`usage_source_for`); whether
+    to open one at all is the runner's call — `--ignore-usage` skips this in the
+    parallel runner. The policy is the Driver's specialisation when it has one,
+    the provider's default otherwise. A dry run gets the pair (the gate and the
+    status line read it) but no snapshot, because it is not a run.
+    """
+    source = usage_source_for(provider)
+    if source is None:
+        return None
+    usage = RunUsage(source,
+                     driver.limit_policy or limits.default_policy(provider),
+                     name)
+    if not dry_run:
+        usage.open()
+    return usage
+
+
 def close_run(ctx: RunContext, *,
-              usage_source=None, limit_policy=None,
-              snapshot_label: str = "at end",
+              usage: Optional[RunUsage] = None,
+              ending: Optional[str] = None,
               mailbox=None,
               push_lock=None) -> None:
     """The housekeeping half of the epilogue, for every ending a run can have.
@@ -294,42 +356,31 @@ def close_run(ctx: RunContext, *,
         with push_lock if push_lock is not None else contextlib.nullcontext():
             final_git_push(ctx.settings.git_push, projectroot.project_dir())
 
-    # End-of-run usage snapshot (the policy's watched quotas), mirroring the one
-    # logged before the first turn — so each run records where it finished.
-    # Forced fresh (cache_value=False) so it reflects the true post-run state
-    # rather than a possibly-recent cached reading from the last limit check.
-    #
-    # The source alone decides, and `limit_policy` is deliberately NOT part of
-    # the condition: both runners set the two together (no source, no policy —
-    # `limits.default_policy` never returns None), so a None policy here means
-    # the caller's pairing broke, and the answer to that is an AttributeError
-    # naming the line, not a snapshot silently skipped for the rest of time.
-    if not ctx.dry_run and usage_source is not None:
-        limit_policy.log_snapshot(usage_source, snapshot_label,
-                                  cache_value=False)
+    # End-of-run usage snapshot, answering the one `open_usage` logged — so each
+    # run records where it finished. `ending` names the abnormal endings; a
+    # normal one closes under the usage's own name (see RunUsage.close).
+    if not ctx.dry_run and usage is not None:
+        usage.close(ending)
 
     operator.report_undelivered_notes(mailbox)
 
 
-def end_run(ctx: RunContext, reason, *, iterations: int = 0,
-            completed: int = 0, remaining: Optional[int] = None,
-            usage_source=None, limit_policy=None,
-            snapshot_label: str = "at end",
+def end_run(ctx: RunContext, result: RunResult, *,
+            usage: Optional[RunUsage] = None,
             mailbox=None,
             push_lock=None) -> RunResult:
     """Everything both runners do when the work is over and they RETURN.
 
     The housekeeping is `close_run`; this adds the two things only a normal
-    ending has — a `RunStopReason` to name it by, and a `RunResult` for whoever
-    called the runner.
+    ending has — a `RunStopReason` to name it by, and the `RunResult` handed back
+    to whoever called the runner.
 
     The reason is RECORDED rather than printed: a wrapper may call several
     runners, the `=== run ended: … ===` line belongs to the process, so the last
     reason set wins and exitlog prints it on the way out.
     """
-    close_run(ctx, usage_source=usage_source, limit_policy=limit_policy,
-              snapshot_label=snapshot_label, mailbox=mailbox,
-              push_lock=push_lock)
+    close_run(ctx, usage=usage, mailbox=mailbox, push_lock=push_lock)
+    reason = result.reason
     exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
-                       iterations=iterations, completed=completed)
-    return RunResult(reason, iterations, completed, remaining)
+                       iterations=result.attempted, completed=result.completed)
+    return result

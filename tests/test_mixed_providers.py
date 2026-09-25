@@ -5,7 +5,8 @@ import time
 
 import pytest
 
-from llm_loop import cyclecore, projectroot, providers, statusline, stopchannel
+from llm_loop import (cyclecore, projectroot, providers, runlifecycle,
+                      statusline, stopchannel)
 from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.drivers import StateFileDriver
 from llm_loop.usage import RateLimitEvent
@@ -66,8 +67,8 @@ def runtime(monkeypatch, tmp_path):
             assert source.provider == policy.provider == provider
             self.selections.append(provider)
 
-    monkeypatch.setattr(cyclecore, "usage_source_for", source_for)
-    monkeypatch.setattr(cyclecore.limits, "default_policy", lambda p: Policy(p, events))
+    monkeypatch.setattr(runlifecycle, "usage_source_for", source_for)
+    monkeypatch.setattr(runlifecycle.limits, "default_policy", lambda p: Policy(p, events))
     monkeypatch.setattr(statusline, "StatusApp", make_app)
     monkeypatch.setattr(statusline, "QuotaRefresher", Refresher)
     monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)

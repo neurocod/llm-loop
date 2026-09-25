@@ -45,7 +45,6 @@ from typing import Callable, Optional
 from . import clispec
 from . import compactline
 from . import exitlog
-from . import limits
 from . import operator
 from . import projectroot
 from . import providers
@@ -79,7 +78,7 @@ from .console import print_markup
 from .gitpush import maybe_git_push
 from .stopchannel import RunResult, RunStopReason
 from .providers import (note_channel, provider_spec, reap_agent_process,
-                        start_agent_process, usage_source_for)
+                        start_agent_process)
 from .drivers import ListFileDriver
 
 # How many of a failed job's discarded non-JSON lines are kept as its failure
@@ -1290,17 +1289,16 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     if wait_on_start:
         stopchannel.wait_for_stop_file_clear()
 
-    # Usage gate: a shared UsageSource (query/cache) plus the Driver's LimitPolicy
-    # (which quotas to gate on). --ignore-usage turns both off.
-    source = None if args.ignore_usage else usage_source_for(provider)
-    policy = None
-    if source is not None:
-        policy = driver.limit_policy or limits.default_policy(provider)
+    # Usage gate: one account's RunUsage (see runlifecycle.open_usage), shared by
+    # every worker. --ignore-usage leaves it unopened, so there is no source to
+    # gate on and no policy to gate with.
+    usage = (None if args.ignore_usage
+             else runlifecycle.open_usage(driver, provider, "parallel",
+                                          dry_run=False))
+    source, policy = ((usage.source, usage.policy) if usage is not None
+                      else (None, None))
     usage_lock = threading.Lock()
     session_start_box = [time.time()]  # shared, refreshed when a window resets
-
-    if source is not None:
-        policy.log_snapshot(source, "at start (parallel)")
 
     # The live knobs reach the workers through the object, never a local:
     # --max-runs reaches the claim loop through `Shared.max_items`, and
@@ -1467,8 +1465,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         exitlog.set_reason("interrupted by the operator (Ctrl+C)",
                            iterations=shared.claimed, completed=shared.done)
         runlifecycle.close_run(
-            ctx, usage_source=source, limit_policy=policy,
-            snapshot_label="at end (interrupted)", mailbox=mailboxes,
+            ctx, usage=usage, ending="interrupted", mailbox=mailboxes,
             push_lock=push_lock)
         sys.exit(130)
 
@@ -1490,7 +1487,5 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # may have given up on a pusher that is still inside `git push` — see
     # PUSHER_JOIN_TIMEOUT_S, and `end_run` for the rest of why.
     return runlifecycle.end_run(
-        ctx, reason, iterations=shared.claimed, completed=shared.done,
-        remaining=remaining, usage_source=source, limit_policy=policy,
-        snapshot_label="at end (parallel)", mailbox=mailboxes,
-        push_lock=push_lock)
+        ctx, RunResult(reason, shared.claimed, shared.done, remaining),
+        usage=usage, mailbox=mailboxes, push_lock=push_lock)

@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from llm_loop import cyclecore, parallel, stopchannel
+from llm_loop import cyclecore, parallel, runlifecycle, stopchannel
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 from llm_loop.stopchannel import RunStopReason
@@ -273,7 +273,7 @@ def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatc
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", blocked_job)
-    monkeypatch.setattr(parallel, "usage_source_for", lambda provider: object())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: object())
     driver = _HookedListDriver(
         [f"products/f{i}.md" for i in range(3)],
         on_finished=lambda command, rc: "a request was filed")

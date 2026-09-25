@@ -1385,7 +1385,7 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
     from llm_loop import cyclecore
 
     source = _CountingSource()
-    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: source)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: source)
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda cmd, raw, partial, prompt="", mailbox=None: 0)
     made = {}
@@ -1846,7 +1846,7 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
     call that displayed it — and a per-call cap is not the invocation's."""
     from llm_loop import cyclecore
 
-    monkeypatch.setattr(cyclecore, "usage_source_for",
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
                         lambda provider: _CountingSource())
     monkeypatch.setattr(cyclecore, "run_agent_streaming",
                         lambda cmd, provider, raw, partial, prompt,

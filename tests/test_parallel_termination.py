@@ -128,7 +128,7 @@ def test_worker_claims_before_touching_the_usage_gate(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
     # A source object is truthy so the gate branch is taken *if reached*.
-    monkeypatch.setattr(parallel, "usage_source_for", lambda provider: object())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: object())
 
     gate_calls = []
 
@@ -326,7 +326,7 @@ def test_a_worker_dying_in_the_usage_gate_gives_the_file_back(
     """
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
-    monkeypatch.setattr(parallel, "usage_source_for", lambda provider: object())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: object())
 
     calls = []
 

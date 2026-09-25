@@ -2,7 +2,7 @@
 
 import pytest
 
-from llm_loop import cyclecore, statusline as sl, termio
+from llm_loop import cyclecore, runlifecycle, statusline as sl, termio
 from llm_loop.breakpoints import Breakpoints
 from llm_loop.drivers import StateFileDriver
 from llm_loop.stopchannel import RunStopReason
@@ -105,7 +105,7 @@ def runner(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sl.StatusApp, "start", start)
     # No account or subprocess is needed for a state-boundary test.
-    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
     args = cyclecore.parse_args([
         "--project-dir", str(tmp_path), "--max-runs", "3",
         "--git-push", "none", "--no-statusline"])
@@ -160,7 +160,7 @@ def test_breakpoint_added_after_selection_still_prevents_launch(runner, monkeypa
         press(apps[0], "b", *"implementation", "\r")
         return None
 
-    monkeypatch.setattr(cyclecore, "usage_source_for", source)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", source)
     result = run(driver, lambda *a, **kw: pytest.fail("agent must not start"))
     assert result.attempted == 0
     assert driver.issued == ["implementation"]
@@ -187,7 +187,7 @@ def test_breakpoint_releases_a_quota_wait_without_launching(runner, monkeypatch)
             return True, session_start
 
     driver.limit_policy = Policy()
-    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: object())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: object())
     monkeypatch.setattr(sl, "push_quotas", lambda *a, **kw: None)
     monkeypatch.setattr(sl.StatusApp, "add_service", lambda self, service: service)
     result = run(driver, lambda *a, **kw: pytest.fail("agent must not start"))

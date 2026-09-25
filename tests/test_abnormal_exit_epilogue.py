@@ -268,7 +268,7 @@ def test_a_driver_that_stops_the_run_still_closes_it_down(
         return 0
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", succeeds)
-    monkeypatch.setattr(cyclecore, "usage_source_for", lambda p: _StubSource())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: _StubSource())
     monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
 
     with pytest.raises(SystemExit) as exit_info:
@@ -298,7 +298,7 @@ def test_invalid_state_model_still_closes_the_run_down(
 
     driver = InvalidSelection()
     driver.limit_policy = _StubPolicy()
-    monkeypatch.setattr(cyclecore, "usage_source_for",
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
                         lambda p: pytest.fail("opened account for invalid selector"))
     with pytest.raises(SystemExit) as stopped:
         cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
@@ -327,7 +327,7 @@ def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(parallel, "join_workers", interrupt)
-    monkeypatch.setattr(parallel, "usage_source_for", lambda provider: _StubSource())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: _StubSource())
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, command, mailbox=None: (0, None, None))
     driver = _OneItemListDriver()

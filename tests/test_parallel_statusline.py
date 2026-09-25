@@ -138,7 +138,7 @@ def test_parallel_weekly_key_changes_the_shared_policy(tmp_path, monkeypatch):
     driver = _MemDriver(["item.md"])
     driver.limit_policy = LimitPolicy([WeeklyLimit(98)])
     source = _CountingSource()
-    monkeypatch.setattr(parallel, "usage_source_for", lambda provider: source)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: source)
 
     def run(*args, **kwargs):
         app = made["app"]
@@ -669,7 +669,7 @@ def test_a_batching_wrapper_never_stacks_two_status_areas(tmp_path, monkeypatch)
 
     monkeypatch.setattr(sl, "StatusApp", _app)
     monkeypatch.setattr(parallel, "run_job", lambda job_id, cmd, mailbox=None: (0, 0.0, 0.01))
-    monkeypatch.setattr(cyclecore, "usage_source_for", lambda provider: None)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
 
     class _NoWork(Driver):
         def next_command(self):

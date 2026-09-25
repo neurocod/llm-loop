@@ -60,13 +60,13 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-# `limits` and `statusline` were imported inside `run_loop` for years, on the
-# grounds that hoisting them would change what a bare `import llm_loop.cyclecore`
-# drags in. Measured 2026-08-24 and false: importing a submodule runs the
-# package's `__init__`, which imports both unconditionally, so they are already
-# in `sys.modules` before this line is reached. The cycle the local import
-# really was for is gone too — neither module imports this one any more.
-from . import (clispec, console, exitlog, limits, operator,
+# `statusline` was imported inside `run_loop` for years, on the grounds that
+# hoisting it would change what a bare `import llm_loop.cyclecore` drags in.
+# Measured 2026-08-24 and false: importing a submodule runs the package's
+# `__init__`, which imports it unconditionally, so it is already in
+# `sys.modules` before this line is reached. The cycle the local import really
+# was for is gone too — it does not import this module any more.
+from . import (clispec, console, exitlog, operator,
                projectroot, providers, runlifecycle, statusline, stopchannel,
                termio, textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
@@ -106,7 +106,7 @@ from .console import (
 # freeze it at the launch directory. That constant is gone — the sentinel is
 # `stop_file_path()`, derived on read — and a function imported by name would
 # NOT freeze. Only the second-address argument was ever load-bearing.
-from .providers import prompt_on_stdin, usage_source_for
+from .providers import prompt_on_stdin
 # Rendering ONE provider stream into a terminal — starting the CLI, printing its
 # events, and the single-stream state that only makes sense with one run in
 # flight — is `streamrender`, its own module.
@@ -556,9 +556,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
     session_start = time.time()   # start of the current 5-hour session window
     consecutive_errors = 0        # reset to 0 after any successful iteration
+    # The selected provider's RunUsage (None without a usage endpoint), and the
+    # two halves of it the gate below reads, unpacked where it is selected.
+    usage = None
     usage_source = None
     limit_policy = None
-    # Sources and fallback session clocks belong to accounts, not the whole
+    # Usage pairs and fallback session clocks belong to accounts, not the whole
     # mixed-provider run. Populate lazily: the launch default may never run.
     usage_states = {}
     provider_refusals = {}
@@ -745,9 +748,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                         f"{stop.message.splitlines()[0]}",
                         iterations=iteration, completed=completed)
                     runlifecycle.close_run(
-                        ctx, usage_source=usage_source,
-                        limit_policy=limit_policy,
-                        snapshot_label="at end (driver stopped the run)",
+                        ctx, usage=usage, ending="driver stopped the run",
                         mailbox=mailbox)
                     sys.exit(stop.exit_code)
                 stop_reason = stopchannel.RunStopReason.DRIVER_STOP
@@ -761,17 +762,18 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             selected_provider = command.provider or ctx.provider
             if selected_provider != provider or provider not in usage_states:
                 if provider in usage_states:
-                    usage_states[provider] = (usage_source, limit_policy, session_start)
+                    usage_states[provider] = (usage, session_start)
                 provider = selected_provider
                 spec = providers.provider_spec(provider)
                 if provider not in usage_states:
-                    source = usage_source_for(provider)
-                    policy = (driver.limit_policy or limits.default_policy(provider)
-                              if source is not None else None)
-                    usage_states[provider] = (source, policy, time.time())
-                    if not dry_run and source is not None:
-                        policy.log_snapshot(source, f"at start ({provider})")
-                usage_source, limit_policy, session_start = usage_states[provider]
+                    usage_states[provider] = (
+                        runlifecycle.open_usage(driver, provider, provider,
+                                                dry_run=dry_run),
+                        time.time())
+                usage, session_start = usage_states[provider]
+                usage_source, limit_policy = ((usage.source, usage.policy)
+                                              if usage is not None
+                                              else (None, None))
                 ignore_usage_limits = (args.max is not None or usage_source is None
                                        or not spec.supports_usage_limits)
                 if quota_refresher is not None:
@@ -1003,8 +1005,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     f"(last exit code {returncode})",
                     iterations=iteration, completed=completed)
                 runlifecycle.close_run(
-                    ctx, usage_source=usage_source, limit_policy=limit_policy,
-                    snapshot_label="at end (provider errors in a row)",
+                    ctx, usage=usage, ending="provider errors in a row",
                     mailbox=mailbox)
                 sys.exit(returncode)
 
@@ -1019,6 +1020,5 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # `gitpush.final_git_push` for why the lock belongs to the caller that has
     # threads rather than to the call.
     return runlifecycle.end_run(
-        ctx, stop_reason, iterations=iteration, completed=completed,
-        usage_source=usage_source, limit_policy=limit_policy,
-        snapshot_label="at end (after last cycle)", mailbox=mailbox)
+        ctx, stopchannel.RunResult(stop_reason, iteration, completed),
+        usage=usage, mailbox=mailbox)
