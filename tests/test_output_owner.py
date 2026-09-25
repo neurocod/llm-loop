@@ -267,7 +267,11 @@ def test_an_owner_that_handed_back_leaves_the_next_owner_open():
     restart_may_go = threading.Event()
     owner._close_locked = hand_back_then_let_a_restart_in
     owner.start()
-    owner.close(timeout=0)                    # the hand-back runs on the owner
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)          # owner is outside its state lock
+    assert not owner.close(timeout=0)         # the hand-back runs on the owner
+    stall.release.set()
     assert restart_may_go.wait(WAIT_S)
     owner.start()
     with owner._changed:                      # a fresh start notifies nobody
