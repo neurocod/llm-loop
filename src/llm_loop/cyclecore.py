@@ -498,7 +498,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     paused_since = 0.0            # start of the pause being held (0.0 = none)
     # Why a driver hook asked to hand control back, latched until the loop head
     # acts on it (see Driver.item_started / item_finished).
-    handback_reason = None
+    handback = stopchannel.DriverHandback()
     stop_reason = stopchannel.RunStopReason.NO_WORK
     stop_file_noted = False       # dry-run: report the sentinel once, not per iteration
     dry_run_prompt_shown = False  # dry-run: show job 1's prompt once, not per pass
@@ -594,8 +594,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # that will never come. Held there, `p` would keep the caller from
             # getting control back until somebody released it, and the gate
             # would keep it until the quota window reset.
-            if handback_reason is not None:
-                print(f"  ⏸ {handback_reason} — "
+            if handback.pending:
+                print(f"  ⏸ {handback.reason} — "
                       f"{stopchannel.DRIVER_HANDBACK_CLAUSE}")
                 stop_reason = stopchannel.RunStopReason.DRIVER_PAUSE
                 break
@@ -809,7 +809,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # notes above are already spliced in). It cannot cancel this
             # iteration — the loop head is where a pause is acted on — so a
             # reason returned here is latched and this turn still runs.
-            handback_reason = handback_reason or driver.item_started(command)
+            handback.latch(driver.item_started(command))
 
             with statusline.describing(app.job(1)):
                 if provider == "claude":
@@ -837,16 +837,15 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # The end-of-item hook: after on_success, so the driver's own queue
             # is up to date, and after the outcome either way — a failed
             # iteration is still an iteration whose side effects are on disk.
-            # `or` keeps the FIRST reason: a pause already asked for is not
-            # withdrawn by a later hook answering None.
-            handback_reason = handback_reason or driver.item_finished(command, returncode)
+            # The latch keeps the FIRST reason (see DriverHandback).
+            handback.latch(driver.item_finished(command, returncode))
 
             # Preserve the wire verdict even when the quota endpoint has no
             # figures. A refused final turn may still exit 0 and advance the
             # state, so defer its wait until this provider is selected again.
             refusal = last_rate_limit_event() if provider == "claude" else None
             if (not ignore_usage_limits and refusal is not None
-                    and refusal.status == "rejected" and handback_reason is None):
+                    and refusal.status == "rejected" and not handback.pending):
                 # +5s so we come back after the reset, not exactly on it.
                 provider_refusals[provider] = (
                     refusal, (refusal.resets_at
@@ -865,7 +864,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             print_error(f"{spec.display_name} exited with code {returncode} "
                         f"(error #{consecutive_errors} in a row).")
 
-            if not ignore_usage_limits and handback_reason is None:
+            if not ignore_usage_limits and not handback.pending:
                 # The pause exclusion is the refusal branch's (see there): this
                 # gate can hold for a whole window, and the head is one `continue`
                 # away from ending the run. The error itself is still counted and

@@ -198,6 +198,7 @@ def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatc
     again by the caller that asked for the pause.
     """
     first_gate = threading.Event()
+    parked = threading.Event()
 
     class BlockingPolicy(StubPolicy):
         def check_and_wait(self, source, session_start, note="",
@@ -207,6 +208,7 @@ def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatc
                 return False, session_start
             # Every later worker parks here until something says otherwise —
             # a fleet over its budget, in one line.
+            parked.set()
             while not should_stop():
                 time.sleep(0.01)
             return False, session_start
@@ -239,6 +241,10 @@ def test_a_pause_releases_a_worker_parked_on_the_usage_gate(tmp_path, monkeypatc
 
     threading.Thread(target=go, daemon=True).start()
     assert running.wait(5), "no worker got past the usage gate"
+    # The second worker must be ON the gate before the hook fires: released
+    # earlier, it finds claims already closed and never parks, and the pin
+    # passes with the gate deaf to the hand-back (seen 2026-09-25).
+    assert parked.wait(5), "the second worker never reached the usage gate"
     release.set()
     assert done.wait(10), "a worker parked on the usage gate never came back"
 
@@ -263,7 +269,60 @@ def test_an_ending_already_latched_is_not_relabelled_by_a_late_pause():
 
     assert shared.request_driver_handback("too late") is False
     assert shared.stop_reason is RunStopReason.LIMIT_REACHED
-    assert shared.handback_reason is None
+    assert not shared.handback.pending
+
+
+def test_the_fleet_announces_one_handback_however_many_workers_ask():
+    """Only the first request closes claims and gets the announcement line.
+
+    A second worker finishing an item a moment later finds claims already
+    closed by the first — the path `request_driver_handback` shares with the
+    cap — and the reason on record stays the first one.
+    """
+    driver = _HookedListDriver(["products/only.md"])
+    shared = parallel.Shared(driver, type("S", (), {"max_runs": None})())
+
+    assert shared.request_driver_handback("first") is True
+    assert shared.request_driver_handback("second") is False
+    assert shared.stop_reason is RunStopReason.DRIVER_PAUSE
+    assert shared.claims_closed.is_set()
+    assert shared.handback.reason == "first"
+
+
+def test_the_handback_latch_keeps_the_first_reason():
+    """The rule both runners lean on: first reason wins, None asks nothing."""
+    handback = stopchannel.DriverHandback()
+    assert not handback.pending and handback.reason is None
+
+    assert handback.latch(None) is False
+    assert handback.latch("") is False
+    assert not handback.pending, "a hook answering nothing latched a pause"
+
+    assert handback.latch("first") is True
+    assert handback.latch("second") is False
+    assert handback.latch(None) is False
+    assert handback.pending and handback.reason == "first"
+
+
+def test_the_handback_latch_answers_true_to_exactly_one_racing_thread():
+    """True is the announcer's ticket, so a race must hand out exactly one."""
+    handback = stopchannel.DriverHandback()
+    start = threading.Barrier(8)
+    wins = []
+
+    def race(n):
+        start.wait()
+        if handback.latch(f"reason {n}"):
+            wins.append(n)
+
+    threads = [threading.Thread(target=race, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert len(wins) == 1
+    assert handback.reason == f"reason {wins[0]}"
 
 
 class _SequentialHookDriver(Driver):
@@ -311,6 +370,37 @@ def test_the_sequential_loop_stops_at_its_boundary_when_a_hook_asks(
     assert driver.started == ["a", "b"]
     assert driver.finished == [("a", 0), ("b", 0)]
     assert driver._items == ["c"], "the unreached item was consumed anyway"
+
+
+@pytest.mark.parametrize("finish_answer", [None, "asked at the finish"])
+def test_the_sequential_loop_announces_the_first_reason_it_was_given(
+    tmp_path, monkeypatch, capsys, finish_answer
+):
+    """A reason from `item_started` survives the same item's `item_finished`.
+
+    A later None must not withdraw the pause, and a later reason must not
+    rename it.
+    """
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda *args, **kwargs: 0)
+
+    class TwoHookDriver(_SequentialHookDriver):
+        def item_started(self, command):
+            super().item_started(command)
+            return "asked at the start"
+
+        def item_finished(self, command, returncode):
+            super().item_finished(command, returncode)
+            return finish_answer
+
+    driver = TwoHookDriver(["a", "b"])
+    result = cyclecore.run_loop(driver, _seq_args(tmp_path),
+                                app_name="pytest-hooks", wait_on_start=False)
+
+    assert result.reason is RunStopReason.DRIVER_PAUSE
+    assert driver.finished == [("a", 0)]
+    out = capsys.readouterr().out
+    assert f"⏸ asked at the start — {stopchannel.DRIVER_HANDBACK_CLAUSE}" in out
 
 
 def test_a_held_sequential_run_still_hands_control_back(tmp_path, monkeypatch):

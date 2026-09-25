@@ -7,7 +7,8 @@ sentinel on disk), the reading of them (`pending_stop` / `latched_stop`), the
 countdown that lets an interactive request be taken back
 (`confirm_stop_request`), the tail that acts on one (`commit_stop`), the
 sentinel's lifecycle across nested runner calls (`stop_file_lifecycle`), the
-`p` key's hold (`pause_requested` / `wait_while_paused`), and the outcome a
+`p` key's hold (`pause_requested` / `wait_while_paused`), a driver hook's
+request to hand control back (`DriverHandback`), and the outcome a
 runner reports afterwards (`RunResult`, `RunStopReason`, `STOP_REASON_TEXT`).
 
 Apart from the runners because BOTH of them speak it, and so does a host
@@ -295,6 +296,58 @@ STOP_FILE_KEPT_CLAUSE = ("stopping; it remains in place until "
 DRIVER_HANDBACK_CLAUSE = ("the driver asked to hand control back; nothing new "
                           "will be started and whatever is running finishes "
                           "first.")
+
+
+class DriverHandback:
+    """The latch a driver hook's hand-back request lands in (see
+    `RunStopReason.DRIVER_PAUSE`): the first reason wins, and it stays.
+
+    The third of this module's holds, and not to be read as either of the other
+    two: the `p` key's (`pause_requested`) is resumed, a stop (`pending_stop`)
+    ends the whole invocation, and this one ends the RUNNER CALL — the caller is
+    expected to ask again. Both runners keep one, because a hook asks for it
+    where the run cannot act on it yet (mid-item, or on a worker that does not
+    own the ending), so the request has to wait somewhere for the place that
+    acts on it.
+
+    First-reason-wins is the whole rule: a pause already asked for is not
+    withdrawn by a later hook answering None, nor renamed by a later one naming
+    something else — the line announcing it is printed once, from the reason
+    that latched. A falsy reason (None, "") is "nothing asked" and latches
+    nothing, which is what the Driver hooks' default answer relies on.
+
+    Its own lock makes `latch` answer True to exactly one caller however many
+    threads race it. What a hand-back must NOT override — a final ending the
+    fleet already latched (`parallel.Shared.request_driver_handback`) — is the
+    caller's coupling to decide under the caller's lock; this class knows
+    nothing about claims or stop reasons.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reason: Optional[str] = None
+
+    def latch(self, reason: Optional[str]) -> bool:
+        """Record `reason` unless one is already latched. True for the caller
+        whose reason is now the latched one — the one that announces it."""
+        if not reason:
+            return False
+        with self._lock:
+            if self._reason is not None:
+                return False
+            self._reason = reason
+            return True
+
+    @property
+    def reason(self) -> Optional[str]:
+        """The latched reason, or None while nothing asked."""
+        return self._reason
+
+    @property
+    def pending(self) -> bool:
+        """Has a hook asked for control back? Read without the lock: a lone
+        attribute read is atomic, and the latch only ever goes None -> str."""
+        return self._reason is not None
 
 
 def commit_stop(app, source: StopSource) -> Tuple[RunStopReason, str]:

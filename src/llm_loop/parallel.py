@@ -624,13 +624,12 @@ class Shared:
         self.stop_owner = None        # job_id deciding the request's fate
         self.stop_reason = None
         # Why the driver asked the run to hand control back (see
-        # request_driver_handback), or None. Read by the workers as well as
-        # written: it is what releases one parked on the usage gate, and what
-        # tells a claim held there that it may go back to the queue. A plain
-        # attribute rather than an Event because the reason travels with it, and
-        # a lone assignment of one is atomic — the lock still guards the
-        # transition that decides WHO latches it.
-        self.handback_reason = None
+        # request_driver_handback). Read by the workers as well as written: it
+        # is what releases one parked on the usage gate, and what tells a claim
+        # held there that it may go back to the queue. The latch's own rule is
+        # stopchannel's; `self.lock` still guards its coupling to
+        # `claims_closed` and `stop_reason`.
+        self.handback = stopchannel.DriverHandback()
         # Whether the fleet has already said it is paused (see note_pause): the
         # `p` key is read by every worker, and a fleet of eight would otherwise
         # announce one keypress eight times.
@@ -898,9 +897,8 @@ class Shared:
         reopenable), and a pause arriving a moment later must not relabel them.
         """
         with self.lock:
-            if self.claims_closed.is_set():
+            if self.claims_closed.is_set() or not self.handback.latch(reason):
                 return False
-            self.handback_reason = reason
             self.stop_reason = RunStopReason.DRIVER_PAUSE
             self.claims_closed.set()
             return True
@@ -1111,7 +1109,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                         paused, new_start = policy.check_and_wait(
                             source, session_start_box[0],
                             should_stop=lambda: (shared.stop_asked(app)
-                                                 or shared.handback_reason is not None))
+                                                 or shared.handback.pending))
                         if paused:
                             session_start_box[0] = new_start
                         # The check just paid for a usage reading; publishing it
@@ -1153,7 +1151,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # got control back. AFTER the stop hold, so a stop that is also
             # pending is still this worker's to latch: an ending a human asked
             # for outranks one a driver did.
-            if shared.handback_reason is not None:
+            if shared.handback.pending:
                 shared.release(line)
                 break
 
