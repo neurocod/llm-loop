@@ -32,6 +32,7 @@ Usage:
   python replace_in_file.py FILE --old X --new Y --count any # any number
   python replace_in_file.py FILE --regex --old '^const A = 1;$' --new 'const A = 0;'
   python replace_in_file.py FILE --old X --new Y --dry-run
+  python replace_in_file.py FILE --remove 'guard();'          # delete it
 
 To mutate a file, run something, and put it back, use try_patch.py (its
 neighbour in this directory) -- it restores even when the command crashes or is
@@ -148,15 +149,47 @@ def parse_count(value: str) -> "int | None":
 
 
 def add_edit_arguments(parser: argparse.ArgumentParser) -> None:
-    """The edit half of the CLI, shared with try_patch.py."""
-    parser.add_argument("--old", required=True, metavar="TEXT",
+    """The edit half of the CLI; resolve_edit() turns it into (old, new).
+
+    Deletion has two spellings, the same two try_patch.py accepts, because the
+    obvious one -- `--new ""` -- never reaches us from Windows PowerShell 5.1:
+    it drops an empty argument to a native program, and a `--new` that REQUIRED
+    a value then saw the next flag, or nothing, and refused the run ("argument
+    --new: expected one argument"; found in an agent transcript 2026-09-12).
+    So a bare --new means "", wherever the dropped token left it, and --remove
+    says the operation by name. Neither depends on an empty token surviving a
+    shell. The report still prints the deleted lines.
+    """
+    parser.add_argument("--old", metavar="TEXT",
                         help="text to find (literal unless --regex)")
-    parser.add_argument("--new", required=True, metavar="TEXT",
-                        help="text to put in its place")
+    parser.add_argument("--new", metavar="TEXT", nargs="?", const="",
+                        help="text to put in its place; bare --new (or "
+                             "--new \"\") deletes")
+    parser.add_argument("--remove", metavar="TEXT",
+                        help="delete TEXT: same as --old TEXT --new \"\" "
+                             "(a regex under --regex)")
     parser.add_argument("--regex", action="store_true",
                         help="treat --old as a regex (MULTILINE; \\1 in --new)")
     parser.add_argument("--count", type=parse_count, default=1, metavar="N",
                         help="occurrences required, or 'any' (default: 1)")
+
+
+def resolve_edit(parser: argparse.ArgumentParser,
+                 options: argparse.Namespace) -> "tuple[str, str]":
+    """(old, new) from either spelling, or a usage error (exit 2).
+
+    Mixing --remove with --old/--new is refused rather than resolved: which one
+    the caller meant is a guess, and a guess here writes a file.
+    """
+    if options.remove is not None:
+        if options.old is not None or options.new is not None:
+            parser.error("--remove TEXT is a whole edit; do not combine it "
+                         "with --old/--new")
+        return options.remove, ""
+    if options.old is None or options.new is None:
+        parser.error("give --old TEXT --new TEXT, or --remove TEXT to delete "
+                     "(a bare --new deletes too)")
+    return options.old, options.new
 
 
 # No read-edit-write-in-one helper lives here on purpose. The obvious one
@@ -182,17 +215,20 @@ def main() -> int:
                "  python %(prog)s FILE --old X --new Y --count any # any number\n"
                "  python %(prog)s FILE --regex --old '^const A = 1;$' "
                "--new 'const A = 0;'\n"
-               "  python %(prog)s FILE --old X --new Y --dry-run\n",
+               "  python %(prog)s FILE --old X --new Y --dry-run\n"
+               "  python %(prog)s FILE --remove 'guard();'          "
+               "# delete it\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("file", type=Path, metavar="FILE")
     add_edit_arguments(parser)
     parser.add_argument("--dry-run", action="store_true",
                         help="report what would change, write nothing")
     options = parser.parse_args()
+    old, new = resolve_edit(parser, options)
 
     try:
         before, crlf = read_text(options.file)
-        after, hits = apply_replacement(before, options.old, options.new,
+        after, hits = apply_replacement(before, old, new,
                                         options.regex, options.count, crlf)
         if not options.dry_run:
             write_text(options.file, after)
