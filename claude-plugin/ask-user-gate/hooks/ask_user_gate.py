@@ -930,11 +930,31 @@ def self_test() -> int:
 
 
 class _Parser(argparse.ArgumentParser):
-    """argparse, plus the one hint its refusal of a bare --check needs.
+    """argparse, with the value-or-flag rule pinned and one hint added.
 
-    That refusal is what `--check ""` looks like after PowerShell 5.1, and the
-    usage line it prints does not name the spelling that works.
+    The hint: argparse's refusal of a bare --check is what `--check ""` looks
+    like after PowerShell 5.1, and the usage line it prints does not name the
+    spelling that works.
     """
+
+    # Which dash-led tokens after a value-taking flag are VALUES because they
+    # are negative numbers -- ours, not argparse's, because argparse changed it:
+    # up to 3.13 `^-\d+$|^-\d*\.\d+$`, from 3.14 the prefix `-\.?\d`, so
+    # `--check -1abc` (also -1e5, -1.2.3, -.5x, -1_000) was a verdict under one
+    # interpreter and a usage error under the other, and the port could agree
+    # with at most one of them. Both of those also read `\d` as any Unicode
+    # digit (`-٥`), and the older `$` matches before a trailing newline (`-5\n`).
+    # This one is the narrow shape -- a dash, ASCII digits, at most one dot,
+    # nothing after -- which C++ spells without a Unicode table (the port's
+    # looksLikeOption), and on a miss the token is a flag: a usage error,
+    # never a verdict on a command the caller did not mean. argparse reads the
+    # attribute as `_negative_number_matcher.match(token)` in every version
+    # this runs on; were that ever to change, parity_check's ARGV_CASES fail.
+    NEGATIVE_NUMBER = re.compile(r"-(?:[0-9]+|[0-9]*\.[0-9]+)\Z")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._negative_number_matcher = self.NEGATIVE_NUMBER
 
     def error(self, message):
         if message.startswith("argument --check: expected one argument"):
@@ -948,7 +968,8 @@ def main() -> int:
                     "permission prompt. Reads a PreToolUse hook payload on "
                     "stdin unless --check/--self-test is given.")
     # The empty command is spelled `--check=`, and a bare --check stays an
-    # error -- in both halves (the port's takeValue says the same). The obvious
+    # error -- in both halves (the port's side, and why its parser had to learn
+    # to tell a flag from a value, is at its looksLikeOption). The obvious
     # `--check ""` never arrives from Windows PowerShell 5.1, which drops an
     # empty argument to a native program; argparse then sees --check followed
     # by the next flag, or by nothing. Reading that bare --check as "" (what
@@ -985,8 +1006,15 @@ def main() -> int:
 
     command = options.check
     if options.check_file is not None:
-        with open(options.check_file, encoding="utf-8") as handle:
-            command = handle.read()
+        # Exit 2, the usage-error code, as the port does: an uncaught OSError
+        # would exit 1, and 1 is this CLI's "denied".
+        try:
+            with open(options.check_file, encoding="utf-8") as handle:
+                command = handle.read()
+        except OSError as exc:
+            print(f"ask_user_gate: cannot read {options.check_file} "
+                  f"({exc.strerror or exc})", file=sys.stderr)
+            return 2
     if command is not None:
         findings = scan(command, options.shell, windows, options.tool)
         if not findings:

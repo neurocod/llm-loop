@@ -17,7 +17,8 @@ verdict until it is far too late.
   python cpp/parity_check.py --exe PATH      # a binary built somewhere else
   python cpp/parity_check.py --verbose       # print every case
 
-Exit 1 on any difference. Requires the binary; build it with cpp/build.py.
+Exit 1 on any difference. Requires the binary, built with cpp/build.py since
+the source last changed (exit 2 otherwise, see newer_sources).
 """
 
 import argparse
@@ -205,12 +206,27 @@ ARGV_CASES = [
     ["--check", "-x"],                        # dash-led, no space: a flag
     ["--check", "-1"],                        # a negative number: a value
     ["--check", "-.5"],
+    # Not negative numbers by the gate's own rule (_Parser.NEGATIVE_NUMBER),
+    # whatever this interpreter's argparse would say: flags, so usage errors.
+    ["--check", "-1e5"],
+    ["--check", "-1abc"],
+    ["--check", "-1.2.3"],
+    ["--check", "-.5x"],
+    ["--check", "-1_000"],
+    ["--check", "-5\n"],                      # the old argparse `$` took it
+    ["--check", "-٥"],                   # a Unicode digit, ARABIC-INDIC 5
+    ["--check", "-= x"],                      # `-` before `=`: every option
     ["--check", "-n 1; cd y && ls"],          # dash-led with a space: a value
     ["--tool", "--check", "cd x && ls"],
     ["--tool", "--check=cd x && ls"],         # a flag, space or not
     ["--check", "--sh=a b"],                  # an abbreviation, space or not
     ["--check", "-h x"],                      # -h glued to anything is -h
     ["--check", "cd x && ls", "--tool", "-h"],
+    # Not a usage error in the argparse sense, but exit 2 all the same: exit 1
+    # is "denied", and a file that cannot be read was not judged.
+    ["--check-file", "no-such-file-7c1f0e.txt"],
+    # No command at all: hook mode, on the empty stdin argv_verdict gives it.
+    ["--tool=Bash"],
 ]
 
 # Hook mode: the path that actually runs. The first group is ordinary traffic;
@@ -305,6 +321,23 @@ def default_exe() -> str:
     return os.path.join(HOOKS, name)
 
 
+def newer_sources(exe: str) -> "list[str]":
+    """The port's sources edited after `exe` was built: a stale binary.
+
+    The binary is gitignored and built by hand, so an edit to the .cpp that
+    nobody rebuilt leaves the OLD port answering here -- and the comparison
+    then pins yesterday's code while reading as today's. By mtime: a checkout
+    that changes the source touches it too, which is right, since the binary
+    no longer matches what is checked out. CMakeLists.txt is left out on
+    purpose: a change there need not relink, and would read as stale forever.
+    """
+    built = os.path.getmtime(exe)
+    sources = [os.path.join(HERE, "ask_user_gate.cpp")]
+    for folder, _, names in os.walk(os.path.join(HERE, "third_party")):
+        sources += [os.path.join(folder, name) for name in names]
+    return [path for path in sources if os.path.getmtime(path) > built]
+
+
 def check_verdict(argv: "list[str]", command: str, shell: str, tool: str,
                   scratch: str, newline: str = "") -> "tuple[int, str]":
     """One command through one gate's CLI, via --check-file.
@@ -334,10 +367,18 @@ def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]"
     """One ARGV_CASES entry through one gate's CLI, host fixed to Windows.
 
     `--platform windows` goes FIRST so that a case can end on a bare --check.
-    A usage error (exit 2) keeps only its code, see ARGV_CASES.
+    A usage error (exit 2) keeps only its code, see ARGV_CASES. stdin is
+    closed because an argv that one half parses as "no command" puts it in
+    hook mode, reading a payload that would never come.
     """
-    result = subprocess.run(argv + ["--platform", "windows"] + arguments,
-                            capture_output=True)
+    try:
+        result = subprocess.run(argv + ["--platform", "windows"] + arguments,
+                                stdin=subprocess.DEVNULL, capture_output=True,
+                                # vs ~70 ms a run (the README's hook-mode
+                                # median): only tells a hang from a slow box
+                                timeout=60)
+    except subprocess.TimeoutExpired:
+        return -1, "<timeout>"
     if result.returncode == 2:
         return 2, "<usage error>"
     if result.stderr:
@@ -403,6 +444,15 @@ def main() -> int:
         print(f"{options.exe} is not there -- build it with "
               f"`python cpp/build.py`", file=sys.stderr)
         return 2
+    # Only the binary built from THIS checkout: one given with --exe may come
+    # from anywhere, and its mtime says nothing about these sources.
+    stale = (newer_sources(options.exe)
+             if os.path.normcase(os.path.abspath(options.exe))
+             == os.path.normcase(default_exe()) else [])
+    if stale:
+        print(f"{options.exe} is older than {', '.join(stale)} -- a stale "
+              f"binary; rebuild it with `python cpp/build.py`", file=sys.stderr)
+        return 2
 
     reference_argv = [sys.executable, os.path.join(HOOKS, "ask_user_gate.py")]
     gate_argv = [options.exe]
@@ -441,11 +491,13 @@ def main() -> int:
             cpp_code, cpp_text = argv_verdict(gate_argv, arguments)
             if (py_code == cpp_code
                     and normalise(py_text) == normalise(cpp_text)):
+                # ascii(), not repr(): a case carries a non-ASCII digit, and a
+                # cp1252 console raises on it mid-report.
                 if options.verbose:
-                    print(f"ok   [argv] {arguments!r} -> exit {py_code}")
+                    print(f"ok   [argv] {ascii(arguments)} -> exit {py_code}")
                 continue
             failures += 1
-            print(f"DIFF [argv] {arguments!r}\n"
+            print(f"DIFF [argv] {ascii(arguments)}\n"
                   f"  python (exit {py_code}):\n{normalise(py_text)}\n"
                   f"  c++    (exit {cpp_code}):\n{normalise(cpp_text)}",
                   file=sys.stderr)

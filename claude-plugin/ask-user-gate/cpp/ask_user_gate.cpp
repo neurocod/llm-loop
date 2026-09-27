@@ -1475,15 +1475,21 @@ bool looksLikeOption(std::string_view token) {
 		if (option == name)
 			return true;
 	// argparse also resolves abbreviations -- any prefix of a long option, and
-	// `-h` glued to anything -- even where the flag itself then fails.
+	// `-h` glued to anything -- even where the flag itself then fails. A single
+	// dash matches by the text before `=` as well, and `-=...` leaves just `-`
+	// there, a prefix of every option: ambiguous, but a flag.
 	if (startsWith(token, "--")) {
 		for (std::string_view option : kOptions)
 			if (startsWith(option, name))
 				return true;
-	} else if (startsWith(token, "-h")) {
+	} else if (startsWith(token, "-h") || startsWith(token, "-=")) {
 		return true;
 	}
-	// A negative number, and anything with a space in it, is a value.
+	// A negative number, and anything with a space in it, is a value. The
+	// negative-number shape is the reference's own _Parser.NEGATIVE_NUMBER, not
+	// argparse's, which moved between Python versions (the reason is there):
+	// a dash, ASCII digits, at most one dot, nothing after -- no exponent, no
+	// Unicode digit, no trailing newline.
 	const auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
 	const std::string_view body = token.substr(1);
 	const size_t dot = body.find('.');
