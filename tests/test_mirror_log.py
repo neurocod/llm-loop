@@ -385,8 +385,9 @@ _BARE_REFUSAL = "argument --cost-log: expected one argument"
 @pytest.mark.parametrize("words, refusal", [
     (["--cost-log="], _LOG_FILE_REFUSAL),
     (["--cost-log=  "], _LOG_FILE_REFUSAL),
+    (["--cost-log", "."], _LOG_FILE_REFUSAL),   # costlog.named_log's rule
     (["--cost-log"], _BARE_REFUSAL),
-], ids=["equals-empty", "equals-blank", "bare"])
+], ids=["equals-empty", "equals-blank", "dot", "bare"])
 def test_an_empty_cost_log_is_a_usage_error(tmp_path, capsys, words, refusal):
     """`--cost-log=` is what PowerShell 5.1 leaves of an empty path that
     survives, and bare `--cost-log` what it leaves of `--cost-log ""`: one

@@ -35,6 +35,7 @@ public for each host to run over the parsers it builds.
 import argparse
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
+from . import costlog
 from . import providers
 from . import termio
 from .gitpush import GIT_PUSH_POLICY, GitPushPolicy
@@ -76,13 +77,18 @@ def log_file(text: str) -> str:
     asked not to run. And it arrives in two spellings for one intent: PowerShell
     5.1 drops the `""` of `--cost-log ""`, which argparse then refuses as a bare
     flag ("expected one argument"), while `--cost-log=` delivers "". Refusing the
-    empty (or blank) value makes both a usage error, exit 2, before anything
-    else runs.
+    empty value makes both a usage error, exit 2, before anything else runs.
+
+    Which paths name no log is `costlog.named_log`'s rule, the one `run_loop`
+    applies to a namespace built past this parser; here it only becomes a
+    usage error, so the two cannot disagree on a spelling.
     """
-    if not text.strip():
+    try:
+        costlog.named_log(text)
+    except ValueError:
         raise argparse.ArgumentTypeError(
             "needs a log file; use --cost without --cost-log to report on this "
-            "entry point's own log")
+            "entry point's own log") from None
     return text
 
 
