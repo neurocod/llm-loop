@@ -8,9 +8,9 @@ says so -- not `git status`, not a test run. Here, a `pytest` does.
 
 The parity case is skipped where the binary was never built, which is every CI
 runner and every fresh clone. A binary older than its source FAILS it instead:
-parity_check refuses to compare yesterday's port (newer_sources there). The script's own `--self-test` is not skipped:
-it needs nothing but the checkout, and it is the half that every plugin install
-actually runs.
+parity_check refuses to compare yesterday's port (newer_sources there). The
+script's own `--self-test` is not skipped: it needs nothing but the checkout,
+and it is the half that every plugin install actually runs.
 """
 
 import os
