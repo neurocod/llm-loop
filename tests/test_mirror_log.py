@@ -16,7 +16,8 @@ import sys
 
 import pytest
 
-from llm_loop import console, costlog, cyclecore, exitlog, parallel, projectroot
+from llm_loop import (console, costlog, cyclecore, exitlog, parallel,
+                      projectroot, runlifecycle)
 
 from _runfixtures import (MemListDriver, NoWorkDriver, OneShotDriver,
                           drop_logger, par_args, root_named_unlike_cwd,
@@ -347,3 +348,63 @@ def test_naming_a_log_reports_instead_of_running_the_loop(
     out = capsys.readouterr().out
     assert str(named) in out
     assert "TOTAL: 2 sessions, 3 costs, $2.2500" in out
+
+
+# --- --cost-log through the real parser -----------------------------------------
+# The pins above hand run_loop a namespace; these start from an argv, because the
+# empty value only exists as a spelling (`--cost-log=`) and it is the parser that
+# decides what it becomes. `--dry-run --git-push none` for the reason
+# test_naming_a_log_reports_instead_of_running_the_loop gives.
+
+def _parsed_cost_args(project, *cost_words):
+    return cyclecore.parse_args(["-C", str(project), "--dry-run", "--git-push",
+                                 "none", "--no-statusline", *cost_words])
+
+
+@pytest.mark.parametrize("spelling", ["pair", "equals"])
+def test_a_parsed_cost_log_reports_instead_of_running_the_loop(
+        tmp_path, log_dir, capsys, spelling):
+    named = tmp_path / "named.log"
+    named.write_text(_TWO_SESSIONS, encoding="utf-8")
+    words = ((["--cost-log", str(named)]) if spelling == "pair"
+             else [f"--cost-log={named}"])
+
+    driver = OneShotDriver()
+    cyclecore.run_loop(driver, _parsed_cost_args(tmp_path, *words),
+                       app_name="pytest-costs-parsed", wait_on_start=False)
+
+    assert driver.served == 0, "the loop ran instead of reporting"
+    assert "TOTAL: 2 sessions, 3 costs, $2.2500" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("words", [["--cost-log="], ["--cost-log=  "],
+                                   ["--cost-log"]],
+                         ids=["equals-empty", "equals-blank", "bare"])
+def test_an_empty_cost_log_is_a_usage_error(tmp_path, capsys, words):
+    """`--cost-log=` is what PowerShell 5.1 leaves of an empty path that
+    survives, and bare `--cost-log` what it leaves of `--cost-log ""`: one
+    intent, so one refusal — exit 2 from the parser — for both."""
+    with pytest.raises(SystemExit) as exc:
+        _parsed_cost_args(tmp_path, *words)
+
+    assert exc.value.code == 2
+    assert "--cost-log" in capsys.readouterr().err
+
+
+def test_an_empty_cost_log_in_a_namespace_never_opens_the_run(
+        tmp_path, log_dir, monkeypatch):
+    """A host that builds its namespace past the parser still gets a refusal,
+    not the loop: the flag's presence picks the report, and the report refuses
+    the empty path before `begin_run` - the prologue that raises the tee, opens
+    the exit record and leads to git and the usage gate."""
+    def forbidden(*args, **kwargs):
+        raise AssertionError("an empty --cost-log reached begin_run")
+
+    monkeypatch.setattr(runlifecycle, "begin_run", forbidden)
+    driver = OneShotDriver()
+
+    with pytest.raises(ValueError, match="--cost-log"):
+        cyclecore.run_loop(driver, seq_args(tmp_path, dry_run=True, cost_log="",
+                                            no_statusline=True),
+                           app_name="pytest-costs-empty", wait_on_start=False)
+    assert driver.served == 0

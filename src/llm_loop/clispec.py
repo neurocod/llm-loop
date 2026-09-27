@@ -49,6 +49,7 @@ __all__ = [
     "PARALLEL",
     "SEQUENTIAL",
     "build_parser",
+    "log_file",
     "unstrippable_flags",
 ]
 
@@ -65,6 +66,24 @@ PARALLEL = "parallel"
 # below, which has to print it. (The other direction is closed anyway: `parallel`
 # imports this module, so this module cannot import `parallel`.)
 DEFAULT_JOBS = 10
+
+
+def log_file(text: str) -> str:
+    """argparse `type=` of --cost-log: a log path, never an empty one.
+
+    The flag's PRESENCE is what selects the report (see `run_loop`), so an empty
+    value cannot mean "absent" there without starting the agent loop the user
+    asked not to run. And it arrives in two spellings for one intent: PowerShell
+    5.1 drops the `""` of `--cost-log ""`, which argparse then refuses as a bare
+    flag ("expected one argument"), while `--cost-log=` delivers "". Refusing the
+    empty (or blank) value makes both a usage error, exit 2, before anything
+    else runs.
+    """
+    if not text.strip():
+        raise argparse.ArgumentTypeError(
+            "needs a log file; omit it (or use --cost) to report on this entry "
+            "point's own log")
+    return text
 
 
 class Flag(NamedTuple):
@@ -165,7 +184,7 @@ OPTIONS: Dict[str, Option] = {
     "--cost-log": Option(
         aliases=("--cost-log",),
         takes_value=True,
-        kwargs=dict(dest="cost_log", metavar="LOG"),
+        kwargs=dict(dest="cost_log", metavar="LOG", type=log_file),
         help="report on this log file instead of this entry point's "
              "own — a rotated backup (<app>-<project>.log.1) or a "
              "copy; implies --cost",

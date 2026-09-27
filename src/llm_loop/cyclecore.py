@@ -429,6 +429,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # same value again, which is what makes doing it twice free.
     # --cost-log implies --cost: naming a log to read and getting a loop run
     # instead would be a silent misfire, and there is nothing else it could mean.
+    # So it is the flag's PRESENCE (`is not None`) that picks the report, never
+    # its truthiness: an empty path read as "absent" started the loop. The parser
+    # refuses an empty path (`clispec.log_file`); a namespace built by hand that
+    # carries one anyway is refused by `report_costs`, still before the prologue.
     projectroot.set_project_root(getattr(args, "project_dir", None))
     # A path query must not open the log or start any part of the loop.
     if getattr(args, "log", False):
@@ -436,7 +440,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
 
     cost_log = getattr(args, "cost_log", None)
-    if getattr(args, "cost", False) or cost_log:
+    if getattr(args, "cost", False) or cost_log is not None:
         costlog.report_costs(app_name, cost_log)
         return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
 

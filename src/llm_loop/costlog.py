@@ -93,8 +93,14 @@ def report_costs(app_name: str = "runCycle",
     a rotated backup (`<app>-<project>.log.1`) or a copy taken elsewhere. It is
     the one case app_name cannot reach, since rotation renames files out from
     under log_file_path.
+
+    An empty or blank string `path` raises ValueError instead of meaning "no
+    path": the caller named a log, and reporting on a different one would look
+    like an answer.
     """
-    path = Path(path) if path else console.log_file_path(app_name)
+    if isinstance(path, str) and not path.strip():
+        raise ValueError(f"--cost-log needs a log file, got {path!r}")
+    path = Path(path) if path is not None else console.log_file_path(app_name)
     # Always name the log we are reading, so an empty report is unambiguous
     # (right file, no data) rather than looking like a silent failure.
     print(f"Reading mirror log: {path}")
