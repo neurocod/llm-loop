@@ -58,6 +58,9 @@ Usage:
   python try_patch.py --file a.ts --old X --new Y \\
                       --file a.ts --old P --new Q -- npm test
 
+  # deleting a line: --remove TEXT is --old TEXT --new ""
+  python try_patch.py --file a.ts --remove 'guard();' --expect-fail -- npm test
+
   python try_patch.py --selftest   # pins the restore contract, no repo
 
   python try_patch.py --recover    # undo what a KILLED run left (see JOURNAL_DIR_NAME)
@@ -93,8 +96,15 @@ class Triple(argparse.Action):
     """
 
     def __call__(self, parser, namespace, values, option_string=None):
+        order = getattr(namespace, "_order")
         key = option_string.lstrip("-")
-        getattr(namespace, "_order").setdefault(key, []).append(values)
+        if key == "remove":
+            # `--remove X` is `--old X --new ""`, filed as that pair so the
+            # zip in collect_edits keeps pairing by position.
+            order.setdefault("old", []).append(values)
+            order.setdefault("new", []).append("")
+            return
+        order.setdefault(key, []).append(values)
 
 
 def collect_edits(namespace) -> list[tuple[Path, str, str]]:
@@ -106,7 +116,7 @@ def collect_edits(namespace) -> list[tuple[Path, str, str]]:
         raise EditError("no --file given")
     if not (len(files) == len(olds) == len(news)):
         raise EditError(
-            f"--file/--old/--new must come in triples "
+            f"--file/--old/--new (or --file/--remove) must come in triples "
             f"(got {len(files)} file, {len(olds)} old, {len(news)} new)")
     return [(Path(f), o, n) for f, o, n in zip(files, olds, news)]
 
@@ -174,6 +184,8 @@ def main() -> int:
                "test/player.test.ts\n"
                "  python %(prog)s --file a.ts --old X --new Y \\\n"
                "                      --file b.ts --old P --new Q -- npm test\n"
+               "  python %(prog)s --file a.ts --remove 'guard();' "
+               "--expect-fail -- npm test\n"
                "  python %(prog)s --selftest   # pins the restore contract\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--file", action=Triple, metavar="FILE",
@@ -187,6 +199,9 @@ def main() -> int:
     parser.add_argument("--new", action=Triple, metavar="TEXT", nargs="?",
                         const="",
                         help="replacement; bare --new (or --new \"\") deletes")
+    parser.add_argument("--remove", action=Triple, metavar="TEXT",
+                        help="delete TEXT: same as --old TEXT --new \"\" "
+                             "(a regex under --regex)")
     parser.add_argument("--regex", action="store_true",
                         help="treat every --old as a regex (MULTILINE)")
     parser.add_argument("--count", type=parse_count, default=1, metavar="N",
@@ -1061,6 +1076,20 @@ def _case_a_bare_new_deletes(work: Path) -> None:
     _expect_bytes(victim, GUARDS, result)
 
 
+def _case_remove_pairs_with_its_own_file(work: Path) -> None:
+    """--remove between two ordinary triples must not shift their pairing."""
+    victim = _victim(work)
+    result = _run(work, *_flip("guardA"),
+                  "--file", "victim.cpp", "--remove", "guardB = true;\n",
+                  *_flip("guardC"), "--", sys.executable, "-c",
+                  "import pathlib, sys; t = pathlib.Path('victim.cpp').read_text();"
+                  " sys.exit(0 if t == 'guardA = false;\\nguardC = false;\\n'"
+                  " else 9)")
+    _expect(result.returncode == 0,
+            f"exit {result.returncode}\n{result.stdout}{result.stderr}")
+    _expect_bytes(victim, GUARDS, result)
+
+
 def _case_failing_command_restores_and_reports(work: Path) -> None:
     victim = _victim(work)
     result = _run(work, *_flip("guardA"), *_flip("guardB"), *CMD_FAIL)
@@ -1406,6 +1435,7 @@ SELFTEST_CASES = (
     _case_stacked_edits_all_reach_the_command,
     _case_same_file_spelled_two_ways,
     _case_a_bare_new_deletes,
+    _case_remove_pairs_with_its_own_file,
     _case_failing_command_restores_and_reports,
     _case_expect_fail_accepts_a_failing_command,
     _case_expect_fail_rejects_a_passing_command,
