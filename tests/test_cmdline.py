@@ -5,7 +5,11 @@ value", so most of these tests are one spelling each: a missed spelling leaves
 the old value on the line next to the new one, which reads as correct and is not.
 """
 
+import base64
+import json
 import os
+import shutil
+import subprocess
 import sys
 
 import pytest
@@ -150,6 +154,31 @@ def test_zero_is_a_value_not_a_removal():
     assert rebuild_argv([], {"--max-runs": 0}) == ["--max-runs", "0"]
 
 
+# --- empty values ---------------------------------------------------------------
+# `--flag=`, one token: the pair `--flag ""` is lost to PowerShell 5.1 on paste
+# (see cmdline._empty_value). The round trip through the shell itself is pinned
+# below, under render.
+
+def test_an_empty_override_is_one_equals_token():
+    assert rebuild_argv(["-m", "5"], {"--project-dir": ""}) == [
+        "-m", "5", "--project-dir="]
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["--project-dir", ""], ["--project-dir="]),
+    (["-C", "", "--raw"], ["--project-dir=", "--raw"]),
+    (["--max", ""], ["--max="]),            # a long alias keeps its spelling
+    (["--project-dir=", "--raw"], ["--project-dir=", "--raw"]),
+])
+def test_a_copied_empty_value_is_respelled_as_one_token(argv, expected):
+    assert rebuild_argv(argv, {}) == expected
+
+
+def test_an_empty_token_after_dashdash_is_left_alone():
+    argv = ["-C", "D:/p", "--", "--project-dir", ""]
+    assert rebuild_argv(argv, {}) == argv
+
+
 # --- the table's address --------------------------------------------------------
 # Its SHAPE is pinned where it is now declared, in test_clispec.py: this module
 # consumes the table, it no longer owns it. What stays this module's business is
@@ -183,6 +212,53 @@ def test_render_quotes_paths_with_spaces():
 def test_render_defaults_the_script_to_argv0(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["runCycle.py", "-m", "5"])
     assert render(["-m", "5"], {}, executable="python") == "python runCycle.py -m 5"
+
+
+POWERSHELL = shutil.which("powershell.exe") if os.name == "nt" else None
+# 2.4-4.2 s per test here (three cases, measured 2026-09-27; the ask-user-gate
+# CLI's round trips measured 0.18-0.20 s the same day on a warm shell); the
+# budget only has to tell a hang from a slow box.
+PS_TIMEOUT_S = 60
+_ECHO_ARGV = "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"
+
+
+@pytest.mark.skipif(POWERSHELL is None,
+                    reason="Windows PowerShell 5.1 is the shell that drops \"\"")
+@pytest.mark.parametrize("argv, overrides", [
+    (["-m", "5"], {"--project-dir": ""}),
+    (["-C", "", "-m", "5"], {"--max-runs": 2}),
+    (["-p", "--finish", "products/configs/x"],
+     {"--start-in": "", "--project-dir": r"C:\my project"}),
+], ids=["empty-override", "copied-empty", "empty-among-values"])
+def test_the_rendered_line_round_trips_through_powershell(
+        tmp_path, argv, overrides):
+    """Paste the line into PowerShell 5.1 and read back the argv it delivers.
+
+    Comparing renderer text alone is what let `--project-dir ""` pass: it is
+    the right CreateProcess spelling and still arrives as a bare flag.
+    """
+    echo = tmp_path / "echo_argv.py"
+    echo.write_text(_ECHO_ARGV, encoding="utf-8")
+    line = render(argv, overrides, executable=sys.executable, script=str(echo))
+    # `& ` because PowerShell reads a QUOTED first token (an interpreter under
+    # "Program Files") as a string expression, not a command; the rendered line
+    # does not carry it, since cmd.exe would reject it.
+    source = "& " + line + "; exit $LASTEXITCODE"
+    encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
+    result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive",
+                             "-EncodedCommand", encoded],
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=PS_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+    delivered = json.loads(result.stdout)
+    assert delivered == rebuild_argv(argv, overrides), line
+
+    # And it MEANS what the run meant: the same namespace as the pair spelling.
+    parser = clispec.build_parser(clispec.SEQUENTIAL, prog="pytest")
+    pairs = list(argv)
+    for flag, value in overrides.items():
+        pairs += [flag, str(value)]
+    assert parser.parse_known_args(delivered) == parser.parse_known_args(pairs)
 
 
 def test_quote_round_trips_through_the_local_shell_rules():

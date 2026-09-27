@@ -68,12 +68,29 @@ def _lookup(arg: str, aliases: Dict[str, Flag]):
         if not spec.takes_value:
             continue
         for alias in spec.aliases:
-            # Glued short form (`-m5`, `-Cd:\proj`): argparse accepts it, and so
-            # does the wrapper's own -C scan, so it must be removable here too.
+            # Glued short form (`-m5`, `-Cd:\proj`): argparse accepts it, so it
+            # must be removable here too.
             if (len(alias) == 2 and not alias.startswith("--")
                     and len(arg) > 2 and arg.startswith(alias)):
                 return canonical, spec, False
     return None, None, False
+
+
+def _empty_value(spelling: str, canonical: str) -> str:
+    """The one token that gives the value-taking flag `spelling` an EMPTY value.
+
+    `--flag=` rather than the pair `--flag ""`: argparse (and the host wrapper's
+    own `--finish=` reader) takes both as the empty value, but only the single
+    token survives the shell the line is pasted into. Windows PowerShell 5.1
+    drops an empty argument to a native program, so a pasted `--project-dir ""`
+    arrives as a bare `--project-dir` that swallows the next flag as its value,
+    or ends the line as a usage error. `list2cmdline` cannot help: `""` is the
+    correct CreateProcess spelling, and the shell in between is what loses it.
+
+    A short spelling has no `=` form (`-C=` is the value "="), so it is
+    replaced by the canonical long one.
+    """
+    return (spelling if spelling.startswith("--") else canonical) + "="
 
 
 def _validate(overrides: Dict[str, Any], aliases: Dict[str, Flag]) -> None:
@@ -102,6 +119,11 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
     have its value misread. A flag a parser offers cannot go missing any more
     (the table is derived from the same declaration the parsers are built from);
     a wrapper-only one still has to be declared in `clispec.OPTIONS` by hand.
+
+    An EMPTY value - an override of `""` or a copied `-C ""` - comes out as the
+    single token `--flag=` (see `_empty_value`), so this is the one place a
+    copied flag is respelled. The `--` tail is never respelled: it is not this
+    table's to read, so an empty token there stays one.
     """
     _validate(overrides, aliases)
     head, tail = _split_passthrough(argv)
@@ -117,7 +139,10 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
         if canonical in dropped:
             i += span
             continue
-        out.extend(head[i:i + span])
+        if span == 2 and head[i + 1] == "":
+            out.append(_empty_value(head[i], canonical))
+        else:
+            out.extend(head[i:i + span])
         i += span
 
     # Appended in table order, never in dict order: the line must be identical
@@ -131,8 +156,12 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
         if spec.takes_value:
             if value is True:
                 raise ValueError(f"{canonical} needs a value, got True")
-            out.append(canonical)
-            out.append(str(value))
+            text = str(value)
+            if text == "":
+                out.append(_empty_value(canonical, canonical))
+            else:
+                out.append(canonical)
+                out.append(text)
         else:
             if value is not True:
                 raise ValueError(
@@ -145,8 +174,10 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
 def quote(parts: List[str]) -> str:
     """Join argv into one pasteable line, quoted for the local shell."""
     if os.name == "nt":
-        # cmd.exe/PowerShell parse the way CreateProcess does; list2cmdline is
-        # the inverse of that parse, shlex is the inverse of the POSIX one.
+        # list2cmdline is the inverse of the CreateProcess/C-runtime parse, as
+        # shlex is of the POSIX one. cmd.exe hands such a line through as is;
+        # PowerShell 5.1 re-parses it and drops an empty `""`, which is why
+        # `rebuild_argv` never emits one for a flag's value.
         return subprocess.list2cmdline(parts)
     return shlex.join(parts)
 
