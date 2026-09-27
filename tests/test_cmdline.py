@@ -215,8 +215,7 @@ def test_render_defaults_the_script_to_argv0(monkeypatch):
 
 
 POWERSHELL = shutil.which("powershell.exe") if os.name == "nt" else None
-# 2.4-4.2 s per test here (three cases, measured 2026-09-27; the ask-user-gate
-# CLI's round trips measured 0.18-0.20 s the same day on a warm shell); the
+# 2.4-6.6 s per case (two runs of the three cases, measured 2026-09-27); the
 # budget only has to tell a hang from a slow box.
 PS_TIMEOUT_S = 60
 _ECHO_ARGV = "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"
@@ -227,15 +226,21 @@ _ECHO_ARGV = "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"
 @pytest.mark.parametrize("argv, overrides", [
     (["-m", "5"], {"--project-dir": ""}),
     (["-C", "", "-m", "5"], {"--max-runs": 2}),
-    (["-p", "--finish", "products/configs/x"],
+    # No `-p`: it selects the parallel parser, which has no --start-in, and the
+    # meaning check below parses with the sequential one.
+    (["--finish", "products/configs/x"],
      {"--start-in": "", "--project-dir": r"C:\my project"}),
 ], ids=["empty-override", "copied-empty", "empty-among-values"])
 def test_the_rendered_line_round_trips_through_powershell(
         tmp_path, argv, overrides):
-    """Paste the line into PowerShell 5.1 and read back the argv it delivers.
+    """Hand the line to PowerShell 5.1 and read back the argv it delivers.
 
     Comparing renderer text alone is what let `--project-dir ""` pass: it is
     the right CreateProcess spelling and still arrives as a bare flag.
+
+    This is argument-delivery coverage, not literal-paste coverage: the line is
+    run behind a prepended `& `, which a user pasting it does not type, and the
+    cases carry no shell metacharacter (`quote` is not shell-safe for those).
     """
     echo = tmp_path / "echo_argv.py"
     echo.write_text(_ECHO_ARGV, encoding="utf-8")

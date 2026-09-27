@@ -83,12 +83,15 @@ def _empty_value(spelling: str, canonical: str) -> str:
     own `--finish=` reader) takes both as the empty value, but only the single
     token survives the shell the line is pasted into. Windows PowerShell 5.1
     drops an empty argument to a native program, so a pasted `--project-dir ""`
-    arrives as a bare `--project-dir` that swallows the next flag as its value,
-    or ends the line as a usage error. `list2cmdline` cannot help: `""` is the
-    correct CreateProcess spelling, and the shell in between is what loses it.
+    arrives as a bare `--project-dir`: argparse refuses it ("expected one
+    argument") whether a flag follows or the line ends there, so the relaunch
+    dies as a usage error. `list2cmdline` cannot help: `""` is the correct
+    CreateProcess spelling, and the shell in between is what loses it.
 
-    A short spelling has no `=` form (`-C=` is the value "="), so it is
-    replaced by the canonical long one.
+    A short spelling is replaced by the canonical long one. argparse would take
+    `-C=` as the empty value too (it splits a known short option at `=`), but
+    the long `--flag=` is the one spelling the line needs, and the one a reader
+    recognises as "empty value" rather than as a typo.
     """
     return (spelling if spelling.startswith("--") else canonical) + "="
 
@@ -123,7 +126,8 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
     An EMPTY value - an override of `""` or a copied `-C ""` - comes out as the
     single token `--flag=` (see `_empty_value`), so this is the one place a
     copied flag is respelled. The `--` tail is never respelled: it is not this
-    table's to read, so an empty token there stays one.
+    table's to read, so an empty token there is copied as `""` and is still
+    dropped by a PowerShell paste - a known gap, not a guarantee.
     """
     _validate(overrides, aliases)
     head, tail = _split_passthrough(argv)
@@ -172,12 +176,20 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
 
 
 def quote(parts: List[str]) -> str:
-    """Join argv into one pasteable line, quoted for the local shell."""
+    """Join argv into one line: POSIX-shell-quoted, or on Windows quoted for
+    CreateProcess only.
+
+    The Windows line is NOT shell-safe. Neither cmd.exe nor PowerShell 5.1 reads
+    it the way CreateProcess would once a value carries a shell metacharacter:
+    `$` or a backtick (PowerShell expands `C:\\a$b` to `C:\\a`), `"` (PowerShell:
+    "string is missing the terminator"), `;`, `&`, `|` or `%` (list2cmdline
+    quotes only for whitespace, so either shell splits the line at them or
+    expands them). The one shell loss handled is the empty value, and
+    `rebuild_argv` handles it (`_empty_value`), not this function.
+    """
     if os.name == "nt":
         # list2cmdline is the inverse of the CreateProcess/C-runtime parse, as
-        # shlex is of the POSIX one. cmd.exe hands such a line through as is;
-        # PowerShell 5.1 re-parses it and drops an empty `""`, which is why
-        # `rebuild_argv` never emits one for a flag's value.
+        # shlex is of the POSIX one - and of nothing a shell does on top.
         return subprocess.list2cmdline(parts)
     return shlex.join(parts)
 
