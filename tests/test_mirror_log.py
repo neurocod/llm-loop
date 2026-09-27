@@ -13,6 +13,7 @@ explain — off the end of the backup chain.
 import logging
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -377,18 +378,60 @@ def test_a_parsed_cost_log_reports_instead_of_running_the_loop(
     assert "TOTAL: 2 sessions, 3 costs, $2.2500" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("words", [["--cost-log="], ["--cost-log=  "],
-                                   ["--cost-log"]],
-                         ids=["equals-empty", "equals-blank", "bare"])
-def test_an_empty_cost_log_is_a_usage_error(tmp_path, capsys, words):
+_LOG_FILE_REFUSAL = "argument --cost-log: needs a log file"
+_BARE_REFUSAL = "argument --cost-log: expected one argument"
+
+
+@pytest.mark.parametrize("words, refusal", [
+    (["--cost-log="], _LOG_FILE_REFUSAL),
+    (["--cost-log=  "], _LOG_FILE_REFUSAL),
+    (["--cost-log"], _BARE_REFUSAL),
+], ids=["equals-empty", "equals-blank", "bare"])
+def test_an_empty_cost_log_is_a_usage_error(tmp_path, capsys, words, refusal):
     """`--cost-log=` is what PowerShell 5.1 leaves of an empty path that
     survives, and bare `--cost-log` what it leaves of `--cost-log ""`: one
-    intent, so one refusal — exit 2 from the parser — for both."""
+    intent, so one refusal — exit 2 from the parser — for both.
+
+    The message is matched whole, not just the flag's name: the usage line
+    every argparse error prints already lists `[--cost-log LOG]`, so the bare
+    name would hold for a refusal of any other flag on the line."""
     with pytest.raises(SystemExit) as exc:
         _parsed_cost_args(tmp_path, *words)
 
     assert exc.value.code == 2
-    assert "--cost-log" in capsys.readouterr().err
+    assert refusal in capsys.readouterr().err
+
+
+def test_the_empty_cost_log_refusal_points_at_cost_alone(tmp_path, capsys):
+    """Dropping --cost-log alone would start the agent loop, not the default
+    report, so the hint must name the flag that reports."""
+    with pytest.raises(SystemExit):
+        _parsed_cost_args(tmp_path, "--cost-log=")
+
+    assert "use --cost without --cost-log" in capsys.readouterr().err
+
+
+def test_an_empty_cost_log_outranks_a_path_query(tmp_path, log_dir, capsys):
+    """`--log` answers before the report does, so an empty --cost-log next to
+    it has to be refused ahead of it, not silently ignored."""
+    with pytest.raises(ValueError, match="--cost-log"):
+        cyclecore.run_loop(OneShotDriver(),
+                           seq_args(tmp_path, dry_run=True, log=True,
+                                    cost_log="", no_statusline=True),
+                           app_name="pytest-costs-empty-log",
+                           wait_on_start=False)
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("path", [Path(""), Path("."), "."],
+                         ids=["path-empty", "path-dot", "str-dot"])
+def test_a_path_that_names_no_log_is_refused_before_the_header(capsys, path):
+    """`Path("")` is `Path(".")`: the empty string survives wrapping only as
+    ".", which used to print "Reading mirror log: ." and then fail reading a
+    directory."""
+    with pytest.raises(ValueError, match="--cost-log needs a log file"):
+        costlog.report_costs("pytest-costs-dot", path)
+    assert "Reading mirror log" not in capsys.readouterr().out
 
 
 def test_an_empty_cost_log_in_a_namespace_never_opens_the_run(

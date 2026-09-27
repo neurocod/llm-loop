@@ -432,14 +432,17 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # So it is the flag's PRESENCE (`is not None`) that picks the report, never
     # its truthiness: an empty path read as "absent" started the loop. The parser
     # refuses an empty path (`clispec.log_file`); a namespace built by hand that
-    # carries one anyway is refused by `report_costs`, still before the prologue.
+    # carries one anyway is refused by `costlog.named_log` - first of all, so
+    # that not even `--log` answers a run that asked for an impossible report.
     projectroot.set_project_root(getattr(args, "project_dir", None))
+    cost_log = getattr(args, "cost_log", None)
+    if cost_log is not None:
+        costlog.named_log(cost_log)
     # A path query must not open the log or start any part of the loop.
     if getattr(args, "log", False):
         print(console.log_file_path(app_name))
         return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
 
-    cost_log = getattr(args, "cost_log", None)
     if getattr(args, "cost", False) or cost_log is not None:
         costlog.report_costs(app_name, cost_log)
         return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)

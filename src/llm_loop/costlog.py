@@ -77,6 +77,22 @@ _SESSION_RE = re.compile(re.escape(iteration_header(1)))
 _COST_RE = re.compile(r"done \(\s*[\d.]+ c,\s*\$([\d.]+)\)")
 
 
+def named_log(path: Union[str, "os.PathLike[str]"]) -> Path:
+    """The --cost-log path as a Path, refusing one that names no log file.
+
+    Raises ValueError for a blank string and for anything that normalises to
+    the current directory: `Path("")` IS `Path(".")`, so once an empty string
+    has been wrapped in a Path the only trace left of it is ".", and reading
+    "." fails later as a PermissionError after the report has already printed
+    its "Reading mirror log: ." header. A directory is never a log, so a
+    literal "." is refused with it.
+    """
+    text = os.fspath(path)
+    if not text.strip() or Path(text) == Path("."):
+        raise ValueError(f"--cost-log needs a log file, got {path!r}")
+    return Path(text)
+
+
 def report_costs(app_name: str = "runCycle",
                  path: Optional[Union[str, Path]] = None) -> None:
     """Print per-session (per-run) cost totals parsed from the mirror log, then
@@ -94,13 +110,12 @@ def report_costs(app_name: str = "runCycle",
     the one case app_name cannot reach, since rotation renames files out from
     under log_file_path.
 
-    An empty or blank string `path` raises ValueError instead of meaning "no
-    path": the caller named a log, and reporting on a different one would look
-    like an answer.
+    A `path` that names no log (`named_log`) raises ValueError instead of
+    meaning "no path": the caller named a log, and reporting on a different one
+    would look like an answer.
     """
-    if isinstance(path, str) and not path.strip():
-        raise ValueError(f"--cost-log needs a log file, got {path!r}")
-    path = Path(path) if path is not None else console.log_file_path(app_name)
+    path = (named_log(path) if path is not None
+            else console.log_file_path(app_name))
     # Always name the log we are reading, so an empty report is unambiguous
     # (right file, no data) rather than looking like a silent failure.
     print(f"Reading mirror log: {path}")

@@ -81,8 +81,8 @@ def log_file(text: str) -> str:
     """
     if not text.strip():
         raise argparse.ArgumentTypeError(
-            "needs a log file; omit it (or use --cost) to report on this entry "
-            "point's own log")
+            "needs a log file; use --cost without --cost-log to report on this "
+            "entry point's own log")
     return text
 
 
