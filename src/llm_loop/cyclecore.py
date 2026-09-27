@@ -430,6 +430,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # --cost-log implies --cost: naming a log to read and getting a loop run
     # instead would be a silent misfire, and there is nothing else it could mean.
     projectroot.set_project_root(getattr(args, "project_dir", None))
+    # A path query must not open the log or start any part of the loop.
+    if getattr(args, "log", False):
+        print(console.log_file_path(app_name))
+        return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
+
     cost_log = getattr(args, "cost_log", None)
     if getattr(args, "cost", False) or cost_log:
         costlog.report_costs(app_name, cost_log)

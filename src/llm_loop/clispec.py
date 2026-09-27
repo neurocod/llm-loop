@@ -194,6 +194,12 @@ OPTIONS: Dict[str, Option] = {
         kwargs=dict(action="store_true"),
         help="print raw JSON events (for debugging)",
     ),
+    "--log": Option(
+        aliases=("--log",),
+        takes_value=False,
+        kwargs=dict(action="store_true"),
+        help="print the mirror log file path and exit (no loop is run)",
+    ),
     "--cost": Option(
         aliases=("-c", "--cost"),
         takes_value=False,
@@ -251,6 +257,7 @@ OPTION_ORDER: Dict[str, Tuple[str, ...]] = {
         "--max-runs",
         "--codex",
         "--dry-run",
+        "--log",
         "--cost",
         "--cost-log",
         "--raw",
