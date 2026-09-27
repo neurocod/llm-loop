@@ -151,23 +151,38 @@ def parse_count(value: str) -> "int | None":
 def add_edit_arguments(parser: argparse.ArgumentParser) -> None:
     """The edit half of the CLI; resolve_edit() turns it into (old, new).
 
-    Deletion has two spellings, the same two try_patch.py accepts, because the
-    obvious one -- `--new ""` -- never reaches us from Windows PowerShell 5.1:
-    it drops an empty argument to a native program, and a `--new` that REQUIRED
-    a value then saw the next flag, or nothing, and refused the run ("argument
-    --new: expected one argument"; found in an agent transcript 2026-09-12).
-    So a bare --new means "", wherever the dropped token left it, and --remove
-    says the operation by name. Neither depends on an empty token surviving a
-    shell. The report still prints the deleted lines.
+    Deletion has ONE spelling, --remove TEXT, and an empty --new in any form --
+    bare, `--new ""`, `--new=` -- is a usage error that names it. The obvious
+    `--new ""` never reaches us from Windows PowerShell 5.1 anyway (it drops an
+    empty argument to a native program; agent transcript 2026-09-12), and every
+    empty spelling of --new is ALSO what a value lost on the way looks like:
+    `--new $x` with $x unset arrives bare from PowerShell and from an unquoted
+    bash word, `--new "$x"` arrives as "", `--new=$x` as `--new=`. Nothing here
+    can tell those from a deletion that was meant, and this script writes the
+    file for good, so a lost replacement would become a permanent deletion
+    reported as success (exit 0). --remove says the operation by name, and a
+    lost --remove value is a bare --remove, which argparse refuses.
+
+    try_patch.py keeps a bare --new as "" on purpose: it puts the file back
+    after the run, so there a lost value costs one misleading test run, not the
+    text. The gate's `--check` refuses its bare form for the same reason as
+    here -- ask_user_gate.py, at its add_argument.
+
+    Every flag is collected with action="append" so that a repeat is refused in
+    resolve_edit(); argparse's default keeps only the last one, and
+    `--remove a --remove b` would then delete b alone and exit 0.
     """
-    parser.add_argument("--old", metavar="TEXT",
+    parser.add_argument("--old", metavar="TEXT", action="append",
                         help="text to find (literal unless --regex)")
-    parser.add_argument("--new", metavar="TEXT", nargs="?", const="",
-                        help="text to put in its place; bare --new (or "
-                             "--new \"\") deletes")
-    parser.add_argument("--remove", metavar="TEXT",
-                        help="delete TEXT: same as --old TEXT --new \"\" "
-                             "(a regex under --regex)")
+    # nargs="?" with const None only so that a bare --new reaches
+    # resolve_edit(), whose refusal names --remove; it is never a value.
+    parser.add_argument("--new", metavar="TEXT", action="append", nargs="?",
+                        const=None,
+                        help="text to put in its place; never empty -- to "
+                             "delete, use --remove")
+    parser.add_argument("--remove", metavar="TEXT", action="append",
+                        help="delete TEXT: the edit --old TEXT with an empty "
+                             "replacement (a regex under --regex)")
     parser.add_argument("--regex", action="store_true",
                         help="treat --old as a regex (MULTILINE; \\1 in --new)")
     parser.add_argument("--count", type=parse_count, default=1, metavar="N",
@@ -178,18 +193,37 @@ def resolve_edit(parser: argparse.ArgumentParser,
                  options: argparse.Namespace) -> "tuple[str, str]":
     """(old, new) from either spelling, or a usage error (exit 2).
 
-    Mixing --remove with --old/--new is refused rather than resolved: which one
-    the caller meant is a guess, and a guess here writes a file.
+    Refused rather than resolved, because a guess here writes a file: a flag
+    given twice, --remove mixed with --old/--new, an empty --new (see
+    add_edit_arguments), and an empty TEXT to find, which matches between
+    every two characters.
     """
-    if options.remove is not None:
-        if options.old is not None or options.new is not None:
+    for name in ("old", "new", "remove"):
+        given = getattr(options, name) or []
+        if len(given) > 1:
+            parser.error(f"--{name} given {len(given)} times; one edit per "
+                         "run -- run the script once for each")
+    old = options.old[0] if options.old else None
+    remove = options.remove[0] if options.remove else None
+    if options.remove:
+        if options.old or options.new:
             parser.error("--remove TEXT is a whole edit; do not combine it "
                          "with --old/--new")
-        return options.remove, ""
-    if options.old is None or options.new is None:
-        parser.error("give --old TEXT --new TEXT, or --remove TEXT to delete "
-                     "(a bare --new deletes too)")
-    return options.old, options.new
+        old = remove
+        new = ""
+    elif options.new:
+        new = options.new[0]
+        if not new:
+            parser.error("--new got no text (a value lost on the way looks "
+                         "the same); to delete, use --remove TEXT")
+    else:
+        new = None
+    if old is None or new is None:
+        parser.error("give --old TEXT --new TEXT, or --remove TEXT to delete")
+    if not old:
+        parser.error(f"--{'remove' if remove is not None else 'old'} got no "
+                     "text; an empty pattern matches everywhere")
+    return old, new
 
 
 # No read-edit-write-in-one helper lives here on purpose. The obvious one

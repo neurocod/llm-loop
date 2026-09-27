@@ -1,11 +1,13 @@
-"""replace_in_file's two ways to delete, through the script's real command line.
+"""replace_in_file's one way to delete, through the script's real command line.
 
-Deleting is `--old TEXT --new ""` in principle, and in practice that spelling
-never arrives from Windows PowerShell 5.1: an empty argument to a native
-program is dropped, so the script sees `--new` followed by the next flag or by
-nothing. These cases hand the script exactly that argv, and the PowerShell
-cases at the end type the command the way an operator does, so the dropped
-token is the shell's doing rather than this file's assumption.
+Deleting is --remove TEXT, and an empty --new in any form is refused: the
+spellings `--new ""`, a bare `--new` (what Windows PowerShell 5.1 makes of
+`--new ""`, dropping the empty argument) and `--new=` are also what a
+replacement lost on the way looks like, and this script writes for good (the
+reasoning sits at add_edit_arguments). These cases hand the script exactly
+those argvs, and the PowerShell cases at the end type the command the way an
+operator does, so the dropped token is the shell's doing rather than this
+file's assumption.
 """
 
 import base64
@@ -40,29 +42,36 @@ def _run(*args: str) -> subprocess.CompletedProcess:
                           errors="replace", timeout=TIMEOUT_S)
 
 
+def _flat(text: str) -> str:
+    """`text` with argparse's line wrapping undone: it wraps at $COLUMNS."""
+    return " ".join(text.split())
+
+
 def _assert_wrote(result: subprocess.CompletedProcess, victim: Path,
                   expected: str) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert victim.read_bytes().decode("utf-8") == expected
 
 
-def _assert_refused(result: subprocess.CompletedProcess, victim: Path) -> None:
+def _assert_refused(result: subprocess.CompletedProcess, victim: Path,
+                    names: str = "") -> None:
     assert result.returncode == 2, result.stdout + result.stderr
     assert victim.read_bytes().decode("utf-8") == TEXT
+    assert names in _flat(result.stderr), result.stderr
 
 
-# --- `--new ""` as it arrives: the empty token is gone ---------------------------
+# --- an empty --new, however it arrives, is not a deletion -----------------------
 
-def test_a_bare_new_before_the_next_flag_deletes(tmp_path):
+@pytest.mark.parametrize("new", [["--new", "--count", "2"],   # PS 5.1, mid-line
+                                 ["--count", "2", "--new"],   # ... at the end
+                                 ["--new", "", "--count", "2"],
+                                 ["--new=", "--count", "2"]],
+                         ids=["bare-before-a-flag", "bare-at-the-end",
+                              "empty-token", "equals"])
+def test_an_empty_new_is_refused_naming_remove(tmp_path, new):
     victim = _victim(tmp_path)
-    _assert_wrote(_run(str(victim), "--old", " guard();", "--new",
-                       "--count", "2"), victim, DELETED)
-
-
-def test_a_bare_new_at_the_end_deletes(tmp_path):
-    victim = _victim(tmp_path)
-    _assert_wrote(_run(str(victim), "--count", "2", "--old", " guard();",
-                       "--new"), victim, DELETED)
+    _assert_refused(_run(str(victim), "--old", " guard();", *new), victim,
+                    "use --remove TEXT")
 
 
 # --- --remove says the operation by name -----------------------------------------
@@ -102,11 +111,32 @@ def test_an_edit_still_needs_both_halves(tmp_path, edit):
     _assert_refused(_run(str(victim), *edit, "--count", "any"), victim)
 
 
-def test_help_names_both_delete_spellings():
+@pytest.mark.parametrize("edit", [["--remove", ""], ["--old", "", "--new", "x"]],
+                         ids=["remove", "old"])
+def test_an_empty_pattern_is_refused(tmp_path, edit):
+    victim = _victim(tmp_path)
+    _assert_refused(_run(str(victim), *edit, "--count", "any"), victim,
+                    "got no text")
+
+
+# --- a repeated flag is refused, not silently narrowed to its last value ----------
+
+@pytest.mark.parametrize("flag, edit", [
+    ("--remove", ["--remove", "a = 1;", "--remove", " guard();"]),
+    ("--old", ["--old", "a = 1;", "--old", " guard();", "--new", "x"]),
+    ("--new", ["--old", " guard();", "--new", "x", "--new", "y"]),
+], ids=["remove", "old", "new"])
+def test_a_repeated_flag_is_refused(tmp_path, flag, edit):
+    victim = _victim(tmp_path)
+    _assert_refused(_run(str(victim), *edit, "--count", "2"), victim,
+                    f"{flag} given 2 times")
+
+
+def test_help_names_the_delete_spelling():
     result = _run("--help")
     assert result.returncode == 0, result.stderr
     assert "--remove TEXT" in result.stdout
-    assert "bare --new" in result.stdout
+    assert "to delete, use --remove" in _flat(result.stdout)
 
 
 # --- the operator's shell ------------------------------------------------------
@@ -137,11 +167,16 @@ needs_powershell = pytest.mark.skipif(
 
 @needs_powershell
 @pytest.mark.parametrize("tail", [["--new", "''", "--count", "2"],
-                                  ["--count", "2", "--new", "''"]])
-def test_powershell_new_empty_deletes(tmp_path, tail):
+                                  ["--count", "2", "--new", "''"],
+                                  # the lost value itself: never assigned
+                                  ["--new", "$replacementNeverSet",
+                                   "--count", "2"]],
+                         ids=["empty-mid-line", "empty-at-the-end",
+                              "unset-variable"])
+def test_powershell_empty_new_is_refused(tmp_path, tail):
     victim = _victim(tmp_path)
-    _assert_wrote(powershell(_ps_quote(str(victim)), "--old", "' guard();'",
-                             *tail), victim, DELETED)
+    _assert_refused(powershell(_ps_quote(str(victim)), "--old", "' guard();'",
+                               *tail), victim, "use --remove TEXT")
 
 
 @needs_powershell
