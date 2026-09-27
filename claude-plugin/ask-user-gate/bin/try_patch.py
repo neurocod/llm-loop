@@ -179,7 +179,14 @@ def main() -> int:
     parser.add_argument("--file", action=Triple, metavar="FILE",
                         help="file to edit (repeatable, with --old/--new)")
     parser.add_argument("--old", action=Triple, metavar="TEXT")
-    parser.add_argument("--new", action=Triple, metavar="TEXT")
+    # A bare --new deletes --old. It exists because the obvious spelling,
+    # `--new ""`, never reaches us from Windows PowerShell 5.1: it drops an
+    # empty argument to a native program, and argparse then saw `--new` followed
+    # by the next flag -- 13 refused runs in three days of the agent loop's logs
+    # (2026-09-25..27). The printed diff still shows what was deleted.
+    parser.add_argument("--new", action=Triple, metavar="TEXT", nargs="?",
+                        const="",
+                        help="replacement; bare --new (or --new \"\") deletes")
     parser.add_argument("--regex", action="store_true",
                         help="treat every --old as a regex (MULTILINE)")
     parser.add_argument("--count", type=parse_count, default=1, metavar="N",
@@ -1037,6 +1044,23 @@ def _case_same_file_spelled_two_ways(work: Path) -> None:
     _expect_bytes(victim, GUARDS, result)
 
 
+def _case_a_bare_new_deletes(work: Path) -> None:
+    """`--new ""` as PowerShell 5.1 delivers it: the empty argument is gone.
+
+    Both places it lands in practice: before the next flag and before the bare
+    `--`. The command sees neither guard, so both deletions reached it.
+    """
+    victim = _victim(work)
+    result = _run(work, "--file", "victim.cpp", "--old", "guardA = true;\n",
+                  "--new", "--file", "victim.cpp", "--old", "guardB = true;\n",
+                  "--new", "--", sys.executable, "-c",
+                  "import pathlib, sys; t = pathlib.Path('victim.cpp').read_text();"
+                  " sys.exit(0 if t == 'guardC = true;\\n' else 9)")
+    _expect(result.returncode == 0,
+            f"exit {result.returncode}\n{result.stdout}{result.stderr}")
+    _expect_bytes(victim, GUARDS, result)
+
+
 def _case_failing_command_restores_and_reports(work: Path) -> None:
     victim = _victim(work)
     result = _run(work, *_flip("guardA"), *_flip("guardB"), *CMD_FAIL)
@@ -1381,6 +1405,7 @@ SELFTEST_CASES = (
     _case_stacked_edits_of_one_file,
     _case_stacked_edits_all_reach_the_command,
     _case_same_file_spelled_two_ways,
+    _case_a_bare_new_deletes,
     _case_failing_command_restores_and_reports,
     _case_expect_fail_accepts_a_failing_command,
     _case_expect_fail_rejects_a_passing_command,
