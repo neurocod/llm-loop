@@ -185,6 +185,34 @@ CRLF_CASES = [
     ("git commit -F @'\nmsg\n'@", "powershell", "PowerShell"),
 ]
 
+# The command line itself, as argv lists: the corpus above goes in through
+# --check-file, so it never sees how a VALUE is found. These are the shapes an
+# operator's shell delivers -- above all Windows PowerShell 5.1, which drops an
+# empty argument, so `--check ""` arrives as a bare --check before the next flag
+# or at the end. The contract (ask_user_gate.py, at the --check add_argument):
+# `--check=` is the empty command, a bare --check is a usage error (exit 2), and
+# a token argparse reads as a flag is never taken as a value. Only the exit code
+# is compared on a usage error: argparse and the port word it differently.
+ARGV_CASES = [
+    ["--check="],
+    ["--check=", "--shell", "powershell"],
+    ["--shell=powershell", "--check="],
+    ["--check", ""],                          # a shell that keeps the token
+    ["--check"],                              # `--check ""` at the end
+    ["--check", "--shell", "powershell"],     # `--check ""` before a flag
+    ["--check", "--platform=windows"],        # ... one written with `=`
+    ["--check", "--sh", "powershell"],        # ... an abbreviation of one
+    ["--check", "-x"],                        # dash-led, no space: a flag
+    ["--check", "-1"],                        # a negative number: a value
+    ["--check", "-.5"],
+    ["--check", "-n 1; cd y && ls"],          # dash-led with a space: a value
+    ["--tool", "--check", "cd x && ls"],
+    ["--tool", "--check=cd x && ls"],         # a flag, space or not
+    ["--check", "--sh=a b"],                  # an abbreviation, space or not
+    ["--check", "-h x"],                      # -h glued to anything is -h
+    ["--check", "cd x && ls", "--tool", "-h"],
+]
+
 # Hook mode: the path that actually runs. The first group is ordinary traffic;
 # the rest is what a JSON reader has to survive without taking the session with
 # it. The contract is fail OPEN -- a payload neither half understands must leave
@@ -302,6 +330,22 @@ def check_verdict(argv: "list[str]", command: str, shell: str, tool: str,
     return result.returncode, result.stdout.decode("utf-8").replace("\r\n", "\n")
 
 
+def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]":
+    """One ARGV_CASES entry through one gate's CLI, host fixed to Windows.
+
+    `--platform windows` goes FIRST so that a case can end on a bare --check.
+    A usage error (exit 2) keeps only its code, see ARGV_CASES.
+    """
+    result = subprocess.run(argv + ["--platform", "windows"] + arguments,
+                            capture_output=True)
+    if result.returncode == 2:
+        return 2, "<usage error>"
+    if result.stderr:
+        return result.returncode, ("<stderr> "
+                                   + result.stderr.decode("utf-8", "replace"))
+    return result.returncode, result.stdout.decode("utf-8").replace("\r\n", "\n")
+
+
 def hook_verdict(argv: "list[str]", payload: bytes) -> "tuple[int, str]":
     """One payload through one gate's HOOK mode -- the path that runs 100k times
     a month, and the only one that exercises the JSON reader, the tool_name
@@ -390,6 +434,21 @@ def main() -> int:
                       file=sys.stderr)
                 print(f"  c++    (exit {cpp_code}):\n{normalise(cpp_text)}",
                       file=sys.stderr)
+
+        for arguments in ARGV_CASES:
+            compared += 1
+            py_code, py_text = argv_verdict(reference_argv, arguments)
+            cpp_code, cpp_text = argv_verdict(gate_argv, arguments)
+            if (py_code == cpp_code
+                    and normalise(py_text) == normalise(cpp_text)):
+                if options.verbose:
+                    print(f"ok   [argv] {arguments!r} -> exit {py_code}")
+                continue
+            failures += 1
+            print(f"DIFF [argv] {arguments!r}\n"
+                  f"  python (exit {py_code}):\n{normalise(py_text)}\n"
+                  f"  c++    (exit {cpp_code}):\n{normalise(cpp_text)}",
+                  file=sys.stderr)
 
         for label, payload in HOOK_CASES:
             compared += 1

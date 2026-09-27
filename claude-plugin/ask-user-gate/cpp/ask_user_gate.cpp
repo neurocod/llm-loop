@@ -40,6 +40,7 @@
 //   ask_user_gate --check "git add -A && git commit -m x"
 //   ask_user_gate --check "Get-Item a; Get-Item b" --shell powershell
 //   ask_user_gate --check-file cmd.txt   // multi-line commands
+//   ask_user_gate --check=               // the empty command
 //   ask_user_gate --self-test
 
 #ifdef _WIN32
@@ -1440,7 +1441,8 @@ Refuse shell commands that would stop for a human permission prompt. Reads a
 PreToolUse hook payload on stdin unless --check/--check-file/--self-test is
 given. Exit 1 when a checked command is denied.
 
-  --check COMMAND    scan one command and print the verdict
+  --check COMMAND    scan one command and print the verdict; the empty command
+                     is --check= (PowerShell 5.1 drops the "" of --check "")
   --check-file PATH  scan the command stored in a file (for the multi-line ones
                      an argument cannot carry)
   --shell SHELL      shell to assume (default: bash)
@@ -1452,6 +1454,48 @@ given. Exit 1 when a checked command is denied.
                      (the hook WIRING is checked by ask_user_gate.py, which owns
                      that question for both halves)
 )GATE";
+
+// Whether argparse would read `token` as a flag rather than as the value of the
+// flag before it (its _parse_optional, over the reference's option strings).
+// The CLI contract is the reference's, and there a bare --check is an error,
+// the empty command being spelled --check= (the doc-comment at its
+// add_argument says why). Taking any next token as the value, as this parser
+// once did, broke that contract exactly where it bites: PowerShell 5.1 turns
+// `--check "" --platform=windows` into `--check --platform=windows`, and the
+// port scanned the flag as the COMMAND and printed "allowed" while the
+// reference refused the run.
+bool looksLikeOption(std::string_view token) {
+	static constexpr std::string_view kOptions[] = {"-h", "--help", "--check", "--check-file",
+		"--shell", "--tool", "--platform", "--self-test"};
+	if (token.size() < 2 || token[0] != '-')
+		return false;
+	const size_t equals = token.find('=');
+	const std::string_view name = token.substr(0, equals);
+	for (std::string_view option : kOptions)
+		if (option == name)
+			return true;
+	// argparse also resolves abbreviations -- any prefix of a long option, and
+	// `-h` glued to anything -- even where the flag itself then fails.
+	if (startsWith(token, "--")) {
+		for (std::string_view option : kOptions)
+			if (startsWith(option, name))
+				return true;
+	} else if (startsWith(token, "-h")) {
+		return true;
+	}
+	// A negative number, and anything with a space in it, is a value.
+	const auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
+	const std::string_view body = token.substr(1);
+	const size_t dot = body.find('.');
+	const std::string_view whole = body.substr(0, dot);
+	const std::string_view fraction = dot == std::string_view::npos ? "" : body.substr(dot + 1);
+	const bool negativeNumber = std::all_of(whole.begin(), whole.end(), isDigit)
+		&& std::all_of(fraction.begin(), fraction.end(), isDigit)
+		&& (dot == std::string_view::npos ? !whole.empty() : !fraction.empty());
+	if (negativeNumber)
+		return false;
+	return token.find(' ') == std::string_view::npos;
+}
 
 int run(int argc, char** argv) {
 	std::optional<std::string> checkCommand;
@@ -1474,8 +1518,9 @@ int run(int argc, char** argv) {
 		auto takeValue = [&](const char* name) -> bool {
 			if (hasInlineValue)
 				return true;
-			if (i + 1 >= argc) {
-				std::fprintf(stderr, "ask_user_gate: %s needs a value\n", name);
+			if (i + 1 >= argc || looksLikeOption(argv[i + 1])) {
+				std::fprintf(stderr, "ask_user_gate: %s needs a value%s\n", name,
+					std::strcmp(name, "--check") == 0 ? " (the empty command is --check=)" : "");
 				return false;
 			}
 			value = argv[++i];

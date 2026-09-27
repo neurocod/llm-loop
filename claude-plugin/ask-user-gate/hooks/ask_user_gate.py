@@ -81,6 +81,7 @@ Standalone use (same verdict, exit 1 when denied):
   python hooks/ask_user_gate.py --check "git add -A && git commit -m x"
   python hooks/ask_user_gate.py --check "Get-Item a; Get-Item b" --shell powershell
   python hooks/ask_user_gate.py --check-file cmd.txt   # multi-line commands
+  python hooks/ask_user_gate.py --check=               # the empty command
   python hooks/ask_user_gate.py --self-test
 """
 
@@ -928,13 +929,38 @@ def self_test() -> int:
     return 1 if failures else 0
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse, plus the one hint its refusal of a bare --check needs.
+
+    That refusal is what `--check ""` looks like after PowerShell 5.1, and the
+    usage line it prints does not name the spelling that works.
+    """
+
+    def error(self, message):
+        if message.startswith("argument --check: expected one argument"):
+            message += " (the empty command is --check=)"
+        super().error(message)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         description="Refuse shell commands that would stop for a human "
                     "permission prompt. Reads a PreToolUse hook payload on "
                     "stdin unless --check/--self-test is given.")
+    # The empty command is spelled `--check=`, and a bare --check stays an
+    # error -- in both halves (the port's takeValue says the same). The obvious
+    # `--check ""` never arrives from Windows PowerShell 5.1, which drops an
+    # empty argument to a native program; argparse then sees --check followed
+    # by the next flag, or by nothing. Reading that bare --check as "" (what
+    # try_patch does for a bare --new) was declined: this CLI answers "is THIS
+    # command allowed?", and a value lost on the way -- an empty `$cmd`, a
+    # forgotten argument -- would come back "allowed", a verification that
+    # cannot fail. An empty command is a corner worth checking, not an answer
+    # worth defaulting to, so it gets a spelling that no shell can drop.
     parser.add_argument("--check", metavar="COMMAND",
-                        help="scan one command and print the verdict")
+                        help="scan one command and print the verdict; the "
+                             "empty command is --check= (PowerShell 5.1 drops "
+                             "the \"\" of --check \"\")")
     parser.add_argument("--check-file", metavar="PATH",
                         help="scan the command stored in a file (for the "
                              "multi-line ones an argument cannot carry)")
