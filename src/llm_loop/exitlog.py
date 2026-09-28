@@ -166,6 +166,19 @@ class RunRecord:
         self._fields = fields
         self._echo = echo
         self._lock = threading.Lock()
+        # The FILE's lock, apart from the fields': held across a whole write
+        # (the temp file and the replace) and across the step of `finish` that
+        # ends writing. Two races it closes: a write already under way when
+        # `finish` removed the record put it back after a clean exit — which
+        # the next launch then reports as a run killed from outside (pinned by
+        # `test_exit_reason.test_a_write_in_flight_does_not_outlive_finish`) —
+        # and two writers (the heartbeat, a worker's `note`) shared one temp
+        # file. Reentrant because `finish` is also called from a signal
+        # handler, which runs on the main thread, possibly in the middle of
+        # that thread's own write: a plain lock would deadlock there. That one
+        # case can still put the record back, if the previous handler lets the
+        # process live on after it.
+        self._file_lock = threading.RLock()
         self._done = threading.Event()
         self._finished = False
         self._reason: Optional[str] = None
@@ -183,11 +196,16 @@ class RunRecord:
             self._fields["alive_at"] = time.time()
             payload = json.dumps(self._fields, ensure_ascii=False, indent=1)
         tmp = self._path.with_name(self._path.name + ".tmp")
-        try:
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, self._path)
-        except OSError:
-            pass    # a diagnostic must never be a reason for the run to fail
+        with self._file_lock:
+            # A finished record is gone for good: written now, it would outlive
+            # the run and be reported as a kill (see `_file_lock`).
+            if self._finished:
+                return
+            try:
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, self._path)
+            except OSError:
+                pass    # a diagnostic must never be a reason for the run to fail
 
     def _heartbeat(self) -> None:
         while not self._done.wait(HEARTBEAT_SECONDS):
@@ -207,7 +225,8 @@ class RunRecord:
 
     def finish(self, reason: Optional[str] = None) -> None:
         """Print the closing line and drop the record. Safe to call twice."""
-        with self._lock:
+        # Waits out a write in flight; none starts after it (see `_file_lock`).
+        with self._file_lock:
             if self._finished:
                 return
             self._finished = True

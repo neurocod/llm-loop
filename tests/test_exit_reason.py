@@ -10,6 +10,7 @@ one thing it cannot.
 import json
 import os
 import sys
+import threading
 
 import pytest
 
@@ -176,6 +177,70 @@ def test_sys_exit_is_named_although_no_excepthook_sees_it(tmp_path, capsys):
 
     assert "=== run ended: sys.exit: error: --grow-kit models nothing" \
         in capsys.readouterr().out
+
+
+# Upper bound on every wait of the write-in-flight pin; only a broken staging
+# comes near it.
+HELD_S = 10.0
+
+# How long that pin lets `finish` run while the heartbeat's write is held. An
+# unguarded `finish` removes the record in well under a millisecond; a guarded
+# one waits for the write, so this is also what the pin costs when it passes.
+FINISH_HEAD_START_S = 1.0
+
+
+class _HeldReplaceOs:
+    """Stands in for `exitlog.os`: the heartbeat's first `replace` waits.
+
+    A replacement MODULE for one importer (patching `os.replace` itself would
+    hold every thread in the process); everything else is forwarded.
+    """
+
+    def __init__(self):
+        self.in_replace = threading.Event()
+        self.release = threading.Event()
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def replace(self, src, dst):
+        if (threading.current_thread().name == "exitlog-heartbeat"
+                and not self.in_replace.is_set()):
+            self.in_replace.set()
+            self.release.wait(timeout=HELD_S)
+        return os.replace(src, dst)
+
+
+def test_a_write_in_flight_does_not_outlive_finish(tmp_path, monkeypatch):
+    """A clean exit must not leave its record behind — not even by a heartbeat.
+
+    The record on disk MEANS "this run never got to end", and the next launch
+    reports it as a kill from outside. `finish` used to remove it while a write
+    begun a moment earlier was still under way; that write then put it back,
+    and a run that ended properly was reported as killed. Staged, not raced: the
+    heartbeat's write is held between its temp file and its replace while
+    `finish` runs.
+    """
+    held = _HeldReplaceOs()
+    monkeypatch.setattr(exitlog, "os", held)
+    monkeypatch.setattr(exitlog, "HEARTBEAT_SECONDS", 0.01)
+    path = tmp_path / f"pytest-exit{exitlog.RECORD_SUFFIX}"
+    record = exitlog.RunRecord(path, {"pid": os.getpid()}, echo=lambda line: None)
+    finisher = threading.Thread(target=record.finish, name="finisher",
+                                daemon=True)
+    try:
+        assert held.in_replace.wait(timeout=HELD_S), "the heartbeat never wrote"
+        finisher.start()
+        finisher.join(timeout=FINISH_HEAD_START_S)
+    finally:
+        held.release.set()
+    finisher.join(timeout=HELD_S)
+    record._beat.join(timeout=HELD_S)
+
+    assert not finisher.is_alive(), "finish never returned"
+    assert not path.exists(), (
+        "a finished run's record is on disk again — the next launch will report "
+        "this clean exit as a run killed from outside")
 
 
 def test_an_unhandled_exception_is_named():
