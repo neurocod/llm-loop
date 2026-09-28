@@ -52,7 +52,6 @@ guessed from error counts, in two layers:
 import argparse
 import math
 import queue
-import re
 import signal
 import sys
 import textwrap
@@ -221,27 +220,24 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
                                 extra_options=extra_options).parse_args(argv)
 
 
-def parse_duration(text: str) -> float:
-    """Parse a duration like '29m', '1h', '90s', '1h30m' into seconds.
+def is_report(args: argparse.Namespace) -> bool:
+    """Does this command line ask for a report instead of a run?
 
-    A bare number is treated as minutes ('29' == '29m'). Raises ValueError on
-    anything it can't make sense of.
+    `--log`, `--cost` and `--cost-log` each answer from the mirror log and exit
+    before the prologue (see `run_loop`, the one reader that acts on it). A host
+    asks the same question before it does anything a run needs and a report must
+    not do — take the script lock, wait out a pending stop file, thaw a frozen
+    kit — because a report is how progress is read DURING a live run, and those
+    steps would act on that run's shared state. Asked of this function rather
+    than spelled per host, so a report flag added here is one no host can miss.
+
+    `--cost-log` counts by its PRESENCE, never its truthiness: an empty path read
+    as "absent" started the loop. Read with getattr because the parallel parser
+    declares none of the three (a namespace from it is never a report).
     """
-    text = text.strip().lower()
-    if not text:
-        raise ValueError("empty duration")
-    if text.isdigit():  # bare number — minutes
-        return int(text) * 60
-
-    units = {"h": 3600, "m": 60, "s": 1}
-    total = 0.0
-    matched = False
-    for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([hms])", text):
-        total += float(value) * units[unit]
-        matched = True
-    if not matched:
-        raise ValueError(f"cannot parse duration: {text!r}")
-    return total
+    return bool(getattr(args, "log", False)
+                or getattr(args, "cost", False)
+                or getattr(args, "cost_log", None) is not None)
 
 
 def _count_down_to(target_ts: float, should_stop=None) -> bool:
@@ -387,9 +383,12 @@ def wait_before_start(spec: str, *, interactive: bool = True) -> None:
     Before the loop's status line exists, this wait owns its own keys: q exits,
     +/- adjusts the deadline by a minute, and Space starts immediately. Ctrl+C
     exits with code 130. Without a terminal, wait silently after the opening line.
+
+    The parser has already refused a malformed `spec` (`clispec.duration`); the
+    refusal here covers a namespace a host builds past it.
     """
     try:
-        seconds = parse_duration(spec)
+        seconds = clispec.parse_duration(spec)
     except ValueError as e:
         print(f"Invalid --start-in value {spec!r}: {e}")
         sys.exit(2)
@@ -434,17 +433,17 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # refuses an empty path (`clispec.log_file`); a namespace built by hand that
     # carries one anyway is refused by `costlog.named_log` - first of all, so
     # that not even `--log` answers a run that asked for an impossible report.
+    # Which flags make a report is `is_report`'s rule, the one hosts ask too.
     projectroot.set_project_root(getattr(args, "project_dir", None))
     cost_log = getattr(args, "cost_log", None)
     if cost_log is not None:
         costlog.named_log(cost_log)
-    # A path query must not open the log or start any part of the loop.
-    if getattr(args, "log", False):
-        print(console.log_file_path(app_name))
-        return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
-
-    if getattr(args, "cost", False) or cost_log is not None:
-        costlog.report_costs(app_name, cost_log)
+    if is_report(args):
+        # A path query must not open the log or start any part of the loop.
+        if getattr(args, "log", False):
+            print(console.log_file_path(app_name))
+        else:
+            costlog.report_costs(app_name, cost_log)
         return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
 
     # `runlifecycle.begin_run` is the prologue both runners share.

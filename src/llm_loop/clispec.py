@@ -33,6 +33,7 @@ public for each host to run over the parsers it builds.
 """
 
 import argparse
+import re
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from . import costlog
@@ -51,7 +52,9 @@ __all__ = [
     "SEQUENTIAL",
     "build_parser",
     "directory",
+    "duration",
     "log_file",
+    "parse_duration",
     "unstrippable_flags",
 ]
 
@@ -112,6 +115,55 @@ def directory(text: str) -> str:
     return text
 
 
+def parse_duration(text: str) -> float:
+    """Parse a duration like '29m', '1h', '90s', '1h30m' into seconds.
+
+    A bare number is treated as minutes ('29' == '29m'). Raises ValueError on
+    anything it can't make sense of.
+
+    Lives here, beside its `type=` validator `duration`, rather than in the
+    runner that waits on it: this module cannot import `cyclecore` (which
+    imports this one), and the check has to run inside the parser.
+    """
+    text = text.strip().lower()
+    if not text:
+        raise ValueError("empty duration")
+    if text.isdigit():  # bare number — minutes
+        return int(text) * 60
+
+    units = {"h": 3600, "m": 60, "s": 1}
+    total = 0.0
+    matched = False
+    for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([hms])", text):
+        total += float(value) * units[unit]
+        matched = True
+    if not matched:
+        raise ValueError(f"cannot parse duration: {text!r}")
+    return total
+
+
+def duration(text: str) -> str:
+    """argparse `type=` of --start-in: a duration `parse_duration` reads.
+
+    Checked at parse time because the runner reads the value only when the wait
+    begins — after the prologue, and in a host wrapper after its script lock,
+    stop-file wait and whatever else it does on the way in — so a typo used to
+    fail late, and differently per host. An empty value (`--start-in=`) is
+    refused too: it used to mean "no delay" while `--start-in ""`, which
+    PowerShell 5.1 delivers as a bare flag, was a usage error.
+
+    Returns the text unchanged, so `args.start_in` stays the spelling the wait
+    announces.
+    """
+    try:
+        parse_duration(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"{exc}; expected e.g. 29m, 1h30m, 90s, or a bare number of "
+            f"minutes") from None
+    return text
+
+
 class Flag(NamedTuple):
     """One canonical flag: every spelling argparse accepts, and its arity."""
 
@@ -164,7 +216,7 @@ OPTIONS: Dict[str, Option] = {
     "--start-in": Option(
         aliases=("-s", "--start-in", "--startIn"),
         takes_value=True,
-        kwargs=dict(dest="start_in", metavar="DURATION"),
+        kwargs=dict(dest="start_in", metavar="DURATION", type=duration),
         help="wait this long before starting the loop, e.g. 29m, 1h30m",
     ),
     "--git-push": Option(

@@ -53,10 +53,14 @@ from . import exitlog
 from . import stopchannel
 from .cyclecore import (
     ConsumedByWrapperAction,
+    is_report,
     parse_args,
-    parse_duration,
     run_loop,
 )
+# Same story as the moves below: parsing a --start-in value moved out of
+# cyclecore into `clispec`, beside the `type=` check that now runs it inside the
+# parser, and the front door is unchanged on purpose.
+from .clispec import parse_duration
 # Same story again: reading a run's cost back out of the mirror log moved from
 # cyclecore into `costlog`, with the two lines it reads, and the front door is
 # unchanged on purpose.
@@ -218,6 +222,7 @@ __all__ = [
     "default_policy",
     "exitlog",
     "find_project_root",
+    "is_report",
     "last_rate_limit_event",
     "latched_stop",
     "log_file_path",

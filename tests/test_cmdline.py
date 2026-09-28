@@ -261,9 +261,9 @@ def test_the_rendered_line_round_trips_through_powershell(
     assert delivered == rebuild_argv(argv, overrides), line
 
     # And it MEANS what the run meant: the same outcome as the pair spelling.
-    # Outcome, not namespace: the parser refuses an empty -C
-    # (`clispec.directory`), and a refusal is a meaning too — the one both
-    # spellings must share.
+    # Outcome, not namespace: the parser refuses an empty -C or --start-in
+    # (`clispec.directory`, `clispec.duration`), and a refusal is a meaning too
+    # — the one both spellings must share.
     pairs = list(argv)
     for flag, value in overrides.items():
         pairs += [flag, str(value)]
