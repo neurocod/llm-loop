@@ -219,6 +219,10 @@ examples/
   runFileList.py         per-file work-queue wrapper
   runFileListParallel.py parallel work-queue wrapper
 ideas/                   study material, never shipped — see ideas/README.md
+scripts/
+  ci_local.py            the GitHub CI matrix run on this machine, one uv venv
+                         per Python: `python scripts/ci_local.py [3.10 ...]`
+  collect_codex_thread.py one Codex rollout JSONL as a chronological view
 ```
 
 One line per module, and every module has one: the map is worth its upkeep only
