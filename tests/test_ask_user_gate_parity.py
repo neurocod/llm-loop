@@ -40,60 +40,37 @@ def test_reference_self_test():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_reference_check_file_it_cannot_read_is_exit_2(tmp_path):
-    """Not 1: exit 1 is "denied", and an unread file was never judged.
-
-    Pinned here as well as in parity_check's ARGV_CASES because that half only
-    runs where the binary was built.
-    """
+def test_reference_check_file_it_cannot_read_says_so(tmp_path):
+    """The message, and no traceback; the exit code is an ARGV_CASES row."""
     result = _run([SCRIPT, "--check-file", str(tmp_path / "missing.txt")])
     assert result.returncode == 2, result.stdout + result.stderr
     assert "cannot read" in result.stderr
     assert "Traceback" not in result.stderr
 
 
-@pytest.mark.parametrize("token, verdict", [
-    ("-1", True), ("-.5", True), ("-2.5", True),
-    ("-1e5", False), ("-1abc", False), ("-1.2.3", False), ("-.5x", False),
-    ("-1_000", False), ("-5\n", False), ("-٥", False), ("-= x", False),
-])
-def test_reference_negative_number_rule_is_its_own(token, verdict):
-    """`--check TOKEN`: a verdict (exit 0/1) or a usage error (exit 2).
+def _parity_module():
+    spec = importlib.util.spec_from_file_location("parity_check_ref", PARITY)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    The rule is _Parser.NEGATIVE_NUMBER, not the interpreter's argparse, which
-    changed it in 3.14; the port mirrors it, and this pins the reference half
-    where there is no binary to compare against.
+
+_PARITY = _parity_module()
+
+
+@pytest.mark.parametrize("argv, code, text", _PARITY.ARGV_CASES,
+                         ids=[ascii(case[0]) for case in _PARITY.ARGV_CASES])
+def test_reference_command_line(argv, code, text):
+    """The reference half of parity_check's ARGV_CASES, binary or not.
+
+    That script compares the two halves only where the port was built; this
+    holds the reference to the table's own answers everywhere else, through
+    the same argv_verdict, so both read one output the same way.
     """
-    result = _run([SCRIPT, "--check", token])
-    assert (result.returncode != 2) == verdict, result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("argv, code, stdout", [
-    (["--check", "-==x y"], 2, None),
-    (["--tool", "-= x", "--check", "ls"], 2, None),
-    (["--check=-= x"], 0, "allowed\n"),  # glued, so a value
-    (["--help", "-= x"], 0, None),
-    (["-= x", "--help"], 2, None),
-    (["--help", "--c"], 0, None),
-])
-def test_reference_ambiguous_flag_is_refused_where_parsing_reaches_it(
-        argv, code, stdout):
-    """A `-=` token and an ambiguous prefix are flags, refused on arrival.
-
-    3.9-3.11 argparse read `-= x` as a value and refused an ambiguous prefix
-    before running anything, --help included; _Parser._get_option_tuples pins
-    the newer reading, which the port shares (ARGV_CASES compare the two).
-    3.12.14+ argparse already gives every one of these results natively, so
-    there the rows guard nothing of the override: they bite on 3.9-3.11 only.
-    The glued row is the control the other way -- a `-=` VALUE that an
-    over-broad refusal would turn into a usage error -- and its verdict is
-    read, not just its exit code: 0 is also what hook mode on an empty stdin
-    returns.
-    """
-    result = _run([SCRIPT, "--platform", "windows"] + argv)
-    assert result.returncode == code, result.stdout + result.stderr
-    if stdout is not None:
-        assert result.stdout == stdout, result.stdout + result.stderr
+    got_code, got_text = _PARITY.argv_verdict([sys.executable, SCRIPT], argv)
+    assert got_code == code, got_text
+    if text is not None:
+        assert got_text == text
 
 
 def _gate_module():

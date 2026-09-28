@@ -186,56 +186,80 @@ CRLF_CASES = [
     ("git commit -F @'\nmsg\n'@", "powershell", "PowerShell"),
 ]
 
-# The command line itself, as argv lists: the corpus above goes in through
-# --check-file, so it never sees how a VALUE is found. These are the shapes an
-# operator's shell delivers -- above all Windows PowerShell 5.1, which drops an
-# empty argument, so `--check ""` arrives as a bare --check before the next flag
-# or at the end. The contract (ask_user_gate.py, at the --check add_argument):
-# `--check=` is the empty command, a bare --check is a usage error (exit 2), and
-# a token argparse reads as a flag is never taken as a value. Only the exit code
-# is compared on a usage error and on the help: argparse and the port word each
-# of them differently.
+# What argv_verdict makes of the output worth pinning; see ARGV_CASES.
+ALLOWED = "allowed\n"
+HELP = "<help>"
+
+# The command line itself: the corpus above goes in through --check-file, so it
+# never sees how a VALUE is found. These are the shapes an operator's shell
+# delivers -- above all Windows PowerShell 5.1, which drops an empty argument,
+# so `--check ""` arrives as a bare --check before the next flag or at the end.
+# The contract (ask_user_gate.py, at the --check add_argument): `--check=` is
+# the empty command, a bare --check is a usage error (exit 2), and a token
+# argparse reads as a flag is never taken as a value.
+#
+# Rows are (argv, exit code, text), and the table has two readers. main() below
+# runs each argv through BOTH halves and compares what argv_verdict returns --
+# only the code on a usage error and on the help, which argparse and the port
+# word differently. tests/test_ask_user_gate_parity.py holds the REFERENCE alone
+# to the code and, where it is not None, to the text: that half needs no
+# binary, so it is the one every checkout and every CI interpreter runs. A row
+# added here is therefore pinned twice by construction, instead of being written
+# into a second list that nothing keeps in step. Text is None where it is a
+# refusal (pinned by the corpus above, not here) or a usage error (always
+# "<usage error>"); a 0 always names its text, since exit 0 with no output is
+# also what hook mode returns on the empty stdin argv_verdict gives it.
 ARGV_CASES = [
-    ["--check="],
-    ["--check=", "--shell", "powershell"],
-    ["--shell=powershell", "--check="],
-    ["--check", ""],                          # a shell that keeps the token
-    ["--check"],                              # `--check ""` at the end
-    ["--check", "--shell", "powershell"],     # `--check ""` before a flag
-    ["--check", "--platform=windows"],        # ... one written with `=`
-    ["--check", "--sh", "powershell"],        # ... an abbreviation of one
-    ["--check", "-x"],                        # dash-led, no space: a flag
-    ["--check", "-1"],                        # a negative number: a value
-    ["--check", "-.5"],
-    # Not negative numbers by the gate's own rule (_Parser.NEGATIVE_NUMBER),
-    # whatever this interpreter's argparse would say: flags, so usage errors.
-    ["--check", "-1e5"],
-    ["--check", "-1abc"],
-    ["--check", "-1.2.3"],
-    ["--check", "-.5x"],
-    ["--check", "-1_000"],
-    ["--check", "-5\n"],                      # the old argparse `$` took it
-    ["--check", "-٥"],                   # a Unicode digit, ARABIC-INDIC 5
-    ["--check", "-= x"],                      # `-` before `=`: every option
-    ["--check", "-==x y"],
-    ["--tool", "-= x", "--check", "ls"],      # after any value-taking flag
-    ["--check=-= x"],                         # glued: a value, so a verdict
-    # An ambiguous flag is refused where parsing REACHES it, so a help before it
-    # still prints (exit 0) and one after it never runs (exit 2).
-    ["--help", "-= x"],
-    ["-= x", "--help"],
-    ["--help", "--c"],                        # ... an ambiguous prefix as well
-    ["--check", "-n 1; cd y && ls"],          # dash-led with a space: a value
-    ["--tool", "--check", "cd x && ls"],
-    ["--tool", "--check=cd x && ls"],         # a flag, space or not
-    ["--check", "--sh=a b"],                  # an abbreviation, space or not
-    ["--check", "-h x"],                      # -h glued to anything is -h
-    ["--check", "cd x && ls", "--tool", "-h"],
+    (["--check="], 0, ALLOWED),
+    (["--check=", "--shell", "powershell"], 0, ALLOWED),
+    (["--shell=powershell", "--check="], 0, ALLOWED),
+    (["--check", ""], 0, ALLOWED),            # a shell that keeps the token
+    (["--check"], 2, None),                   # `--check ""` at the end
+    (["--check", "--shell", "powershell"], 2, None),  # ... before a flag
+    (["--check", "--platform=windows"], 2, None),     # ... one written with `=`
+    (["--check", "--sh", "powershell"], 2, None),     # ... an abbreviation
+    (["--check", "-x"], 2, None),             # dash-led, no space: a flag
+    # The gate's own negative-number rule (_Parser.NEGATIVE_NUMBER), whatever
+    # this interpreter's argparse would say: a negative number is a value ...
+    (["--check", "-1"], 0, ALLOWED),
+    (["--check", "-.5"], 0, ALLOWED),
+    (["--check", "-2.5"], 0, ALLOWED),
+    # ... and these are not negative numbers: flags, so usage errors.
+    (["--check", "-1e5"], 2, None),
+    (["--check", "-1abc"], 2, None),
+    (["--check", "-1.2.3"], 2, None),
+    (["--check", "-.5x"], 2, None),
+    (["--check", "-1_000"], 2, None),
+    (["--check", "-5\n"], 2, None),           # the old argparse `$` took it
+    (["--check", "-٥"], 2, None),        # a Unicode digit, ARABIC-INDIC 5
+    (["--check", "-= x"], 2, None),           # `-` before `=`: every option
+    # A `-=` token and an ambiguous prefix are flags, refused on arrival.
+    # 3.9-3.11 argparse read `-= x` as a value and refused an ambiguous prefix
+    # before running anything, --help included; _Parser._get_option_tuples pins
+    # the newer reading, which the port shares. 3.12.14+ argparse gives every
+    # one of these natively, so there the rows guard nothing of the override:
+    # they bite on 3.9-3.11 only.
+    (["--check", "-==x y"], 2, None),
+    (["--tool", "-= x", "--check", "ls"], 2, None),   # after any value flag
+    # Glued: a `-=` VALUE, the control the other way -- an over-broad refusal
+    # would turn it into a usage error.
+    (["--check=-= x"], 0, ALLOWED),
+    # Refused where parsing REACHES it, so a help before it still prints and
+    # one after it never runs.
+    (["--help", "-= x"], 0, HELP),
+    (["-= x", "--help"], 2, None),
+    (["--help", "--c"], 0, HELP),             # ... an ambiguous prefix as well
+    (["--check", "-n 1; cd y && ls"], 1, None),   # dash-led with a space: a value
+    (["--tool", "--check", "cd x && ls"], 2, None),
+    (["--tool", "--check=cd x && ls"], 2, None),  # a flag, space or not
+    (["--check", "--sh=a b"], 2, None),       # an abbreviation, space or not
+    (["--check", "-h x"], 2, None),           # -h glued to anything is -h
+    (["--check", "cd x && ls", "--tool", "-h"], 2, None),
     # Not a usage error in the argparse sense, but exit 2 all the same: exit 1
     # is "denied", and a file that cannot be read was not judged.
-    ["--check-file", "no-such-file-7c1f0e.txt"],
+    (["--check-file", "no-such-file-7c1f0e.txt"], 2, None),
     # No command at all: hook mode, on the empty stdin argv_verdict gives it.
-    ["--tool=Bash"],
+    (["--tool=Bash"], 0, ""),
 ]
 
 # Hook mode: the path that actually runs. The first group is ordinary traffic;
@@ -373,7 +397,7 @@ def check_verdict(argv: "list[str]", command: str, shell: str, tool: str,
 
 
 def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]":
-    """One ARGV_CASES entry through one gate's CLI, host fixed to Windows.
+    """One ARGV_CASES argv through one gate's CLI, host fixed to Windows.
 
     `--platform windows` goes FIRST so that a case can end on a bare --check.
     A usage error (exit 2) and the help keep only their code, see ARGV_CASES.
@@ -497,7 +521,7 @@ def main() -> int:
                 print(f"  c++    (exit {cpp_code}):\n{normalise(cpp_text)}",
                       file=sys.stderr)
 
-        for arguments in ARGV_CASES:
+        for arguments, _, _ in ARGV_CASES:
             compared += 1
             py_code, py_text = argv_verdict(reference_argv, arguments)
             cpp_code, cpp_text = argv_verdict(gate_argv, arguments)
