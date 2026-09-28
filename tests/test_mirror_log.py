@@ -13,6 +13,7 @@ explain — off the end of the backup chain.
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,51 @@ def test_the_tee_still_logs_normally_after_a_guarded_call(tmp_path):
 
     written = (tmp_path / "mirror.log").read_text(encoding="utf-8")
     assert "first" in written and "second" in written
+
+
+def test_two_threads_writing_the_tee_log_their_lines_in_the_screens_order():
+    """A parallel run has more than one thread writing the tee (a line written
+    directly past a stuck console route beside the route's owner). One write
+    at a time: unguarded, a second writer's line reached the log while the
+    first's was still on its way to the screen, and `_buf` was shared by both."""
+    class FreezesOnFirst:
+        def __init__(self):
+            self.writes = []
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def write(self, text):
+            self.writes.append(text)
+            if text.startswith("first"):
+                self.entered.set()
+                self.release.wait(5)
+            return len(text)
+
+        def flush(self):
+            pass
+
+    records = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    screen = FreezesOnFirst()
+    tee = console.TeeToLog(screen, _logger("runCycle.test-tee-order", Collect()))
+    first = threading.Thread(target=tee.write, args=("first\n",))
+    first.start()
+    assert screen.entered.wait(5)
+    second = threading.Thread(target=tee.write, args=("second\n",))
+    second.start()
+    # Long enough for an unguarded second write to finish (it waits for
+    # nothing); a guarded one waits for the release below whatever this is.
+    second.join(0.5)
+    screen.release.set()
+    first.join(5)
+    second.join(5)
+
+    assert screen.writes == ["first\n", "second\n"]
+    assert records == ["first", "second"]
 
 
 # --- a dry run is a preview, and stays out of the shared record ----------------

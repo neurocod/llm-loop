@@ -163,6 +163,17 @@ class TeeToLog:
     Partial writes (streaming tokens emitted with ``end=""``) are buffered until a
     newline, so the file holds clean, complete lines while the screen keeps showing
     live token-by-token output.
+
+    One write at a time per tee, screen and log together (`_lock`): more than
+    one thread writes here during a parallel run (see `route_through`), and
+    unguarded two of them lose each other's text in `_buf` or log their lines
+    in the other order from the screen. A stream that is stuck holds the lock
+    for as long as the write is — where the next writer's own write to that
+    stream would have blocked anyway. Each tee has its own lock, so a stuck
+    stdout never holds up the stderr tee that reports it. The logger is called
+    inside the lock, which is safe because the mirror handler never writes a
+    stream (`_MirrorLogHandler.handleError`); reentrant, because a handler
+    that does, writing to this same tee, comes back here on the same thread.
     """
 
     # Set while this thread is inside a logging call, so anything the logging
@@ -175,20 +186,22 @@ class TeeToLog:
         self._stream = stream
         self._logger = logger
         self._buf = ""
+        self._lock = threading.RLock()
 
     def write(self, text: str) -> int:
-        self._stream.write(text)
-        if getattr(self._in_logging, "active", False):
+        with self._lock:
+            self._stream.write(text)
+            if getattr(self._in_logging, "active", False):
+                return len(text)
+            self._buf += text
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                self._in_logging.active = True
+                try:
+                    self._logger.info(line)
+                finally:
+                    self._in_logging.active = False
             return len(text)
-        self._buf += text
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            self._in_logging.active = True
-            try:
-                self._logger.info(line)
-            finally:
-                self._in_logging.active = False
-        return len(text)
 
     def flush(self) -> None:
         self._stream.flush()
@@ -363,15 +376,44 @@ class _Route:
         self.owner = owner
         self.post_timeout = post_timeout
         # Lines written on their caller's thread because the owner's queue had
-        # no room for `post_timeout` (see `route_through`). Under `_ROUTE_LOCK`.
+        # no room (see `route_through`). Under `_ROUTE_LOCK`, like `closed`.
         self.written_directly = 0
+        # Set by a post that found no room, cleared by one that did: while
+        # set, a poster does not wait for room at all (see `route_through`).
+        self.stalled = False
+        # Set when the window closes and its count is reported: a line written
+        # directly after that reports itself (see `_on_console`).
+        self.closed = False
 
 
-# Guards installing and removing the route, and its counter. Never held across
+# Guards installing and removing the route, and its counters. Never held across
 # a write or a post: a reader takes `_route` with one plain read (atomic), so a
 # console that is stuck cannot hold up the install, the removal or a poster.
 _ROUTE_LOCK = threading.Lock()
 _route: Optional[_Route] = None
+
+# Threads inside `unrouted_here`, as a per-thread nesting depth.
+_UNROUTED = threading.local()
+
+
+@contextlib.contextmanager
+def unrouted_here():
+    """While inside, THIS thread's console writes are made on it, never routed.
+
+    For a thread whose stdout is diverted away from the console by thread:
+    the status line's quota refresher collects a usage source's diagnostics
+    with `statusline.capture_stdout_here`, which is keyed on the thread that
+    writes. Posted to a route's owner, the line would be written on the
+    owner's thread — past the capture, onto the screen and into the mirror
+    log — and the refresher, having captured nothing, would read the source as
+    recovered. Nests; other threads are unaffected.
+    """
+    depth = getattr(_UNROUTED, "depth", 0)
+    _UNROUTED.depth = depth + 1
+    try:
+        yield
+    finally:
+        _UNROUTED.depth = depth
 
 
 @contextlib.contextmanager
@@ -381,20 +423,30 @@ def route_through(owner, *, post_timeout: float):
     `owner` is an `ownership.OwnerThread`. `print_markup` and `print_line` —
     and so the whole print_* family and `LINES` — post their write to it
     instead of making it, so a line printed by a thread the runner does not own
-    (the usage gate on a worker, the background git pusher, a usage source on
-    the status line's refresher) lands in the one stream the owner writes, after
-    every line already queued there, and never inside another write. Why this
-    lives here and not with the runner: those threads reach the console through
-    this module's names, imported by value, which the runner cannot intercept
-    without patching another module's globals.
+    (the usage gate on a worker, the background git pusher) lands in the one
+    stream the owner writes, after every line already queued there. A thread
+    inside `unrouted_here` is not routed (the status line's refresher, whose
+    usage diagnostics are captured, not printed). Why this lives here and not
+    with the runner: those threads reach the console through this module's
+    names, imported by value, which the runner cannot intercept without
+    patching another module's globals.
 
     The window may be opened before `owner.start()` and closed after
     `owner.close()`: with no owner thread a post runs on its caller (see
     `OwnerThread.post`), which is exactly what a write did before the route.
-    `parallel.run_parallel` opens it that way round, so there is no moment in
-    which a line is routed to an owner that has not yet, or no longer, got the
-    lines before it. On the owner's own thread a write is made at once — the
-    owner cannot wait for a queue only it empties.
+    `parallel.run_parallel` opens it that way round, so while the owner is
+    healthy no line is routed to an owner that has not yet got the lines
+    before it, and none written directly ahead of what it still holds. On the
+    owner's own thread a write is made at once — the owner cannot wait for a
+    queue only it empties.
+
+    What the route does NOT promise is order around a console that is stuck.
+    A close that times out (`parallel._close_console`) leaves the owner
+    writing its backlog as a daemon: a line posted just before the window
+    closed is queued behind that backlog and lost with it if the process exits
+    first, and a line written after the window closed is written at once,
+    ahead of it. The lines written directly inside the window (below) are out
+    of order too, by design.
 
     THE BLOCKING POLICY — a poster waits at most `post_timeout` for room in the
     owner's queue, and past it writes the line ITSELF, out of order, counting
@@ -412,8 +464,18 @@ def route_through(owner, *, post_timeout: float):
     A queue full for the whole of `post_timeout` means the console itself is
     stuck, so the direct write may block there as well — which is where the
     write blocked before this route existed, so the worst case is the old
-    behaviour after a bounded wait, not a new hang. The count is reported to
-    stderr once the window closes.
+    behaviour after a bounded wait, not a new hang. And it is paid once, not
+    per line: past one such timeout the route is STALLED, and a poster only
+    takes room that is free at once (`try_post`), writing the line itself
+    otherwise, until a post finds room again. Without that, every line of the
+    gate — which holds `usage_lock` meanwhile — would wait its own
+    `post_timeout` before reaching the point where the old write blocked.
+
+    A line written directly is written whole (`_print_flushed`, and the tee's
+    lock in `TeeToLog`), so it can land between two of the owner's lines but
+    not inside one. The count is reported to stderr once the window closes; a
+    poster that was still waiting then, and writes directly afterwards,
+    reports its own line (`_on_console`).
 
     A write that raises on the owner costs that line only and is reported by
     the owner (`OwnerThread._report`); it no longer unwinds the thread that
@@ -432,11 +494,12 @@ def route_through(owner, *, post_timeout: float):
     finally:
         with _ROUTE_LOCK:
             _route = None
+            route.closed = True
             direct = route.written_directly
         if direct:
             print(f"  ⚠ {owner.name}: {direct} line(s) written directly, out of "
-                  f"order — its queue stayed full for {post_timeout:g} s.",
-                  file=sys.stderr)
+                  f"order — its queue had no room (the first after waiting "
+                  f"{post_timeout:g} s).", file=sys.stderr)
 
 
 def _on_console(call, *args) -> None:
@@ -444,13 +507,28 @@ def _on_console(call, *args) -> None:
 
     `call` is the write itself (never `print_markup`, which would route again
     on the owner's side and recurse there).
+
+    A direct write is counted under `_ROUTE_LOCK`, which also orders it
+    against the window's close: counted before it, it is in the close's
+    report; after it — a poster that took the route, waited, and timed out
+    once the window had closed and reported — it says so itself, since
+    nothing else would.
     """
     route = _route
-    if route is not None and not route.owner.owns_current_thread:
-        if route.owner.post(call, *args, timeout=route.post_timeout):
+    if (route is not None and not getattr(_UNROUTED, "depth", 0)
+            and not route.owner.owns_current_thread):
+        timeout = 0 if route.stalled else route.post_timeout
+        if route.owner.post(call, *args, timeout=timeout):
+            route.stalled = False
             return
         with _ROUTE_LOCK:
+            route.stalled = True
             route.written_directly += 1
+            late = route.closed
+        if late:
+            print(f"  ⚠ {route.owner.name}: 1 line written directly, out of "
+                  f"order, after the window closed — its queue stayed full.",
+                  file=sys.stderr)
     call(*args)
 
 
@@ -462,18 +540,25 @@ def _render_markup(plain: str, markup: str) -> None:
     appear as it is written rather than when a buffer happens to fill — and the
     flush has to be made by the thread that wrote the line, after it: a flush on
     the poster's side would run before a routed line was written at all. Rich
-    flushes its own writes; `print` is told to.
+    flushes its own writes; the plain path is `_print_flushed`.
     """
     if RICH_AVAILABLE:
         _RichConsole(file=real_stream()).print(markup)
         _log_plain(plain)
     else:
-        print(plain, flush=True)
+        _print_flushed(plain)
 
 
 def _print_flushed(text: str) -> None:
-    """The write behind `print_line` (flushed for `_render_markup`'s reason)."""
-    print(text, flush=True)
+    """One whole line, in ONE write, then flushed (see `_render_markup`).
+
+    Not `print`: it writes the text and the newline in two calls, and a line
+    written directly past a stuck route (`route_through`) can land between
+    them — "queued" + "direct\\n" + "\\n".
+    """
+    stream = sys.stdout
+    stream.write(text + "\n")
+    stream.flush()
 
 
 def print_markup(plain: str, markup: str) -> None:
@@ -495,12 +580,13 @@ def print_markup(plain: str, markup: str) -> None:
 
 
 def print_line(text: str) -> None:
-    """`print(text)`, but inside `route_through` written by the owner.
+    """`print(text, flush=True)`, but inside `route_through` written by the owner.
 
     For the plain lines of code that can run beside a parallel run's workers —
     the usage gate, the usage sources. A bare `print` there would be written
     past the owner, and ahead of the gate's own `print_percents` lines queued a
-    moment earlier.
+    moment earlier. Always flushed, like `print_markup` and for its reason
+    (see `_render_markup`): the gate's lines include a paused run's countdown.
     """
     _on_console(_print_flushed, text)
 

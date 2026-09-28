@@ -22,8 +22,8 @@ import time
 
 import pytest
 
-from llm_loop import (console, cyclecore, projectroot, runlifecycle,
-                      stopchannel, textwidth)
+from llm_loop import (console, cyclecore, ownership, projectroot,
+                      runlifecycle, stopchannel, textwidth, usage)
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
@@ -1998,6 +1998,61 @@ def test_capture_only_diverts_the_thread_that_asked_for_it(capsys):
     assert "".join(chunks) == "mine\n"
     assert capsys.readouterr().out == "from another thread\n"
     assert not isinstance(sys.stdout, sl._ThreadScopedCapture)   # uninstalled
+
+
+def test_a_capture_still_holds_inside_a_console_route(capsys):
+    """A parallel run routes `console.print_line` to its console's owner — a
+    thread the capture does not cover — so a captured thread is kept out of
+    the route (`console.unrouted_here`), and the owner writes nothing."""
+    owner = ownership.OwnerThread("console-lines").start()
+    captured = []
+
+    def refresher_like():
+        with sl.capture_stdout_here() as chunks:
+            console.print_line("  · no usage figures: 401")
+        captured.append("".join(chunks))
+
+    try:
+        with console.route_through(owner, post_timeout=5.0):
+            thread = threading.Thread(target=refresher_like,
+                                      name="statusline-quotas")
+            thread.start()
+            thread.join(5)
+            assert owner.drain(5)
+    finally:
+        assert owner.close(5)
+
+    assert captured == ["  · no usage figures: 401\n"]
+    assert capsys.readouterr().out == ""          # nothing reached the stream
+
+
+def test_a_routed_quota_poll_notes_a_failed_usage_query_instead_of_printing(
+        tmp_path, monkeypatch, capsys):
+    """The real usage source, with no credentials to read, inside the route a
+    parallel run holds open: its diagnostic reaches the note row, not the
+    stream — and so not the mirror log either."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))   # no credentials
+    owner = ownership.OwnerThread("console-lines").start()
+    app = sl.StatusApp(terminal=LiveTerminal(),
+                       input_source=tio.NullInputSource(), refresh=60)
+    try:
+        with console.route_through(owner, post_timeout=5.0):
+            with app:
+                refresher = sl.QuotaRefresher(app, usage.UsageSource(),
+                                              interval=0.01)
+                refresher.start()
+                # Measured with the unrouted twin above: 0.02-0.03 s.
+                deadline = time.time() + 5
+                while not app.status.note and time.time() < deadline:
+                    time.sleep(0.01)
+                refresher.stop()
+            assert owner.drain(5)
+    finally:
+        assert owner.close(5)
+
+    assert "quota refresh" in app.status.note
+    assert "no usage figures" in app.status.note
+    assert capsys.readouterr().out == ""          # nothing reached the stream
 
 
 # --- the model the CLI actually runs ------------------------------------------

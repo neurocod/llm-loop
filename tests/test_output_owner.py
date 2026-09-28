@@ -866,9 +866,18 @@ class _ThreadedStdout:
         return False
 
     def lines(self):
-        """(thread, text) of every write that is a line, not a bare newline."""
+        """(thread, text) of every write that is a line, not a bare newline —
+        its own newline dropped (a `console` line is one write, newline
+        included; a bare `print` makes two). Blind to a line split by another
+        write: that is what `screen` is for."""
         with self._lock:
-            return [(name, text) for name, text in self.writes if text != "\n"]
+            return [(name, text[:-1] if text.endswith("\n") else text)
+                    for name, text in self.writes if text != "\n"]
+
+    def screen(self):
+        """Everything written, in order: what the terminal shows."""
+        with self._lock:
+            return "".join(text for _name, text in self.writes)
 
 
 class _OnePushGit:
@@ -1012,6 +1021,137 @@ def test_a_route_whose_queue_stays_full_writes_the_line_itself_and_says_so(
     assert "pin-console: 1 line(s) written directly" in capsys.readouterr().err
 
 
+class _StallsTheOwnersWrite(_ThreadedStdout):
+    """Holds the first write made on `owner`'s thread — after recording it —
+    until `release`: a console that froze in the middle of the owner's line."""
+
+    def __init__(self, owner):
+        super().__init__()
+        self._owner = owner
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def write(self, text):
+        written = super().write(text)
+        if (threading.current_thread().name == self._owner
+                and not self.entered.is_set()):
+            self.entered.set()
+            self.release.wait(WAIT_S)
+        return written
+
+
+def test_a_line_written_past_a_stuck_route_never_lands_inside_the_owners(
+        monkeypatch, capsys):
+    """A direct write lands between two of the owner's lines, not inside one.
+
+    `print` writes a line's text and its newline in two calls; with the owner
+    frozen between them, the poster's line used to land in the gap and the
+    screen read "queueddirect" followed by two newlines.
+    """
+    out = _StallsTheOwnersWrite("pin-console")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    owner = ownership.OwnerThread("pin-console", maxsize=1).start()
+    try:
+        with console.route_through(owner, post_timeout=0.05):
+            console.print_line("queued")
+            assert out.entered.wait(WAIT_S)
+            owner.post(lambda: None)            # the one slot: full
+            poster = threading.Thread(target=console.print_line,
+                                      args=("direct",), name="pin-poster")
+            poster.start()
+            poster.join(WAIT_S)
+            assert not poster.is_alive(), "the direct write waited for the owner"
+    finally:
+        out.release.set()
+        assert owner.close(WAIT_S)
+
+    assert out.screen() == "queued\ndirect\n"
+    assert "pin-console: 1 line(s) written directly" in capsys.readouterr().err
+
+
+def test_past_one_timeout_a_route_stops_waiting_for_room_until_there_is_some(
+        monkeypatch, capsys):
+    """A stuck console costs a route ONE `post_timeout`, not one per line.
+
+    The gate prints several lines under `usage_lock`; each used to wait the
+    whole timeout before writing itself. Past the first, a poster takes only
+    room that is free at once — and waits again once a post has found some.
+    """
+    out = _ThreadedStdout()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    owner = ownership.OwnerThread("pin-console", maxsize=1).start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    owner.post(lambda: None)                    # the one slot: full
+    waits = []
+    real_post = owner.post
+
+    def post(call, *args, timeout=None):
+        waits.append(timeout)
+        return real_post(call, *args, timeout=timeout)
+
+    monkeypatch.setattr(owner, "post", post)
+    try:
+        with console.route_through(owner, post_timeout=0.05):
+            for n in range(3):
+                console.print_line(f"stuck {n}")
+            stall.release.set()
+            assert owner.drain(WAIT_S)
+            console.print_line("room again")
+            assert owner.drain(WAIT_S)          # room for the next, surely
+            console.print_line("waited for again")
+    finally:
+        stall.release.set()
+        assert owner.close(WAIT_S)
+
+    assert waits == [0.05, 0, 0, 0, 0.05]
+    assert [text for _name, text in out.lines()] == [
+        "stuck 0", "stuck 1", "stuck 2", "room again", "waited for again"]
+    assert "pin-console: 3 line(s) written directly" in capsys.readouterr().err
+
+
+class _PostHeldUntilTheWindowCloses:
+    """An owner whose post waits for `go`, then finds no room."""
+
+    name = "pin-console"
+    owns_current_thread = False
+
+    def __init__(self):
+        self.waiting = threading.Event()
+        self.go = threading.Event()
+
+    def post(self, call, *args, timeout=None):
+        self.waiting.set()
+        self.go.wait(WAIT_S)
+        return False
+
+
+def test_a_line_written_directly_after_the_window_closed_reports_itself(
+        monkeypatch, capsys):
+    """The close reports what was written directly by then; a poster still
+    waiting at that moment is not in its count, and says so itself."""
+    out = _ThreadedStdout()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    owner = _PostHeldUntilTheWindowCloses()
+    poster = threading.Thread(target=console.print_line, args=("late",),
+                              name="pin-poster")
+    with console.route_through(owner, post_timeout=WAIT_S):
+        poster.start()
+        assert owner.waiting.wait(WAIT_S)
+    at_close = capsys.readouterr().err
+    owner.go.set()
+    poster.join(WAIT_S)
+
+    assert at_close == "", "the close counted a line not yet written"
+    assert out.lines() == [("pin-poster", "late")]
+    assert ("pin-console: 1 line written directly, out of order, after the "
+            "window closed") in capsys.readouterr().err
+
+
 def test_one_route_at_a_time():
     owner = ownership.OwnerThread("pin-console")
     with console.route_through(owner, post_timeout=1.0):
@@ -1030,6 +1170,10 @@ def test_a_phase_that_raises_leaves_the_console_unrouted(tmp_path, monkeypatch):
                         lambda job_id, command, mailbox=None: (0, 0.0, 0.01))
 
     def blow_up(threads):
+        # Joined first: a worker left running writes its first line after the
+        # test, into whichever test's stdout is installed by then.
+        for thread in threads:
+            thread.join(WAIT_S)
         raise RuntimeError("the phase failed")
 
     monkeypatch.setattr(parallel, "join_workers", blow_up)

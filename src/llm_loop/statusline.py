@@ -2151,7 +2151,12 @@ class _ThreadScopedCapture:
 
 @contextmanager
 def capture_stdout_here():
-    """Collect THIS thread's stdout writes; yields the list of chunks."""
+    """Collect THIS thread's stdout writes; yields the list of chunks.
+
+    `console.unrouted_here` too: inside a parallel run's `console.route_through`
+    a `console.print_line` would otherwise be written by the route's owner, on
+    its own thread, past this capture.
+    """
     ident = threading.get_ident()
     buffer: List[str] = []
     with _capture_lock:
@@ -2159,7 +2164,8 @@ def capture_stdout_here():
             sys.stdout = _ThreadScopedCapture(sys.stdout)
         _captured[ident] = buffer
     try:
-        yield buffer
+        with console.unrouted_here():
+            yield buffer
     finally:
         with _capture_lock:
             _captured.pop(ident, None)
