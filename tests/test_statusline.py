@@ -28,6 +28,7 @@ from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
 from _runfixtures import isolated_run, seq_args
+from _termfixtures import LiveTerminal
 
 
 @pytest.fixture(autouse=True)
@@ -1338,37 +1339,6 @@ def test_concurrent_job_updates_never_tear_a_snapshot():
 # --- the loop's wiring: live caps, primed quotas, no forced polls ---------------
 
 
-class _LiveTerminal(tio.Terminal):
-    """Active from reserve() on, with no screen behind it.
-
-    What these tests are about happens on either side of start() (push_quotas is
-    silent until the app is enabled), which a NullTerminal — off always, and
-    short-circuited by start() — cannot express and a real Terminal needs a tty
-    for.
-    """
-
-    def __init__(self):
-        super().__init__(stream=io.StringIO())
-        self._on = False
-
-    @property
-    def active(self):
-        return self._on
-
-    def size(self):
-        return (120, 30)
-
-    def reserve(self, rows):
-        self._on = True
-        return True
-
-    def paint(self, lines, *, reassert=False):
-        return True
-
-    def release(self):
-        self._on = False
-
-
 class _CountingSource:
     """A UsageSource that never leaves the process."""
 
@@ -1406,7 +1376,7 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
 
     def _app(**kwargs):
         kwargs.pop("enabled", None)
-        app = real_app_class(terminal=_LiveTerminal(),
+        app = real_app_class(terminal=LiveTerminal(),
                              input_source=tio.NullInputSource(), refresh=60,
                              **kwargs)
         made["app"] = app
@@ -1856,7 +1826,7 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
 
     def _app(**kwargs):
         kwargs.pop("enabled", None)
-        app = real_app_class(terminal=_LiveTerminal(),
+        app = real_app_class(terminal=LiveTerminal(),
                              input_source=tio.NullInputSource(), refresh=60,
                              **kwargs)
         made.append(app)
@@ -2019,7 +1989,7 @@ def test_a_background_quota_poll_notes_its_failure_instead_of_printing(capsys):
             print("  · no usage figures: the stored OAuth token was rejected (401)")
             raise RuntimeError("no figures")     # quota_rows swallows this
 
-    app = sl.StatusApp(terminal=_LiveTerminal(),
+    app = sl.StatusApp(terminal=LiveTerminal(),
                        input_source=tio.NullInputSource(), refresh=60)
     with app:
         refresher = sl.QuotaRefresher(app, _NoisySource(), interval=0.01)

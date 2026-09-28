@@ -13,7 +13,6 @@ Two things are pinned here, and only the first is cosmetic:
     boundary (a cap is not a request).
 """
 
-import io
 import sys
 import threading
 
@@ -26,6 +25,7 @@ from llm_loop import termio as tio
 
 from _runfixtures import (MemListDriver, NoWorkDriver, isolated_run, par_args,
                           seq_args)
+from _termfixtures import LiveTerminal
 
 
 @pytest.fixture(autouse=True)
@@ -46,43 +46,13 @@ class _MemDriver(MemListDriver):
             self._items.append(item)
 
 
-class _LiveTerminal(tio.Terminal):
-    """Active from reserve() on, with no screen behind it.
-
-    The grace is interactive-only (`app.enabled`), so a NullTerminal — which is
-    what a test process without a tty otherwise gets — cannot express the very
-    behaviour under test.
-    """
-
-    def __init__(self):
-        super().__init__(stream=io.StringIO())
-        self._on = False
-
-    @property
-    def active(self):
-        return self._on
-
-    def size(self):
-        return (120, 30)
-
-    def reserve(self, rows):
-        self._on = True
-        return True
-
-    def paint(self, lines, *, reassert=False):
-        return True
-
-    def release(self):
-        self._on = False
-
-
 def _live_statusline(monkeypatch, made, *, live=True):
     """Make run_parallel build a status line the test can drive, and capture it."""
     real_app_class = sl.StatusApp        # captured before the patch below
 
     def _app(**kwargs):
         enabled = kwargs.pop("enabled", True)
-        terminal = _LiveTerminal() if (live and enabled) else tio.NullTerminal()
+        terminal = LiveTerminal() if (live and enabled) else tio.NullTerminal()
         app = real_app_class(terminal=terminal,
                              input_source=tio.NullInputSource(), refresh=60,
                              **kwargs)
@@ -598,7 +568,7 @@ def test_only_one_worker_owns_the_pending_request():
 # --- periodic runs alternate the two runners --------------------------------------
 
 
-class _RecordingTerminal(_LiveTerminal):
+class _RegionLoggingTerminal(LiveTerminal):
     """A live terminal that logs when its region opens and closes.
 
     The terminal itself goes into the log, not its id(). That reference is
@@ -633,7 +603,7 @@ def test_a_batching_wrapper_never_stacks_two_status_areas(tmp_path, monkeypatch)
 
     def _app(**kwargs):
         kwargs.pop("enabled", None)
-        return real_app_class(terminal=_RecordingTerminal(log),
+        return real_app_class(terminal=_RegionLoggingTerminal(log),
                               input_source=tio.NullInputSource(), refresh=60,
                               **kwargs)
 
@@ -660,7 +630,8 @@ def test_a_batching_wrapper_never_stacks_two_status_areas(tmp_path, monkeypatch)
     pairs = list(zip(log[::2], log[1::2]))
     assert all(opened is closed for (_r, opened), (_x, closed) in pairs)
     # `log` holds every terminal alive, so identity here really does mean
-    # "four different objects" — see _RecordingTerminal on why ids would not.
+    # "four different objects" — see _RegionLoggingTerminal on why ids would
+    # not.
     assert len({id(opened) for (_r, opened) in log[::2]}) == 4
 
 

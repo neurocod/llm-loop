@@ -1,8 +1,5 @@
 """Exercise the painted editor, including a terminal too slow for each key."""
 
-import io
-import queue
-import re
 import threading
 import time
 
@@ -10,20 +7,7 @@ import pytest
 
 from llm_loop import operator, statusline as sl, termio, textwidth
 
-
-class RecordingTerminal(termio.Terminal):
-    def __init__(self, columns=80):
-        super().__init__(io.StringIO())
-        self.columns = columns
-        self.frames = queue.Queue()
-
-    def size(self):
-        return self.columns, 30
-
-    def paint(self, lines, *, reassert=False):
-        result = super().paint(lines, reassert=reassert)
-        self.frames.put([re.sub(r"\x1b\[[0-9;]*m", "", line) for line in lines])
-        return result
+from _termfixtures import KeysByHand, RecordingTerminal
 
 
 @pytest.mark.parametrize("text", ["a" * 200, "полка " * 100, "码" * 200],
@@ -54,11 +38,7 @@ def test_painted_long_note_scrolls_without_touching_the_last_column(text):
 
 
 def test_slow_paint_does_not_block_input_and_eventually_shows_the_latest_note():
-    class Input(termio.NullInputSource):
-        def start(self, handler):
-            self.handler = handler
-
-    terminal, source = RecordingTerminal(), Input()
+    terminal, source = RecordingTerminal(), KeysByHand()
     mailbox = operator.Mailbox()
     app = sl.StatusApp(terminal=terminal, input_source=source, messages=mailbox)
     text = "measure the shelf " * 100 + "FINAL"
@@ -115,11 +95,7 @@ def test_arrows_show_a_literal_caret_at_the_insertion_position():
 
 
 def test_restarting_the_same_app_restarts_input_repainting():
-    class Input(termio.NullInputSource):
-        def start(self, handler):
-            self.handler = handler
-
-    terminal, source = RecordingTerminal(), Input()
+    terminal, source = RecordingTerminal(), KeysByHand()
     app = sl.StatusApp(terminal=terminal, input_source=source,
                        messages=operator.Mailbox())
     with app:

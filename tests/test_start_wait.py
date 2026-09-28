@@ -6,24 +6,25 @@ import pytest
 
 from llm_loop import cyclecore, termio
 
+from _termfixtures import RecordingTerminal
+
+
+class _Waiting(SimpleNamespace):
+    """The fake clock and keys, and what the wait did to the terminal it got."""
+
+    @property
+    def frames(self):
+        return self.terminal.painted if self.terminal else []
+
+    @property
+    def released(self):
+        return bool(self.terminal and self.terminal.releases)
+
 
 @pytest.fixture
 def waiting(monkeypatch):
-    state = SimpleNamespace(now=0.0, actions=[], frames=[], stopped=False,
-                            released=False, enabled=None, width=80)
-
-    class Terminal:
-        def reserve(self, rows):
-            return state.enabled
-
-        def size(self):
-            return state.width, 24
-
-        def paint(self, rows):
-            state.frames.append(list(rows))
-
-        def release(self):
-            state.released = True
+    state = _Waiting(now=0.0, actions=[], stopped=False, terminal=None,
+                     width=80)
 
     class Reader:
         def usable(self):
@@ -52,8 +53,11 @@ def waiting(monkeypatch):
             raise cyclecore.queue.Empty
 
     def terminal_for(*, enabled):
-        state.enabled = enabled
-        return Terminal()
+        # What the real factory answers for a disabled UI; a console otherwise.
+        if not enabled:
+            return termio.NullTerminal()
+        state.terminal = RecordingTerminal(columns=state.width, lines=24)
+        return state.terminal
 
     def sleep(seconds):
         state.now += seconds
