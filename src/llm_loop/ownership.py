@@ -69,8 +69,10 @@ class OwnerThread:
     The bounded queue holds back posters, never the owner's own life cycle:
     `start(first=)` and `close(final=)` queue the call that sets the resource
     up and the one that puts it back past `maxsize`, so neither a restart nor
-    a hand-back waits for room behind a stuck resource. One of each per window
-    is what they can add, so the bound still holds give or take two.
+    a hand-back waits for room behind a stuck resource. The bound is on posts,
+    then: every such call comes on top of it, repeated ones are not merged,
+    and a caller that opens and closes over a stuck resource in a loop grows
+    the queue by its own calls.
 
     `idle` is the owner's own work — a periodic repaint, a frame coalesced over
     a burst of posted calls. The owner calls it when its queue is empty and it
@@ -298,11 +300,15 @@ class OwnerThread:
         try:
             while True:
                 with self._changed:
-                    if window != self._window:
-                        # Opened again while this thread was closing: what
-                        # the last window made due is not this one's.
-                        window, idle_due = self._window, None
-                    while not self._items and self._state == _OPEN:
+                    while True:
+                        # Asked again after every wake, not once per call: a
+                        # close and a reopen can both land while this thread
+                        # sleeps, and what the last window made due — a delay
+                        # the hook answered — is not this one's.
+                        if window != self._window:
+                            window, idle_due = self._window, None
+                        if self._items or self._state != _OPEN:
+                            break
                         if idle_due is None:
                             self._changed.wait()
                             continue
@@ -322,8 +328,7 @@ class OwnerThread:
                         self._close_locked()
                         return
                 if call is None:
-                    idle_due = self._idle_due_after(
-                        self._invoke(self._idle, ()))
+                    idle_due = self._invoke(self._idle_pass, ())
                     continue
                 try:
                     self._invoke(call, args)
@@ -372,21 +377,22 @@ class OwnerThread:
         except BaseException:           # noqa: BLE001 - the reporter may not end us
             pass
 
-    def _idle_due_after(self, delay) -> Optional[float]:
-        """When `idle` is next due after it answered `delay` (monotonic).
+    def _idle_pass(self) -> Optional[float]:
+        """Run `idle`; when it is next due (monotonic), or None.
 
-        An answer that is not a delay — a string, NaN — is the hook's failure
-        and is reported as one, rather than reaching `Condition.wait` and ending
-        the owner there; a delay past IDLE_DELAY_MAX (`inf` included) is
-        clamped to it.
+        Run through `_invoke` whole, answer included, so nothing the answer
+        does can get past it and end the owner: an answer that is not a delay
+        — a string, NaN — raises here and is reported as the hook's failure.
+        A delay past IDLE_DELAY_MAX (`inf`, `10**1000`) is clamped to it
+        BEFORE `float()`, which would overflow on an int that large.
         """
+        delay = self._idle()
         if delay is None:
             return None
         if not isinstance(delay, (int, float)) or delay != delay:
-            self._fail(TypeError(f"idle answered {delay!r}, not a delay in "
-                                 f"seconds or None"))
-            return None
-        return time.monotonic() + min(max(0.0, float(delay)), IDLE_DELAY_MAX)
+            raise TypeError(f"idle answered {delay!r}, not a delay in "
+                            f"seconds or None")
+        return time.monotonic() + float(min(max(0, delay), IDLE_DELAY_MAX))
 
     def _report(self, exc: BaseException) -> None:
         """One stderr line per distinct failure, not one per failed call.

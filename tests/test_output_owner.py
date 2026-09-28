@@ -476,15 +476,111 @@ def test_idle_is_not_due_in_a_reopened_window_before_its_first_post():
     assert owner.close(WAIT_S)
 
 
+class _HeldWake(threading.Condition):
+    """The owner's condition, able to hold the owner inside a wait.
+
+    While `hold` is set, the owner's wait does not return — woken or timed out
+    — until the test clears it, the lock released all along. That stages "a
+    close and a reopen both landed while the owner slept" without a race: a
+    real `Condition.wait` is free to return that late. `asleep` is set as the
+    owner enters a wait, under the lock, so a test that sees it and then takes
+    the lock knows the owner is inside that wait.
+    """
+
+    def __init__(self, lock):
+        super().__init__(lock)
+        self.hold = threading.Event()
+        self.asleep = threading.Event()
+
+    def wait(self, timeout=None):
+        if threading.current_thread().name != "pin-owner":
+            return super().wait(timeout)
+        self.asleep.set()
+        woke = super().wait(timeout)
+        deadline = time.monotonic() + WAIT_S
+        while self.hold.is_set() and time.monotonic() < deadline:
+            super().wait(0.005)
+        return woke
+
+
+def _sleeping_owner(delay):
+    """An open owner asleep after one post and one idle pass that answered
+    `delay`, held there (see `_HeldWake`); (owner, its condition, ran, idle
+    calls)."""
+    ran, calls = [], []
+
+    def idle():
+        calls.append(list(ran))
+        if len(calls) == 1:
+            held.hold.set()             # every wake from here on waits for us
+            held.asleep.clear()         # and the next wait is the one we want
+        return delay
+
+    owner = ownership.OwnerThread("pin-owner", idle=idle)
+    owner._changed = held = _HeldWake(owner._lock)
+    owner.start()
+    owner.post(ran.append, "a")
+    assert held.asleep.wait(WAIT_S)
+    return owner, held, ran, calls
+
+
+def test_a_reopen_with_a_first_call_while_the_owner_sleeps_makes_idle_due():
+    """Close and reopen both land in one sleep, and the new window's `first`
+    is the owner's next call: it makes idle due like any call of the window.
+
+    The owner used to ask which window it was in once per call, before its
+    wait: it ran `first` still counting the last window, marked idle due,
+    then noticed the new window and dropped that — no idle until a post.
+    """
+    owner, held, ran, calls = _sleeping_owner(None)
+    assert not owner.close(timeout=0)
+    owner.start(first=lambda: ran.append("first"))
+    held.hold.clear()
+    assert _wait_for(lambda: len(calls) == 2), \
+        "idle was not due after the reopened window's first call"
+    assert calls[1] == ["a", "first"]
+    assert owner.close(WAIT_S)
+
+
+# How long past the old window's idle delay the pin below watches for a pass
+# that must not come. Under the fix nothing ever comes, so no value can turn it
+# red; it only has to outlast the 0.2 s delay for the unfixed owner to show.
+_STALE_DELAY_S = 0.2
+_WATCH_S = 0.6
+
+
+def test_a_reopen_while_the_owner_sleeps_drops_the_last_windows_idle_delay():
+    """Close and reopen with nothing posted, both in one sleep: the delay the
+    hook answered in the last window does not make it due in this one.
+
+    The owner used to wake, find the queue still empty and go on waiting for
+    the old delay — then run idle in a window nothing had been posted in.
+    """
+    owner, held, ran, calls = _sleeping_owner(_STALE_DELAY_S)
+    assert not owner.close(timeout=0)
+    owner.start()
+    held.hold.clear()
+    time.sleep(_WATCH_S)
+    assert len(calls) == 1, "idle ran in the new window before its first post"
+    owner.post(ran.append, "new")
+    assert _wait_for(lambda: len(calls) >= 2)
+    assert calls[1] == ["a", "new"]
+    assert owner.close(WAIT_S)
+
+
 @pytest.mark.parametrize("answer, failure", [(float("inf"), None),
                                              (10 ** 30, None),
+                                             (10 ** 1000, None),
                                              (float("nan"), "TypeError"),
-                                             ("soon", "TypeError")])
+                                             ("soon", "TypeError")],
+                         ids=["inf", "1e30", "1e1000", "nan", "str"])
 def test_an_idle_answer_that_is_not_a_delay_cannot_end_the_owner(
         answer, failure, capsys):
     """`inf` reached `Condition.wait` as an OverflowError and ended the owner,
-    after which every post ran on its caller. Too long a delay is clamped to
-    IDLE_DELAY_MAX; what is not a delay at all is the hook's failure."""
+    after which every post ran on its caller; `10**1000` did the same one step
+    earlier, in `float()`, outside the net a posted call runs in. Too long a
+    delay is clamped to IDLE_DELAY_MAX; what is not a delay at all is the
+    hook's failure."""
     answered = threading.Event()
 
     def idle():
