@@ -5,19 +5,21 @@ value", so most of these tests are one spelling each: a missed spelling leaves
 the old value on the line next to the new one, which reads as correct and is not.
 """
 
-import base64
 import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 
 import pytest
 
+from _pwsh import needs_powershell, run_powershell
 from llm_loop import clispec, cmdline
-from llm_loop.cmdline import quote, rebuild_argv, render
+from llm_loop.cmdline import (POSIX, POWERSHELL, NotPasteable, paste_shell,
+                              quote, rebuild_argv, render)
 
 
 # --- removal: every spelling of one flag ---------------------------------------
@@ -194,69 +196,268 @@ def test_the_table_still_answers_at_this_module_s_address():
 
 
 
-# --- render ---------------------------------------------------------------------
+# --- render: one line, for the shell it is pasted into -------------------------
 
-def test_render_prefixes_interpreter_and_script():
-    line = render(["-m", "5"], {"--max-runs": 2},
-                  executable="python", script="runGenerateModels.py")
-    assert line == "python runGenerateModels.py --max-runs 2"
+@pytest.mark.parametrize("shell, expected", [
+    (POWERSHELL, "& python runGenerateModels.py --max-runs 2"),
+    (POSIX, "python runGenerateModels.py --max-runs 2"),
+])
+def test_render_prefixes_interpreter_and_script(shell, expected):
+    line = render(["-m", "5"], {"--max-runs": 2}, executable="python",
+                  script="runGenerateModels.py", shell=shell)
+    assert line == expected
 
 
-def test_render_quotes_paths_with_spaces():
+@pytest.mark.parametrize("shell, expected", [
+    (POWERSHELL, r"& python 'run models.py' -p --project-dir 'C:\my project'"),
+    (POSIX, r"python 'run models.py' -p --project-dir 'C:\my project'"),
+])
+def test_render_quotes_paths_with_spaces(shell, expected):
     line = render(["-p"], {"--project-dir": r"C:\my project"},
-                  executable="python", script="run models.py")
-    if os.name == "nt":
-        assert line == 'python "run models.py" -p --project-dir "C:\\my project"'
-    else:
-        assert line == "python 'run models.py' -p --project-dir 'C:\\my project'"
+                  executable="python", script="run models.py", shell=shell)
+    assert line == expected
 
 
 def test_render_defaults_the_script_to_argv0(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["runCycle.py", "-m", "5"])
-    assert render(["-m", "5"], {}, executable="python") == "python runCycle.py -m 5"
+    assert render(["-m", "5"], {}, executable="python",
+                  shell=POSIX) == "python runCycle.py -m 5"
 
 
-POWERSHELL = shutil.which("powershell.exe") if os.name == "nt" else None
-# 2.4-6.6 s per case (two runs of the three cases, measured 2026-09-27); the
-# budget only has to tell a hang from a slow box.
-PS_TIMEOUT_S = 60
+@pytest.mark.parametrize("os_name, environ, expected", [
+    ("nt", {}, POWERSHELL),
+    ("nt", {"MSYSTEM": "MINGW64"}, POSIX),          # Git Bash
+    ("nt", {"MSYSTEM": "UCRT64"}, POSIX),           # an MSYS2 shell
+    ("nt", {"MSYSTEM": ""}, POWERSHELL),
+    ("nt", {"SHELL": "/usr/bin/bash"}, POWERSHELL),  # not a console signal
+    ("posix", {}, POSIX),
+    ("posix", {"MSYSTEM": "MINGW64"}, POSIX),
+])
+def test_the_paste_shell_decision_table(os_name, environ, expected):
+    assert cmdline._shell_for(os_name, environ) == expected
+
+
+def test_the_default_shell_reads_this_process_s_environment(monkeypatch):
+    # Native Windows Python started from Git Bash sees MSYSTEM (measured); bash
+    # rejects the PowerShell line's leading `& `.
+    monkeypatch.setenv("MSYSTEM", "MINGW64")
+    assert paste_shell() == POSIX
+    monkeypatch.delenv("MSYSTEM")
+    assert paste_shell() == (POWERSHELL if os.name == "nt" else POSIX)
+    parts = ["python", "a b.py", "--max-runs", "5"]
+    assert quote(parts) == quote(parts, paste_shell())
+    assert render(["-m", "5"], {}, executable="python", script="x.py") == \
+        render(["-m", "5"], {}, executable="python", script="x.py",
+               shell=paste_shell())
+
+
+def test_an_unknown_shell_is_refused():
+    with pytest.raises(ValueError, match="cmd"):
+        quote(["python"], "cmd")
+
+
+@pytest.mark.parametrize("word, expected", [
+    # Bare: PowerShell 5.1 delivers each of these verbatim (measured).
+    ("5", "5"), ("1e5", "1e5"), ("--max-runs", "--max-runs"), ("-m5", "-m5"),
+    ("--project-dir=", "--project-dir="), (r"C:\a\b", r"C:\a\b"),
+    ("D:/proj", "D:/proj"), ("--", "--"),
+    # Quoted: each would be expanded, split or dropped if left bare.
+    ("$HOME", "'$HOME'"), ("a`b", "'a`b'"), ("a;b", "'a;b'"), ("a&b", "'a&b'"),
+    ("a|b", "'a|b'"), ("@a", "'@a'"), ("(a)", "'(a)'"), ("{a}", "'{a}'"),
+    ("a,b", "'a,b'"), ("#a", "'#a'"), ("--%x", "'--%x'"), ("a b", "'a b'"),
+    ("-foo.bar", "'-foo.bar'"), ("\u043f\u0440\u043e", "'\u043f\u0440\u043e'"),
+    # Split at the colon after a bare `--` (measured), so quoted everywhere.
+    ("-C:foo", "'-C:foo'"), ("-a:b", "'-a:b'"), ("--x:y", "'--x:y'"),
+    ("-CD:/proj", "'-CD:/proj'"), ("C:foo", "C:foo"),
+    # Every quote PowerShell ends a '...' string at is doubled.
+    ("it's", "'it''s'"), ("it\u2019s", "'it\u2019\u2019s'"),
+])
+def test_a_powershell_word_is_bare_only_when_delivered_verbatim(word, expected):
+    assert quote([word], POWERSHELL) == "& " + expected
+
+
+@pytest.mark.parametrize("word", ["", 'a"b', "C:\\my dir\\", "--%"],
+                         ids=["empty", "double-quote",
+                              "space-and-trailing-backslash", "stop-parsing"])
+def test_an_argument_powershell_cannot_deliver_is_refused(word):
+    with pytest.raises(NotPasteable):
+        quote(["python", word], POWERSHELL)
+    # The POSIX line has a spelling for each of them.
+    assert shlex.split(quote(["python", word], POSIX)) == ["python", word]
+
+
+@pytest.mark.parametrize("shell", [POWERSHELL, POSIX])
+@pytest.mark.parametrize("word", [
+    "a\0b", "a\nb", "a\rb", "a\tb", "a\x1b[2Jb", "a\x7fb", "a\x85b",
+    "a\u2028b", "a\u200bb", "a\u202eb", "a\udcffb"],
+    ids=["nul", "lf", "cr", "tab", "esc", "del", "nel", "line-separator",
+         "zero-width-space", "bidi-override", "lone-surrogate"])
+def test_an_argument_that_does_not_print_as_one_line_is_refused(shell, word):
+    with pytest.raises(NotPasteable):
+        quote(["python", word, "SENTINEL"], shell)
+    with pytest.raises(NotPasteable):
+        quote([word, "SENTINEL"], shell)     # the program's own path too
+
+
+def test_a_nul_is_refused_by_its_name():
+    # 5.1 delivered ["a\0b", "SENTINEL"] as ["a"] with exit 0: the silent cut
+    # is the reason the message has to say what happened.
+    with pytest.raises(NotPasteable, match="NUL"):
+        quote(["python", "a\0b", "SENTINEL"], POWERSHELL)
+
+
+@pytest.mark.parametrize("shell", [POWERSHELL, POSIX])
+@pytest.mark.parametrize("word", ["a\u00a0b", "a\u3000b"],
+                         ids=["no-break-space", "ideographic-space"])
+def test_a_space_separator_is_quoted_not_refused(shell, word):
+    line = quote(["python", word], shell)
+    assert word in line and line.endswith("b'")
+
+
+def test_a_posix_word_starting_with_equals_is_quoted_for_zsh():
+    # zsh's EQUALS expands a bare `=foo` into the path of the command `foo`.
+    assert quote(["python", "=foo", "a=b"], POSIX) == "python '=foo' a=b"
+    assert shlex.split(quote(["python", "=it's"], POSIX)) == ["python", "=it's"]
+
+
+def test_an_empty_value_after_dashdash_is_refused_for_powershell():
+    # The one empty value `rebuild_argv` does not respell (see its docstring).
+    with pytest.raises(NotPasteable):
+        render(["--", ""], {}, executable="python", script="x.py",
+               shell=POWERSHELL)
+
+
+# --- the rendered line, pasted into the shell itself ---------------------------
+# Comparing renderer text alone is what let `--project-dir ""` pass: it was the
+# right CreateProcess spelling and still arrived as a bare flag. So each case is
+# handed, exactly as printed, to the shell it was written for, and the argv the
+# program receives is read back.
+
 _ECHO_ARGV = "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"
 
 
-@pytest.mark.skipif(POWERSHELL is None,
-                    reason="Windows PowerShell 5.1 is the shell that drops \"\"")
-@pytest.mark.parametrize("argv, overrides", [
-    (["-m", "5"], {"--project-dir": ""}),
-    (["-C", "", "-m", "5"], {"--max-runs": 2}),
+def _msys_bash():
+    """A bash that runs this interpreter, or None.
+
+    On Windows only an MSYS one (Git Bash) qualifies: `bash` there may be WSL's
+    launcher, which runs a different machine that has no such path. Git's
+    `Git/bin/bash.exe` is a launcher for `Git/usr/bin/bash.exe`, the one with
+    `msys-2.0.dll` beside it, so it is resolved to that before the check.
+    """
+    bash = shutil.which("bash")
+    if not bash or os.name != "nt":
+        return bash
+    beside_usr = os.path.join(os.path.dirname(os.path.dirname(bash)),
+                              "usr", "bin", os.path.basename(bash))
+    for candidate in (bash, beside_usr):
+        if os.path.isfile(os.path.join(os.path.dirname(candidate),
+                                       "msys-2.0.dll")) \
+                and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the MSYS check is Windows-only")
+def test_git_s_bash_launcher_counts_as_git_bash_and_wsl_s_does_not(
+        tmp_path, monkeypatch):
+    for name in ("Git/bin/bash.exe", "Git/usr/bin/bash.exe",
+                 "Git/usr/bin/msys-2.0.dll", "System32/bash.exe"):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(b"")
+    found = {}
+    monkeypatch.setattr(shutil, "which", lambda name: found["bash"])
+    found["bash"] = str(tmp_path / "Git" / "bin" / "bash.exe")
+    assert _msys_bash() == str(tmp_path / "Git" / "usr" / "bin" / "bash.exe")
+    found["bash"] = str(tmp_path / "Git" / "usr" / "bin" / "bash.exe")
+    assert _msys_bash() == found["bash"]
+    found["bash"] = str(tmp_path / "System32" / "bash.exe")
+    assert _msys_bash() is None
+
+
+BASH = _msys_bash()
+# 0.95-2.9 s per case through Git Bash (two runs of the six cases, measured
+# 2026-09-28); the budget only has to tell a hang from a slow box.
+BASH_TIMEOUT_S = 60
+
+
+def _deliver_by_powershell(line, tmp_path):
+    return run_powershell(line)
+
+
+def _deliver_by_bash(line, tmp_path):
+    # From a file, not `bash -c`: the line then reaches bash untouched by any
+    # command-line quoting of our own. MSYS rewrites POSIX-looking arguments to
+    # a native program as Windows paths unless told not to - so this pins the
+    # QUOTING only; a real Git Bash paste of `/foo` delivers
+    # `C:/Program Files/Git/foo` (see `cmdline.paste_shell`).
+    script = tmp_path / "line.sh"
+    script.write_text(line + "\n", encoding="utf-8")
+    env = dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")
+    return subprocess.run([BASH, str(script)], env=env,
+                          stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace",
+                          timeout=BASH_TIMEOUT_S)
+
+
+SHELLS = [
+    pytest.param(POWERSHELL, _deliver_by_powershell, id="powershell",
+                 marks=needs_powershell),
+    pytest.param(POSIX, _deliver_by_bash, id="bash", marks=pytest.mark.skipif(
+        BASH is None, reason="no bash to paste into (on Windows: no Git Bash)")),
+]
+
+_METACHARACTERS = ("C:\\a$b `c;d&e|f@g(h){i}[j],k#l%m'n\u2019o \u043f\u0440\u043e"
+                   "\u00a0p=q")
+
+
+def _interpreter_under_a_space(tmp_path):
+    """This interpreter, reached through a directory whose name has a space.
+
+    A link to its real directory rather than a copy, which would lose the
+    runtime beside it. The base interpreter, not a venv's: a Windows venv
+    launcher looks for its pyvenv.cfg next to the path it was started by.
+    """
+    base = getattr(sys, "_base_executable", sys.executable)
+    link = tmp_path / "Program Files x"
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(os.path.dirname(base), str(link))
+    else:
+        os.symlink(os.path.dirname(base), str(link))
+    # The base's own name: a Linux venv's `python` may have no namesake in
+    # the base directory (/usr/bin holds `python3` only).
+    return str(link / os.path.basename(base))
+
+
+@pytest.mark.parametrize("shell, deliver", SHELLS)
+@pytest.mark.parametrize("argv, overrides, spaced_interpreter", [
+    (["-m", "5"], {"--project-dir": ""}, False),
+    (["-C", "", "-m", "5"], {"--max-runs": 2}, False),
     # No `-p`: it selects the parallel parser, which has no --start-in, and the
     # meaning check below parses with the sequential one.
     (["--finish", "products/configs/x"],
-     {"--start-in": "", "--project-dir": r"C:\my project"}),
-], ids=["empty-override", "copied-empty", "empty-among-values"])
-def test_the_rendered_line_round_trips_through_powershell(
-        tmp_path, argv, overrides):
-    """Hand the line to PowerShell 5.1 and read back the argv it delivers.
-
-    Comparing renderer text alone is what let `--project-dir ""` pass: it is
-    the right CreateProcess spelling and still arrives as a bare flag.
-
-    This is argument-delivery coverage, not literal-paste coverage: the line is
-    run behind a prepended `& `, which a user pasting it does not type, and the
-    cases carry no shell metacharacter (`quote` is not shell-safe for those).
-    """
+     {"--start-in": "", "--project-dir": r"C:\my project"}, False),
+    (["-m", "5"], {"--project-dir": _METACHARACTERS}, False),
+    (["-m", "5", "--", "-foo.bar", "--%x", "@a", "a,b", "$x", "it's"], {},
+     False),
+    # 5.1 splits a dash word at its colon only after a bare `--`; both sides.
+    (["-a:b", "-CD:/proj", "--", "-C:foo", "-a:b", "-CD:/proj", "--x:y"], {},
+     False),
+    (["-m", "5", "--", "=foo", "--x=a:b"], {}, False),
+    (["-m", "5"], {"--project-dir": r"C:\my project\sub"}, True),
+], ids=["empty-override", "copied-empty", "empty-among-values",
+        "metacharacters", "tail-words", "colon-words", "equals-words",
+        "interpreter-under-a-space"])
+def test_the_rendered_line_round_trips_through_its_shell(
+        tmp_path, shell, deliver, argv, overrides, spaced_interpreter):
     echo = tmp_path / "echo_argv.py"
     echo.write_text(_ECHO_ARGV, encoding="utf-8")
-    line = render(argv, overrides, executable=sys.executable, script=str(echo))
-    # `& ` because PowerShell reads a QUOTED first token (an interpreter under
-    # "Program Files") as a string expression, not a command; the rendered line
-    # does not carry it, since cmd.exe would reject it.
-    source = "& " + line + "; exit $LASTEXITCODE"
-    encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
-    result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive",
-                             "-EncodedCommand", encoded],
-                            capture_output=True, text=True, encoding="utf-8",
-                            errors="replace", timeout=PS_TIMEOUT_S)
-    assert result.returncode == 0, result.stdout + result.stderr
+    executable = (_interpreter_under_a_space(tmp_path) if spaced_interpreter
+                  else sys.executable)
+    line = render(argv, overrides, executable=executable, script=str(echo),
+                  shell=shell)
+    result = deliver(line, tmp_path)
+    assert result.returncode == 0, line + "\n" + result.stdout + result.stderr
     delivered = json.loads(result.stdout)
     assert delivered == rebuild_argv(argv, overrides), line
 
@@ -282,9 +483,37 @@ def _parse_outcome(argv):
         return exc.code, err.getvalue()
 
 
-def test_quote_round_trips_through_the_local_shell_rules():
-    parts = ["python", "a b.py", "--max-runs", "5"]
-    if os.name == "nt":
-        assert quote(parts) == 'python "a b.py" --max-runs 5'
+# --- the one production caller: the rich-install hint at startup ---------------
+
+def _missing_rich_hint(monkeypatch, capsys):
+    from llm_loop import console
+    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    monkeypatch.setattr(console, "_DEPENDENCY_WARNING_SHOWN", False)
+    console.warn_missing_dependencies()
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("msystem, shell, label", [
+    (None, POWERSHELL if os.name == "nt" else POSIX,
+     " (PowerShell)" if os.name == "nt" else ""),
+    ("MINGW64", POSIX, ""),
+])
+def test_the_rich_hint_is_a_line_for_the_paste_shell(monkeypatch, capsys,
+                                                     msystem, shell, label):
+    if msystem is None:
+        monkeypatch.delenv("MSYSTEM", raising=False)
     else:
-        assert quote(parts) == "python 'a b.py' --max-runs 5"
+        monkeypatch.setenv("MSYSTEM", msystem)
+    monkeypatch.setattr(sys, "executable", r"C:\Program Files\Py\python.exe")
+    out = _missing_rich_hint(monkeypatch, capsys)
+    install = quote([sys.executable, "-m", "pip", "install", "rich"], shell)
+    assert f"  Install with{label}: {install}\n" in out
+
+
+def test_the_rich_hint_survives_an_interpreter_with_no_path(monkeypatch,
+                                                            capsys):
+    # Embedded / frozen: sys.executable is "", which no line can name. This
+    # runs at startup; raising here would stop the run over a missing extra.
+    monkeypatch.setattr(sys, "executable", "")
+    out = _missing_rich_hint(monkeypatch, capsys)
+    assert "Install with: pip install rich" in out

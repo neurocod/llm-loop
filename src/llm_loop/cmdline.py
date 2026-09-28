@@ -20,9 +20,10 @@ cycle. `clispec` is below all of them and is safe to import; see there.
 """
 
 import os
+import re
 import shlex
-import subprocess
 import sys
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 # The flag table this module strips an argv with, and the record type it is made
@@ -34,7 +35,12 @@ from typing import Any, Dict, List, Optional, Tuple
 # reaches for them.
 from .clispec import FLAG_ALIASES, Flag
 
-__all__ = ["FLAG_ALIASES", "Flag", "rebuild_argv", "render"]
+__all__ = ["FLAG_ALIASES", "Flag", "NotPasteable", "POSIX", "POWERSHELL",
+           "paste_shell", "quote", "rebuild_argv", "render"]
+
+# The shells a line can be rendered for; see `render` for which one is chosen.
+POWERSHELL = "powershell"
+POSIX = "posix"
 
 
 def _split_passthrough(argv: List[str]) -> Tuple[List[str], List[str]]:
@@ -126,8 +132,9 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
     An EMPTY value - an override of `""` or a copied `-C ""` - comes out as the
     single token `--flag=` (see `_empty_value`), so this is the one place a
     copied flag is respelled. The `--` tail is never respelled: it is not this
-    table's to read, so an empty token there is copied as `""` and is still
-    dropped by a PowerShell paste - a known gap, not a guarantee.
+    table's to read, so an empty token there is copied as is, and `quote`
+    refuses it for PowerShell (NotPasteable) rather than print a line that
+    loses it.
     """
     _validate(overrides, aliases)
     head, tail = _split_passthrough(argv)
@@ -175,32 +182,190 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
     return out + tail
 
 
-def quote(parts: List[str]) -> str:
-    """Join argv into one line: POSIX-shell-quoted, or on Windows quoted for
-    CreateProcess only.
+class NotPasteable(ValueError):
+    """An argument no line for the target shell delivers to the program intact.
 
-    The Windows line is NOT shell-safe. Neither cmd.exe nor PowerShell 5.1 reads
-    it the way CreateProcess would once a value carries a shell metacharacter:
-    `$` or a backtick (PowerShell expands `C:\\a$b` to `C:\\a`), `"` (PowerShell:
-    "string is missing the terminator"), `;`, `&`, `|` or `%` (list2cmdline
-    quotes only for whitespace, so either shell splits the line at them or
-    expands them). The one shell loss handled is the empty value, and
-    `rebuild_argv` handles it (`_empty_value`), not this function.
+    Raised rather than printing a line that looks reproducible and is not; the
+    message names the argument and the reason.
     """
-    if os.name == "nt":
-        # list2cmdline is the inverse of the CreateProcess/C-runtime parse, as
-        # shlex is of the POSIX one - and of nothing a shell does on top.
-        return subprocess.list2cmdline(parts)
-    return shlex.join(parts)
+
+
+def _shell_for(os_name: str, environ) -> str:
+    """`paste_shell`'s decision, on the values it reads (a table to pin)."""
+    if os_name != "nt":
+        return POSIX
+    # Git Bash and the MSYS2 shells set MSYSTEM (MINGW64, UCRT64, MSYS, ...)
+    # and hand it to the native Windows Python they start (measured
+    # 2026-09-28: `python` from Git Bash sees MSYSTEM=MINGW64, from
+    # PowerShell sees none). SHELL is not used: Git Bash exports it too, but
+    # it is also set machine-wide by tools and editor setups that never make
+    # bash the console, so it would flip lines typed in PowerShell to POSIX.
+    # The miss that remains: a PowerShell started FROM Git Bash inherits
+    # MSYSTEM and gets the POSIX line.
+    if environ.get("MSYSTEM"):
+        return POSIX
+    return POWERSHELL
+
+
+def paste_shell() -> str:
+    """The shell a line printed by this process is most likely pasted into.
+
+    PowerShell on Windows (the console the author and the project's docs use;
+    cmd.exe is not supported - see `render`), unless the process was started
+    from Git Bash / MSYS2 (MSYSTEM set), and a POSIX sh everywhere else. A
+    POSIX line pasted into Git Bash still passes through MSYS's path
+    conversion on its way to a native program (`/foo` becomes
+    `C:/Program Files/Git/foo`); the run's own argv, when it came from Git
+    Bash, already holds the converted Windows forms, which MSYS leaves alone.
+    """
+    return _shell_for(os.name, os.environ)
+
+
+# A word PowerShell delivers to a native program exactly as written, measured
+# against Windows PowerShell 5.1 on 2026-09-28 (bare `1e5`, `0x10`, `1kb`,
+# `--x=a.b`, `--`, `--flag=` all arrive verbatim; argument mode does not turn
+# number-like words into numbers). Everything else is single-quoted: `$`,
+# backtick, `;`, `&`, `|`, `@` (splatting: a bare `@a` delivers nothing), `(`,
+# `{`, `,`, `#`, `%`, quotes and whitespace.
+_PS_BARE = re.compile(r"[A-Za-z0-9_\-./\\:=]+")
+# PowerShell reads these four as the single quote too, so inside '...' each
+# must be doubled like `'` itself or it ends the string.
+_PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
+
+
+def _powershell_word(arg: str) -> str:
+    """`arg` as one PowerShell word that reaches the program unchanged.
+
+    Four arguments have no such word, and are refused rather than guessed.
+    Three because PowerShell 5.1 builds the program's command line by pasting
+    each value between `"` when it holds whitespace and escaping nothing, while
+    pwsh 7.3+ escapes properly - so a pre-escape that repaired one would break
+    the other:
+      - `""`: 5.1 drops an empty argument (a flag's empty value never gets
+        here: `rebuild_argv` spells it `--flag=`).
+      - a `"`: 5.1 hands it over raw and the C runtime reads it as quoting
+        (`a"b` arrives as `ab`); Windows paths cannot contain one.
+      - whitespace with a trailing backslash: 5.1 prints `"C:\\my dir\\"`,
+        whose `\\"` escapes the closing quote (`C:\\my dir"` arrives).
+    And `--%`, which 5.1 drops even quoted (`'--%'`, `"--%"`, `('--%')` all
+    deliver nothing, measured 2026-09-28): it compares the VALUE with its
+    stop-parsing token. Whitespace alone needs nothing more: PowerShell adds
+    the `"` itself.
+    """
+    if arg == "":
+        raise NotPasteable(
+            "PowerShell 5.1 drops an empty argument to a native program")
+    if arg == "--%":
+        raise NotPasteable(
+            "PowerShell 5.1 drops a '--%' argument to a native program, "
+            "quoted or not")
+    if '"' in arg:
+        raise NotPasteable(
+            f"PowerShell 5.1 passes the double quote in {arg!r} unescaped")
+    if arg.endswith("\\") and any(ch.isspace() for ch in arg):
+        raise NotPasteable(
+            f"PowerShell 5.1 turns the trailing backslash of {arg!r} into an "
+            f"escaped quote")
+    # `-foo.bar` and `-a=b.c` arrive split at the dot (5.1, measured), and so
+    # do `-C:foo`, `-a=b:c` and `-CD:/proj` at the colon - but only once a bare
+    # `--` precedes them on the line (`-C:` `foo`; before it, and first after
+    # the program, they arrive whole; measured 2026-09-28). So a dash word
+    # with a dot or a colon is quoted even though every character is plain,
+    # wherever it stands - `--x=a.b` and `--x:y` too, measured intact: one
+    # rule is easier to trust than a rule per position.
+    if _PS_BARE.fullmatch(arg) and not (
+            arg.startswith("-") and ("." in arg or ":" in arg)):
+        return arg
+    return "'" + "".join(ch * 2 if ch in _PS_SINGLE_QUOTES else ch
+                         for ch in arg) + "'"
+
+
+def _refuse_unprintable(arg: str) -> None:
+    """NotPasteable unless every character of `arg` prints as itself.
+
+    For either shell, because the line is PRINTED before it is pasted. A NUL
+    ends the program's command line there (5.1 delivered `["a\\0b",
+    "SENTINEL"]` as `["a"]`, exit 0; POSIX argv cannot hold one at all). A
+    line feed, CR or U+2028 breaks the one printed line into several, a tab
+    is a completion key when pasted into PSReadLine, and ESC turns the status
+    line that prints the command into a terminal escape sequence (`\\x1b[2J`
+    clears the screen). Refused by class rather than by list:
+    `str.isprintable` is false for control (Cc), format (Cf: zero-width and
+    bidi overrides, which make the line read differently from what it runs),
+    line/paragraph separator, private-use, surrogate and unassigned
+    characters. The one class let through is Zs, the space separators
+    (U+00A0, U+3000, ...): they print as a space, both shells quote them
+    (`shlex` quotes any non-ASCII-word character; `_PS_BARE` is ASCII), and
+    5.1 delivered them intact (measured 2026-09-28).
+    """
+    for ch in arg:
+        if ch == "\0":
+            raise NotPasteable(
+                f"{arg!r} holds a NUL, which ends a program's command line")
+        if not ch.isprintable() and unicodedata.category(ch) != "Zs":
+            raise NotPasteable(
+                f"{arg!r} holds {ch!r}, which does not print as itself on a "
+                f"one-line command")
+
+
+def _posix_word(arg: str) -> str:
+    """`shlex.quote`, plus quoting for a leading `=`.
+
+    zsh (EQUALS, on by default) expands a word starting with `=` into the path
+    of the command it names (`=python` -> `/usr/bin/python`), and `=` is in
+    `shlex`'s safe set, so such a word gets single quotes of its own.
+    """
+    if arg.startswith("="):
+        return "'" + arg.replace("'", "'\"'\"'") + "'"
+    return shlex.quote(arg)
+
+
+def quote(parts: List[str], shell: Optional[str] = None) -> str:
+    """Join a program and its arguments into one line for `shell`.
+
+    `shell` is POWERSHELL or POSIX, `paste_shell()` when omitted. The
+    PowerShell line starts with the call operator `& `: without it a quoted
+    first word (an interpreter under "Program Files") is a string expression
+    and the paste fails with "Unexpected token". It raises NotPasteable for an
+    argument no PowerShell line delivers intact (see `_powershell_word`), and
+    for either shell for one that does not print as one line
+    (`_refuse_unprintable`). The POSIX line is `shlex.join`'s quoting, which
+    quotes every argument, however written, for sh, bash and zsh alike, plus
+    `_posix_word`'s rule for zsh.
+    """
+    shell = paste_shell() if shell is None else shell
+    if shell not in (POWERSHELL, POSIX):
+        raise ValueError(
+            f"unknown shell {shell!r}; known: {POWERSHELL}, {POSIX}")
+    for part in parts:
+        _refuse_unprintable(part)
+    if shell == POWERSHELL:
+        return " ".join(["&", *map(_powershell_word, parts)])
+    return " ".join(map(_posix_word, parts))
 
 
 def render(argv: List[str], overrides: Dict[str, Any], *,
            executable: str = sys.executable, script: Optional[str] = None,
-           aliases: Dict[str, Flag] = FLAG_ALIASES) -> str:
+           aliases: Dict[str, Flag] = FLAG_ALIASES,
+           shell: Optional[str] = None) -> str:
     """The full copy-pasteable command line reproducing this run.
 
     `script` defaults to `sys.argv[0]` - the wrapper actually launched
     (runGenerateModels.py), not this module - so the line can be pasted as-is.
+
+    The line is written for ONE shell, the one it will be pasted into: a line
+    is only reproducible in the shell that parses it, and the two candidates
+    disagree on nearly every metacharacter. `shell` defaults to `paste_shell()`
+    - PowerShell on Windows, a POSIX sh elsewhere - because a status line is
+    read in the console it runs in. The PowerShell line is written and measured
+    for Windows PowerShell 5.1 (`powershell.exe`, present on every Windows); it
+    carries no pre-escape for 5.1's native-argument passing, so pwsh 7.3+,
+    which passes arguments properly, should read it the same - unmeasured, as
+    the author's machine has no pwsh. cmd.exe is not a target: it would reject
+    the leading `& ` and read `%` and `^` in values; the older CreateProcess-only
+    line (`list2cmdline`) worked there and in no shell the author uses. Raises
+    NotPasteable when an argument cannot be written for the shell (see
+    `quote`); the caller shows that message instead of a line.
     """
     if script is None:
         script = sys.argv[0] if sys.argv else ""
@@ -208,4 +373,4 @@ def render(argv: List[str], overrides: Dict[str, Any], *,
     if script:
         parts.append(script)
     parts.extend(rebuild_argv(argv, overrides, aliases=aliases))
-    return quote(parts)
+    return quote(parts, shell)

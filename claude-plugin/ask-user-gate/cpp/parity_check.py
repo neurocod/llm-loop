@@ -229,9 +229,8 @@ def denied(command: str, shell: str = "bash", tool: str = "Bash",
 # only the code on a usage error and on the help, which argparse and the port
 # word differently. tests/test_ask_user_gate_parity.py holds the REFERENCE alone
 # to the code and, where it is not None, to the text: that half needs no
-# binary, so it is the one every checkout and every CI interpreter runs. A row
-# added here is therefore pinned twice by construction, instead of being written
-# into a second list that nothing keeps in step. Text is None for a usage error
+# binary, so it is the one every checkout and every CI interpreter runs. Text is
+# None for a usage error
 # only (always "<usage error>"), and a verdict always names its text -- the
 # pytest reader refuses a row that does not: a 0 because exit 0 with no output
 # is also what hook mode returns on the empty stdin argv_verdict gives it, a 1
