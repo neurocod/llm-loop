@@ -21,7 +21,8 @@ import sys
 import threading
 from contextlib import contextmanager
 
-from llm_loop import clispec, console, exitlog, projectroot, runlifecycle
+from llm_loop import (clispec, console, exitlog, projectroot, providers,
+                      runlifecycle)
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
@@ -35,10 +36,16 @@ def isolated_run(monkeypatch, tmp_path):
     dir under the home directory — with its closing line registered on `atexit`,
     and `begin` is idempotent per process, so the next unisolated run inherits
     it. Inside this block the log dir is `tmp_path / "logs"` (yielded) and the
-    record slot starts empty; on the way out the record is finished, the
-    streams the tee wrapped and the project root the run anchored are put back,
-    and every mirror handler the run opened in that log dir is closed — whatever
-    `app_name` the run used, so a caller cannot name the wrong one.
+    record slot starts empty; on the way out the record is finished, and the
+    streams the tee wrapped, the project root the run anchored, the mirror
+    logger and the live-message transport `begin_run` set are put back.
+
+    Every mirror handler is closed on the way in AND out, whatever `app_name`
+    the run used, so a caller cannot name the wrong one:
+    `console.setup_file_logging` attaches a handler only to a logger that has
+    none, so one left open would carry the next run's output into an earlier
+    test's (deleted) file while this run's own path is merely printed — and on
+    Windows keep that directory from being removed.
 
     Called explicitly, from a thin autouse fixture in each file that stages runs;
     `conftest.py` fails any test that leaves a record open, the root moved or
@@ -46,16 +53,19 @@ def isolated_run(monkeypatch, tmp_path):
     """
     logs = tmp_path / "logs"
     monkeypatch.setattr(console, "LOG_DIR", logs)
+    monkeypatch.setattr(console, "_FILE_LOGGER", console._FILE_LOGGER)
+    monkeypatch.setattr(providers, "_LIVE_MESSAGES", providers._LIVE_MESSAGES)
     monkeypatch.setattr(exitlog, "_record", None)
     root = projectroot.project_dir()
     streams = sys.stdout, sys.stderr
+    _close_mirror_handlers()
     try:
         yield logs
     finally:
         finish_record()
         sys.stdout, sys.stderr = streams
         projectroot.set_project_root(root)
-        _drop_loggers_writing_under(logs)
+        _close_mirror_handlers()
 
 
 def finish_record(reason=None):
@@ -70,22 +80,31 @@ def finish_record(reason=None):
     return record
 
 
-def _drop_loggers_writing_under(log_dir):
-    """Close the mirror handlers whose file lies in `log_dir`, on any app's logger.
+def _close_mirror_handlers():
+    """Close and detach every mirror handler (`console._MirrorLogHandler`), on
+    whichever logger holds it, and let that logger propagate again.
 
-    `console.setup_file_logging` reuses a logger's handler when it has one, so
-    a handler left open would carry the NEXT test's run into this test's
-    (deleted) directory — and on Windows keep that directory from being removed.
-    """
-    prefix = os.path.normcase(os.path.abspath(str(log_dir))) + os.sep
-    for name in list(logging.Logger.manager.loggerDict):
-        if name.startswith("runCycle."):
-            logger = logging.getLogger(name)
-            for handler in list(logger.handlers):
-                path = getattr(handler, "baseFilename", "")
-                if os.path.normcase(os.path.abspath(path)).startswith(prefix):
-                    handler.close()
-                    logger.removeHandler(handler)
+    The propagate flag is half of it. pytest (9.1 here) attaches its capture
+    handlers, at the start of every phase, to each logger that does NOT
+    propagate — and `setup_file_logging` adds a mirror only to a logger with no
+    handlers at all. A mirror logger left non-propagating therefore gets no
+    mirror the next time a run uses its app name: measured, the vanished-run
+    pin in test_exit_reason found no log file once an earlier test there had
+    run "pytest-exit". A logger that propagates is what
+    `setup_file_logging` finds on a name nobody used yet.
+
+    Loggers are read from the registry as they are: `logging.getLogger` on a
+    placeholder name would create one."""
+    for logger in list(logging.Logger.manager.loggerDict.values()):
+        if not isinstance(logger, logging.Logger):
+            continue
+        mirrors = [handler for handler in logger.handlers
+                   if isinstance(handler, console._MirrorLogHandler)]
+        for handler in mirrors:
+            handler.close()
+            logger.removeHandler(handler)
+        if mirrors:
+            logger.propagate = True
 
 
 def record_exit_pushes(monkeypatch) -> list:
@@ -283,12 +302,3 @@ def root_named_unlike_cwd(tmp_path) -> str:
         "the project folder and the process cwd share a name, so this pin " \
         "cannot tell an anchored root from an ambient one"
     return root
-
-
-def drop_logger(app_name):
-    """Close and forget the mirror handler this app's logger holds, so the tmp
-    dir can be cleaned up and the next run opens a fresh one."""
-    logger = logging.getLogger(f"runCycle.{app_name}")
-    for handler in list(logger.handlers):
-        handler.close()
-    logger.handlers = []

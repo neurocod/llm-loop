@@ -24,12 +24,10 @@ def _isolated_run(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def no_live_messages():
-    """The pre-operator-notes transport: prompt in argv, stdin inherited."""
-    previous = providers.live_messages_enabled("claude")
+def no_live_messages(_isolated_run):
+    """The pre-operator-notes transport: prompt in argv, stdin inherited.
+    Put back by `isolated_run`, which is why it is requested first."""
     providers.set_live_messages(False)
-    yield
-    providers.set_live_messages(previous)
 
 
 def test_claude_argv_keeps_existing_contract(no_live_messages):
@@ -691,19 +689,15 @@ def test_a_failed_prompt_handover_does_not_leave_the_provider_running(monkeypatc
     def boom(prompt):
         raise ValueError("the payload could not be encoded")
 
-    previous = providers.live_messages_enabled("claude")
-    providers.set_live_messages(True)
-    try:
-        monkeypatch.setattr(
-            providers, "runtime_argv",
-            lambda argv, provider: [sys.executable, "-c", _FAKE_PROVIDER_SRC])
-        monkeypatch.setattr(providers, "user_message_line", boom)
-        monkeypatch.setattr(providers.subprocess, "Popen", watch_popen)
+    providers.set_live_messages(True)       # put back by `isolated_run`
+    monkeypatch.setattr(
+        providers, "runtime_argv",
+        lambda argv, provider: [sys.executable, "-c", _FAKE_PROVIDER_SRC])
+    monkeypatch.setattr(providers, "user_message_line", boom)
+    monkeypatch.setattr(providers.subprocess, "Popen", watch_popen)
 
-        with pytest.raises(ValueError):
-            start_agent_process(["claude", "-p"], "claude", "work", os.getcwd())
-    finally:
-        providers.set_live_messages(previous)
+    with pytest.raises(ValueError):
+        start_agent_process(["claude", "-p"], "claude", "work", os.getcwd())
 
     assert started, "no process was started — the pin proved nothing"
     assert not _outlived_the_runner(started[0]), \

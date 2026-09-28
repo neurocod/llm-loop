@@ -115,6 +115,10 @@ NOTE_TTL = 8.0
 # the painter then releases the terminal as its own last act (see `stop`).
 PAINTER_JOIN_SECONDS = 1.0
 
+# The painter thread's name: the pins tell "written on the painter" from
+# "written beside it" by it.
+PAINTER_THREAD_NAME = "statusline-paint"
+
 # How long a thread that hands the painter a call AND needs its effect before
 # going on (`handle_event` / `disable` called directly while the app is started)
 # waits for the painter to run it. A round trip is one wake-up of the painter,
@@ -2392,7 +2396,7 @@ class StatusApp:
             self._paint_thread = threading.Thread(
                 target=self._repaint_loop,
                 args=(self._paint_stop, self._paint_requested),
-                name="statusline-paint", daemon=True)
+                name=PAINTER_THREAD_NAME, daemon=True)
             # Owner from before its first instruction, so no paint in between
             # runs on the caller's thread beside it.
             self._take_terminal(self._paint_thread)

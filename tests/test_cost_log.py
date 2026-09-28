@@ -14,7 +14,7 @@ import pytest
 
 from llm_loop import console, costlog, cyclecore, runlifecycle, streamrender
 
-from _runfixtures import OneShotDriver, drop_logger, isolated_run, seq_args
+from _runfixtures import OneShotDriver, isolated_run, seq_args
 
 
 @pytest.fixture(autouse=True)
@@ -88,7 +88,6 @@ def test_a_real_runs_mirror_log_is_what_the_report_sums(
     finally:
         # The run tees stdout into its log; the report must not append to it.
         sys.stdout, sys.stderr = out, err
-        drop_logger(app_name)
     capsys.readouterr()
 
     costlog.report_costs(app_name, console.log_file_path(app_name))

@@ -13,7 +13,6 @@ Two deliveries and one hazard, and every test here is about one of the three:
     typed, because `s` is the stop key one layer down.
 """
 
-import io
 import json
 import queue
 import threading
@@ -37,16 +36,13 @@ def _isolated_run(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _live_messages_on():
+def _live_messages_on(_isolated_run):
     """The default transport, whatever the environment of the test machine says.
 
-    Through the setter, not the private global: a runner flips it the same way,
-    so a test that leaves it wrong leaves it wrong for the rest of the session.
+    Through the setter, not the private global: it is what a runner flips.
+    `isolated_run` puts the transport back, which is why it is requested first.
     """
-    previous = providers.live_messages_enabled("claude")
     providers.set_live_messages(True)
-    yield
-    providers.set_live_messages(previous)
 
 
 # --- the transport ------------------------------------------------------------

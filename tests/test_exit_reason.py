@@ -15,8 +15,8 @@ import pytest
 
 from llm_loop import console, cyclecore, exitlog, parallel
 
-from _runfixtures import (MemListDriver, NoWorkDriver, drop_logger,
-                          isolated_run, par_args, seq_args)
+from _runfixtures import (MemListDriver, NoWorkDriver, isolated_run, par_args,
+                          seq_args)
 
 
 @pytest.fixture(autouse=True)
@@ -116,11 +116,9 @@ def test_the_report_of_a_vanished_run_lands_in_the_log(
     logs.mkdir(parents=True, exist_ok=True)
     project = os.path.basename(str(tmp_path))
     app_name = "pytest-exit"
-    # `console.setup_file_logging` attaches a mirror handler only to a logger
-    # that has none, so a handler another test left on this name would keep this
-    # run's output going to THAT test's file while this one's path is merely
-    # printed — which reads exactly like the defect below and is not it.
-    drop_logger(app_name)
+    # A mirror handler another test left on this name would send this run's
+    # output to THAT test's file — which reads exactly like the defect below
+    # and is not it. `isolated_run` closes every one on the way in.
     dead = exitlog.record_path(logs, app_name, project, 424242)
     dead.write_text(json.dumps({
         "pid": 424242, "app": app_name, "project": project,

@@ -24,7 +24,8 @@ from llm_loop.breakpoints import Breakpoints
 from _runfixtures import MemListDriver, isolated_run, par_args
 from _termfixtures import KeysByHand, RecordingTerminal
 
-# Upper bound on every wait below; each one is a handshake that a healthy run
+# Upper bound on every wait below, the painter stalls a pin arms included (a
+# pin that fails by hanging still ends); each one is a handshake that a healthy run
 # completes at once, so only a broken owner ever gets near it. 0.49 s for this
 # whole file, measured 2026-09-25 — the bound is many times that.
 WAIT_S = 10.0
@@ -572,7 +573,7 @@ def test_while_started_only_the_painter_writes_the_terminal():
             pass
         writers = set(terminal.writers)
 
-    assert writers == {"statusline-paint"}
+    assert writers == {sl.PAINTER_THREAD_NAME}
 
 
 def test_without_a_painter_the_caller_paints():
@@ -605,9 +606,9 @@ def test_while_started_keys_and_resizes_are_handled_on_the_painter():
         handled = list(recorder.handled_on)
         writers = set(terminal.writers)
 
-    assert handled == [("statusline-paint", termio.Key("x")),
-                       ("statusline-paint", termio.Key("y"))]
-    assert "statusline-paint" in writers and writers == {"statusline-paint"}, \
+    assert handled == [(sl.PAINTER_THREAD_NAME, termio.Key("x")),
+                       (sl.PAINTER_THREAD_NAME, termio.Key("y"))]
+    assert writers == {sl.PAINTER_THREAD_NAME}, \
         "a key or a resize wrote the terminal off the painter"
 
 
@@ -619,7 +620,7 @@ def test_disabling_from_another_thread_is_carried_out_by_the_painter():
         app.disable()
         released_by = list(terminal.releases)
 
-    assert released_by == ["statusline-paint"]
+    assert released_by == [sl.PAINTER_THREAD_NAME]
     assert isinstance(app.terminal, termio.NullTerminal)
 
 
@@ -636,7 +637,7 @@ def test_stop_leaves_the_release_to_a_painter_stuck_in_its_frame(monkeypatch):
                        refresh=60)
     app.start()
     painter = app._paint_thread
-    terminal.arm_stall()
+    terminal.arm_stall(WAIT_S)
     app.update(iteration=1)
     assert terminal.stalled.wait(WAIT_S)
     try:
@@ -647,7 +648,7 @@ def test_stop_leaves_the_release_to_a_painter_stuck_in_its_frame(monkeypatch):
         terminal.unstall.set()
     painter.join(WAIT_S)
     assert not painter.is_alive()
-    assert terminal.releases == ["statusline-paint"], \
+    assert terminal.releases == [sl.PAINTER_THREAD_NAME], \
         "the painter did not release the terminal on its way out"
 
 
@@ -665,7 +666,7 @@ def test_a_restart_after_a_timed_out_stop_does_not_revive_the_old_painter(
                        refresh=60)
     app.start()
     old = app._paint_thread
-    terminal.arm_stall()
+    terminal.arm_stall(WAIT_S)
     app.update(iteration=1)
     assert terminal.stalled.wait(WAIT_S)
     try:
@@ -707,7 +708,7 @@ def test_a_note_is_stamped_and_expired_by_the_painter(monkeypatch):
         left = app.status.note
 
     assert left == "", "the note never expired"
-    assert stamped_on == ["statusline-paint"]
+    assert stamped_on == [sl.PAINTER_THREAD_NAME]
 
 
 def test_a_paste_tail_posted_behind_its_enter_is_discarded_with_it():
@@ -725,7 +726,7 @@ def test_a_paste_tail_posted_behind_its_enter_is_discarded_with_it():
     app.register_action(sl.BreakpointAction(points))
     with app:
         app.handle_event(termio.Key("b"))
-        terminal.arm_stall()
+        terminal.arm_stall(WAIT_S)
         app.update(iteration=1)
         assert terminal.stalled.wait(WAIT_S)     # the painter is held in a frame
         try:

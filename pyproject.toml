@@ -45,7 +45,9 @@ classifiers = [
 # because one test renders a job tag through rich's markup parser to prove the
 # tag survives it, and without the package installed that test silently skips -
 # which in CI means it would never run at all.
-test = ["pytest>=7", "rich"]
+# pytest 8 for the pluggy (>= 1.1) behind tests/conftest.py's
+# `hookimpl(wrapper=True)`: 7.x may resolve pluggy 1.0, which refuses the conftest.
+test = ["pytest>=8", "rich"]
 
 [project.urls]
 Homepage = "https://github.com/neurocod/llm-loop"
@@ -71,3 +73,5 @@ llm_loop = ["py.typed"]
 # material, never shipped, and reachable only while testing.
 pythonpath = ["src", "ideas"]
 testpaths = ["tests"]
+# The `test` extra's floor, said where an older pytest reads it first.
+minversion = "8.0"

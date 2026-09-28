@@ -37,7 +37,7 @@ def _isolated_run(tmp_path, monkeypatch):
         yield
 
 
-NOW =1_700_000_000.0
+NOW = 1_700_000_000.0
 
 
 def sequential_status(**fields):

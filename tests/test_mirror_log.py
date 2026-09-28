@@ -21,14 +21,14 @@ from llm_loop import (console, costlog, cyclecore, exitlog, parallel,
                       projectroot, runlifecycle)
 
 from _runfixtures import (MemListDriver, NoWorkDriver, OneShotDriver,
-                          drop_logger, isolated_run, par_args,
-                          root_named_unlike_cwd, seq_args)
+                          isolated_run, par_args, root_named_unlike_cwd,
+                          seq_args)
 
 
 @pytest.fixture(autouse=True)
 def _isolated_run(tmp_path, monkeypatch):
-    with isolated_run(monkeypatch, tmp_path):
-        yield
+    with isolated_run(monkeypatch, tmp_path) as logs:
+        yield logs
 
 
 def _handler(tmp_path, **kwargs):
@@ -128,7 +128,7 @@ def test_the_tee_still_logs_normally_after_a_guarded_call(tmp_path):
 @pytest.fixture
 def log_dir(_isolated_run):
     """The test's own mirror-log directory (`isolated_run`), never the user's."""
-    return console.LOG_DIR
+    return _isolated_run
 
 
 def test_a_parallel_dry_run_writes_nothing_to_the_shared_log(
@@ -164,14 +164,11 @@ def test_a_sequential_dry_run_writes_nothing_to_the_shared_log(
 def test_a_real_run_still_mirrors_to_the_shared_log(tmp_path, log_dir):
     """The other half of the fix: only the dry run lost its mirror."""
     app_name = "pytest-real-mirror"
-    try:
-        cyclecore.run_loop(NoWorkDriver(),
-                           seq_args(tmp_path, no_statusline=True),
-                           app_name=app_name, wait_on_start=False)
-        written = console.log_file_path(app_name).read_text(
-            encoding="utf-8", errors="replace")
-    finally:
-        drop_logger(app_name)
+    cyclecore.run_loop(NoWorkDriver(),
+                       seq_args(tmp_path, no_statusline=True),
+                       app_name=app_name, wait_on_start=False)
+    written = console.log_file_path(app_name).read_text(
+        encoding="utf-8", errors="replace")
     assert "logging to" in written
 
 
@@ -277,7 +274,7 @@ def test_cost_reads_the_named_projects_log_not_the_launch_directorys(
 
 
 def test_cost_neither_mirrors_its_report_nor_opens_an_exit_record(
-        tmp_path, log_dir, monkeypatch, capsys):
+        tmp_path, log_dir, capsys):
     """The other half of why `--cost` sits before the shared prologue.
 
     A report is not a run. `runlifecycle.begin_run`'s first two acts are raising
@@ -295,24 +292,19 @@ def test_cost_neither_mirrors_its_report_nor_opens_an_exit_record(
     log_dir.mkdir(parents=True, exist_ok=True)
     named = tmp_path / "named.log"
     named.write_text(_TWO_SESSIONS, encoding="utf-8")
-    # No record of an earlier run to inherit: `exitlog.begin` is idempotent per
-    # process, so a leftover one would make this pass whatever the branch did.
-    monkeypatch.setattr(exitlog, "_record", None)
-    drop_logger("pytest-costs-record")
+    # `isolated_run` starts the record slot empty — `exitlog.begin` is
+    # idempotent per process, so a leftover record would make this pass
+    # whatever the branch did — and closes whatever this run opens.
     args = seq_args(project, cost_log=str(named), no_statusline=True)
 
-    try:
-        cyclecore.run_loop(OneShotDriver(), args,
-                           app_name="pytest-costs-record", wait_on_start=False)
+    cyclecore.run_loop(OneShotDriver(), args,
+                       app_name="pytest-costs-record", wait_on_start=False)
 
-        assert "TOTAL: 2 sessions, 3 costs, $2.2500" in capsys.readouterr().out
-        assert exitlog.current() is None, \
-            "--cost opened an exit record for a run that never ran"
-        assert not console.log_file_path("pytest-costs-record").exists(), \
-            "--cost mirrored its report into the shared rotating log"
-    finally:
-        drop_logger("pytest-costs-record")
-        exitlog.finish()
+    assert "TOTAL: 2 sessions, 3 costs, $2.2500" in capsys.readouterr().out
+    assert exitlog.current() is None, \
+        "--cost opened an exit record for a run that never ran"
+    assert not console.log_file_path("pytest-costs-record").exists(), \
+        "--cost mirrored its report into the shared rotating log"
 
 
 def test_naming_a_log_reports_instead_of_running_the_loop(
