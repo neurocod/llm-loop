@@ -2266,13 +2266,13 @@ class StatusApp:
                  terminal: Optional[termio.Terminal] = None,
                  input_source: Optional[termio.InputSource] = None,
                  layout: Optional[Layout] = None,
-                 settings: Optional[SettingsRegistry] = None,
+                 registry: Optional[SettingsRegistry] = None,
                  messages=None,
                  enabled: bool = True, refresh: float = REFRESH_SECONDS,
                  stop_file: Optional[str] = None,
                  default_actions: bool = True):
         self.status = status or LoopStatus()
-        self.settings = settings or SettingsRegistry()
+        self.registry = registry or SettingsRegistry()
         # This run's operator.Mailbox/MailboxSet, or None when there is nobody to
         # address (a dry run). Registering the key on the same condition keeps
         # the legend from offering what it cannot do.

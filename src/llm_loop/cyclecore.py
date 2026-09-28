@@ -534,7 +534,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # The caps are read LIVE (see RunSettings) and republished here, so an
             # edit made while the run is going is what the pinned row shows at
             # this boundary. Only republished: the edit already moved the knob
-            # and the denominator (see `runlifecycle.script_settings`).
+            # and the denominator (see `runlifecycle.knob_registry`).
             app.update(**progress.summary_fields(),
                        script_limits=ctx.registry.status_entries())
             pending = stopchannel.pending_stop(app)

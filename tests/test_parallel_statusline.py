@@ -801,7 +801,7 @@ def test_a_batchs_cap_edit_reaches_the_claim_loop(tmp_path, monkeypatch):
     def raise_the_cap_from_the_first_file(job_id, command, mailbox=None):
         if not edited.is_set():
             edited.set()
-            made["app"].settings.get("max-runs").set(3)
+            made["app"].registry.get("max-runs").set(3)
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", raise_the_cap_from_the_first_file)

@@ -78,7 +78,7 @@ class RunSettings:
         self.git_push = git_push or GitPushPolicy(GIT_PUSH_POLICY)
 
 
-def script_settings(run_settings: RunSettings, progress=None) -> Any:
+def knob_registry(run_settings: RunSettings, progress=None) -> Any:
     """The script's knobs as a SettingsRegistry — the display AND edit surface.
 
     One registry is the single source of truth for both the pinned row
@@ -132,7 +132,7 @@ class RunContext(NamedTuple):
     dry_run: bool
     progress: Any
     settings: RunSettings
-    # The knob registry over `settings` (see script_settings).
+    # The knob registry over `settings` (see knob_registry).
     registry: Any
     # Whether the pinned status area is drawn: never for a dry run, and not
     # under `--no-statusline`. Off, open_status hands back the Null app.
@@ -178,7 +178,7 @@ def begin_run(driver, args, app_name: str, progress=None, *,
 
     settings = RunSettings(max_runs=args.max,
                            git_push=GitPushPolicy(args.git_push))
-    registry = script_settings(settings, progress if owns_progress else None)
+    registry = knob_registry(settings, progress if owns_progress else None)
     dry_run = bool(args.dry_run)
 
     # Anchor every project-relative operation (git/provider cwd, the stop file,
@@ -254,7 +254,7 @@ def open_status(ctx: RunContext, driver, *, job_count: int,
         progress.note_remaining(total)
     app = statusline.StatusApp(
         status=statusline.LoopStatus(jobs=progress.jobs(job_count)),
-        settings=ctx.registry,
+        registry=ctx.registry,
         messages=messages,
         enabled=ctx.status_enabled)
     app.update(

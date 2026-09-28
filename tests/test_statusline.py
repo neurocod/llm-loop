@@ -881,11 +881,11 @@ def test_disabling_mid_paint_cannot_leave_a_name_on_the_window(monkeypatch):
 
 
 def test_the_git_push_value_is_lit_like_a_healthy_figure():
-    """Through `script_settings`, not a hand-written field: the colouring is
+    """Through `knob_registry`, not a hand-written field: the colouring is
     anchored on the knob's NAME, and this is what makes renaming it move the
     colour instead of quietly losing it."""
-    settings = runlifecycle.script_settings(runlifecycle.RunSettings())
-    line = sl.render_rows(sequential_status(script_limits=settings.status_entries()),
+    registry = runlifecycle.knob_registry(runlifecycle.RunSettings())
+    line = sl.render_rows(sequential_status(script_limits=registry.status_entries()),
                           200, now=NOW)[1]
 
     assert "git-push each_hour" in line       # the plain row is unchanged
@@ -1513,7 +1513,7 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
         def next_command(self):
             self.calls += 1
             if self.calls == 1:
-                self.app.settings.get("max-runs").set(2)
+                self.app.registry.get("max-runs").set(2)
             return AgentCommand("do the thing", "", f"item-{self.calls}")
 
     driver = _RaisesItsOwnCap()

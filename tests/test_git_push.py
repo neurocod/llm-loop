@@ -235,8 +235,8 @@ def _capture_status_app(monkeypatch) -> dict:
     """Hand the test the run's own StatusApp, and with it the knob registry.
 
     Through the seam a run already has — the app is handed the registry it will
-    edit — rather than by replacing `runlifecycle.script_settings`: the editor a
-    key press reaches is `app.settings`, so a pin about editing a knob should
+    edit — rather than by replacing `runlifecycle.knob_registry`: the editor a
+    key press reaches is `app.registry`, so a pin about editing a knob should
     hold the same object the `l` key does. `test_parallel_statusline` reaches it
     the same way.
     """
@@ -273,7 +273,7 @@ def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
 
     def edit_the_knob_then_wait(job_id, command, mailbox=None):
         # The `l` key's editor, reached the way the status line reaches it.
-        made["app"].settings.get(gitpush.GIT_PUSH_SETTING).set("after_new_commits")
+        made["app"].registry.get(gitpush.GIT_PUSH_SETTING).set("after_new_commits")
         saw_push.append(fake.pushed.wait(timeout=PUMP_WAIT_S))
         return 0, None, None
 
