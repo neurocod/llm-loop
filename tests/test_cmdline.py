@@ -6,6 +6,8 @@ the old value on the line next to the new one, which reads as correct and is not
 """
 
 import base64
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -258,12 +260,26 @@ def test_the_rendered_line_round_trips_through_powershell(
     delivered = json.loads(result.stdout)
     assert delivered == rebuild_argv(argv, overrides), line
 
-    # And it MEANS what the run meant: the same namespace as the pair spelling.
-    parser = clispec.build_parser(clispec.SEQUENTIAL, prog="pytest")
+    # And it MEANS what the run meant: the same outcome as the pair spelling.
+    # Outcome, not namespace: the parser refuses an empty -C
+    # (`clispec.directory`), and a refusal is a meaning too — the one both
+    # spellings must share.
     pairs = list(argv)
     for flag, value in overrides.items():
         pairs += [flag, str(value)]
-    assert parser.parse_known_args(delivered) == parser.parse_known_args(pairs)
+    assert _parse_outcome(delivered) == _parse_outcome(pairs)
+
+
+def _parse_outcome(argv):
+    """The sequential parser's namespace for `argv`, or its exit code and
+    message when it refuses the line."""
+    parser = clispec.build_parser(clispec.SEQUENTIAL, prog="pytest")
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            return parser.parse_known_args(argv)
+    except SystemExit as exc:
+        return exc.code, err.getvalue()
 
 
 def test_quote_round_trips_through_the_local_shell_rules():

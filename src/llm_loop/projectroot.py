@@ -49,8 +49,14 @@ PROJECT_DIR = os.getcwd()
 def set_project_root(path: Optional[str]) -> str:
     """Point the engine at the project root (cwd for git/provider CLI, base for
     the stop file, the mirror log's name and relative Driver paths). `path`
-    None/empty means "keep the current value" (which defaults to the process
-    cwd). Returns the resolved absolute path.
+    None means "keep the current value" (which defaults to the process cwd).
+    Returns the resolved absolute path.
+
+    An empty or blank `path` raises ValueError instead of meaning None: it is
+    what `--project-dir=` delivers, and reading it as "keep" would give one
+    input two outcomes (PowerShell 5.1 turns `--project-dir ""` into a bare
+    flag the parser refuses). The parser refuses it first (`clispec.directory`);
+    this covers a namespace a host builds past the parser.
 
     The runners are single-process, so a module-level singleton set once at
     startup is enough. Setting it is all there is to it: everything derived from
@@ -58,7 +64,10 @@ def set_project_root(path: Optional[str]) -> str:
     forgotten (see the module header for the mirrors that used to be it).
     """
     global PROJECT_DIR
-    if path:
+    if path is not None:
+        if not path.strip():
+            raise ValueError("--project-dir needs a directory, got an empty "
+                             "value; pass None to keep the current root")
         PROJECT_DIR = os.path.abspath(path)
     return PROJECT_DIR
 

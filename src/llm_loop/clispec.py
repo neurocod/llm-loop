@@ -50,6 +50,7 @@ __all__ = [
     "PARALLEL",
     "SEQUENTIAL",
     "build_parser",
+    "directory",
     "log_file",
     "unstrippable_flags",
 ]
@@ -89,6 +90,25 @@ def log_file(text: str) -> str:
         raise argparse.ArgumentTypeError(
             "needs a log file; use --cost without --cost-log to report on this "
             "entry point's own log") from None
+    return text
+
+
+def directory(text: str) -> str:
+    """argparse `type=` of -C/--project-dir: a directory, never an empty one.
+
+    An empty value has no meaning of its own, only accidents: `--project-dir=`
+    delivers "", which reads as "no root given" (the launch cwd) to the engine
+    and as `Path("")` - also the launch cwd, but by a different road - to a
+    wrapper that anchors its default elsewhere; while PowerShell 5.1 drops the
+    `""` of `--project-dir ""`, which argparse then refuses as a bare flag. Two
+    spellings of one input, two outcomes; refusing the empty value makes both a
+    usage error, exit 2, before anything runs. Omitting the flag is how one asks
+    for the default root. Returns the text unchanged: resolving it is
+    `projectroot.set_project_root`'s job, which refuses a blank path as well.
+    """
+    if not text.strip():
+        raise argparse.ArgumentTypeError(
+            "needs a directory; omit the flag to use the default project root")
     return text
 
 
@@ -162,7 +182,8 @@ OPTIONS: Dict[str, Option] = {
     "--project-dir": Option(
         aliases=("-C", "--project-dir"),
         takes_value=True,
-        kwargs=dict(dest="project_dir", metavar="DIR", default=None),
+        kwargs=dict(dest="project_dir", metavar="DIR", default=None,
+                    type=directory),
         help="project root: cwd for git/provider CLI, base for the stop "
              "file and the Driver's relative paths "
              "(default: the current working directory)",
