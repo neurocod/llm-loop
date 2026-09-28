@@ -72,7 +72,9 @@ so a wrong pattern fails instead of silently editing nothing and exiting 0.
 `try_patch.py` mutates a file, runs a command and restores the file from a
 `finally` — with `--expect-fail` for the usual case, proving that a test really
 does fail without its fix. A run killed before its `finally` is undone by the
-next one (or `--recover`) from its journal, `JOURNAL_DIR_NAME` in the script.
+next one (or `--recover`) from its journal, `try_patch_journal.py` beside it:
+a standard-library-only module, so a commit helper can refuse a file a run
+still holds without loading the CLI.
 
 ## The C++ port, for machines that call it a lot
 
