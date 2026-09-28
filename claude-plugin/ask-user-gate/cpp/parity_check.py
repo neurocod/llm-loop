@@ -193,7 +193,8 @@ CRLF_CASES = [
 # or at the end. The contract (ask_user_gate.py, at the --check add_argument):
 # `--check=` is the empty command, a bare --check is a usage error (exit 2), and
 # a token argparse reads as a flag is never taken as a value. Only the exit code
-# is compared on a usage error: argparse and the port word it differently.
+# is compared on a usage error and on the help: argparse and the port word both
+# differently.
 ARGV_CASES = [
     ["--check="],
     ["--check=", "--shell", "powershell"],
@@ -216,6 +217,14 @@ ARGV_CASES = [
     ["--check", "-5\n"],                      # the old argparse `$` took it
     ["--check", "-٥"],                   # a Unicode digit, ARABIC-INDIC 5
     ["--check", "-= x"],                      # `-` before `=`: every option
+    ["--check", "-==x y"],
+    ["--tool", "-= x", "--check", "ls"],      # after any value-taking flag
+    ["--check=-= x"],                         # glued: a value, so a verdict
+    # An ambiguous flag is refused where parsing REACHES it, so a help before it
+    # still prints (exit 0) and one after it never runs (exit 2).
+    ["--help", "-= x"],
+    ["-= x", "--help"],
+    ["--help", "--c"],                        # ... an ambiguous prefix as well
     ["--check", "-n 1; cd y && ls"],          # dash-led with a space: a value
     ["--tool", "--check", "cd x && ls"],
     ["--tool", "--check=cd x && ls"],         # a flag, space or not
@@ -367,7 +376,8 @@ def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]"
     """One ARGV_CASES entry through one gate's CLI, host fixed to Windows.
 
     `--platform windows` goes FIRST so that a case can end on a bare --check.
-    A usage error (exit 2) keeps only its code, see ARGV_CASES. stdin is
+    A usage error (exit 2) and the help keep only their code, see
+    ARGV_CASES. stdin is
     closed because an argv that one half parses as "no command" puts it in
     hook mode, reading a payload that would never come.
     """
@@ -384,7 +394,10 @@ def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]"
     if result.stderr:
         return result.returncode, ("<stderr> "
                                    + result.stderr.decode("utf-8", "replace"))
-    return result.returncode, result.stdout.decode("utf-8").replace("\r\n", "\n")
+    text = result.stdout.decode("utf-8").replace("\r\n", "\n")
+    if result.returncode == 0 and text.startswith("usage:"):
+        return 0, "<help>"
+    return result.returncode, text
 
 
 def hook_verdict(argv: "list[str]", payload: bytes) -> "tuple[int, str]":

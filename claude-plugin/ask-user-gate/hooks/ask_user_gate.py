@@ -929,6 +929,18 @@ def self_test() -> int:
     return 1 if failures else 0
 
 
+class _AmbiguousOption(argparse.Action):
+    """What _Parser._get_option_tuples returns for an ambiguous abbreviation:
+    a flag (so never a value) that is refused only when parsing reaches it."""
+
+    def __init__(self, token, names):
+        super().__init__(option_strings=[], dest=argparse.SUPPRESS, nargs=0)
+        self.message = f"ambiguous option: {token} could match {', '.join(names)}"
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        raise argparse.ArgumentError(None, self.message)
+
+
 class _Parser(argparse.ArgumentParser):
     """argparse, with the value-or-flag rule pinned and one hint added.
 
@@ -956,17 +968,34 @@ class _Parser(argparse.ArgumentParser):
         super().__init__(*args, **kwargs)
         self._negative_number_matcher = self.NEGATIVE_NUMBER
 
-    def _parse_optional(self, arg_string):
-        # A token led by `-=` is a flag -- ours too, for the same reason: a
-        # single dash is matched by the text before `=`, which here is just `-`,
-        # a prefix of every option. 3.13 reads it that way (ambiguous, but a
-        # flag); 3.10 took the whole token as the prefix, matched nothing, and
-        # its space rule made `--check "-= x"` a verdict. The port's
-        # looksLikeOption has the 3.13 shape, so this pins the reference to it.
-        if arg_string.startswith("-="):
-            self.error(f"argument {arg_string!r}: `-` before `=` abbreviates "
-                       f"every option, so this is a flag, not a value")
-        return super()._parse_optional(arg_string)
+    def _get_option_tuples(self, option_string):
+        # Two more rules argparse moved, pinned to the newer shape the port
+        # (looksLikeOption, and its one-pass loop) already has:
+        #
+        # - A token led by `-=` abbreviates EVERY option: a single dash is
+        #   matched by the text before `=`, which here is just `-`. 3.9-3.11 (and
+        #   early 3.12) took the whole token as the prefix, matched nothing, and
+        #   their space rule made `--check "-= x"` a verdict; 3.12.14 (a
+        #   backport) and 3.13+ read a flag.
+        # - An ambiguous abbreviation is refused when argparse REACHES it, not
+        #   while it first classifies argv: 3.9-3.11 refused `--help --c` (exit
+        #   2) before --help could run, 3.12.14+ print the help (exit 0).
+        # Measured on 3.9.25, 3.10.21, 3.11.16, 3.12.14, 3.13.7 and 3.14.7.
+        #
+        # Both come back as one stand-in match that raises once consumed. Raised
+        # as ArgumentError, not self.error(): parse_known_args turns it into the
+        # usage error, and exit_on_error=False into an exception, as it does
+        # for argparse's own.
+        matches = super()._get_option_tuples(option_string)
+        if len(matches) < 2 and not option_string.startswith("-="):
+            return matches
+        names = ([match[1] for match in matches] if len(matches) > 1
+                 else ["every option"])
+        # The tuple's width moved too (3 fields up to 3.10, 4 from 3.11), so it
+        # is copied from an unambiguous lookup rather than written down.
+        width = len(super()._get_option_tuples("--hel")[0])
+        return [(_AmbiguousOption(option_string, names), option_string)
+                + (None,) * (width - 2)]
 
     def error(self, message):
         if message.startswith("argument --check: expected one argument"):

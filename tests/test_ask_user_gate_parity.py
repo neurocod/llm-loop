@@ -66,6 +66,25 @@ def test_reference_negative_number_rule_is_its_own(token, verdict):
     assert (result.returncode != 2) == verdict, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("argv, code", [
+    (["--check", "-==x y"], 2),
+    (["--tool", "-= x", "--check", "ls"], 2),
+    (["--check=-= x"], 0),              # glued, so a value: "allowed"
+    (["--help", "-= x"], 0),
+    (["-= x", "--help"], 2),
+    (["--help", "--c"], 0),
+])
+def test_reference_ambiguous_flag_is_refused_where_parsing_reaches_it(argv, code):
+    """A `-=` token and an ambiguous prefix are flags, refused on arrival.
+
+    3.9-3.11 argparse read `-= x` as a value and refused an ambiguous prefix
+    before running anything, --help included; _Parser._get_option_tuples pins
+    the newer reading, which the port shares (ARGV_CASES compare the two).
+    """
+    result = _run([SCRIPT, "--platform", "windows"] + argv)
+    assert result.returncode == code, result.stdout + result.stderr
+
+
 @pytest.mark.skipif(not os.path.isfile(BINARY),
                     reason="the C++ gate is an opt-in build; see cpp/build.py")
 def test_port_agrees_with_the_reference():
