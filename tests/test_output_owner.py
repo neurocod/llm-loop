@@ -24,8 +24,8 @@ from llm_loop.breakpoints import Breakpoints
 from _runfixtures import MemListDriver, isolated_run, par_args
 from _termfixtures import KeysByHand, RecordingTerminal
 
-# Upper bound on every wait below, the painter stalls a pin arms included (a
-# pin that fails by hanging still ends); each one is a handshake that a healthy run
+# Upper bound on every wait below, and on every painter stall a pin arms (so a
+# pin that fails by hanging still ends). Each wait is a handshake a healthy run
 # completes at once, so only a broken owner ever gets near it. 0.49 s for this
 # whole file, measured 2026-09-25 — the bound is many times that.
 WAIT_S = 10.0

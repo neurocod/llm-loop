@@ -1,5 +1,6 @@
 """What the runner pins hand `run_loop` / `run_parallel`: arguments, drivers, a
-quota policy, and the two "provably elsewhere" project roots.
+quota policy, the two "provably elsewhere" project roots — and `isolated_run`,
+which keeps what such a run leaves in the process inside the test.
 
 Imported by name (`from _runfixtures import ...`), never through an autouse
 `conftest.py`: a pin that reads a helper it can see explains itself, and one that
