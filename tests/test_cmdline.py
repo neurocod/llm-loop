@@ -287,7 +287,7 @@ def test_an_argument_powershell_cannot_deliver_is_refused(word):
 @pytest.mark.parametrize("shell", [POWERSHELL, POSIX])
 @pytest.mark.parametrize("word", [
     "a\0b", "a\nb", "a\rb", "a\tb", "a\x1b[2Jb", "a\x7fb", "a\x85b",
-    "a b", "a​b", "a‮b", "a\udcffb"],
+    "a\u2028b", "a\u200bb", "a\u202eb", "a\udcffb"],
     ids=["nul", "lf", "cr", "tab", "esc", "del", "nel", "line-separator",
          "zero-width-space", "bidi-override", "lone-surrogate"])
 def test_an_argument_that_does_not_print_as_one_line_is_refused(shell, word):
@@ -305,7 +305,7 @@ def test_a_nul_is_refused_by_its_name():
 
 
 @pytest.mark.parametrize("shell", [POWERSHELL, POSIX])
-@pytest.mark.parametrize("word", ["a b", "a　b"],
+@pytest.mark.parametrize("word", ["a\u00a0b", "a\u3000b"],
                          ids=["no-break-space", "ideographic-space"])
 def test_a_space_separator_is_quoted_not_refused(shell, word):
     line = quote(["python", word], shell)
