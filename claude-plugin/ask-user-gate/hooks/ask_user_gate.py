@@ -941,6 +941,35 @@ class _AmbiguousOption(argparse.Action):
         raise argparse.ArgumentError(None, self.message)
 
 
+def _option_tuple_fields() -> int:
+    """How many fields argparse's option tuples have here: 3 or 4.
+
+    The width moved between releases and is private API, so it is read, not
+    written down: (action, option, explicit_arg) measured on 3.9.25 and
+    3.10.21, (action, option, separator, explicit_arg) on 3.11.16, 3.12.14,
+    3.13.7 and 3.14.7 -- which release made the move is not established.
+
+    Read from a probe parser of its own, never from the parser being used: a
+    lookup on that one depends on its options and its allow_abbrev, and came
+    back empty (an IndexError, not a usage error) without --help. Both known
+    layouts are checked field by field, and anything else raises: a stand-in
+    padded to a width nobody measured would give argparse a tuple whose fields
+    mean something this code never read.
+    """
+    probe = argparse.ArgumentParser(add_help=False, allow_abbrev=True)
+    action = probe.add_argument("--probe")
+    found = argparse.ArgumentParser._get_option_tuples(probe, "--pro=v")
+    if found == [(action, "--probe", "v")]:
+        return 3
+    if found == [(action, "--probe", "=", "v")]:
+        return 4
+    raise RuntimeError(
+        f"argparse {sys.version.split()[0]} returns option tuples shaped "
+        f"{found!r} for `--pro=v`; _Parser knows only (action, option, "
+        f"explicit_arg) and (action, option, separator, explicit_arg) -- teach "
+        f"_option_tuple_fields this one")
+
+
 class _Parser(argparse.ArgumentParser):
     """argparse, with the value-or-flag rule pinned and one hint added.
 
@@ -966,6 +995,13 @@ class _Parser(argparse.ArgumentParser):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # The rules _get_option_tuples pins are abbreviation rules, measured
+        # with abbreviations on. With them off, newer argparse reads `-= x` as
+        # a value, which the stand-in would contradict -- refused rather than
+        # half-modelled.
+        if not self.allow_abbrev:
+            raise ValueError("_Parser pins argparse's abbreviation rules and "
+                             "does not support allow_abbrev=False")
         self._negative_number_matcher = self.NEGATIVE_NUMBER
 
     def _get_option_tuples(self, option_string):
@@ -991,11 +1027,9 @@ class _Parser(argparse.ArgumentParser):
             return matches
         names = ([match[1] for match in matches] if len(matches) > 1
                  else ["every option"])
-        # The tuple's width moved too (3 fields up to 3.10, 4 from 3.11), so it
-        # is copied from an unambiguous lookup rather than written down.
-        width = len(super()._get_option_tuples("--hel")[0])
+        # No separator and no explicit argument, whichever layout this is.
         return [(_AmbiguousOption(option_string, names), option_string)
-                + (None,) * (width - 2)]
+                + (None,) * (_option_tuple_fields() - 2)]
 
     def error(self, message):
         if message.startswith("argument --check: expected one argument"):
