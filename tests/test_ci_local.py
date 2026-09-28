@@ -90,7 +90,7 @@ def test_a_dash_run_block_ends_at_its_sibling_key():
 
 # id -> (the steps, a fragment of the refusal naming the reason). The fragment
 # keeps each case honest: a refusal for some other reason would pass without it.
-REFUSED = {
+REFUSED_STEP_SHAPES = {
     "folded block": ("      - run: >\n          echo a\n          echo b\n", "'>'"),
     "folded strip": ("      - run: >-\n          echo a\n", "'>-'"),
     "keep chomping": ("      - run: |+\n          echo a\n", "'|+'"),
@@ -124,7 +124,8 @@ REFUSED = {
 }
 
 
-@pytest.mark.parametrize("steps, reason", list(REFUSED.values()), ids=list(REFUSED))
+@pytest.mark.parametrize("steps, reason", list(REFUSED_STEP_SHAPES.values()),
+                         ids=list(REFUSED_STEP_SHAPES))
 def test_a_step_shape_it_does_not_model_is_refused(steps, reason):
     with pytest.raises(ci_local.WorkflowShapeError) as refused:
         ci_local.parse_workflow(workflow(steps))
@@ -132,7 +133,7 @@ def test_a_step_shape_it_does_not_model_is_refused(steps, reason):
 
 
 RUN = "      - run: echo a\n"
-REFUSED_AROUND = {
+REFUSED_WORKFLOW_SHAPES = {
     "second job": (HEAD + RUN + "  other:\n    runs-on: x\n    steps:\n" + RUN,
                    "exactly one job"),
     "workflow defaults": ("defaults:\n  run:\n    shell: bash\n" + HEAD + RUN,
@@ -156,12 +157,22 @@ REFUSED_AROUND = {
 }
 
 
-@pytest.mark.parametrize("text, reason", list(REFUSED_AROUND.values()),
-                         ids=list(REFUSED_AROUND))
+@pytest.mark.parametrize("text, reason", list(REFUSED_WORKFLOW_SHAPES.values()),
+                         ids=list(REFUSED_WORKFLOW_SHAPES))
 def test_a_workflow_shape_it_does_not_model_is_refused(text, reason):
     with pytest.raises(ci_local.WorkflowShapeError) as refused:
         ci_local.parse_workflow(text)
     assert reason in str(refused.value)
+
+
+def _run_steps(steps, tmp_path):
+    """run_steps with this interpreter first on PATH; (its result, the log)."""
+    env = dict(os.environ)
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    log_path = tmp_path / "log.txt"
+    with open(log_path, "w", encoding="utf-8") as log:
+        failed = ci_local.run_steps(steps, env, log, cwd=tmp_path)
+    return failed, log_path.read_text(encoding="utf-8")
 
 
 def test_a_failing_line_fails_its_step_even_when_a_later_one_passes(tmp_path):
@@ -173,12 +184,8 @@ def test_a_failing_line_fails_its_step_even_when_a_later_one_passes(tmp_path):
     marker = tmp_path / "ran"
     steps = [ci_local.Step("Fails", failing),
              ci_local.Step("After", f'python -c "open(r\'{marker}\', \'w\')"')]
-    env = {key: value for key, value in os.environ.items()}
-    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
-    with open(tmp_path / "log.txt", "w", encoding="utf-8") as log:
-        failed = ci_local.run_steps(steps, env, log, cwd=tmp_path)
-    assert failed is not None and failed.startswith("Fails"), \
-        (tmp_path / "log.txt").read_text(encoding="utf-8")
+    failed, log = _run_steps(steps, tmp_path)
+    assert failed is not None and failed.startswith("Fails"), log
     assert not marker.exists()
 
 
@@ -187,9 +194,5 @@ def test_a_multi_line_step_is_one_script(tmp_path):
     script = ('$v = "7"\npython -c "import sys; sys.exit(int(sys.argv[1]) - 7)" $v\n'
               if os.name == "nt" else
               'v=7\npython -c "import sys; sys.exit(int(sys.argv[1]) - 7)" "$v"\n')
-    env = dict(os.environ)
-    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
-    with open(tmp_path / "log.txt", "w", encoding="utf-8") as log:
-        failed = ci_local.run_steps([ci_local.Step("Carry", script)], env, log,
-                                    cwd=tmp_path)
-    assert failed is None, (tmp_path / "log.txt").read_text(encoding="utf-8")
+    failed, log = _run_steps([ci_local.Step("Carry", script)], tmp_path)
+    assert failed is None, log
