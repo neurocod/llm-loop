@@ -1165,15 +1165,8 @@ def test_a_dry_run_prints_the_prompt_block_for_job_one(tmp_path, capsys):
             return AgentCommand("do the thing, carefully", "", "the-thing")
 
     args = seq_args(tmp_path, dry_run=True)
-
-    previous = projectroot.project_dir()
-    streams = (sys.stdout, sys.stderr)
-    try:
-        cyclecore.run_loop(_OneShot(), args, app_name="pytest-statusline",
-                           setup_logging=False, wait_on_start=False)
-    finally:
-        projectroot.set_project_root(previous)
-        sys.stdout, sys.stderr = streams
+    cyclecore.run_loop(_OneShot(), args, app_name="pytest-statusline",
+                       setup_logging=False, wait_on_start=False)
 
     out = capsys.readouterr().out
     assert "DRY-RUN:" in out                      # unchanged, tests match on it
@@ -1388,14 +1381,9 @@ def _run_with_status(monkeypatch, tmp_path, driver, *, on_app=None,
 
     arg_fields.setdefault("max", 1)
     args = seq_args(tmp_path, **arg_fields)
-
-    previous = projectroot.project_dir()
-    try:
-        cyclecore.run_loop(driver, args, app_name="pytest-statusline",
-                           setup_logging=False, wait_on_start=False,
-                           progress=progress)
-    finally:
-        projectroot.set_project_root(previous)
+    cyclecore.run_loop(driver, args, app_name="pytest-statusline",
+                       setup_logging=False, wait_on_start=False,
+                       progress=progress)
     return made["app"], source
 
 
@@ -1518,13 +1506,8 @@ class _QueueDriver:
 def _begin(tmp_path, progress=None):
     """`runlifecycle.begin_run` as a dry run: no lock, no tee, no exit record."""
     args = seq_args(tmp_path, max=1, dry_run=True)
-    previous = projectroot.project_dir()
-    try:
-        ctx = runlifecycle.begin_run(_QueueDriver(None), args, "pytest-statusline",
-                                     progress, setup_logging=False)
-    finally:
-        projectroot.set_project_root(previous)
-    return ctx
+    return runlifecycle.begin_run(_QueueDriver(None), args, "pytest-statusline",
+                                  progress, setup_logging=False)
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -1837,15 +1820,11 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
     args = seq_args(tmp_path, max=2, provider="codex")
 
     progress = sl.InvocationProgress()
-    previous = projectroot.project_dir()
-    try:
-        for _call in (1, 2):        # what a periodic wrapper does, twice
-            cyclecore.run_loop(_counts_down(2), args,
-                               app_name="pytest-statusline",
-                               setup_logging=False, wait_on_start=False,
-                               progress=progress)
-    finally:
-        projectroot.set_project_root(previous)
+    for _call in (1, 2):        # what a periodic wrapper does, twice
+        cyclecore.run_loop(_counts_down(2), args,
+                           app_name="pytest-statusline",
+                           setup_logging=False, wait_on_start=False,
+                           progress=progress)
 
     first, second = made
     assert first.status.jobs[0] is second.status.jobs[0]
