@@ -987,7 +987,7 @@ class _Parser(argparse.ArgumentParser):
     # digit (`-٥`), and the older `$` matches before a trailing newline (`-5\n`).
     # This one is the narrow shape -- a dash, ASCII digits, at most one dot,
     # nothing after -- which C++ spells without a Unicode table (the port's
-    # looksLikeOption), and on a miss the token is a flag: a usage error,
+    # classifyArgument), and on a miss the token is a flag: a usage error,
     # never a verdict on a command the caller did not mean. argparse reads the
     # attribute as `_negative_number_matcher.match(token)` in every version
     # this runs on; were that ever to change, parity_check's ARGV_CASES fail.
@@ -1006,7 +1006,7 @@ class _Parser(argparse.ArgumentParser):
 
     def _get_option_tuples(self, option_string):
         # Two more rules argparse moved, pinned to the newer shape the port
-        # (looksLikeOption, and its one-pass loop) already has:
+        # (classifyArgument, and the loop in its run()) already has:
         #
         # - A token led by `-=` abbreviates EVERY option: a single dash is
         #   matched by the text before `=`, which here is just `-`. 3.9-3.11 (and
@@ -1037,14 +1037,16 @@ class _Parser(argparse.ArgumentParser):
         super().error(message)
 
 
-def main() -> int:
+def build_parser() -> _Parser:
+    """The CLI. Its own function because parity_check reads its option strings:
+    the port's kOptions copies them, and ARGV_CASES gets a row per option."""
     parser = _Parser(
         description="Refuse shell commands that would stop for a human "
                     "permission prompt. Reads a PreToolUse hook payload on "
                     "stdin unless --check/--self-test is given.")
     # The empty command is spelled `--check=`, and a bare --check stays an
     # error -- in both halves (the port's side, and why its parser had to learn
-    # to tell a flag from a value, is at its looksLikeOption). The obvious
+    # to tell a flag from a value, is at its classifyArgument). The obvious
     # `--check ""` never arrives from Windows PowerShell 5.1, which drops an
     # empty argument to a native program; argparse then sees --check followed
     # by the next flag, or by nothing. Reading that bare --check as "" (what
@@ -1071,7 +1073,11 @@ def main() -> int:
                              "note depends on it (default: auto)")
     parser.add_argument("--self-test", action="store_true",
                         help="run the built-in scanner cases")
-    options = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    options = build_parser().parse_args()
 
     if options.self_test:
         return self_test()

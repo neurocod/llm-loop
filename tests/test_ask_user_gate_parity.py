@@ -16,6 +16,7 @@ and it is the half that every plugin install actually runs.
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 
@@ -71,6 +72,25 @@ def test_reference_command_line(argv, code, text):
     assert got_code == code, got_text
     if text is not None:
         assert got_text == text
+
+
+def test_port_options_are_the_reference_options():
+    """The port's kOptions is a hand copy of the reference's option strings.
+
+    Read from the source, so it bites on every checkout: the behavioural pin
+    (parity_check's per-option ARGV_CASES rows) needs the binary, and an option
+    added to the script alone would otherwise stay unknown to the port -- a
+    usage error there, a verdict here -- until someone built it.
+    """
+    with open(os.path.join(PLUGIN, "cpp", "ask_user_gate.cpp"),
+              encoding="utf-8") as handle:
+        source = handle.read()
+    block = re.search(r"constexpr CliOption kOptions\[\] = \{(.*?)\n\};", source,
+                      re.DOTALL)
+    assert block, "kOptions initializer not found in ask_user_gate.cpp"
+    port = {name: arity == "Value" for name, arity in
+            re.findall(r'\{"([^"]+)", Arity::(\w+)\}', block.group(1))}
+    assert port == _PARITY.reference_options()
 
 
 def _gate_module():

@@ -24,6 +24,7 @@ the source last changed (exit 2 otherwise, see newer_sources).
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -189,6 +190,10 @@ CRLF_CASES = [
 # What argv_verdict makes of the output worth pinning; see ARGV_CASES.
 ALLOWED = "allowed\n"
 HELP = "<help>"
+SELF_TEST = "<self-test>"
+# sed -i is refused under bash and not under PowerShell, so this command tells
+# which shell an abbreviated --shell actually set.
+SED = "sed -i s/a/b/ f"
 
 # The command line itself: the corpus above goes in through --check-file, so it
 # never sees how a VALUE is found. These are the shapes an operator's shell
@@ -260,7 +265,103 @@ ARGV_CASES = [
     (["--check-file", "no-such-file-7c1f0e.txt"], 2, None),
     # No command at all: hook mode, on the empty stdin argv_verdict gives it.
     (["--tool=Bash"], 0, ""),
+    # An unambiguous prefix is its option, with the value space- or =-joined;
+    # the verdict row shows WHICH option it set, not just that it parsed.
+    (["--sh", "powershell", "--check", SED], 0, ALLOWED),
+    (["--sh=powershell", "--check", SED], 0, ALLOWED),
+    (["--check", SED], 1, None),              # the control: bash refuses it
+    (["--t=Monitor", "--check", "sleep 5"], 1, None),
+    (["--pl", "posix", "--check", "ls"], 0, ALLOWED),
+    (["--plat=bogus", "--check", "ls"], 2, None),
+    (["--check-f", os.devnull], 0, ALLOWED),
+    (["--check-fi=" + os.devnull], 0, ALLOWED),
+    (["--check", "cd x && ls", "--self"], 0, SELF_TEST),
+    # A prefix of several options is ambiguous, with `=` or without.
+    (["--che", "ls"], 2, None),
+    (["--che=ls"], 2, None),
+    (["--s=bash"], 2, None),
+    # A flag that takes no value refuses one given with `=`, the empty one too.
+    (["--help="], 2, None),
+    (["--self-test="], 2, None),
+    (["--sh="], 2, None),                     # a value option: '' is no shell
+    (["--tool=", "--check", "ls"], 0, ALLOWED),   # ... but it is a tool name
+    # -h glued to more h's is that many -h; to `-` or `=` it is refused by every
+    # Python. (To a letter it depends on the version: no row, see the port.)
+    (["-hh"], 0, HELP),
+    (["--zz", "-hhh"], 0, HELP),
+    (["-h-", "--help"], 2, None),
+    (["-hh=x"], 2, None),
+    # Unrecognised tokens are reported after the parse, so a --help anywhere
+    # still prints; every other refusal stops where parsing reaches it.
+    (["-x", "--help"], 0, HELP),
+    (["--zz=1", "--help"], 0, HELP),
+    (["foo", "--help"], 0, HELP),
+    (["-1", "--help"], 0, HELP),
+    (["-", "--help"], 0, HELP),
+    (["", "--help"], 0, HELP),
+    (["--help", "foo"], 0, HELP),
+    (["--shell", "zsh", "--help"], 2, None),
+    (["--help", "--shell", "zsh"], 0, HELP),
+    (["--zz", "--check", "ls"], 2, None),     # ... and a verdict never prints
+    (["--check", "ls", "foo"], 2, None),
+    (["--self-test", "--zz"], 2, None),
+    # `--` ends the options, and nothing here takes what follows it.
+    (["--"], 2, None),
+    (["--help", "--"], 0, HELP),
+    (["--check", "ls", "--", "--help"], 2, None),
+    (["--", "--check", "ls"], 2, None),
+    (["--check", "--", "ls"], 2, None),
+    (["--=x", "--help"], 2, None),            # `--` before `=`: every option
+    # Values that only look like flags, and repeats.
+    (["--check", "--zz x"], 0, ALLOWED),
+    (["--check", "--sh x"], 0, ALLOWED),      # no `=`: the space decides
+    (["--check", "-"], 0, ALLOWED),
+    (["--check=ls", "--check=pwd"], 0, ALLOWED),
 ]
+
+
+def reference_options() -> "dict[str, bool]":
+    """Every option string of the reference's CLI -> whether it takes a value.
+
+    The port's kOptions is a hand copy of exactly this; the pytest suite
+    compares the two without a binary, and _option_rows below makes the
+    comparison behavioural where there is one.
+    """
+    return {option: action.nargs != 0
+            for action in reference.build_parser()._actions
+            for option in action.option_strings}
+
+
+def _option_rows() -> list:
+    """Two ARGV_CASES rows per option string, and two per shortest unambiguous
+    prefix of each long one: `[x, "--help"]` and `[x=v, "--help"]`.
+
+    An option nobody knows is reported after the parse, so --help wins both
+    rows. A value option fails the first (a flag is no value) and prints the
+    help on the second; a flag prints the help on the first and refuses the
+    `=` of the second. So every real spelling answers unlike an unknown one,
+    and one missing from the port's kOptions makes a DIFF -- generated from
+    the reference's own parser, so an option added there needs no row by hand.
+    """
+    options = reference_options()
+    actions = reference.build_parser()._option_string_actions
+    rows = []
+    for option, takes_value in options.items():
+        spellings = [option]
+        for end in range(3, len(option)) if option.startswith("--") else ():
+            if [name for name in options if name.startswith(option[:end])] == [option]:
+                spellings.append(option[:end])
+                break
+        choices = actions[option].choices
+        value = choices[0] if choices else "x"
+        for spelling in spellings:
+            rows.append(([spelling, "--help"],) + ((2, None) if takes_value else (0, HELP)))
+            rows.append(([f"{spelling}={value}", "--help"],)
+                        + ((0, HELP) if takes_value else (2, None)))
+    return rows
+
+
+ARGV_CASES += _option_rows()
 
 # Hook mode: the path that actually runs. The first group is ordinary traffic;
 # the rest is what a JSON reader has to survive without taking the session with
@@ -400,7 +501,8 @@ def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]"
     """One ARGV_CASES argv through one gate's CLI, host fixed to Windows.
 
     `--platform windows` goes FIRST so that a case can end on a bare --check.
-    A usage error (exit 2) and the help keep only their code, see ARGV_CASES.
+    A usage error (exit 2) and the help keep only their code, see ARGV_CASES,
+    and so does a passing self-test: the two halves count different checks.
     stdin is closed because an argv that one half parses as "no command" puts
     it in hook mode, reading a payload that would never come.
     """
@@ -419,7 +521,9 @@ def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]"
                                    + result.stderr.decode("utf-8", "replace"))
     text = result.stdout.decode("utf-8").replace("\r\n", "\n")
     if result.returncode == 0 and text.startswith("usage:"):
-        return 0, "<help>"
+        return 0, HELP
+    if result.returncode == 0 and re.fullmatch(r"\d+/\d+ checks pass\n", text):
+        return 0, SELF_TEST
     return result.returncode, text
 
 
