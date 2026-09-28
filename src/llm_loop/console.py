@@ -370,20 +370,43 @@ def render_markdown_block(text: str) -> None:
 
 
 class _Route:
-    """One `route_through` window: its owner, and what it could not take."""
+    """One `route_through` window: its owner, and the lines it could not take.
+
+    `stalled` is set by a post that found no room and cleared by one that did;
+    while set, a post takes only room that is free at once. `written_directly`
+    counts the lines handed back to their caller, and `closed` is set when the
+    window closes and reports that count; both are under `_ROUTE_LOCK`, which
+    orders a count against the close (see `post`).
+    """
 
     def __init__(self, owner, post_timeout: float):
         self.owner = owner
         self.post_timeout = post_timeout
-        # Lines written on their caller's thread because the owner's queue had
-        # no room (see `route_through`). Under `_ROUTE_LOCK`, like `closed`.
-        self.written_directly = 0
-        # Set by a post that found no room, cleared by one that did: while
-        # set, a poster does not wait for room at all (see `route_through`).
         self.stalled = False
-        # Set when the window closes and its count is reported: a line written
-        # directly after that reports itself (see `_on_console`).
+        self.written_directly = 0
         self.closed = False
+
+    def post(self, call, *args) -> bool:
+        """Hand one write to the owner; False when the caller must make it.
+
+        A line handed back is counted: before the close, into the close's
+        report; after it — a poster that took the route, waited, and timed
+        out once the window had closed and reported — it says so itself,
+        since nothing else would.
+        """
+        timeout = 0 if self.stalled else self.post_timeout
+        if self.owner.post(call, *args, timeout=timeout):
+            self.stalled = False
+            return True
+        with _ROUTE_LOCK:
+            self.stalled = True
+            self.written_directly += 1
+            late = self.closed
+        if late:
+            print(f"  ⚠ {self.owner.name}: 1 line written directly, out of "
+                  f"order, after the window closed — its queue stayed full.",
+                  file=sys.stderr)
+        return False
 
 
 # Guards installing and removing the route, and its counters. Never held across
@@ -473,12 +496,11 @@ def route_through(owner, *, post_timeout: float):
 
     A line written directly is written whole (`_print_flushed`, and the tee's
     lock in `TeeToLog`), so it can land between two of the owner's lines but
-    not inside one. The count is reported to stderr once the window closes; a
-    poster that was still waiting then, and writes directly afterwards,
-    reports its own line (`_on_console`).
+    not inside one. The count is reported to stderr once the window closes
+    (a later one reports itself: `_Route.post`).
 
     A write that raises on the owner costs that line only and is reported by
-    the owner (`OwnerThread._report`); it no longer unwinds the thread that
+    the owner (`OwnerThread._report`); it does not unwind the thread that
     printed. Refused if a route is already open: two owners would each believe
     they order the console.
     """
@@ -507,28 +529,12 @@ def _on_console(call, *args) -> None:
 
     `call` is the write itself (never `print_markup`, which would route again
     on the owner's side and recurse there).
-
-    A direct write is counted under `_ROUTE_LOCK`, which also orders it
-    against the window's close: counted before it, it is in the close's
-    report; after it — a poster that took the route, waited, and timed out
-    once the window had closed and reported — it says so itself, since
-    nothing else would.
     """
     route = _route
     if (route is not None and not getattr(_UNROUTED, "depth", 0)
-            and not route.owner.owns_current_thread):
-        timeout = 0 if route.stalled else route.post_timeout
-        if route.owner.post(call, *args, timeout=timeout):
-            route.stalled = False
-            return
-        with _ROUTE_LOCK:
-            route.stalled = True
-            route.written_directly += 1
-            late = route.closed
-        if late:
-            print(f"  ⚠ {route.owner.name}: 1 line written directly, out of "
-                  f"order, after the window closed — its queue stayed full.",
-                  file=sys.stderr)
+            and not route.owner.owns_current_thread
+            and route.post(call, *args)):
+        return
     call(*args)
 
 
@@ -570,7 +576,7 @@ def print_markup(plain: str, markup: str) -> None:
     With Rich available the `markup` string (Rich console markup: colours, bold,
     italic, underline) is rendered straight to the real terminal, while a clean
     `plain` copy is mirrored to the file log — so colour/redraw escapes never end
-    up in the log. Without Rich it degrades to a plain `print` (screen + log via
+    up in the log. Without Rich it degrades to the plain line (screen + log via
     the tee). Note: terminals can't switch *font family*; only colour and the
     bold/italic/underline attributes are available.
 
@@ -585,8 +591,7 @@ def print_line(text: str) -> None:
     For the plain lines of code that can run beside a parallel run's workers —
     the usage gate, the usage sources. A bare `print` there would be written
     past the owner, and ahead of the gate's own `print_percents` lines queued a
-    moment earlier. Always flushed, like `print_markup` and for its reason
-    (see `_render_markup`): the gate's lines include a paused run's countdown.
+    moment earlier. Always flushed, like `print_markup` (`_render_markup`).
     """
     _on_console(_print_flushed, text)
 
@@ -655,10 +660,6 @@ def markup_percents(text: str) -> str:
 def print_percents(text: str) -> None:
     """Print a line whose percentages are colour-coded on screen (plain in the
     log). A no-op difference from `print` when Rich is unavailable.
-
-    These lines include the once-a-minute countdown printed while a run is
-    paused on a limit, which is why every `print_markup` write is flushed (see
-    `_render_markup`).
     """
     print_markup(text, markup_percents(text))
 
