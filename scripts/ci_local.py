@@ -3,7 +3,8 @@
 The matrix and the commands are read from .github/workflows/tests.yml rather
 than restated here, so a version or a step added to the workflow is run locally
 without touching this file. Only the `os` axis is not reproducible: the local
-one is the one you get.
+one is the one you get, and each step runs in the shell CI gives that OS (see
+step_command).
 
 Each version gets its own venv, made by uv (https://docs.astral.sh/uv/). uv is
 what keeps this from disturbing the machine: a Python it has to download lands
@@ -19,25 +20,36 @@ already installed is used as the venv's base and left untouched.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import List, NamedTuple, Optional
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "tests.yml"
 # Outside the checkout on purpose: a venv inside it would be walked by every
 # tool that walks the tree, and would be one more thing .gitignore must name.
-VENVS = Path.home() / ".cache" / "llm-loop-ci"
+# Keyed on the checkout: two worktrees of this repository run at once, and a
+# shared venv is `uv venv --clear`ed by one under the other's tests, and holds
+# an editable install of whichever checkout ran `pip install -e` last.
+VENVS = (Path.home() / ".cache" / "llm-loop-ci"
+         / hashlib.sha256(str(ROOT).lower().encode()).hexdigest()[:12])
+
+
+class WorkflowShapeError(ValueError):
+    """The workflow uses a shape this reader does not model; nothing was run."""
 
 
 class Step(NamedTuple):
     name: str
-    commands: List[str]
+    script: str
 
 
 class Plan(NamedTuple):
@@ -45,74 +57,433 @@ class Plan(NamedTuple):
     steps: List[Step]
 
 
-def parse_workflow(text: str) -> Plan:
-    """The matrix's python-version list and the `run:` steps, in order.
+# ---------------------------------------------------------------------------
+# The workflow reader.
+#
+# Not a YAML parser -- the standard library has none, and this repository takes
+# no dependency for a dev script. It is a reader of a SUBSET: block mappings and
+# sequences by indentation, plain one-line scalars, flow lists of quoted
+# strings, and `|` / `|-` literal blocks. Anything else -- folded or indented
+# block headers, quoted or multi-line scalars, anchors, tags, tabs -- is refused
+# with its line number, and so is every workflow key that would change what a
+# step does locally without this script modelling it (see plan_from). Refusing
+# before anything runs is the whole contract: a local run that quietly covers
+# less than CI, or runs something else, reads as a green CI.
+# ---------------------------------------------------------------------------
 
-    Not a YAML parser -- the standard library has none, and this repository
-    takes no dependency for a dev script. It reads exactly the shapes
-    tests.yml uses: a flow list `python-version: [...]`, and `run:` either
-    inline or as a `|` block. A workflow that outgrows them fails here loudly
-    (no versions, or no steps) instead of running half a matrix.
-    """
-    match = re.search(r"^\s*python-version:\s*\[(.*?)\]", text, re.MULTILINE)
+_KEY = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_.-]*):(?:[ ]+(.*))?$")
+# Characters that open something other than a plain scalar at a value's start.
+_NOT_PLAIN = set("\"'&*!%@`{}|>?,[]#")
+
+
+class Scalar(NamedTuple):
+    text: str   # a plain scalar's raw text (comment included), or a block's content
+    line: int   # 1-based, for the refusal message
+    block: bool
+
+
+class _Reader:
+    def __init__(self, text: str):
+        self.lines = text.replace("\r\n", "\n").split("\n")
+        self.index = 0
+
+    def fail(self, line: int, why: str):
+        raise WorkflowShapeError(f"{WORKFLOW.name}:{line}: {why}")
+
+    def indent(self, number: int) -> int:
+        line = self.lines[number]
+        width = len(line) - len(line.lstrip(" "))
+        if line[width:width + 1] == "\t":
+            self.fail(number + 1, "a tab in the indentation")
+        return width
+
+    def next_significant(self) -> Optional[int]:
+        number = self.index
+        while number < len(self.lines):
+            stripped = self.lines[number].strip()
+            if stripped and not stripped.startswith("#"):
+                return number
+            number += 1
+        return None
+
+    def node(self, parent: int):
+        """The block node under a key at column `parent`, or None."""
+        number = self.next_significant()
+        if number is None or self.indent(number) <= parent:
+            return None
+        column = self.indent(number)
+        text = self.lines[number][column:]
+        if text == "-" or text.startswith("- "):
+            return self.sequence(column)
+        return self.mapping(column)
+
+    def mapping(self, column: int, first: Optional[Tuple[int, str]] = None) -> dict:
+        result: dict = {}
+        while True:
+            if first is not None:
+                number, text = first
+                first = None
+            else:
+                number = self.next_significant()
+                if number is None or self.indent(number) < column:
+                    return result
+                if self.indent(number) > column:
+                    self.fail(number + 1, "unexpected indentation")
+                text = self.lines[number][column:]
+            match = _KEY.match(text)
+            if not match:
+                self.fail(number + 1, f"not a `key: value` line: {text.strip()!r}")
+            key = match.group(1)
+            if key in result:
+                self.fail(number + 1, f"duplicate key {key!r}")
+            self.index = number + 1
+            result[key] = self.value(match.group(2) or "", column, number)
+
+    def sequence(self, column: int) -> list:
+        items = []
+        while True:
+            number = self.next_significant()
+            if number is None or self.indent(number) < column:
+                return items
+            text = self.lines[number][column:]
+            if self.indent(number) > column or not (text == "-" or text.startswith("- ")):
+                self.fail(number + 1, "expected a `- ` sequence item")
+            rest = text[1:]
+            body = rest.lstrip(" ")
+            self.index = number + 1
+            if not body or body.startswith("#"):
+                items.append(self.node(column))
+            elif _KEY.match(body):
+                items.append(self.mapping(column + 1 + len(rest) - len(body),
+                                          first=(number, body)))
+            else:
+                items.append(self.value(body, column, number))
+
+    def value(self, text: str, column: int, number: int):
+        """What follows `key:` on line `number`, the key being at `column`."""
+        if not text or text.startswith("#"):
+            return self.node(column)
+        if text[0] in "|>":
+            return self.block(text, column, number)
+        if text[0] in _NOT_PLAIN - set("\"'["):
+            self.fail(number + 1, f"YAML syntax this reader does not model: {text!r}")
+        following = self.next_significant()
+        if following is not None and self.indent(following) > column:
+            self.fail(following + 1, "a scalar continued on the next line")
+        return Scalar(text, number + 1, False)
+
+    def block(self, header: str, column: int, number: int) -> Scalar:
+        # `|` keeps the final newline, `|-` drops it. Folding (`>`), keep (`|+`)
+        # and explicit indentation (`|2`) change the text a shell receives, and a
+        # comment after the header is one more thing to get wrong: refused.
+        if header not in ("|", "|-"):
+            self.fail(number + 1, f"block scalar header {header!r}: only `|` and "
+                                  f"`|-` are modelled")
+        body = []
+        cursor = self.index
+        while cursor < len(self.lines):
+            line = self.lines[cursor]
+            if line.strip() and self.indent(cursor) <= column:
+                break
+            body.append((cursor, line))
+            cursor += 1
+        self.index = cursor
+        while body and not body[-1][1].strip():
+            body.pop()
+        if not body:
+            return Scalar("", number + 1, True)
+        width = self.indent(next(n for n, line in body if line.strip()))
+        out = []
+        for line_number, line in body:
+            if line.strip() and self.indent(line_number) < width:
+                self.fail(line_number + 1, "less indented than the block's first line")
+            out.append(line[width:])
+        return Scalar("\n".join(out) + ("\n" if header == "|" else ""), number + 1, True)
+
+
+def parse_yaml_subset(text: str) -> dict:
+    reader = _Reader(text)
+    number = reader.next_significant()
+    if number is None:
+        raise WorkflowShapeError(f"{WORKFLOW.name}: empty")
+    if reader.indent(number):
+        reader.fail(number + 1, "the top level is indented")
+    document = reader.mapping(0)
+    left = reader.next_significant()
+    if left is not None:
+        reader.fail(left + 1, "unexpected text after the document")
+    return document
+
+
+def _plain(node, where: str) -> str:
+    """A plain one-line scalar, its trailing comment removed."""
+    if not isinstance(node, Scalar) or node.block:
+        raise WorkflowShapeError(f"{WORKFLOW.name}: {where}: expected a one-line value")
+    text = node.text
+    if text[0] in "\"'[":
+        raise WorkflowShapeError(f"{WORKFLOW.name}:{node.line}: {where}: a quoted or "
+                                 f"flow value is not modelled here")
+    # In a plain scalar ` #` starts a comment even inside what looks like
+    # quotes, and `: ` is an error; neither is guessed at.
+    if ": " in text or text.endswith(":"):
+        raise WorkflowShapeError(f"{WORKFLOW.name}:{node.line}: {where}: `: ` in a "
+                                 f"plain value")
+    return re.sub(r"\s+#.*$", "", text).strip()
+
+
+def _only(mapping: dict, allowed: set, where: str) -> None:
+    extra = [key for key in mapping if key not in allowed]
+    if extra:
+        raise WorkflowShapeError(
+            f"{WORKFLOW.name}: {where}: {', '.join(extra)} not modelled by "
+            f"ci_local.py -- teach it, or it would run something other than CI")
+
+
+_FLOW_OF_QUOTED = re.compile(
+    r"""\[\s*((?:"[^"\\]*"|'[^']*')(?:\s*,\s*(?:"[^"\\]*"|'[^']*'))*)\s*,?\s*\]"""
+    r"""\s*(?:#.*)?$""")
+
+
+def _versions(node) -> List[str]:
+    if not isinstance(node, Scalar) or node.block or not node.text.startswith("["):
+        raise WorkflowShapeError(f"{WORKFLOW.name}: matrix.python-version must be a "
+                                 f"one-line flow list `[...]`")
+    match = _FLOW_OF_QUOTED.match(node.text)
     if not match:
-        raise ValueError("no `python-version: [...]` list in the workflow")
-    versions = [item.strip().strip("\"'") for item in match.group(1).split(",")
-                if item.strip()]
+        # Unquoted items are floats to YAML: `3.10` would be CI's 3.1.
+        raise WorkflowShapeError(f"{WORKFLOW.name}:{node.line}: every python-version "
+                                 f"must be quoted (YAML reads 3.10 as the float 3.1)")
+    versions = [item[1:-1] for item in
+                re.findall(r""""[^"\\]*"|'[^']*'""", match.group(1))]
+    bad = [v for v in versions if not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", v)]
+    if bad or len(set(versions)) != len(versions):
+        raise WorkflowShapeError(f"{WORKFLOW.name}:{node.line}: python-version "
+                                 f"items {versions} are not plain distinct versions")
+    return versions
 
-    steps: List[Step] = []
-    lines = text.splitlines()
-    name = ""
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        index += 1
-        if re.match(r"\s*-\s", line):
-            name = ""  # a new step: a `uses:` one leaves no name behind
-        named = re.match(r"\s*-\s*name:\s*(.+)", line)
-        if named:
-            name = named.group(1).strip()
-            continue
-        run = re.match(r"(\s*)(?:-\s*)?run:\s*(.*)", line)
-        if not run:
-            continue
-        indent, value = len(run.group(1)), run.group(2).strip()
-        if value not in ("|", "|-", ">", ">-"):
-            steps.append(Step(name, [value]))
-        else:
-            block = []
-            while index < len(lines) and (not lines[index].strip()
-                                          or len(lines[index]) - len(lines[index].lstrip()) > indent):
-                if lines[index].strip():
-                    block.append(lines[index].strip())
-                index += 1
-            steps.append(Step(name, block))
-    if not versions or not steps:
-        raise ValueError("the workflow parsed to no versions or no steps")
+
+def _step(node, index: int) -> Optional[Step]:
+    where = f"step {index + 1}"
+    if not isinstance(node, dict):
+        raise WorkflowShapeError(f"{WORKFLOW.name}: {where} is not a mapping")
+    name = _plain(node["name"], where) if "name" in node else ""
+    where = f"step {index + 1} ({name})" if name else where
+    if "uses" in node:
+        _only(node, {"name", "uses", "with"}, where)
+        action = _plain(node["uses"], where).split("@")[0]
+        if action == "actions/checkout" and "with" not in node:
+            return None  # the checkout is this one
+        if (action == "actions/setup-python" and isinstance(node.get("with"), dict)
+                and set(node["with"]) == {"python-version"}
+                and isinstance(node["with"]["python-version"], Scalar)
+                and node["with"]["python-version"].text.strip()
+                == "${{ matrix.python-version }}"):
+            return None  # the venv is this one
+        raise WorkflowShapeError(f"{WORKFLOW.name}: {where}: `uses: "
+                                 f"{_plain(node['uses'], where)}` (with its `with:`) "
+                                 f"is not an action ci_local.py reproduces")
+    if "run" not in node:
+        raise WorkflowShapeError(f"{WORKFLOW.name}: {where}: neither `uses` nor `run`")
+    # shell, working-directory, env, if, continue-on-error all change what the
+    # step does or whether it counts.
+    _only(node, {"name", "run"}, where)
+    run = node["run"]
+    if isinstance(run, Scalar) and run.block:
+        script = run.text
+    else:
+        script = _plain(run, where)
+        if isinstance(run, Scalar) and re.search(r"\s#", run.text):
+            raise WorkflowShapeError(f"{WORKFLOW.name}:{run.line}: {where}: a comment "
+                                     f"after an inline `run:` -- use a `|` block")
+    if "${{" in script:
+        raise WorkflowShapeError(f"{WORKFLOW.name}: {where}: `${{{{ ... }}}}` "
+                                 f"expressions are not evaluated by ci_local.py")
+    if not script.strip():
+        raise WorkflowShapeError(f"{WORKFLOW.name}: {where}: an empty `run:`")
+    return Step(name, script)
+
+
+def parse_workflow(text: str) -> Plan:
+    """The matrix's python-version list and the `run:` steps of its one job.
+
+    Raises WorkflowShapeError on any shape it does not model (see the reader
+    above), so a workflow that outgrows it fails here instead of running half
+    a matrix, or a different one.
+    """
+    document = parse_yaml_subset(text)
+    _only(document, {"name", "run-name", "on", "jobs", "permissions", "concurrency"},
+          "the workflow")
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict) or len(jobs) != 1:
+        raise WorkflowShapeError(f"{WORKFLOW.name}: exactly one job is modelled")
+    (job_name, job), = jobs.items()
+    if not isinstance(job, dict):
+        raise WorkflowShapeError(f"{WORKFLOW.name}: job {job_name} is not a mapping")
+    _only(job, {"name", "runs-on", "strategy", "steps", "timeout-minutes", "permissions"},
+          f"job {job_name}")
+    strategy = job.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    if not isinstance(matrix, dict):
+        raise WorkflowShapeError(f"{WORKFLOW.name}: job {job_name} has no "
+                                 f"strategy.matrix")
+    _only(strategy, {"fail-fast", "max-parallel", "matrix"}, f"job {job_name} strategy")
+    _only(matrix, {"os", "python-version"}, f"job {job_name} matrix")
+    if "python-version" not in matrix:
+        raise WorkflowShapeError(f"{WORKFLOW.name}: the matrix has no python-version")
+    versions = _versions(matrix["python-version"])
+    raw_steps = job.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise WorkflowShapeError(f"{WORKFLOW.name}: job {job_name} has no steps")
+    steps = [step for step in (_step(node, i) for i, node in enumerate(raw_steps))
+             if step is not None]
+    if not steps:
+        raise WorkflowShapeError(f"{WORKFLOW.name}: no `run:` steps")
     return Plan(versions, steps)
 
+
+# ---------------------------------------------------------------------------
+# Running it.
+# ---------------------------------------------------------------------------
 
 def venv_bin(venv: Path) -> Path:
     return venv / ("Scripts" if os.name == "nt" else "bin")
 
 
-def run_logged(command: str, env: dict, log) -> int:
-    log.write(f"\n$ {command}\n")
-    log.flush()
-    # shell=True: the workflow's lines are shell lines (quoting, `.[test]`).
-    return subprocess.run(command, shell=True, cwd=ROOT, env=env,
-                          stdout=log, stderr=subprocess.STDOUT).returncode
+def step_command(script_path: Path) -> Tuple[List[str], str]:
+    """The argv CI runs a `run:` step with (no `shell:`), and the script text
+    wrapper, for this OS. From the runner, not guessed: the default shell and
+    its arguments (https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#defaultsrunshell)
+    and the PowerShell wrapper, ScriptHandlerHelpers.FixUpScriptContents in
+    https://github.com/actions/runner/blob/main/src/Runner.Worker/Handlers/ScriptHandlerHelpers.cs.
+
+    POSIX: `bash -e {0}` (sh -e without bash) -- the whole script, stopping at
+    the first failing line, but a failure inside a pipeline is not one.
+    Windows: pwsh (the runner falls back to Windows PowerShell without it),
+    `$ErrorActionPreference = 'stop'` before the script and `exit
+    $LASTEXITCODE` after it: a failing NATIVE command does not stop the
+    script, and only the last one's exit code is the step's.
+    """
+    if os.name == "nt":
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            raise RuntimeError("neither pwsh nor powershell is on PATH")
+        quoted = str(script_path).replace("'", "''")
+        return ([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-command", f". '{quoted}'"], ".ps1")
+    bash = shutil.which("bash")
+    return ([bash, "-e", str(script_path)] if bash
+            else ["sh", "-e", str(script_path)]), ".sh"
+
+
+def wrap_script(script: str, suffix: str) -> str:
+    if suffix == ".ps1":
+        return ("$ErrorActionPreference = 'stop'\n" + script + "\n"
+                + "if ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) "
+                  "{ exit $LASTEXITCODE }\n")
+    return script
+
+
+def run_steps(steps: List[Step], env: Dict[str, str], log, cwd: Path = ROOT
+              ) -> Optional[str]:
+    """None when every step passed, else the name of the first that failed.
+    Each step is ONE script in one shell, as in CI: `cd`, variables and
+    multi-line constructs carry from line to line, and a failure counts
+    exactly when CI's shell would count it."""
+    with tempfile.TemporaryDirectory(prefix="ci_local-") as scratch:
+        for number, step in enumerate(steps, 1):
+            label = step.name or f"step {number}"
+            suffix = step_command(Path(scratch))[1]
+            path = Path(scratch) / f"step{number}{suffix}"
+            path.write_text(wrap_script(step.script, suffix), encoding="utf-8")
+            argv, _ = step_command(path)
+            log.write(f"\n== {label}\n$ {' '.join(argv)}\n{step.script.rstrip()}\n--\n")
+            log.flush()
+            code = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=log, stderr=subprocess.STDOUT).returncode
+            if code:
+                log.write(f"-- exit {code}\n")
+                return f"{label} (exit {code})"
+    return None
+
+
+# Nothing of the caller's Python setup reaches the steps: CI has none of it, and
+# PYTHONPATH or PYTEST_ADDOPTS alone can make a local run test other code.
+_SCRUBBED = ("PYTHON", "PIP_", "PYTEST_", "VIRTUAL_ENV", "CONDA_")
+
+
+def step_env(venv: Path) -> Dict[str, str]:
+    env = {key: value for key, value in os.environ.items()
+           if not key.upper().startswith(_SCRUBBED)}
+    env["VIRTUAL_ENV"] = str(venv)
+    env["PATH"] = str(venv_bin(venv)) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def check_interpreters(venv: Path, env: Dict[str, str], steps: List[Step], log
+                       ) -> Optional[str]:
+    """Why the steps would not run the venv's Python, or None.
+
+    The venv is on PATH first, but a name it lacks falls through to the
+    system: a Windows venv has no python3.exe, so a `python3` step would run
+    whatever python3 the machine has and be reported as this version.
+    """
+    for name in ("python", "python3"):
+        if name == "python3" and not any(re.search(r"\bpython3\b", s.script)
+                                         for s in steps):
+            continue
+        found = shutil.which(name, path=env["PATH"])
+        # The directory, not the file: a POSIX venv's python is a symlink out.
+        if not found or Path(found).parent.resolve() != venv_bin(venv).resolve():
+            return f"`{name}` resolves to {found}, not into {venv}"
+    python = str(venv_bin(venv) / "python")
+    result = subprocess.run([python, "-c", "import sys; print(sys.prefix)"],
+                            env=env, capture_output=True, text=True)
+    if result.returncode or Path(result.stdout.strip()).resolve() != venv.resolve():
+        return f"the venv's python reports sys.prefix {result.stdout.strip()!r}"
+    version = subprocess.run([python, "-VV"], env=env, capture_output=True, text=True)
+    log.write(f"interpreter: {version.stdout.strip()}  ({python})\n")
+    return None
+
+
+@contextlib.contextmanager
+def exclusive(path: Path) -> Iterator[None]:
+    """Hold `path` locked for the whole create/install/test of one version, so
+    a second run of the same checkout waits instead of clearing the venv
+    under the first."""
+    with path.open("a+b") as handle:
+        told = False
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if not told:
+                    print(f"   waiting for {path} (another ci_local run)", flush=True)
+                    told = True
+                time.sleep(2)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def run_version(version: str, steps: List[Step], log_path: Path) -> Optional[str]:
-    """None when every command passed, else the step that failed first.
-
-    A `|` block is run line by line and stops at the first failure, which is
-    stricter than CI's Windows shell (pwsh there reports only the LAST line's
-    exit code) and equal to its bash.
-    """
+    """None when every step passed, else what failed first."""
     venv = VENVS / version
-    with log_path.open("w", encoding="utf-8", errors="replace") as log:
+    with exclusive(VENVS / f"{version}.lock"), \
+            log_path.open("w", encoding="utf-8", errors="replace") as log:
         # --seed puts pip in the venv, so the workflow's own
         # `python -m pip install -e ".[test]"` runs as written.
         create = ["uv", "venv", "--clear", "--seed", "--python", version, str(venv)]
@@ -120,15 +491,12 @@ def run_version(version: str, steps: List[Step], log_path: Path) -> Optional[str
         log.flush()
         if subprocess.run(create, stdout=log, stderr=subprocess.STDOUT).returncode:
             return "create the venv"
-        env = dict(os.environ)
-        env["VIRTUAL_ENV"] = str(venv)
-        env["PATH"] = str(venv_bin(venv)) + os.pathsep + env.get("PATH", "")
-        env.pop("PYTHONHOME", None)
-        for step in steps:
-            for command in step.commands:
-                if run_logged(command, env, log):
-                    return f"{step.name or 'step'}: {command}"
-    return None
+        env = step_env(venv)
+        wrong = check_interpreters(venv, env, steps, log)
+        if wrong:
+            log.write(wrong + "\n")
+            return wrong
+        return run_steps(steps, env, log)
 
 
 def tail(path: Path, count: int = 25) -> str:
@@ -145,7 +513,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="print the versions and steps, run nothing")
     options = parser.parse_args(argv)
 
-    plan = parse_workflow(WORKFLOW.read_text(encoding="utf-8"))
+    try:
+        plan = parse_workflow(WORKFLOW.read_text(encoding="utf-8"))
+    except WorkflowShapeError as error:
+        print(f"ci_local: {error}", file=sys.stderr)
+        return 2
     unknown = [v for v in options.versions if v not in plan.versions]
     if unknown:
         parser.error(f"not in the workflow matrix {plan.versions}: {unknown}")
@@ -153,10 +525,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if options.list:
         print("versions:", " ".join(versions))
-        for step in plan.steps:
-            print(f"{step.name or 'step'}:")
-            for command in step.commands:
-                print(f"  {command}")
+        print("shell:", " ".join(step_command(Path("{0}"))[0]))
+        for number, step in enumerate(plan.steps, 1):
+            print(f"{step.name or f'step {number}'}:")
+            for line in step.script.rstrip("\n").split("\n"):
+                print(f"  {line}")
         return 0
 
     if not shutil.which("uv"):
