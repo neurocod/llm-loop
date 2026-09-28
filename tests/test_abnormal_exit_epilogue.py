@@ -24,17 +24,14 @@ these runs are launched `--git-push none` so that stays true of them, which it
 was not at first (see `_seq_args`).
 """
 
-import sys
-
 import pytest
 
-from llm_loop import (console, cyclecore, exitlog, operator, parallel,
-                      projectroot, runlifecycle)
+from llm_loop import cyclecore, exitlog, operator, parallel, runlifecycle
 from llm_loop.agentwork import ClaudeCommand, Driver, LoopStop
 from llm_loop.drivers import StateFileDriver
 
-from _runfixtures import (MemListDriver, StubPolicy, drop_logger, par_args,
-                          seq_args)
+from _runfixtures import (MemListDriver, StubPolicy, StubSource, isolated_run,
+                          par_args, record_exit_pushes, seq_args)
 
 # What the operator typed and never got delivered. One string, asserted by
 # identity, so a run that printed SOME note would not satisfy a pin about THIS
@@ -86,47 +83,15 @@ def _par_args(project_dir):
     return par_args(project_dir, jobs=1, ignore_usage=False, no_statusline=True)
 
 
-class _StubSource:
-    """Stands in for a UsageSource without an endpoint behind it.
-
-    Only the two calls a closing run makes are answered; the status area is a
-    Null object under `--no-statusline`, so nothing else reaches for it.
-    """
-
-    def get_usage(self):
-        return None
-
-    def invalidate(self):
-        pass
-
-
 @pytest.fixture(autouse=True)
 def _isolated_run(tmp_path, monkeypatch):
-    """Own log dir, own exit record, and the process globals put back after."""
-    monkeypatch.setattr(console, "LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(exitlog, "_record", None)
-    root = projectroot.project_dir()
-    streams = sys.stdout, sys.stderr
-    yield
-    exitlog.finish()
-    sys.stdout, sys.stderr = streams
-    projectroot.set_project_root(root)
-    drop_logger("pytest-abnormal")
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 @pytest.fixture
 def exit_pushes(monkeypatch):
-    """Records every call to the EXIT push, and stops it reaching git.
-
-    Replaced on `runlifecycle`, not on `gitpush`: the epilogue imported the name,
-    so that is the binding its call resolves — patching the owner would leave the
-    real push running and the recorder empty.
-    """
-    calls = []
-    monkeypatch.setattr(runlifecycle, "final_git_push",
-                        lambda policy, project_dir: calls.append(
-                            (policy, project_dir)))
-    return calls
+    return record_exit_pushes(monkeypatch)
 
 
 @pytest.fixture
@@ -201,7 +166,7 @@ def test_a_driver_that_stops_the_run_still_closes_it_down(
         return 0
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", succeeds)
-    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: _StubSource())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
     monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
 
     with pytest.raises(SystemExit) as exit_info:
@@ -260,7 +225,7 @@ def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(parallel, "join_workers", interrupt)
-    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: _StubSource())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: StubSource())
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, command, mailbox=None: (0, None, None))
     driver = MemListDriver(["products/only.md"])

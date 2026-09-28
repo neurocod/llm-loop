@@ -23,7 +23,14 @@ from llm_loop import cyclecore, parallel, runlifecycle, stopchannel
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.stopchannel import RunStopReason
 
-from _runfixtures import MemListDriver, StubPolicy, par_args, seq_args
+from _runfixtures import (MemListDriver, StubPolicy, isolated_run, par_args,
+                          seq_args)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 class _HookedListDriver(MemListDriver):

@@ -7,6 +7,14 @@ from llm_loop.breakpoints import Breakpoints
 from llm_loop.drivers import StateFileDriver
 from llm_loop.stopchannel import RunStopReason
 
+from _runfixtures import isolated_run
+
+
+@pytest.fixture(autouse=True)
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
+
 
 def press(app, *keys):
     for key in keys:

@@ -27,10 +27,16 @@ from llm_loop import (console, cyclecore, projectroot, runlifecycle,
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
-from _runfixtures import seq_args
+from _runfixtures import isolated_run, seq_args
 
 
-NOW = 1_700_000_000.0
+@pytest.fixture(autouse=True)
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
+
+
+NOW =1_700_000_000.0
 
 
 def sequential_status(**fields):

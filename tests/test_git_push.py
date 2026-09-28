@@ -16,44 +16,24 @@ directory git was actually handed, never merely that a push happened.
 """
 
 import subprocess
-import sys
 import threading
 
 import pytest
 
-from llm_loop import cyclecore, gitpush, parallel, projectroot, statusline
+from llm_loop import cyclecore, gitpush, parallel, statusline
 
-from _runfixtures import (MemListDriver, OneShotDriver, par_args, root_not_cwd,
-                          seq_args)
-
-
-@pytest.fixture(autouse=True)
-def _restore_streams():
-    """Both runners tee sys.stdout/stderr into their log and never put them back;
-    undo that so one test's tee does not follow the next one."""
-    out, err = sys.stdout, sys.stderr
-    yield
-    sys.stdout, sys.stderr = out, err
+from _runfixtures import (MemListDriver, OneShotDriver, isolated_run, par_args,
+                          root_not_cwd, seq_args)
 
 
 @pytest.fixture(autouse=True)
-def _restore_project_root():
-    """Put the process-wide project root back after a run has moved it.
-
-    Every pin here points a runner at a tmp_path, and the stop sentinel and the
-    mirror log's file name are both derived from that root. This file collects
-    second alphabetically, so without this every later file would inherit a tmp
-    root that no longer exists — green today, and the standard seed of an
-    order-dependent flake.
-
-    ONE global to restore, not three: the sentinel and the log name used to be
-    mirrors with setters of their own, so this fixture was repairing a root that
-    had been copied into `stopchannel` and `console` as well. They read it now
-    (see `projectroot`), so putting the root back puts everything back.
-    """
-    previous = projectroot.project_dir()
-    yield
-    projectroot.set_project_root(previous)
+def _isolated_run(tmp_path, monkeypatch):
+    """Every pin here points a real, non-dry runner at a tmp_path: without this
+    the run's exit record and tee outlive the test, and every later file
+    inherits a tmp project root that no longer exists — green today, and the
+    standard seed of an order-dependent flake."""
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 class _FakeGitModule:

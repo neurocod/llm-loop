@@ -16,11 +16,91 @@ option reaches every pin the day it reaches `clispec`.
 import argparse
 import logging
 import os
+import sys
 import threading
+from contextlib import contextmanager
 
-from llm_loop import clispec
+from llm_loop import clispec, console, exitlog, projectroot, runlifecycle
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
+
+
+@contextmanager
+def isolated_run(monkeypatch, tmp_path):
+    """Keep what a staged run leaves in the PROCESS inside the test that ran it.
+
+    A run that is not dry opens an exit record and raises the tee, and both are
+    process-wide: the record sits in `console.LOG_DIR` — the operator's real log
+    dir under the home directory — with its closing line registered on `atexit`,
+    and `begin` is idempotent per process, so the next unisolated run inherits
+    it. Inside this block the log dir is `tmp_path / "logs"` (yielded) and the
+    record slot starts empty; on the way out the record is finished, the
+    streams the tee wrapped and the project root the run anchored are put back,
+    and every mirror handler the run opened in that log dir is closed — whatever
+    `app_name` the run used, so a caller cannot name the wrong one.
+
+    Called explicitly, from a thin autouse fixture in each file that stages runs;
+    `conftest.py` fails any test that leaves a record open without it.
+    """
+    logs = tmp_path / "logs"
+    monkeypatch.setattr(console, "LOG_DIR", logs)
+    monkeypatch.setattr(exitlog, "_record", None)
+    root = projectroot.project_dir()
+    streams = sys.stdout, sys.stderr
+    try:
+        yield logs
+    finally:
+        exitlog.finish()
+        sys.stdout, sys.stderr = streams
+        projectroot.set_project_root(root)
+        _drop_loggers_writing_under(logs)
+
+
+def _drop_loggers_writing_under(log_dir):
+    """Close the mirror handlers whose file lies in `log_dir`, on any app's logger.
+
+    `console.setup_file_logging` reuses a logger's handler when it has one, so
+    a handler left open would carry the NEXT test's run into this test's
+    (deleted) directory — and on Windows keep that directory from being removed.
+    """
+    prefix = os.path.normcase(os.path.abspath(str(log_dir))) + os.sep
+    for name in list(logging.Logger.manager.loggerDict):
+        if name.startswith("runCycle."):
+            logger = logging.getLogger(name)
+            for handler in list(logger.handlers):
+                path = getattr(handler, "baseFilename", "")
+                if os.path.normcase(os.path.abspath(path)).startswith(prefix):
+                    handler.close()
+                    logger.removeHandler(handler)
+
+
+def record_exit_pushes(monkeypatch) -> list:
+    """Record every call to the EXIT push, and stop it reaching git.
+
+    Returns the list the calls land in, as `(policy, project_dir)` pairs.
+    Replaced on `runlifecycle`, not on `gitpush`: the epilogue imported the name,
+    so that is the binding its call resolves — patching the owner would leave the
+    real push running and the recorder empty.
+    """
+    calls = []
+    monkeypatch.setattr(runlifecycle, "final_git_push",
+                        lambda policy, project_dir: calls.append(
+                            (policy, project_dir)))
+    return calls
+
+
+class StubSource:
+    """Stands in for a UsageSource without an endpoint behind it.
+
+    Only the two calls a closing run makes are answered; the status area is a
+    Null object under `--no-statusline`, so nothing else reaches for it.
+    """
+
+    def get_usage(self):
+        return None
+
+    def invalidate(self):
+        pass
 
 
 def _parsed(mode: str, project_dir, fields: dict) -> argparse.Namespace:
@@ -70,19 +150,26 @@ def par_args(project_dir, *, jobs: int, **fields) -> argparse.Namespace:
 class StubPolicy:
     """A LimitPolicy that never reads the usage report and never pauses.
 
-    `log_snapshot` RECORDS the label instead of doing nothing: the closing
+    `log_snapshot` RECORDS the call instead of doing nothing: the closing
     snapshot is one of the steps `test_abnormal_exit_epilogue` pins, and a stub
     that swallowed it would leave that step unpinned while looking pinned.
+    `logged` holds each call whole — `(source, label, cache_value)`, for the pins
+    about which source was read and whether fresh — and `snapshots` the labels
+    alone, for the pins about which snapshots were taken.
     """
 
     def __init__(self):
-        self.snapshots = []
+        self.logged = []
+
+    @property
+    def snapshots(self):
+        return [label for _source, label, _cache_value in self.logged]
 
     def describe(self):
         return "stub"
 
     def log_snapshot(self, source, label="", cache_value=True):
-        self.snapshots.append(label)
+        self.logged.append((source, label, cache_value))
 
     def check_and_wait(self, source, session_start, note="",
                        cache_value=True, should_stop=None):

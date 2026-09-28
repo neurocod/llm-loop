@@ -24,7 +24,14 @@ from llm_loop import (cyclecore, parallel, projectroot, runlifecycle,
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
-from _runfixtures import MemListDriver, NoWorkDriver, par_args, seq_args
+from _runfixtures import (MemListDriver, NoWorkDriver, isolated_run, par_args,
+                          seq_args)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 class _MemDriver(MemListDriver):

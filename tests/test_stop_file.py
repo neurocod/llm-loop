@@ -19,7 +19,6 @@ root can be stopped on its own (see stopchannel.StopSource).
 """
 
 import os
-import sys
 import threading
 import time
 from pathlib import Path
@@ -33,16 +32,14 @@ from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.limits import LimitPolicy, SessionLimit
 from llm_loop.usage import Usage, UsageReading
 
-from _runfixtures import MemListDriver, OneShotDriver, par_args, seq_args
+from _runfixtures import (MemListDriver, OneShotDriver, isolated_run, par_args,
+                          seq_args)
 
 
 @pytest.fixture(autouse=True)
-def _restore_streams():
-    """Both runners tee sys.stdout/stderr into their log and never put them back;
-    undo that so one test's tee does not follow the next one."""
-    out, err = sys.stdout, sys.stderr
-    yield
-    sys.stdout, sys.stderr = out, err
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 class _StopAfterOneDriver(OneShotDriver):

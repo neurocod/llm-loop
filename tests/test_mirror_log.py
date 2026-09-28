@@ -21,15 +21,14 @@ from llm_loop import (console, costlog, cyclecore, exitlog, parallel,
                       projectroot, runlifecycle)
 
 from _runfixtures import (MemListDriver, NoWorkDriver, OneShotDriver,
-                          drop_logger, par_args, root_named_unlike_cwd,
-                          seq_args)
+                          drop_logger, isolated_run, par_args,
+                          root_named_unlike_cwd, seq_args)
 
 
 @pytest.fixture(autouse=True)
-def _restore_streams():
-    out, err = sys.stdout, sys.stderr
-    yield
-    sys.stdout, sys.stderr = out, err
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 def _handler(tmp_path, **kwargs):
@@ -127,18 +126,9 @@ def test_the_tee_still_logs_normally_after_a_guarded_call(tmp_path):
 
 
 @pytest.fixture
-def log_dir(tmp_path, monkeypatch):
-    """Point the mirror log at the test's own directory, never the user's."""
-    logs = tmp_path / "logs"
-    monkeypatch.setattr(console, "LOG_DIR", logs)
-    yield logs
-
-
-@pytest.fixture(autouse=True)
-def _restore_project_root():
-    previous = projectroot.project_dir()
-    yield
-    projectroot.set_project_root(previous)
+def log_dir(_isolated_run):
+    """The test's own mirror-log directory (`isolated_run`), never the user's."""
+    return console.LOG_DIR
 
 
 def test_a_parallel_dry_run_writes_nothing_to_the_shared_log(

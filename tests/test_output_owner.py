@@ -19,11 +19,11 @@ import time
 
 import pytest
 
-from llm_loop import ownership, parallel, projectroot, termio
+from llm_loop import ownership, parallel, termio
 from llm_loop import statusline as sl
 from llm_loop.breakpoints import Breakpoints
 
-from _runfixtures import MemListDriver, par_args
+from _runfixtures import MemListDriver, isolated_run, par_args
 
 # Upper bound on every wait below; each one is a handshake that a healthy run
 # completes at once, so only a broken owner ever gets near it. 0.49 s for this
@@ -32,13 +32,9 @@ WAIT_S = 10.0
 
 
 @pytest.fixture(autouse=True)
-def _restore_run_state():
-    """The runner tees the streams and moves the project root; put both back."""
-    out, err = sys.stdout, sys.stderr
-    root = projectroot.project_dir()
-    yield
-    sys.stdout, sys.stderr = out, err
-    projectroot.set_project_root(root)
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 # --- the owner itself -----------------------------------------------------------

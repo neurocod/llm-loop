@@ -29,7 +29,13 @@ import pytest
 from llm_loop import parallel, runlifecycle, stopchannel
 from llm_loop.stopchannel import RunStopReason
 
-from _runfixtures import MemListDriver, par_args
+from _runfixtures import MemListDriver, isolated_run, par_args
+
+
+@pytest.fixture(autouse=True)
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 def _run_and_wait(driver, args, timeout=10.0, result_box=None):

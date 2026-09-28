@@ -11,10 +11,10 @@ is an error instead of a run with a silently chosen default.
 
 import pytest
 
-from llm_loop import clispec, console, exitlog, projectroot, runlifecycle
+from llm_loop import clispec, projectroot, runlifecycle
 
-from _runfixtures import (NoWorkDriver, par_args, root_named_unlike_cwd,
-                          root_not_cwd, seq_args)
+from _runfixtures import (NoWorkDriver, isolated_run, par_args,
+                          root_named_unlike_cwd, root_not_cwd, seq_args)
 
 # What `begin_run` reads without a fallback.
 STRICT = ("provider", "dry_run", "project_dir", "no_live_messages")
@@ -30,12 +30,8 @@ BUILDERS = {
 def _isolated_run(tmp_path, monkeypatch):
     """The project root put back, and a run that defaulted `dry_run` to False —
     the regression the refusal pins exist for — kept off the real exit record."""
-    monkeypatch.setattr(console, "LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(exitlog, "_record", None)
-    previous = projectroot.project_dir()
-    yield
-    exitlog.finish()
-    projectroot.set_project_root(previous)
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 def _begin(args):

@@ -12,7 +12,6 @@ only ever runs when the budget is already spent, i.e. the one nobody exercises b
 hand, so it is pinned with a fake run instead.
 """
 
-import sys
 import time
 from datetime import datetime, timezone
 
@@ -23,7 +22,7 @@ from llm_loop.usage import RateLimitEvent
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
 
-from _runfixtures import StubPolicy, seq_args
+from _runfixtures import StubPolicy, isolated_run, seq_args
 
 
 # A response like the endpoint's, trimmed to the quotas the engine reads. The
@@ -62,11 +61,9 @@ class _StubSource:
 
 
 @pytest.fixture(autouse=True)
-def _restore_streams():
-    """run_loop tees sys.stdout/stderr into its log and never puts them back."""
-    out, err = sys.stdout, sys.stderr
-    yield
-    sys.stdout, sys.stderr = out, err
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 # -- the usage report -----------------------------------------------------------

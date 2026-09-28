@@ -13,20 +13,20 @@ import pytest
 
 from llm_loop import cyclecore, limits, operator, parallel, runlifecycle
 from llm_loop.stopchannel import RunStopReason
-# The staged-run scaffolding of the abnormal endings; `_isolated_run` is autouse
-# there, and importing it makes it autouse here too (own log dir, exit record).
-from test_abnormal_exit_epilogue import (_isolated_run, _par_args,  # noqa: F401
-                                         _seq_args, _StubSource, exit_pushes)
 
-from _runfixtures import MemListDriver, OneShotDriver
+from _runfixtures import (MemListDriver, OneShotDriver, StubPolicy, StubSource,
+                          isolated_run, par_args, record_exit_pushes, seq_args)
 
 
-class _RecordingPolicy:
-    def __init__(self):
-        self.snapshots = []
+@pytest.fixture(autouse=True)
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
-    def log_snapshot(self, source, label, cache_value=True):
-        self.snapshots.append((source, label, cache_value))
+
+@pytest.fixture
+def exit_pushes(monkeypatch):
+    return record_exit_pushes(monkeypatch)
 
 
 class _Driver:
@@ -42,7 +42,7 @@ def test_a_usage_pair_refuses_a_missing_half(source, policy):
 
 def test_no_usage_endpoint_opens_nothing(monkeypatch):
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
-    policy = _RecordingPolicy()
+    policy = StubPolicy()
 
     assert runlifecycle.open_usage(_Driver(policy), "claude",
                                    dry_run=False) is None
@@ -52,18 +52,18 @@ def test_no_usage_endpoint_opens_nothing(monkeypatch):
 def test_opening_pairs_the_drivers_policy_and_logs_the_start(monkeypatch):
     source = object()
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: source)
-    policy = _RecordingPolicy()
+    policy = StubPolicy()
 
     usage = runlifecycle.open_usage(_Driver(policy), "claude", name="parallel",
                                     dry_run=False)
 
     assert (usage.source, usage.policy) == (source, policy)
-    assert policy.snapshots == [(source, "at start (parallel)", True)]
+    assert policy.logged == [(source, "at start (parallel)", True)]
 
 
 def test_opening_falls_back_to_the_providers_default_policy(monkeypatch):
     source = object()
-    default = _RecordingPolicy()
+    default = StubPolicy()
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: source)
     monkeypatch.setattr(limits, "default_policy",
                         lambda provider: default if provider == "codex" else None)
@@ -75,14 +75,14 @@ def test_opening_falls_back_to_the_providers_default_policy(monkeypatch):
 
 
 def test_the_closing_snapshot_answers_the_opening_one():
-    source, policy = object(), _RecordingPolicy()
+    source, policy = object(), StubPolicy()
     usage = runlifecycle.RunUsage(source, policy, "claude")
 
     usage.open()
     usage.close()
     usage.close("interrupted")
 
-    assert policy.snapshots == [
+    assert policy.logged == [
         (source, "at start (claude)", True),
         # Fresh, not cached: the closing figures are the post-run state.
         (source, "at end (claude)", False),
@@ -100,7 +100,7 @@ def test_closing_a_run_answers_every_usage_it_opened(exit_pushes):
     unanswered in the log. A None is an account without a usage endpoint and
     closes nothing.
     """
-    policy = _RecordingPolicy()
+    policy = StubPolicy()
     claude = runlifecycle.RunUsage("claude-source", policy, "claude")
     codex = runlifecycle.RunUsage("codex-source", policy, "codex")
     ctx = runlifecycle.RunContext(
@@ -111,7 +111,7 @@ def test_closing_a_run_answers_every_usage_it_opened(exit_pushes):
     runlifecycle.close_run(ctx, usages=[claude, None, codex],
                            ending="interrupted")
 
-    assert [(source, label) for source, label, _fresh in policy.snapshots] == [
+    assert [(source, label) for source, label, _fresh in policy.logged] == [
         ("claude-source", "at end (claude: interrupted)"),
         ("codex-source", "at end (codex: interrupted)"),
     ]
@@ -128,7 +128,7 @@ def test_one_failing_close_costs_only_its_own_line(exit_pushes, capsys):
         def get_usage(self, cache_value=True):
             raise OSError("usage endpoint unreachable")
 
-    policy = _RecordingPolicy()
+    policy = StubPolicy()
     broken = runlifecycle.RunUsage(_BrokenSource(), limits.default_policy("claude"),
                                    "claude")
     codex = runlifecycle.RunUsage("codex-source", policy, "codex")
@@ -141,8 +141,7 @@ def test_one_failing_close_costs_only_its_own_line(exit_pushes, capsys):
 
     runlifecycle.close_run(ctx, usages=[broken, codex], mailbox=mailbox)
 
-    assert [label for _source, label, _fresh in policy.snapshots] == [
-        "at end (codex)"]
+    assert policy.snapshots == ["at end (codex)"]
     out = capsys.readouterr().out
     assert "usage at end (claude) could not be read" in out
     assert "usage endpoint unreachable" in out
@@ -155,12 +154,12 @@ def test_a_sequential_run_that_returns_closes_the_usage_it_opened(
     `test_abnormal_exit_epilogue`, this is the door that returns a RunResult."""
     monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **k: 0)
     monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
-    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: _StubSource())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
     # One command, then no more work: the ending a sequential run RETURNS from.
     driver = OneShotDriver()
 
-    result = cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
-                                app_name="pytest-abnormal", wait_on_start=False)
+    result = cyclecore.run_loop(driver, seq_args(tmp_path, no_statusline=True),
+                                app_name="pytest-run-usage", wait_on_start=False)
 
     assert result.reason is RunStopReason.NO_WORK
     assert driver.limit_policy.snapshots == ["at start (claude)",
@@ -169,13 +168,15 @@ def test_a_sequential_run_that_returns_closes_the_usage_it_opened(
 
 def test_a_parallel_run_that_returns_closes_the_usage_it_opened(
         tmp_path, monkeypatch, exit_pushes):
-    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: _StubSource())
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, command, mailbox=None: (0, None, None))
     driver = MemListDriver(["products/only.md"])
 
-    result = parallel.run_parallel(driver, _par_args(str(tmp_path)),
-                                   app_name="pytest-abnormal", wait_on_start=False)
+    # `ignore_usage` off, or the run opens no usage and there is no pair to close.
+    args = par_args(tmp_path, jobs=1, ignore_usage=False, no_statusline=True)
+    result = parallel.run_parallel(driver, args, app_name="pytest-run-usage",
+                                   wait_on_start=False)
 
     assert result.reason is RunStopReason.NO_WORK
     # The account in the name, as a sequential run's lines have it: `parallel`

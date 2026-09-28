@@ -13,24 +13,17 @@ import sys
 
 import pytest
 
-from llm_loop import console, cyclecore, exitlog, parallel, projectroot
+from llm_loop import console, cyclecore, exitlog, parallel
 
-from _runfixtures import (MemListDriver, NoWorkDriver, drop_logger, par_args,
-                          seq_args)
+from _runfixtures import (MemListDriver, NoWorkDriver, drop_logger,
+                          isolated_run, par_args, seq_args)
 
 
 @pytest.fixture(autouse=True)
-def _isolated_record(tmp_path, monkeypatch):
+def _isolated_run(tmp_path, monkeypatch):
     """Every test gets its own log dir and its own fresh record."""
-    monkeypatch.setattr(console, "LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(exitlog, "_record", None)
-    root = projectroot.project_dir()
-    streams = sys.stdout, sys.stderr
-    yield
-    exitlog.finish()
-    sys.stdout, sys.stderr = streams
-    projectroot.set_project_root(root)
-    drop_logger("pytest-exit")
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 def _run_once(tmp_path):

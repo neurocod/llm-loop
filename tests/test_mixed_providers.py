@@ -5,13 +5,13 @@ import time
 
 import pytest
 
-from llm_loop import (console, cyclecore, exitlog, projectroot, providers,
-                      runlifecycle, statusline, stopchannel)
+from llm_loop import (cyclecore, providers, runlifecycle, statusline,
+                      stopchannel)
 from llm_loop.agentwork import AgentCommand, Driver, LoopStop
 from llm_loop.drivers import StateFileDriver
 from llm_loop.usage import RateLimitEvent
 
-from _runfixtures import seq_args
+from _runfixtures import isolated_run, seq_args
 
 
 class Source:
@@ -44,7 +44,6 @@ class Policy:
 @pytest.fixture
 def runtime(monkeypatch, tmp_path):
     events, sources, apps, refreshers, snapshots = [], [], [], [], []
-    previous_root = projectroot.project_dir()
     real_app = statusline.StatusApp
 
     def source_for(provider):
@@ -71,22 +70,17 @@ def runtime(monkeypatch, tmp_path):
             assert source.provider == policy.provider == provider
             self.selections.append(provider)
 
-    # These runs are not dry, so `begin_run` opens an exit record: give it its
-    # own log dir and a fresh slot, and close it on teardown, or the real one
-    # under the home dir gets a record and the suite ends with its
-    # `=== run ended: … ===` line (see test_abnormal_exit_epilogue._isolated_run).
-    monkeypatch.setattr(console, "LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(exitlog, "_record", None)
     monkeypatch.setattr(runlifecycle, "usage_source_for", source_for)
     monkeypatch.setattr(runlifecycle.limits, "default_policy", lambda p: Policy(p, events, snapshots))
     monkeypatch.setattr(statusline, "StatusApp", make_app)
     monkeypatch.setattr(statusline, "QuotaRefresher", Refresher)
     monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
     args = seq_args(tmp_path, no_statusline=True, provider="claude")
-    yield SimpleNamespace(args=args, events=events, sources=sources, apps=apps,
-                          refreshers=refreshers, snapshots=snapshots)
-    exitlog.finish()
-    projectroot.set_project_root(previous_root)
+    # These runs are not dry, so `begin_run` opens an exit record.
+    with isolated_run(monkeypatch, tmp_path):
+        yield SimpleNamespace(args=args, events=events, sources=sources,
+                              apps=apps, refreshers=refreshers,
+                              snapshots=snapshots)
 
 
 def run(driver, runtime):

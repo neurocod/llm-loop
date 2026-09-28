@@ -27,7 +27,13 @@ from llm_loop import termio as tio
 from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.providers import build_agent_argv, start_agent_process
 
-from _runfixtures import MemListDriver, par_args, seq_args
+from _runfixtures import MemListDriver, isolated_run, par_args, seq_args
+
+
+@pytest.fixture(autouse=True)
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 @pytest.fixture(autouse=True)

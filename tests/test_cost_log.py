@@ -12,23 +12,16 @@ import sys
 
 import pytest
 
-from llm_loop import (console, costlog, cyclecore, exitlog, projectroot,
-                      runlifecycle, streamrender)
+from llm_loop import console, costlog, cyclecore, runlifecycle, streamrender
 
-from _runfixtures import OneShotDriver, drop_logger, seq_args
+from _runfixtures import OneShotDriver, drop_logger, isolated_run, seq_args
 
 
 @pytest.fixture(autouse=True)
-def _isolated(tmp_path, monkeypatch):
-    out, err = sys.stdout, sys.stderr
-    previous = projectroot.project_dir()
-    monkeypatch.setattr(console, "LOG_DIR", tmp_path / "logs")
+def _isolated_run(tmp_path, monkeypatch):
     monkeypatch.setattr(streamrender, "_turn_cost_base", 0.0)
-    monkeypatch.setattr(exitlog, "_record", None)
-    yield
-    exitlog.finish()
-    projectroot.set_project_root(previous)
-    sys.stdout, sys.stderr = out, err
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 def _printed_header(tmp_path, capsys) -> str:
