@@ -17,6 +17,8 @@ verdict until it is far too late.
   python cpp/parity_check.py --exe PATH      # a binary built somewhere else
   python cpp/parity_check.py --verbose       # print every case
   python cpp/parity_check.py --jobs 1        # one launch at a time
+  PARITY_JOBS=2 python cpp/parity_check.py   # the same, for a caller (pytest)
+                                             # that cannot pass --jobs
 
 Exit 1 on any difference. Requires the binary, built with cpp/build.py since
 the source last changed (exit 2 otherwise, see newer_sources).
@@ -24,12 +26,14 @@ the source last changed (exit 2 otherwise, see newer_sources).
 
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.normpath(os.path.join(HERE, os.pardir))
@@ -495,13 +499,86 @@ HOOK_CASES = [
 # share a pool. 8 and not more: in a slow phase 8 workers gave 0.59 s a launch
 # against 1.35 s for one and 0.42 s for 16 (32 launches each), the whole run
 # 101 s against 215-238 s, and the machine is usually running another suite.
+# Capped by the CPU count, and overridden by --jobs or, for a caller that runs
+# this script without choosing its argv (the pytest parity case), by the
+# PARITY_JOBS environment variable: two slots each running the suite would
+# otherwise start 16 interpreters at once. See resolve_jobs.
 DEFAULT_JOBS = 8
+JOBS_ENV = "PARITY_JOBS"
 
 # Per launch, only to turn a hang into a failure that names its argv instead
-# of an endless test. The slowest launch measured 2026-09-29 was 6.6 s in the
-# pool of 8 (3.3 s one at a time); 16 concurrent launches had a MEDIAN of
-# 11.8 s, which is what a second suite on the same machine looks like.
+# of an endless test. Slowest single launch, measured 2026-09-29: 6.6 s in one
+# run's pool of 8 (3.3 s one at a time); with two runs of 8 at once -- what a
+# second suite on the same machine looks like -- 7.0 s and 1.2 s in a fast
+# phase, 12.1 s and 15.0 s in a slow one (those two runs took 120 s and 108 s).
 LAUNCH_TIMEOUT = 120
+
+# The "exit code" of a launch that outlived LAUNCH_TIMEOUT. Not an int: every
+# int is some process's real return code (-1 is SIGHUP on POSIX), and a hang
+# must never compare equal to one.
+TIMED_OUT = "timeout"
+
+
+def resolve_jobs(cli: "int | None", environ=os.environ) -> int:
+    """Launches at a time: --jobs, else $PARITY_JOBS, else DEFAULT_JOBS capped
+    by the CPU count. A value that is not a whole number >= 1 is an error
+    (ValueError), never a quiet fall back to the default."""
+    if cli is not None:
+        source, value = "--jobs", cli
+    elif JOBS_ENV in environ:
+        raw = environ[JOBS_ENV]
+        if not re.fullmatch(r"[0-9]+", raw):
+            raise ValueError(f"{JOBS_ENV}={raw!r} is not a whole number")
+        source, value = JOBS_ENV, int(raw)
+    else:
+        return min(DEFAULT_JOBS, os.cpu_count() or 1)
+    if value < 1:
+        raise ValueError(f"{source} must be at least 1, not {value}")
+    return value
+
+
+class _Launches:
+    """The children in flight, so that a run stopped early -- an exception in
+    a worker, Ctrl+C -- kills them rather than waiting each one out, and starts
+    no new one after abort()."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._live = set()
+        self._aborted = False
+
+    def start(self, argv: "list[str]", stdin) -> subprocess.Popen:
+        if self._aborted:
+            raise RuntimeError("the parity run was aborted")
+        process = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        with self._lock:
+            self._live.add(process)
+            aborted = self._aborted
+        # abort() ran between the check above and the add: it did not see this
+        # child, so it is killed here.
+        if aborted:
+            process.kill()
+        return process
+
+    def finish(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            self._live.discard(process)
+
+    def abort(self) -> None:
+        with self._lock:
+            self._aborted = True
+            live = list(self._live)
+        for process in live:
+            process.kill()
+
+    def reopen(self) -> None:
+        """Only once no worker is left: the next main() starts afresh."""
+        with self._lock:
+            self._aborted = False
+
+
+_LAUNCHES = _Launches()
 
 
 def launch(argv: "list[str]", payload: "bytes | None" = None
@@ -511,23 +588,45 @@ def launch(argv: "list[str]", payload: "bytes | None" = None
     stdin is the payload or closed, never inherited: an argv that one half
     reads as "no command" puts it in hook mode, and an inherited stdin (a
     console, or the pipe of whoever started this script) would keep it waiting
-    for a payload that never comes. The timeout does not cover writing
-    `payload` on Windows (communicate() writes it before the clock starts), so
-    it holds only because both halves read all of stdin before anything else.
+    for a payload that never comes.
+
+    The payload goes in through a temporary FILE, not a pipe, so the timeout
+    covers the whole launch. communicate(input=...) sets its deadline and then
+    writes the input; on Windows through 3.13 (3.13.7 read 2026-09-29; 3.14
+    moved it to a thread) that write blocks this thread, so a child that never
+    reads a payload larger than the pipe buffer (HOOK_CASES has 200 KB ones)
+    held the launch forever, timeout or not. The price: hook mode reads a file here and a pipe in a real
+    session, which both halves' readers (json.load, fread) do not tell apart.
     """
-    stdin = {"input": payload} if payload is not None else {
-        "stdin": subprocess.DEVNULL}
+    stdin_file = None
     try:
-        return subprocess.run(argv, capture_output=True, timeout=LAUNCH_TIMEOUT,
-                              **stdin)
-    except subprocess.TimeoutExpired:
-        return None
+        if payload is None:
+            stdin = subprocess.DEVNULL
+        else:
+            stdin = stdin_file = tempfile.TemporaryFile()
+            stdin_file.write(payload)
+            stdin_file.seek(0)
+        process = _LAUNCHES.start(argv, stdin)
+    finally:
+        if stdin_file is not None:
+            stdin_file.close()  # the child holds its own handle
+    try:
+        with process:
+            try:
+                stdout, stderr = process.communicate(timeout=LAUNCH_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                return None
+    finally:
+        _LAUNCHES.finish(process)
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
-def timed_out(argv: "list[str]") -> "tuple[int, str]":
+def timed_out(argv: "list[str]") -> "tuple[str, str]":
     """The verdict of a launch that never finished; it names the argv, so the
     report says which half hung on what rather than just that one did."""
-    return -1, f"<no answer in {LAUNCH_TIMEOUT} s from {ascii(argv)}>"
+    return TIMED_OUT, f"<no answer in {LAUNCH_TIMEOUT} s from {ascii(argv)}>"
 
 
 def default_exe() -> str:
@@ -553,7 +652,7 @@ def newer_sources(exe: str) -> "list[str]":
 
 
 def check_verdict(argv: "list[str]", command: str, shell: str, tool: str,
-                  scratch: str, newline: str = "") -> "tuple[int, str]":
+                  scratch: str, newline: str = "") -> "tuple[int | str, str]":
     """One command through one gate's CLI, via --check-file.
 
     Both halves go through their COMMAND LINE, the reference included. Calling
@@ -579,7 +678,7 @@ def check_verdict(argv: "list[str]", command: str, shell: str, tool: str,
     return result.returncode, result.stdout.decode("utf-8").replace("\r\n", "\n")
 
 
-def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]":
+def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int | str, str]":
     """One ARGV_CASES argv through one gate's CLI, host fixed to Windows.
 
     `--platform windows` goes FIRST so that a case can end on a bare --check.
@@ -603,7 +702,7 @@ def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]"
     return result.returncode, text
 
 
-def hook_verdict(argv: "list[str]", payload: bytes) -> "tuple[int, str]":
+def hook_verdict(argv: "list[str]", payload: bytes) -> "tuple[int | str, str]":
     """One payload through one gate's HOOK mode -- the path that runs 100k times
     a month, and the only one that exercises the JSON reader, the tool_name
     routing, `cwd` and the escaping of the reason into the envelope."""
@@ -647,16 +746,43 @@ def normalise(text: str) -> str:
     return "\n".join(lines)
 
 
+@contextlib.contextmanager
+def launch_pool(jobs: int):
+    """A ThreadPoolExecutor that an exception LEAVES rather than drains.
+
+    main() queues every launch up front, and a plain `with` executor waits for
+    all of them on the way out: a decode error in the first case surfaced only
+    after all ~630 launches had run, and Ctrl+C the same. Here any exception --
+    from a worker, via result(), or KeyboardInterrupt -- cancels what is still
+    queued, kills the children in flight and reaps them, then propagates. On
+    Windows a console Ctrl+C reaches those children as well, but not the ones
+    a worker starts after it; the kill covers both.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(jobs)
+    try:
+        yield pool
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        _LAUNCHES.abort()
+        pool.shutdown(wait=True)
+        _LAUNCHES.reopen()
+        raise
+    pool.shutdown(wait=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--exe", default=default_exe(),
                         help="the built gate (default: next to hooks.json)")
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS,
-                        help=f"launches at a time (default: {DEFAULT_JOBS})")
+    parser.add_argument("--jobs", type=int, default=None,
+                        help=f"launches at a time (default: ${JOBS_ENV}, else "
+                             f"{DEFAULT_JOBS} capped by the CPU count)")
     options = parser.parse_args()
-    if options.jobs < 1:
-        parser.error("--jobs must be at least 1")
+    try:
+        jobs = resolve_jobs(options.jobs)
+    except ValueError as error:
+        parser.error(str(error))
 
     if not os.path.isfile(options.exe):
         print(f"{options.exe} is not there -- build it with "
@@ -682,8 +808,7 @@ def main() -> int:
     # Every launch is queued up front and read back in corpus order, so the
     # report is the one a sequential run prints. The pool is left before the
     # scratch directory the --check-file cases write into.
-    with tempfile.TemporaryDirectory() as scratch, \
-            concurrent.futures.ThreadPoolExecutor(options.jobs) as pool:
+    with tempfile.TemporaryDirectory() as scratch, launch_pool(jobs) as pool:
         def both(verdict, *args):
             return (pool.submit(verdict, reference_argv, *args),
                     pool.submit(verdict, gate_argv, *args))
@@ -745,14 +870,14 @@ def main() -> int:
             # Fail OPEN is the contract, so a crash or a hang is a failure even
             # when both halves manage it: `catch (...)` does not see a Windows
             # stack overflow, and a dead hook returns no verdict at all.
-            crashed = [f"{name} {text}" if code == -1 else name
+            crashed = [f"{name} {text}" if code == TIMED_OUT
+                       else f"{name} exited {code}"
                        for name, code, text in (("python", py_code, py_text),
                                                 ("c++", cpp_code, cpp_text))
                        if code != 0]
             if crashed:
                 failures += 1
-                print(f"CRASH [hook] {label}: {', '.join(crashed)} exited "
-                      f"non-zero (python {py_code}, c++ {cpp_code})",
+                print(f"CRASH [hook] {label}: {', '.join(crashed)}",
                       file=sys.stderr)
                 continue
             if normalise(py_text) == normalise(cpp_text):
