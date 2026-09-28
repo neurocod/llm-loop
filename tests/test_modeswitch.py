@@ -68,6 +68,12 @@ def _refused(argv, capsys) -> str:
     (["--jobs=3"], True, True),
     (["--jobs", "3"], True, True),
     (["--", "-p"], False, False),
+    # Short flags combined into one token, with an engine flag (clispec).
+    (["-dp"], True, False),
+    (["-pd"], True, False),
+    (["-dj3"], True, True),
+    # A line argparse refuses reads as no switch; the parser it picks refuses it.
+    (["-p", "--random=x"], False, False),
 ])
 def test_the_scan_reads_every_argparse_spelling_and_stops_at_dashdash(
         argv, parallel, jobs_seen):
@@ -90,6 +96,33 @@ def test_a_dash_led_token_is_not_a_value():
 
     assert scanned.finish is None and "finish" in scanned.seen
     assert scanned.parallel is True
+
+
+def _argparse_reads(value):
+    """What a plain argparse `--finish` option makes of `value` on THIS Python:
+    the value, or None when argparse takes it for an option instead."""
+    parser = argparse.ArgumentParser(prog="plain")
+    parser.add_argument("--finish")
+    try:
+        return parser.parse_args(["--finish", value]).finish
+    except SystemExit:
+        return None
+
+
+# Dash-led tokens that are values to argparse: `-` and a token with a space on
+# every version, `-1x` from 3.14 (argparse's negative-number test widened). A
+# hand-written copy of argparse's test missed all three.
+@pytest.mark.parametrize("value", ["-", "-x y", "-1x", "-5", "-.5"])
+def test_the_scan_takes_a_value_exactly_when_argparse_does(value, capsys):
+    expected = _argparse_reads(value)
+    capsys.readouterr()
+
+    assert modeswitch.scan(["--finish", value], SWITCHES).finish == expected
+    if expected is None:
+        assert "argument --finish: expected one argument" in _refused(
+            ["--finish", value], capsys)
+    else:
+        assert _dispatch(["--finish", value])[1].finish == expected
 
 
 # --- scan -> parse -> refuse ----------------------------------------------------
@@ -116,8 +149,8 @@ def test_a_value_flag_never_takes_a_switch_as_its_value(flag, switch, capsys):
 
 @pytest.mark.parametrize("argv, named", [
     (["--rand"], "--random"),
-    (["--para"], "--parallel (or --jobs)"),
-    (["--job", "2"], "--parallel (or --jobs)"),
+    (["--para"], "--parallel"),
+    (["--job", "2"], "--jobs"),
     (["--fin", "f"], "--finish"),
 ])
 def test_an_abbreviated_switch_is_refused_by_name(argv, named, capsys):
@@ -126,10 +159,42 @@ def test_an_abbreviated_switch_is_refused_by_name(argv, named, capsys):
     assert f"error: {named} was read differently" in err
 
 
-def test_a_value_switch_given_twice_is_refused(capsys):
-    err = _refused(["--finish", "a", "--finish", "b"], capsys)
+# Occurrences are compared, not spellings: an abbreviation of a switch given in
+# full elsewhere on the line ends as the full spelling would.
+@pytest.mark.parametrize("argv", [
+    ["--finish", "a", "--finish", "b"], ["--finish=a", "--finish=a"],
+    ["--finish=a", "--fin=a"], ["--fin=a", "--finish", "a"],
+])
+def test_a_value_switch_given_twice_is_refused_however_spelled(argv, capsys):
+    assert "error: --finish may be given only once" in _refused(argv, capsys)
 
-    assert "--finish may be given only once" in err
+
+@pytest.mark.parametrize("argv", [["-p", "-p"], ["-p", "--parallel"],
+                                  ["-p", "--para"], ["--parallel", "--par"]])
+def test_a_boolean_switch_given_twice_is_given(argv):
+    scanned, args = _dispatch(argv)
+
+    assert scanned.parallel is True and args.parallel is True
+
+
+# -j in the parallel parser is that parser's own option: last value wins, as in
+# every `main_parallel` host, abbreviated or not.
+@pytest.mark.parametrize("argv", [["-j", "2", "-j", "3"], ["-j2", "--job", "3"],
+                                  ["-p", "-j", "2", "--jobs=3"],
+                                  ["-p", "--jo", "3"]])
+def test_the_parallel_parsers_own_option_reads_as_it_does_there(argv):
+    scanned, args = _dispatch(argv)
+
+    assert scanned.parallel is True and args.jobs == 3
+
+
+@pytest.mark.parametrize("argv, jobs", [(["-dp"], None), (["-pd"], None),
+                                        (["-dj3"], 3)])
+def test_combined_short_flags_run_as_argparse_reads_them(argv, jobs):
+    scanned, args = _dispatch(argv)
+
+    assert scanned.parallel is True
+    assert args.dry_run is True and args.jobs == jobs
 
 
 @pytest.mark.parametrize("argv", [["--finish="], ["--finish", " "]])

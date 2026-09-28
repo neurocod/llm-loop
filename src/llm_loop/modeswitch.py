@@ -24,15 +24,20 @@ off it:
     the scan does not (`--rand`), which would otherwise run the default mode
     behind a flag that looks as if it worked.
 
+Only the three together read a switch: a host that registers the table and
+then dispatches through `Driver.main()` parses `-p` and ignores it. The whole
+dispatch is in the README's "Wrapper options in `--help`".
+
 A switch's `dest` names it everywhere: the scan result's attribute and the
 parsed namespace's are the same name.
 """
 
 import argparse
-import re
 import sys
-from typing import (Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional,
+from typing import (Any, Callable, Dict, FrozenSet, NamedTuple, Optional,
                     Sequence, Tuple)
+
+from . import clispec
 
 __all__ = [
     "ModeSwitch",
@@ -57,7 +62,11 @@ class ModeSwitch(NamedTuple):
 
     A switch whose every spelling the chosen parser already offers is that
     parser's own option (the parallel runner's `-j/--jobs`): `register` leaves
-    it alone, and its `dest` must be that option's.
+    it alone, its `dest` must be that option's, and the parser's reading of it
+    is final — abbreviated or repeated, as for any other option of that parser
+    (`-j 2 -j 3` runs 3 workers, as in every `main_parallel` host). That is
+    sound only while the parser owning a switch is the one the switch itself
+    chooses, as the parallel parser is for `-j`.
     """
 
     aliases: Tuple[str, ...]
@@ -79,17 +88,17 @@ class Scan:
     """What `scan` read: one attribute per switch `dest`.
 
     A boolean switch reads True when given or implied; a value switch reads its
-    first value, or None. `seen` holds the dests given on the line (a value
-    switch given without a value is seen and reads None), `repeated` the dests
-    of value switches given more than once.
+    last value, as argparse keeps it, or None. `seen` holds the dests given on
+    the line (a value switch given without a value is seen and reads None),
+    `counts` how many times each dest was given.
     """
 
     def __init__(self, switches: Sequence[ModeSwitch], values: Dict[str, Any],
-                 seen: FrozenSet[str], repeated: Tuple[str, ...]):
+                 counts: Dict[str, int]):
         self.switches = tuple(switches)
         self.values = dict(values)
-        self.seen = seen
-        self.repeated = repeated
+        self.counts = dict(counts)
+        self.seen = frozenset(dest for dest, n in counts.items() if n)
 
     def __getattr__(self, dest: str) -> Any:
         values = self.__dict__.get("values", {})
@@ -105,7 +114,7 @@ def _check_table(switches: Sequence[ModeSwitch]) -> None:
     dests = [s.dest for s in switches]
     if len(set(dests)) != len(dests):
         raise ValueError(f"mode switch dests repeat: {dests}")
-    reserved = {"switches", "values", "seen", "repeated"} & set(dests)
+    reserved = {"switches", "values", "seen", "counts"} & set(dests)
     if reserved:
         raise ValueError(f"mode switch dest shadows a Scan attribute: {reserved}")
     by_dest = {s.dest: s for s in switches}
@@ -117,72 +126,115 @@ def _check_table(switches: Sequence[ModeSwitch]) -> None:
                                  f"a boolean switch of the same table")
 
 
-# argparse's own test for "this dash-led token is a number, not an option"
-# (`ArgumentParser._negative_number_matcher`), valid while no option of the
-# parser itself looks like a negative number — true of every parser here.
-_NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
+class _Unscannable(Exception):
+    """The scan parser met a line argparse refuses (`--random=x`)."""
 
 
-def _value_after(argv: List[str], i: int) -> Tuple[Optional[str], int]:
-    """The value token after argv[i], as argparse would take it, and the index
-    after it. A token that looks like an option is not a value (argparse then
-    refuses the line), and is left to be read as a token of its own."""
-    if i + 1 < len(argv):
-        token = argv[i + 1]
-        if not token.startswith("-") or _NEGATIVE_NUMBER.match(token):
-            return token, i + 2
-    return None, i + 1
+class _ScanParser(argparse.ArgumentParser):
+    """An argparse parser that raises instead of printing usage and exiting:
+    the scan must not end the process, the chosen parser reports the error."""
+
+    def error(self, message):
+        raise _Unscannable(message)
+
+
+class _Occurrences(argparse.Action):
+    """Scan side: records each occurrence of a switch, in order — True for a
+    boolean, the value (None when missing) for a value switch."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        got = list(getattr(namespace, self.dest) or ())
+        got.append(True if self.nargs == 0 else values)
+        setattr(namespace, self.dest, got)
+
+
+def _scan_parser(switches: Sequence[ModeSwitch]) -> argparse.ArgumentParser:
+    """The grammar the scan reads argv with: argparse's own, on this Python.
+
+    Hand-written, the scan was a second grammar that drifted from argparse's:
+    which dash-led token is a value (`-`, `"-x y"`, and since 3.14 `-1x` are
+    values to argparse) and short flags combined into one token (`-dp`). Here
+    the table's switches and every option of `clispec.OPTIONS` are declared
+    with their arity (a switch wins a spelling both declare), so argparse
+    tokenises the line exactly as the chosen parser will; `-h/--help` too,
+    since `-ph` combines with it.
+
+    Two deliberate differences, neither of which can reach a runner:
+      * `allow_abbrev=False`: an abbreviation is left unmatched, which is what
+        `refuse_disagreement` detects against the chosen parser;
+      * a value takes `nargs='?'`, so a missing value (`--finish -p`) reads
+        None instead of failing the scan; the chosen parser then says
+        "expected one argument".
+    A spelling neither the table nor `clispec.OPTIONS` declares (a host's own
+    option) is an unknown one: its value, if it has one, is read as a token of
+    its own — harmless, since a value that spells an option makes the chosen
+    parser refuse the line anyway.
+    """
+    parser = _ScanParser(prog="modeswitch.scan", add_help=False,
+                         allow_abbrev=False)
+    for s in switches:
+        parser.add_argument(*s.aliases, dest=s.dest, action=_Occurrences,
+                            nargs="?" if s.takes_value else 0, default=None)
+    taken = set(parser._option_string_actions)
+    rows = [(("-h", "--help"), False)]
+    rows += [(option.aliases, option.takes_value)
+             for option in clispec.OPTIONS.values()]
+    for n, (aliases, takes_value) in enumerate(rows):
+        free = [alias for alias in aliases if alias not in taken]
+        if not free:
+            continue
+        kwargs = (dict(nargs="?") if takes_value
+                  else dict(action="store_true"))
+        parser.add_argument(*free, dest=f"_option_{n}", **kwargs)
+        taken.update(free)
+    return parser
 
 
 def scan(argv: Sequence[str], switches: Sequence[ModeSwitch]) -> Scan:
-    """Read `switches` off `argv`, which is left intact. Stops at `--`.
+    """Read `switches` off `argv`, which is left intact.
 
-    The spellings are argparse's, in full: `--flag`, `--flag VALUE` and
-    `--flag=VALUE`; a short `-f VALUE`, `-fVALUE` and `-f=VALUE`. An
-    abbreviation is NOT matched — that is `refuse_disagreement`'s case.
+    With argparse's grammar (see `_scan_parser`): every full spelling
+    (`--flag VALUE`, `--flag=VALUE`, `-fVALUE`, `-f=VALUE`, `-dp`), nothing
+    after `--`, and no abbreviation — that is `refuse_disagreement`'s case. A
+    line argparse refuses outright reads as no switch at all: the parser that
+    choice picks refuses it too, with its own usage.
     """
     _check_table(switches)
-    argv = list(argv)
-    values: Dict[str, Any] = {s.dest: (None if s.takes_value else False)
-                              for s in switches}
-    seen = set()
-    repeated = []
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--":
-            break
-        hit = None
-        value = None
-        nxt = i + 1
-        for s in switches:
-            for alias in s.aliases:
-                if arg == alias:
-                    hit = s
-                    if s.takes_value:
-                        value, nxt = _value_after(argv, i)
-                elif s.takes_value and arg.startswith(alias + "="):
-                    hit, value = s, arg[len(alias) + 1:]
-                elif (s.takes_value and len(alias) == 2
-                        and arg.startswith(alias) and len(arg) > 2):
-                    hit, value = s, arg[2:]
-                if hit is not None:
-                    break
-            if hit is not None:
-                break
-        if hit is not None:
-            if hit.takes_value:
-                if hit.dest in seen and hit.dest not in repeated:
-                    repeated.append(hit.dest)
-                if hit.dest not in seen:
-                    values[hit.dest] = value
-            else:
-                values[hit.dest] = True
-            seen.add(hit.dest)
-            if hit.implies is not None:
-                values[hit.implies] = True
-        i = nxt
-    return Scan(switches, values, frozenset(seen), tuple(repeated))
+    try:
+        parsed, _rest = _scan_parser(switches).parse_known_args(list(argv))
+    except _Unscannable:
+        parsed = argparse.Namespace(**{s.dest: None for s in switches})
+    values: Dict[str, Any] = {}
+    counts: Dict[str, int] = {}
+    for s in switches:
+        got = getattr(parsed, s.dest) or []
+        counts[s.dest] = len(got)
+        if s.takes_value:
+            values[s.dest] = got[-1] if got else None
+        else:
+            values[s.dest] = bool(got)
+    for s in switches:
+        if s.implies is not None and counts[s.dest]:
+            values[s.implies] = True
+    return Scan(switches, values, counts)
+
+
+# The namespace attribute `register`'s actions count occurrences into: a dict
+# of every registered dest to its count, so a dest missing from it is one the
+# parser owns (see `ModeSwitch`).
+_COUNTS = "_mode_switch_counts"
+
+
+class _Counted(argparse.Action):
+    """`register`'s action: `store` (or `store_true` with nargs=0) that also
+    counts the occurrence in `_COUNTS`. The dict is copied, never mutated: it
+    starts as the parser's default object, shared by every parse."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, True if self.nargs == 0 else values)
+        counts = dict(getattr(namespace, _COUNTS))
+        counts[self.dest] += 1
+        setattr(namespace, _COUNTS, counts)
 
 
 def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
@@ -199,6 +251,11 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
     spelling is its own option and is skipped (see `ModeSwitch`); one it offers
     under only some spellings, or under another dest, is a conflict.
 
+    Each registered switch also COUNTS its occurrences into the namespace
+    (`_COUNTS`), whatever spelling argparse resolved, so `refuse_disagreement`
+    compares occurrences rather than spellings: `--finish=x --fin=x` is a
+    second --finish exactly as `--finish=x --finish=x` is.
+
     Reads `parser._option_string_actions`: argparse offers no public lookup.
     """
     _check_table(switches)
@@ -206,6 +263,7 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
     target = (parser.add_argument_group("modes", group_description)
               if listed else parser)
     owned = parser._option_string_actions
+    counts = dict(parser.get_default(_COUNTS) or {})
     for s in switches:
         taken = [alias for alias in s.aliases if alias in owned]
         if taken:
@@ -222,8 +280,11 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
             if s.type is not None:
                 kwargs["type"] = s.type
         else:
-            kwargs = dict(action="store_true")
-        target.add_argument(*s.aliases, dest=s.dest, help=help_text, **kwargs)
+            kwargs = dict(nargs=0, default=False)
+        target.add_argument(*s.aliases, dest=s.dest, help=help_text,
+                            action=_Counted, **kwargs)
+        counts[s.dest] = 0
+    parser.set_defaults(**{_COUNTS: counts})
 
 
 class _Unreadable:
@@ -231,51 +292,60 @@ class _Unreadable:
     the parser can have produced."""
 
 
-def _given(args: argparse.Namespace, switch: ModeSwitch) -> bool:
-    """Whether the parser read `switch` as given on the line."""
-    value = getattr(args, switch.dest)
-    return value is not None if switch.takes_value else bool(value)
-
-
 def _refuse(prog: str, message: str) -> None:
     print(f"{prog}: error: {message}", file=sys.stderr)
     sys.exit(2)
 
 
+def _read_alike(switch: ModeSwitch, parsed: Any, scanned: Any) -> bool:
+    """Whether a value switch given once holds the same value on both sides.
+
+    The parser already applied `type` to ITS reading, and exited had it
+    failed; the scan's reading is compared in the same terms. One the type
+    refuses is a reading the parser did not share.
+    """
+    if switch.type is not None and scanned is not None:
+        try:
+            scanned = switch.type(scanned)
+        except (ValueError, TypeError, argparse.ArgumentTypeError):
+            scanned = _Unreadable
+    return parsed == scanned
+
+
 def refuse_disagreement(args: argparse.Namespace, scanned: Scan,
                         prog: str) -> None:
-    """Exit 2 unless the parser read every switch as `scanned` did.
+    """Exit 2 unless the parser read every registered switch as `scanned` did.
 
-    They differ when argparse resolves a spelling the scan does not match — an
-    abbreviation such as `--rand`, or a combined short flag — and running on
-    the scan's reading would be the wrong mode behind a flag that appears to
-    have worked. A value switch given twice is refused too: the scan keeps the
-    first value and argparse the last, and a mode named twice is ambiguous
-    anyway.
+    They differ when argparse resolves a spelling the scan leaves unmatched —
+    an abbreviation such as `--rand`, or a short flag combined with one only
+    the host's parser knows — and running on the scan's reading would be the
+    wrong mode behind a flag that appears to have worked. What is compared is
+    OCCURRENCES, which `register` counts whatever the spelling, so the outcome
+    never depends on how a switch was spelled:
+
+      * a boolean switch: given on both sides, or on neither (`-p --para` is
+        `-p -p`, which is harmless);
+      * a value switch: given as often on both sides, and at most once — the
+        mode it names would be ambiguous — with the same value.
+
+    A switch the parser owns (`register` skipped it) is not compared: its
+    reading is that parser's, as for any other option it offers (see
+    `ModeSwitch`).
     """
-    switches = scanned.switches
-    by_dest = {s.dest: s for s in switches}
-    for dest in scanned.repeated:
-        _refuse(prog, f"{by_dest[dest].name} may be given only once")
-    for s in switches:
-        if s.implies is not None:
-            continue                # compared through the switch it implies
-        parsed = getattr(args, s.dest)
-        impliers = [t for t in switches if t.implies == s.dest]
-        if not s.takes_value:
-            parsed = bool(parsed) or any(_given(args, t) for t in impliers)
-        expected = getattr(scanned, s.dest)
-        if s.takes_value and s.type is not None and expected is not None:
-            # The parser already applied it to ITS reading, and exited had it
-            # failed; the scan's reading is compared in the same terms. One the
-            # type refuses is a reading the parser did not share.
-            try:
-                expected = s.type(expected)
-            except (ValueError, TypeError, argparse.ArgumentTypeError):
-                expected = _Unreadable
-        if parsed != expected:
-            also = "".join(f" (or {t.name})" for t in impliers)
-            _refuse(prog, f"{s.name}{also} was read differently by the argv "
-                          f"scan that picks the mode and by the parser. Spell "
-                          f"it out in full; abbreviations are resolved by the "
-                          f"parser and are invisible to the scan.")
+    counts = getattr(args, _COUNTS, {})
+    for s in scanned.switches:
+        if s.dest not in counts:
+            continue
+        parsed_n, scanned_n = counts[s.dest], scanned.counts[s.dest]
+        if s.takes_value and parsed_n > 1:
+            _refuse(prog, f"{s.name} may be given only once")
+        agree = (parsed_n == scanned_n and (
+                     parsed_n == 0 or _read_alike(s, getattr(args, s.dest),
+                                                  getattr(scanned, s.dest)))
+                 if s.takes_value else bool(parsed_n) == bool(scanned_n))
+        if not agree:
+            _refuse(prog, f"{s.name} was read differently by the argv scan "
+                          f"that picks the mode and by the parser. Spell it "
+                          f"out in full and on its own: an abbreviation, or a "
+                          f"short flag combined with one the scan does not "
+                          f"know, is resolved by the parser alone.")

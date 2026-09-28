@@ -169,7 +169,9 @@ class Driver:
         as a `modeswitch.ModeSwitch` table and call `modeswitch.register` here:
         the same table drives the scan, so a spelling cannot drift between
         what is listed and what is recognised, and the parser then reads the
-        whole line, switches included.
+        whole line, switches included. Such a wrapper dispatches itself
+        (README, "Wrapper options in `--help`"): main() parses a switch and
+        never acts on it.
         """
 
     def next_command(self) -> Optional[AgentCommand]:

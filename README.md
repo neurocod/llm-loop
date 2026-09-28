@@ -370,9 +370,10 @@ A wrapper that offers a mode of its own has to scan `argv` for it — the two
 parsers have disjoint option sets, so the flag choosing between them decides
 which parser runs. Declare such flags once, as a
 [`modeswitch`](src/llm_loop/modeswitch.py) table: `scan` picks the parser,
-`register` (called from `add_cli_options`, which both entry points call) puts
-the switches into it, and `refuse_disagreement` exits 2 when an abbreviation
-made the two readings differ:
+`register` (called from each driver's `add_cli_options`) puts the switches
+into it, and `refuse_disagreement` exits 2 when an abbreviation made the two
+readings differ. The wrapper dispatches itself — `Driver.main()` never reads
+the switches, so `-p` would parse and be ignored:
 
 ```python
 SWITCHES = (ModeSwitch(("-p", "--parallel"), "parallel", False,
@@ -382,6 +383,23 @@ class FileListDriver(ListFileDriver):
     @classmethod
     def add_cli_options(cls, parser):
         modeswitch.register(parser, SWITCHES, "sequential")
+
+class FileListParallelDriver(FileListDriver):
+    @classmethod
+    def add_cli_options(cls, parser):      # parsed, not listed, in its --help
+        modeswitch.register(parser, SWITCHES, "parallel")
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    scanned = modeswitch.scan(argv, SWITCHES)
+    driver = FileListParallelDriver if scanned.parallel else FileListDriver
+    parse = parse_parallel_args if scanned.parallel else parse_args
+    prog = driver.resolved_prog()
+    args = parse(argv, prog=prog, description=driver.description,
+                 extra_options=driver.add_cli_options)
+    modeswitch.refuse_disagreement(args, scanned, prog)
+    run = run_parallel if scanned.parallel else run_loop
+    run(driver(), args, app_name=driver.resolved_app_name())
 ```
 
 The switches stay in `argv`: the chosen parser reads the whole line, so a value
