@@ -762,9 +762,6 @@ def test_while_started_only_the_painter_writes_the_terminal():
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
     with app:
-        # start() paints its first frame itself, before the painter exists.
-        del terminal.writers[:]
-
         def feed(k):
             for n in range(20):
                 app.note(f"note {k}-{n}")
@@ -805,8 +802,10 @@ def test_while_started_keys_and_resizes_are_handled_on_the_painter():
     app = sl.StatusApp(terminal=terminal, input_source=keys, refresh=60)
     recorder = _RecordingMode(app)
     app.push_mode(recorder)
+    # push_mode() named the window on this thread: nobody owned the terminal
+    # yet. From start() on, the region is pinned and painted by the painter.
+    del terminal.writers[:]
     with app:
-        del terminal.writers[:]       # start() pins and paints on its own thread
         keys.handler(termio.Key("x"))
         keys.handler(termio.Resize(100, 30))
         # From this thread it is handed over too, and waited for — after the
