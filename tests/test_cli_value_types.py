@@ -10,7 +10,7 @@ itself.
 
 import pytest
 
-from llm_loop import cyclecore, parallel, projectroot
+from llm_loop import clispec, cyclecore, parallel, projectroot
 
 PARSERS = [cyclecore.parse_args, parallel.parse_args]
 PARSER_IDS = ["sequential", "parallel"]
@@ -83,7 +83,13 @@ _START_IN_REFUSAL = "argument -s/--start-in/--startIn: "
     (["--startIn", "h"], "cannot parse duration: 'h'"),
     (["--start-in="], "empty duration"),
     (["--start-in", "  "], "empty duration"),
-], ids=["short", "equals", "deprecated-alias", "equals-empty", "blank"])
+    # The whole text must be a duration: a search for its parts read `1h30` as
+    # 1 h and `abc1m` as 1 min.
+    (["-s", "1h30"], "cannot parse duration: '1h30'"),
+    (["-s", "abc1m"], "cannot parse duration: 'abc1m'"),
+    (["-s", "1.5"], "cannot parse duration: '1.5'"),
+], ids=["short", "equals", "deprecated-alias", "equals-empty", "blank",
+        "unit-less-tail", "leading-junk", "bare-fraction"])
 def test_a_malformed_start_in_is_a_usage_error(argv, why, capsys):
     # At parse time, not when the wait begins: a runner reads the value only
     # after its prologue, and a host wrapper after its own startup steps.
@@ -92,8 +98,17 @@ def test_a_malformed_start_in_is_a_usage_error(argv, why, capsys):
     assert _START_IN_REFUSAL + why in err
 
 
-@pytest.mark.parametrize("spelling", ["1h30m", "29", "90s", "0"])
+@pytest.mark.parametrize("spelling", ["1h30m", "29", "90s", "0", " 29m ",
+                                      "1h 30m"])
 def test_a_well_formed_start_in_is_kept_as_typed(spelling):
     # As typed, not in seconds: the wait announces the spelling it was given.
     assert cyclecore.parse_args(["-s", spelling]).start_in == spelling
     assert cyclecore.parse_args([]).start_in is None
+
+
+@pytest.mark.parametrize("text, seconds", [
+    ("0", 0), ("29", 29 * 60), ("90s", 90), ("1h30m", 5400), ("1h 30m", 5400),
+    (" 29M ", 29 * 60), ("1.5h", 5400), ("1h30m15s", 5415),
+])
+def test_parse_duration_sums_every_part(text, seconds):
+    assert clispec.parse_duration(text) == seconds

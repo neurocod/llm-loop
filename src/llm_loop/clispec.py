@@ -18,7 +18,7 @@ So `OPTIONS` below is the single table, and everything else is DERIVED from it:
     it) is the same table projected down to what an argv rewriter needs: every
     spelling of a flag, and whether it eats the next token.
 
-A row that no parser offers is legitimate and carries `kwargs=None`:
+A row that `build_parser` never adds is legitimate and carries `kwargs=None`:
 `--parallel`/`--grow-kit`/`--random`/`--finish` are a wrapper's mode switches,
 which the wrapper declares and registers itself (`modeswitch`) into whichever
 parser its argv scan picks, and `--session-limit`/`--weekly-limit` are ceilings
@@ -116,6 +116,12 @@ def directory(text: str) -> str:
     return text
 
 
+# One or more `<number><unit>` parts, spaces allowed after each: 1h30m, 90s,
+# `1h 30m`, 1.5h.
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)\s*([hms])\s*")
+_DURATION = re.compile(r"(?:\d+(?:\.\d+)?\s*[hms]\s*)+")
+
+
 def parse_duration(text: str) -> float:
     """Parse a duration like '29m', '1h', '90s', '1h30m' into seconds.
 
@@ -131,16 +137,13 @@ def parse_duration(text: str) -> float:
         raise ValueError("empty duration")
     if text.isdigit():  # bare number — minutes
         return int(text) * 60
-
-    units = {"h": 3600, "m": 60, "s": 1}
-    total = 0.0
-    matched = False
-    for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([hms])", text):
-        total += float(value) * units[unit]
-        matched = True
-    if not matched:
+    # The WHOLE text, not the parts that happen to match: searching for
+    # `<number><unit>` read `1h30` as 1 h (the 30 dropped) and `abc1m` as 1 min.
+    if not _DURATION.fullmatch(text):
         raise ValueError(f"cannot parse duration: {text!r}")
-    return total
+    units = {"h": 3600, "m": 60, "s": 1}
+    return sum(float(value) * units[unit]
+               for value, unit in _DURATION_PART.findall(text))
 
 
 def duration(text: str) -> str:
@@ -151,7 +154,10 @@ def duration(text: str) -> str:
     stop-file wait and whatever else it does on the way in — so a typo used to
     fail late, and differently per host. An empty value (`--start-in=`) is
     refused too: it used to mean "no delay" while `--start-in ""`, which
-    PowerShell 5.1 delivers as a bare flag, was a usage error.
+    PowerShell 5.1 delivers as a bare flag, was a usage error. A line that
+    waits for nothing still fails: a dry run or a report (`--cost`, `--log`)
+    never read the value and used to run on past a typo in it; it is exit 2
+    now, like any other malformed option on that line.
 
     Returns the text unchanged, so `args.start_in` stays the spelling the wait
     announces.
@@ -182,10 +188,12 @@ class Option(NamedTuple):
     derives from `kwargs`, so the two cannot disagree quietly.
 
     `kwargs` is handed to `add_argument` verbatim (minus the flag strings and
-    `help`); `None` means no parser offers this flag at all - see the module
-    header. `help` is what both modes print, and `parallel_help` replaces it in
-    the parallel parser for the options the two runners genuinely mean
-    differently (an iteration cap vs a total-files cap, and so on).
+    `help`); `None` means `build_parser` never adds this flag - a host may
+    (a wrapper's mode switch, through `modeswitch.register`), and the status
+    line may write it into a command line; see the module header. `help` is
+    what both modes print, and `parallel_help` replaces it in the parallel
+    parser for the options the two runners genuinely mean differently (an
+    iteration cap vs a total-files cap, and so on).
     """
 
     aliases: Tuple[str, ...]
