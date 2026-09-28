@@ -91,13 +91,21 @@ def apply_replacement(text: str, old: str, new: str, regex: bool,
     like (`--old=$x`, `--old "$x"` with $x unset). try_patch bypassed the CLI
     check and certified such a run under --expect-fail (2026-09-27).
 
-    "Empty" means the empty STRING, in both modes, and not "a regex that can
-    match empty". `^`, `$`, `\\b` or a lookahead are zero-width on purpose --
-    the way to insert at every line start or before a word -- and are always
-    something the caller typed, never the residue of a lost value. A written
-    pattern that degenerately matches everywhere (`x*`, `(?:)`) is left to
-    the count: the default of 1 refuses it on any text longer than nothing,
-    and `--count any` is the caller saying any number is right.
+    A regex loses its value into something that is not the empty string: the
+    wrapper the caller typed around it survives -- `"($x)"` leaves `()`,
+    `"(?i)$x"` leaves `(?i)`, `"^$x"` leaves `^`. So under --regex the rule is
+    "does on THIS text exactly what the empty pattern does": every match is
+    empty and there are len(text) + 1 of them, one at every position. That is
+    the empty pattern's own signature, and it is refused whatever the count
+    says -- `()`, `(?:)`, `(?i)`, `(?x)`, and `x*` on a text without an x.
+    Zero-width patterns that pick positions stay allowed, because inserting is
+    their use: `^`, `$`, `\\b` and lookaheads hit some positions, not all.
+    The price, named: a lost value that leaves `^` is one of those, and under
+    `--count any` it inserts at every line start; only the default count of 1
+    stands in its way. Conversely, a typed `^` on a text of blank lines, or
+    anything zero-width on the empty file (one position, one match), is
+    refused -- there it does what the empty pattern does, and nothing on that
+    text could tell the two apart.
     """
     if not old:
         raise EditError(
@@ -110,7 +118,14 @@ def apply_replacement(text: str, old: str, new: str, regex: bool,
             pattern = re.compile(old, re.MULTILINE)
         except re.error as exc:
             raise EditError(f"bad --regex pattern: {exc}") from exc
-        hits = len(pattern.findall(body))
+        spans = [match.span() for match in pattern.finditer(body)]
+        hits = len(spans)
+        if hits == len(body) + 1 and all(start == end for start, end in spans):
+            raise EditError(
+                f"the regex {old!r} matches the empty string at every position "
+                "of the text, which is what an empty pattern does (a value "
+                "lost inside `(...)` or after `(?i)` leaves exactly that); "
+                "nothing written")
         replaced = pattern.sub(new, body)
     else:
         hits = body.count(old)
