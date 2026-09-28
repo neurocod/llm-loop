@@ -929,6 +929,47 @@ def self_test() -> int:
     return 1 if failures else 0
 
 
+class _AmbiguousOption(argparse.Action):
+    """What _Parser._get_option_tuples returns for an ambiguous abbreviation:
+    a flag (so never a value) that is refused only when parsing reaches it."""
+
+    def __init__(self, token, names):
+        super().__init__(option_strings=[], dest=argparse.SUPPRESS, nargs=0)
+        self.message = f"ambiguous option: {token} could match {', '.join(names)}"
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        raise argparse.ArgumentError(None, self.message)
+
+
+def _option_tuple_fields() -> int:
+    """How many fields argparse's option tuples have here: 3 or 4.
+
+    The width moved between releases and is private API, so it is read, not
+    written down: (action, option, explicit_arg) measured on 3.9.25 and
+    3.10.21, (action, option, separator, explicit_arg) on 3.11.16, 3.12.14,
+    3.13.7 and 3.14.7 -- which release made the move is not established.
+
+    Read from a probe parser of its own, never from the parser being used: a
+    lookup on that one depends on its options and its allow_abbrev, and came
+    back empty (an IndexError, not a usage error) without --help. Both known
+    layouts are checked field by field, and anything else raises: a stand-in
+    padded to a width nobody measured would give argparse a tuple whose fields
+    mean something this code never read.
+    """
+    probe = argparse.ArgumentParser(add_help=False, allow_abbrev=True)
+    action = probe.add_argument("--probe")
+    found = argparse.ArgumentParser._get_option_tuples(probe, "--pro=v")
+    if found == [(action, "--probe", "v")]:
+        return 3
+    if found == [(action, "--probe", "=", "v")]:
+        return 4
+    raise RuntimeError(
+        f"argparse {sys.version.split()[0]} returns option tuples shaped "
+        f"{found!r} for `--pro=v`; _Parser knows only (action, option, "
+        f"explicit_arg) and (action, option, separator, explicit_arg) -- teach "
+        f"_option_tuple_fields this one")
+
+
 class _Parser(argparse.ArgumentParser):
     """argparse, with the value-or-flag rule pinned and one hint added.
 
@@ -946,7 +987,7 @@ class _Parser(argparse.ArgumentParser):
     # digit (`-٥`), and the older `$` matches before a trailing newline (`-5\n`).
     # This one is the narrow shape -- a dash, ASCII digits, at most one dot,
     # nothing after -- which C++ spells without a Unicode table (the port's
-    # looksLikeOption), and on a miss the token is a flag: a usage error,
+    # classifyArgument), and on a miss the token is a flag: a usage error,
     # never a verdict on a command the caller did not mean. argparse reads the
     # attribute as `_negative_number_matcher.match(token)` in every version
     # this runs on; were that ever to change, parity_check's ARGV_CASES fail.
@@ -954,19 +995,57 @@ class _Parser(argparse.ArgumentParser):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # The rules _get_option_tuples pins are abbreviation rules, measured
+        # with abbreviations on. With them off, newer argparse reads `-= x` as
+        # a value, which the stand-in would contradict -- refused rather than
+        # half-modelled.
+        if not self.allow_abbrev:
+            raise ValueError("_Parser pins argparse's abbreviation rules and "
+                             "does not support allow_abbrev=False")
         self._negative_number_matcher = self.NEGATIVE_NUMBER
 
-    def _parse_optional(self, arg_string):
-        # A token led by `-=` is a flag -- ours too, for the same reason: a
-        # single dash is matched by the text before `=`, which here is just `-`,
-        # a prefix of every option. 3.13 reads it that way (ambiguous, but a
-        # flag); 3.10 took the whole token as the prefix, matched nothing, and
-        # its space rule made `--check "-= x"` a verdict. The port's
-        # looksLikeOption has the 3.13 shape, so this pins the reference to it.
-        if arg_string.startswith("-="):
-            self.error(f"argument {arg_string!r}: `-` before `=` abbreviates "
-                       f"every option, so this is a flag, not a value")
-        return super()._parse_optional(arg_string)
+    def _get_option_tuples(self, option_string):
+        # Two more rules argparse moved, pinned to the newer shape the port
+        # (classifyArgument, and the loop in its run()) already has:
+        #
+        # - A token led by `-=` abbreviates EVERY option: a single dash is
+        #   matched by the text before `=`, which here is just `-`. 3.9-3.11 (and
+        #   early 3.12) took the whole token as the prefix, matched nothing, and
+        #   their space rule made `--check "-= x"` a verdict; 3.12.14 (a
+        #   backport) and 3.13+ read a flag.
+        # - An ambiguous abbreviation is refused when argparse REACHES it, not
+        #   while it first classifies argv: 3.9-3.11 refused `--help --c` (exit
+        #   2) before --help could run, 3.12.14+ print the help (exit 0).
+        # Measured on 3.9.25, 3.10.21, 3.11.16, 3.12.14, 3.13.7 and 3.14.7.
+        #
+        # Both come back as one stand-in match that raises once consumed. Raised
+        # as ArgumentError, not self.error(): parse_known_args turns it into the
+        # usage error, and exit_on_error=False into an exception, as it does
+        # for argparse's own.
+        matches = super()._get_option_tuples(option_string)
+        if len(matches) < 2 and not option_string.startswith("-="):
+            return matches
+        names = ([match[1] for match in matches] if len(matches) > 1
+                 else ["every option"])
+        # No separator and no explicit argument, whichever layout this is.
+        return [(_AmbiguousOption(option_string, names), option_string)
+                + (None,) * (_option_tuple_fields() - 2)]
+
+    def _get_values(self, action, arg_strings):
+        # One more rule argparse moved: 3.9 and 3.10 strip the first `--` from
+        # an OPTION's values too, not only from a positional's, and the only
+        # way one reaches an option is glued: `--check=--`. The value then came
+        # back as [] -- a traceback, exit 1, which is "denied" -- where 3.11+
+        # and the port read the command `--` (and refuse `--shell=--` /
+        # `--platform=--` as no choice, where [] had passed as one). Pinned to
+        # the newer reading: the value, converted and checked as 3.11+ does.
+        # Measured on 3.9.25, 3.10.21, 3.11.16 and 3.14.7; parity_check's
+        # `=--` ARGV_CASES bite on 3.9/3.10 only.
+        if action.option_strings and action.nargs is None and arg_strings == ["--"]:
+            value = self._get_value(action, "--")
+            self._check_value(action, value)
+            return value
+        return super()._get_values(action, arg_strings)
 
     def error(self, message):
         if message.startswith("argument --check: expected one argument"):
@@ -974,14 +1053,16 @@ class _Parser(argparse.ArgumentParser):
         super().error(message)
 
 
-def main() -> int:
+def build_parser() -> _Parser:
+    """The CLI. Its own function because parity_check reads its option strings:
+    the port's kOptions copies them, and ARGV_CASES gets a row per option."""
     parser = _Parser(
         description="Refuse shell commands that would stop for a human "
                     "permission prompt. Reads a PreToolUse hook payload on "
                     "stdin unless --check/--self-test is given.")
     # The empty command is spelled `--check=`, and a bare --check stays an
     # error -- in both halves (the port's side, and why its parser had to learn
-    # to tell a flag from a value, is at its looksLikeOption). The obvious
+    # to tell a flag from a value, is at its classifyArgument). The obvious
     # `--check ""` never arrives from Windows PowerShell 5.1, which drops an
     # empty argument to a native program; argparse then sees --check followed
     # by the next flag, or by nothing. Reading that bare --check as "" (what
@@ -1008,7 +1089,11 @@ def main() -> int:
                              "note depends on it (default: auto)")
     parser.add_argument("--self-test", action="store_true",
                         help="run the built-in scanner cases")
-    options = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    options = build_parser().parse_args()
 
     if options.self_test:
         return self_test()

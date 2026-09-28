@@ -42,8 +42,11 @@ jobs:
       # `testpaths`, so pytest never reaches it. Both are stdlib-only and
       # platform-guarded, which is why they can ride the same matrix: it is the
       # only thing keeping the gate's path resolver and its wiring check honest
-      # on a machine that is not the author's.
-      - name: Test the ask-user-gate plugin
-        run: |
-          python claude-plugin/ask-user-gate/hooks/ask_user_gate.py --self-test
-          python claude-plugin/ask-user-gate/bin/try_patch.py --selftest
+      # on a machine that is not the author's. One command per step: on Windows
+      # the default shell (pwsh) reports only a script's LAST exit code, so a
+      # failing first command in a shared step would pass.
+      - name: Test the ask-user-gate hook
+        run: python claude-plugin/ask-user-gate/hooks/ask_user_gate.py --self-test
+
+      - name: Test the ask-user-gate try_patch
+        run: python claude-plugin/ask-user-gate/bin/try_patch.py --selftest

@@ -1455,35 +1455,111 @@ given. Exit 1 when a checked command is denied.
                      that question for both halves)
 )GATE";
 
-// Whether argparse would read `token` as a flag rather than as the value of the
-// flag before it (its _parse_optional, over the reference's option strings).
-// The CLI contract is the reference's, and there a bare --check is an error,
-// the empty command being spelled --check= (the doc-comment at its
-// add_argument says why). Taking any next token as the value, as this parser
-// once did, broke that contract exactly where it bites: PowerShell 5.1 turns
-// `--check "" --platform=windows` into `--check --platform=windows`, and the
-// port scanned the flag as the COMMAND and printed "allowed" while the
-// reference refused the run.
-bool looksLikeOption(std::string_view token) {
-	static constexpr std::string_view kOptions[] = {"-h", "--help", "--check", "--check-file",
-		"--shell", "--tool", "--platform", "--self-test"};
+// The command line. Its contract is the reference's build_parser(), token for
+// token, so these are argparse's rules (_parse_optional and consume_optional)
+// plus the two the reference's _Parser pins, and not a simpler set of our own:
+//
+//   * An unambiguous prefix of a long option IS that option (`--sh bash`,
+//     `--t=Monitor`); a prefix of several, and any `-=`-led token, is refused
+//     where parsing reaches it. The other way to one contract -- turning
+//     abbreviations off in the reference -- is closed: _Parser refuses
+//     allow_abbrev=False, because newer argparse then reads `-= x` as a value
+//     and the pinned rule would be contradicted, and it would also narrow a
+//     public CLI that people already type abbreviated.
+//   * A token nothing claims is collected and reported AFTER the loop, as
+//     argparse's "unrecognized arguments" is, while every other refusal (a
+//     missing or rejected value, an ambiguous prefix) stops at its position.
+//     So `-x --help` prints the help, and `--help -x` does too, but
+//     `--shell zsh --help` does not.
+//   * A flag that takes no value refuses one given with `=`, even an empty
+//     one (argparse's "ignored explicit argument"): `--help=x`, `--self-test=`.
+//   * `--` ends the options, and since nothing here takes a positional, it and
+//     everything after it are unrecognised.
+//   * `-h` glued to more h's is that many -h, and glued to `-` or `=` after
+//     them it is refused by every version. Glued to anything else (`-hx`,
+//     `-h x`, `-hhx`) 3.9 and 3.10 refuse it and 3.11+ print the help; the
+//     reference does not pin that, so this takes the refusal and parity_check
+//     has no row for it. (`-h=` is the `=` rule above, where 3.9.25 raises an
+//     IndexError instead.) Measured on 3.9 to 3.14, 2026-09-28.
+//
+// parity_check's ARGV_CASES carry one row per option (generated from the
+// reference's parser, so an option added there reaches the port without
+// anyone remembering to), the leading abbreviation of each, and the ordering
+// and `=` shapes above.
+
+// One entry per reference option string, with whether it takes a value.
+// tests/test_ask_user_gate_parity.py reads this initializer and compares it with
+// the reference's parser, so keep it one `{"name", Arity::...}` pair per entry.
+enum class Arity { None, Value };
+struct CliOption {
+	std::string_view name;
+	Arity arity;
+};
+constexpr CliOption kOptions[] = {
+	{"-h", Arity::None}, {"--help", Arity::None}, {"--check", Arity::Value},
+	{"--check-file", Arity::Value}, {"--shell", Arity::Value}, {"--tool", Arity::Value},
+	{"--platform", Arity::Value}, {"--self-test", Arity::None},
+};
+
+// What one argv token is to argparse before anything is done with it.
+struct CliToken {
+	enum class Kind {
+		Value,         // positional: the value of the option before it, else unrecognised
+		Option,        // one of kOptions, spelled out or abbreviated
+		Ambiguous,     // a prefix of several options, or `-=`-led: refused when reached
+		Unknown,       // flag-shaped, but no option's: unrecognised
+		EndOfOptions,  // `--`
+	};
+	Kind kind = Kind::Value;
+	const CliOption* option = nullptr;
+	std::optional<std::string_view> inlineValue;  // after `=`
+	std::string_view glued;                       // after a short option, no `=`
+};
+
+// argparse's _parse_optional over kOptions. Telling a flag from a value is
+// what this is for: taking any next token as the value, as the first parser
+// did, broke the --check contract exactly where it bites -- PowerShell 5.1
+// turns `--check "" --platform=windows` into `--check --platform=windows`, and
+// the port scanned the flag as the COMMAND and printed "allowed" while the
+// reference refused the run (the empty command is `--check=`; the reason is at
+// the reference's --check add_argument).
+CliToken classifyArgument(std::string_view token) {
+	using Kind = CliToken::Kind;
+	if (token == "--")
+		return {Kind::EndOfOptions};
 	if (token.size() < 2 || token[0] != '-')
-		return false;
+		return {Kind::Value};
+	for (const CliOption& option : kOptions)
+		if (option.name == token)
+			return {Kind::Option, &option};
 	const size_t equals = token.find('=');
-	const std::string_view name = token.substr(0, equals);
-	for (std::string_view option : kOptions)
-		if (option == name)
-			return true;
-	// argparse also resolves abbreviations -- any prefix of a long option, and
-	// `-h` glued to anything -- even where the flag itself then fails. A single
-	// dash matches by the text before `=` as well, and `-=...` leaves just `-`
-	// there, a prefix of every option: ambiguous, but a flag.
-	if (startsWith(token, "--")) {
-		for (std::string_view option : kOptions)
-			if (startsWith(option, name))
-				return true;
-	} else if (startsWith(token, "-h") || startsWith(token, "-=")) {
-		return true;
+	if (equals != std::string_view::npos)
+		for (const CliOption& option : kOptions)
+			if (option.name == token.substr(0, equals))
+				return {Kind::Option, &option, token.substr(equals + 1)};
+	// A single dash is matched by the text before `=` too, and `-=...` leaves
+	// just `-` there, a prefix of every option (_Parser._get_option_tuples).
+	if (startsWith(token, "-="))
+		return {Kind::Ambiguous};
+	const bool longForm = token[1] == '-';
+	const std::string_view prefix = token.substr(0, equals);
+	const CliOption* match = nullptr;
+	int matches = 0;
+	for (const CliOption& option : kOptions) {
+		const bool gluedShort = !longForm && option.name == token.substr(0, 2);
+		if (gluedShort || startsWith(option.name, prefix)) {
+			match = &option;
+			++matches;
+		}
+	}
+	if (matches > 1)
+		return {Kind::Ambiguous};
+	if (matches == 1) {
+		if (!longForm)
+			return {Kind::Option, match, std::nullopt, token.substr(2)};
+		if (equals == std::string_view::npos)
+			return {Kind::Option, match};
+		return {Kind::Option, match, token.substr(equals + 1)};
 	}
 	// A negative number, and anything with a space in it, is a value. The
 	// negative-number shape is the reference's own _Parser.NEGATIVE_NUMBER, not
@@ -1498,78 +1574,98 @@ bool looksLikeOption(std::string_view token) {
 	const bool negativeNumber = std::all_of(whole.begin(), whole.end(), isDigit)
 		&& std::all_of(fraction.begin(), fraction.end(), isDigit)
 		&& (dot == std::string_view::npos ? !whole.empty() : !fraction.empty());
-	if (negativeNumber)
-		return false;
-	return token.find(' ') == std::string_view::npos;
+	if (negativeNumber || token.find(' ') != std::string_view::npos)
+		return {Kind::Value};
+	return {Kind::Unknown};
 }
 
 int run(int argc, char** argv) {
+	using Kind = CliToken::Kind;
 	std::optional<std::string> checkCommand;
 	std::optional<std::string> checkFile;
 	std::string shell = "bash";
 	std::string tool = "Bash";
 	std::string platform = "auto";
 	bool wantSelfTest = false;
+	std::vector<std::string> unrecognised;
 
 	for (int i = 1; i < argc; ++i) {
-		std::string argument = argv[i];
-		std::string value;
-		bool hasInlineValue = false;
-		const size_t equals = argument.find('=');
-		if (startsWith(argument, "--") && equals != std::string::npos) {
-			value = argument.substr(equals + 1);
-			argument = argument.substr(0, equals);
-			hasInlineValue = true;
+		const CliToken token = classifyArgument(argv[i]);
+		if (token.kind == Kind::EndOfOptions) {
+			unrecognised.insert(unrecognised.end(), argv + i, argv + argc);
+			break;
 		}
-		auto takeValue = [&](const char* name) -> bool {
-			if (hasInlineValue)
-				return true;
-			if (i + 1 >= argc || looksLikeOption(argv[i + 1])) {
-				std::fprintf(stderr, "ask_user_gate: %s needs a value%s\n", name,
-					std::strcmp(name, "--check") == 0 ? " (the empty command is --check=)" : "");
-				return false;
+		if (token.kind == Kind::Value || token.kind == Kind::Unknown) {
+			unrecognised.push_back(argv[i]);
+			continue;
+		}
+		if (token.kind == Kind::Ambiguous) {
+			std::fprintf(stderr, "ask_user_gate: ambiguous option: %s\n", argv[i]);
+			return 2;
+		}
+		const std::string_view name = token.option->name;
+		if (token.option->arity == Arity::None) {
+			if (token.inlineValue || token.glued.find_first_not_of('h') != std::string_view::npos) {
+				std::fprintf(stderr, "ask_user_gate: %.*s takes no value (%s)\n",
+					static_cast<int>(name.size()), name.data(), argv[i]);
+				return 2;
 			}
+			if (name == "--self-test") {
+				wantSelfTest = true;
+				continue;
+			}
+			if (name == "-h" || name == "--help") {
+				writeStdout(kUsage);
+				return 0;
+			}
+			std::fprintf(stderr, "ask_user_gate: %.*s is in kOptions but not handled\n",
+				static_cast<int>(name.size()), name.data());
+			return 2;
+		}
+		std::string value;
+		if (token.inlineValue) {
+			value = *token.inlineValue;
+		} else if (!token.glued.empty()) {
+			value = token.glued;
+		} else if (i + 1 < argc && classifyArgument(argv[i + 1]).kind == Kind::Value) {
 			value = argv[++i];
-			return true;
-		};
-		if (argument == "--self-test") {
-			wantSelfTest = true;
-		} else if (argument == "--check") {
-			if (!takeValue("--check"))
-				return 2;
+		} else {
+			std::fprintf(stderr, "ask_user_gate: %.*s needs a value%s\n",
+				static_cast<int>(name.size()), name.data(),
+				name == "--check" ? " (the empty command is --check=)" : "");
+			return 2;
+		}
+		if (name == "--check") {
 			checkCommand = value;
-		} else if (argument == "--check-file") {
-			if (!takeValue("--check-file"))
-				return 2;
+		} else if (name == "--check-file") {
 			checkFile = value;
-		} else if (argument == "--shell") {
-			if (!takeValue("--shell"))
-				return 2;
+		} else if (name == "--shell") {
 			if (value != "bash" && value != "powershell") {
 				std::fprintf(stderr, "ask_user_gate: --shell must be bash or powershell\n");
 				return 2;
 			}
 			shell = value;
-		} else if (argument == "--tool") {
-			if (!takeValue("--tool"))
-				return 2;
+		} else if (name == "--tool") {
 			tool = value;
-		} else if (argument == "--platform") {
-			if (!takeValue("--platform"))
-				return 2;
+		} else if (name == "--platform") {
 			if (value != "auto" && value != "windows" && value != "posix") {
 				std::fprintf(stderr, "ask_user_gate: --platform must be auto, windows or posix\n");
 				return 2;
 			}
 			platform = value;
-		} else if (argument == "-h" || argument == "--help") {
-			writeStdout(kUsage);
-			return 0;
 		} else {
-			std::fprintf(stderr, "ask_user_gate: unrecognised argument %s\n", argument.c_str());
-			writeStdout(kUsage);
+			std::fprintf(stderr, "ask_user_gate: %.*s is in kOptions but not handled\n",
+				static_cast<int>(name.size()), name.data());
 			return 2;
 		}
+	}
+	if (!unrecognised.empty()) {
+		std::string list;
+		for (const std::string& argument : unrecognised)
+			list += (list.empty() ? "" : " ") + argument;
+		std::fprintf(stderr, "ask_user_gate: unrecognised arguments: %s\n", list.c_str());
+		writeStdout(kUsage);
+		return 2;
 	}
 
 	if (wantSelfTest)

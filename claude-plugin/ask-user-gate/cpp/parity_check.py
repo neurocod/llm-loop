@@ -24,6 +24,7 @@ the source last changed (exit 2 otherwise, see newer_sources).
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -186,48 +187,216 @@ CRLF_CASES = [
     ("git commit -F @'\nmsg\n'@", "powershell", "PowerShell"),
 ]
 
-# The command line itself, as argv lists: the corpus above goes in through
-# --check-file, so it never sees how a VALUE is found. These are the shapes an
-# operator's shell delivers -- above all Windows PowerShell 5.1, which drops an
-# empty argument, so `--check ""` arrives as a bare --check before the next flag
-# or at the end. The contract (ask_user_gate.py, at the --check add_argument):
-# `--check=` is the empty command, a bare --check is a usage error (exit 2), and
-# a token argparse reads as a flag is never taken as a value. Only the exit code
-# is compared on a usage error: argparse and the port word it differently.
+# What argv_verdict makes of the output worth pinning; see ARGV_CASES.
+ALLOWED = "allowed\n"
+HELP = "<help>"
+SELF_TEST = "<self-test>"
+# sed -i is refused under bash and not under PowerShell, so this command tells
+# which shell an abbreviated --shell actually set.
+SED = "sed -i s/a/b/ f"
+# Refused on every host, with the Git Bash note on Windows only, so its text
+# tells which platform an abbreviated --platform actually set.
+CHAIN = "cd x && echo hi > out.txt"
+
+
+def denied(command: str, shell: str = "bash", tool: str = "Bash",
+           windows: bool = True) -> str:
+    """The refusal the reference prints for `command` under these options.
+
+    Computed in process, not copied: the refusal's wording is the corpus's to
+    pin (above), and what an ARGV_CASES row pins is which shell, tool and
+    platform its argv delivered to scan() -- the remedy for Monitor, the Git
+    Bash note, which of two repeated --check values won. It also keeps a crash
+    out of a row that expects a refusal: a traceback exits 1 as well.
+    """
+    findings = reference.scan(command, shell, windows, tool)
+    if not findings:
+        raise ValueError(f"{command!r} is allowed under {shell}/{tool}; "
+                         f"an exit-1 row needs a command that is refused")
+    return reference.render(findings) + "\n"
+
+
+# The command line itself: the corpus above goes in through --check-file, so it
+# never sees how a VALUE is found. These are the shapes an operator's shell
+# delivers -- above all Windows PowerShell 5.1, which drops an empty argument,
+# so `--check ""` arrives as a bare --check before the next flag or at the end.
+# The contract (ask_user_gate.py, at the --check add_argument): `--check=` is
+# the empty command, a bare --check is a usage error (exit 2), and a token
+# argparse reads as a flag is never taken as a value.
+#
+# Rows are (argv, exit code, text), and the table has two readers. main() below
+# runs each argv through BOTH halves and compares what argv_verdict returns --
+# only the code on a usage error and on the help, which argparse and the port
+# word differently. tests/test_ask_user_gate_parity.py holds the REFERENCE alone
+# to the code and, where it is not None, to the text: that half needs no
+# binary, so it is the one every checkout and every CI interpreter runs. A row
+# added here is therefore pinned twice by construction, instead of being written
+# into a second list that nothing keeps in step. Text is None for a usage error
+# only (always "<usage error>"), and a verdict always names its text -- the
+# pytest reader refuses a row that does not: a 0 because exit 0 with no output
+# is also what hook mode returns on the empty stdin argv_verdict gives it, a 1
+# because a traceback exits 1 too. A refusal's text is denied(), compared
+# through normalise() as the halves are.
 ARGV_CASES = [
-    ["--check="],
-    ["--check=", "--shell", "powershell"],
-    ["--shell=powershell", "--check="],
-    ["--check", ""],                          # a shell that keeps the token
-    ["--check"],                              # `--check ""` at the end
-    ["--check", "--shell", "powershell"],     # `--check ""` before a flag
-    ["--check", "--platform=windows"],        # ... one written with `=`
-    ["--check", "--sh", "powershell"],        # ... an abbreviation of one
-    ["--check", "-x"],                        # dash-led, no space: a flag
-    ["--check", "-1"],                        # a negative number: a value
-    ["--check", "-.5"],
-    # Not negative numbers by the gate's own rule (_Parser.NEGATIVE_NUMBER),
-    # whatever this interpreter's argparse would say: flags, so usage errors.
-    ["--check", "-1e5"],
-    ["--check", "-1abc"],
-    ["--check", "-1.2.3"],
-    ["--check", "-.5x"],
-    ["--check", "-1_000"],
-    ["--check", "-5\n"],                      # the old argparse `$` took it
-    ["--check", "-٥"],                   # a Unicode digit, ARABIC-INDIC 5
-    ["--check", "-= x"],                      # `-` before `=`: every option
-    ["--check", "-n 1; cd y && ls"],          # dash-led with a space: a value
-    ["--tool", "--check", "cd x && ls"],
-    ["--tool", "--check=cd x && ls"],         # a flag, space or not
-    ["--check", "--sh=a b"],                  # an abbreviation, space or not
-    ["--check", "-h x"],                      # -h glued to anything is -h
-    ["--check", "cd x && ls", "--tool", "-h"],
+    (["--check="], 0, ALLOWED),
+    (["--check=", "--shell", "powershell"], 0, ALLOWED),
+    (["--shell=powershell", "--check="], 0, ALLOWED),
+    (["--check", ""], 0, ALLOWED),            # a shell that keeps the token
+    (["--check"], 2, None),                   # `--check ""` at the end
+    (["--check", "--shell", "powershell"], 2, None),  # ... before a flag
+    (["--check", "--platform=windows"], 2, None),     # ... one written with `=`
+    (["--check", "--sh", "powershell"], 2, None),     # ... an abbreviation
+    (["--check", "-x"], 2, None),             # dash-led, no space: a flag
+    # The gate's own negative-number rule (_Parser.NEGATIVE_NUMBER), whatever
+    # this interpreter's argparse would say: a negative number is a value ...
+    (["--check", "-1"], 0, ALLOWED),
+    (["--check", "-.5"], 0, ALLOWED),
+    (["--check", "-2.5"], 0, ALLOWED),
+    # ... and these are not negative numbers: flags, so usage errors.
+    (["--check", "-1e5"], 2, None),
+    (["--check", "-1abc"], 2, None),
+    (["--check", "-1.2.3"], 2, None),
+    (["--check", "-.5x"], 2, None),
+    (["--check", "-1_000"], 2, None),
+    (["--check", "-5\n"], 2, None),           # the old argparse `$` took it
+    (["--check", "-٥"], 2, None),        # a Unicode digit, ARABIC-INDIC 5
+    (["--check", "-= x"], 2, None),           # `-` before `=`: every option
+    # A `-=` token and an ambiguous prefix are flags, refused on arrival.
+    # 3.9-3.11 argparse read `-= x` as a value and refused an ambiguous prefix
+    # before running anything, --help included; _Parser._get_option_tuples pins
+    # the newer reading, which the port shares. 3.12.14+ argparse gives every
+    # one of these natively, so there the rows guard nothing of the override:
+    # they bite on 3.9-3.11 only.
+    (["--check", "-==x y"], 2, None),
+    (["--tool", "-= x", "--check", "ls"], 2, None),   # after any value flag
+    # Glued: a `-=` VALUE, the control the other way -- an over-broad refusal
+    # would turn it into a usage error.
+    (["--check=-= x"], 0, ALLOWED),
+    # Refused where parsing REACHES it, so a help before it still prints and
+    # one after it never runs.
+    (["--help", "-= x"], 0, HELP),
+    (["-= x", "--help"], 2, None),
+    (["--help", "--c"], 0, HELP),             # ... an ambiguous prefix as well
+    # dash-led with a space: a value
+    (["--check", "-n 1; cd y && ls"], 1, denied("-n 1; cd y && ls")),
+    (["--tool", "--check", "cd x && ls"], 2, None),
+    (["--tool", "--check=cd x && ls"], 2, None),  # a flag, space or not
+    (["--check", "--sh=a b"], 2, None),       # an abbreviation, space or not
+    (["--check", "-h x"], 2, None),           # -h glued to anything is -h
+    (["--check", "cd x && ls", "--tool", "-h"], 2, None),
     # Not a usage error in the argparse sense, but exit 2 all the same: exit 1
     # is "denied", and a file that cannot be read was not judged.
-    ["--check-file", "no-such-file-7c1f0e.txt"],
+    (["--check-file", "no-such-file-7c1f0e.txt"], 2, None),
     # No command at all: hook mode, on the empty stdin argv_verdict gives it.
-    ["--tool=Bash"],
+    (["--tool=Bash"], 0, ""),
+    # An unambiguous prefix is its option, with the value space- or =-joined;
+    # the verdict row shows WHICH option it set, not just that it parsed.
+    (["--sh", "powershell", "--check", SED], 0, ALLOWED),
+    (["--sh=powershell", "--check", SED], 0, ALLOWED),
+    (["--check", SED], 1, denied(SED)),       # the control: bash refuses it
+    # Monitor's remedy for a sleep is not Bash's (see `--tool=--` below).
+    (["--t=Monitor", "--check", "sleep 5"], 1, denied("sleep 5", tool="Monitor")),
+    (["--pl", "posix", "--check", CHAIN], 1, denied(CHAIN, windows=False)),
+    (["--check", CHAIN], 1, denied(CHAIN)),   # the control: the Windows note
+    (["--plat=bogus", "--check", "ls"], 2, None),
+    (["--check-f", os.devnull], 0, ALLOWED),
+    (["--check-fi=" + os.devnull], 0, ALLOWED),
+    (["--check", "cd x && ls", "--self"], 0, SELF_TEST),
+    # A prefix of several options is ambiguous, with `=` or without.
+    (["--che", "ls"], 2, None),
+    (["--che=ls"], 2, None),
+    (["--s=bash"], 2, None),
+    # A flag that takes no value refuses one given with `=`, the empty one too.
+    (["--help="], 2, None),
+    (["--self-test="], 2, None),
+    (["--sh="], 2, None),                     # a value option: '' is no shell
+    (["--tool=", "--check", "ls"], 0, ALLOWED),   # ... but it is a tool name
+    # -h glued to more h's is that many -h; to `-` or `=` it is refused by every
+    # Python. (To a letter it depends on the version: no row, see the port.)
+    (["-hh"], 0, HELP),
+    (["--zz", "-hhh"], 0, HELP),
+    (["-h-", "--help"], 2, None),
+    (["-hh=x"], 2, None),
+    # Unrecognised tokens are reported after the parse, so a --help anywhere
+    # still prints; every other refusal stops where parsing reaches it.
+    (["-x", "--help"], 0, HELP),
+    (["--zz=1", "--help"], 0, HELP),
+    (["foo", "--help"], 0, HELP),
+    (["-1", "--help"], 0, HELP),
+    (["-", "--help"], 0, HELP),
+    (["", "--help"], 0, HELP),
+    (["--help", "foo"], 0, HELP),
+    (["--shell", "zsh", "--help"], 2, None),
+    (["--help", "--shell", "zsh"], 0, HELP),
+    (["--zz", "--check", "ls"], 2, None),     # ... and a verdict never prints
+    (["--check", "ls", "foo"], 2, None),
+    (["--self-test", "--zz"], 2, None),
+    # `--` ends the options, and nothing here takes what follows it.
+    (["--"], 2, None),
+    (["--help", "--"], 0, HELP),
+    (["--check", "ls", "--", "--help"], 2, None),
+    (["--", "--check", "ls"], 2, None),
+    (["--check", "--", "ls"], 2, None),
+    (["--=x", "--help"], 2, None),            # `--` before `=`: every option
+    # ... but glued to an option it is that option's value: the command `--`, a
+    # path, a tool name, no choice. 3.9/3.10 argparse gave [] instead -- a
+    # traceback (exit 1: "denied") or a pass; _Parser._get_values pins 3.11+.
+    (["--check=--"], 0, ALLOWED),
+    (["--check-file=--"], 2, None),           # no file of that name
+    (["--tool=--", "--check", "sleep 5"], 1, denied("sleep 5", tool="--")),
+    (["--shell=--", "--check", "ls"], 2, None),
+    (["--platform=--", "--check", "ls"], 2, None),
+    # Values that only look like flags, and repeats: the last one wins.
+    (["--check", "--zz x"], 0, ALLOWED),
+    (["--check", "--sh x"], 0, ALLOWED),      # no `=`: the space decides
+    (["--check", "-"], 0, ALLOWED),
+    (["--check=cd x && ls", "--check=ls"], 0, ALLOWED),
+    (["--check=ls", "--check=cd x && ls"], 1, denied("cd x && ls")),
 ]
+
+
+def reference_options() -> "dict[str, bool]":
+    """Every option string of the reference's CLI -> whether it takes a value.
+
+    The port's kOptions is a hand copy of exactly this; the pytest suite
+    compares the two without a binary, and _option_rows below makes the
+    comparison behavioural where there is one.
+    """
+    return {option: action.nargs != 0
+            for action in reference.build_parser()._actions
+            for option in action.option_strings}
+
+
+def _option_rows() -> list:
+    """Two ARGV_CASES rows per option string, and two per shortest unambiguous
+    prefix of each long one: `[x, "--help"]` and `[x=v, "--help"]`.
+
+    An option nobody knows is reported after the parse, so --help wins both
+    rows. A value option fails the first (a flag is no value) and prints the
+    help on the second; a flag prints the help on the first and refuses the
+    `=` of the second. So every real spelling answers unlike an unknown one,
+    and one missing from the port's kOptions makes a DIFF -- generated from
+    the reference's own parser, so an option added there needs no row by hand.
+    """
+    options = reference_options()
+    actions = reference.build_parser()._option_string_actions
+    rows = []
+    for option, takes_value in options.items():
+        spellings = [option]
+        for end in range(3, len(option)) if option.startswith("--") else ():
+            if [name for name in options if name.startswith(option[:end])] == [option]:
+                spellings.append(option[:end])
+                break
+        choices = actions[option].choices
+        value = choices[0] if choices else "x"
+        for spelling in spellings:
+            rows.append(([spelling, "--help"],) + ((2, None) if takes_value else (0, HELP)))
+            rows.append(([f"{spelling}={value}", "--help"],)
+                        + ((0, HELP) if takes_value else (2, None)))
+    return rows
+
+
+ARGV_CASES += _option_rows()
 
 # Hook mode: the path that actually runs. The first group is ordinary traffic;
 # the rest is what a JSON reader has to survive without taking the session with
@@ -364,12 +533,13 @@ def check_verdict(argv: "list[str]", command: str, shell: str, tool: str,
 
 
 def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]":
-    """One ARGV_CASES entry through one gate's CLI, host fixed to Windows.
+    """One ARGV_CASES argv through one gate's CLI, host fixed to Windows.
 
     `--platform windows` goes FIRST so that a case can end on a bare --check.
-    A usage error (exit 2) keeps only its code, see ARGV_CASES. stdin is
-    closed because an argv that one half parses as "no command" puts it in
-    hook mode, reading a payload that would never come.
+    A usage error (exit 2) and the help keep only their code, see ARGV_CASES,
+    and so does a passing self-test: the two halves count different checks.
+    stdin is closed because an argv that one half parses as "no command" puts
+    it in hook mode, reading a payload that would never come.
     """
     try:
         result = subprocess.run(argv + ["--platform", "windows"] + arguments,
@@ -384,7 +554,12 @@ def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]"
     if result.stderr:
         return result.returncode, ("<stderr> "
                                    + result.stderr.decode("utf-8", "replace"))
-    return result.returncode, result.stdout.decode("utf-8").replace("\r\n", "\n")
+    text = result.stdout.decode("utf-8").replace("\r\n", "\n")
+    if result.returncode == 0 and text.startswith("usage:"):
+        return 0, HELP
+    if result.returncode == 0 and re.fullmatch(r"\d+/\d+ checks pass\n", text):
+        return 0, SELF_TEST
+    return result.returncode, text
 
 
 def hook_verdict(argv: "list[str]", payload: bytes) -> "tuple[int, str]":
@@ -485,7 +660,7 @@ def main() -> int:
                 print(f"  c++    (exit {cpp_code}):\n{normalise(cpp_text)}",
                       file=sys.stderr)
 
-        for arguments in ARGV_CASES:
+        for arguments, _, _ in ARGV_CASES:
             compared += 1
             py_code, py_text = argv_verdict(reference_argv, arguments)
             cpp_code, cpp_text = argv_verdict(gate_argv, arguments)
