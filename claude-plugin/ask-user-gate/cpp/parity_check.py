@@ -16,12 +16,14 @@ verdict until it is far too late.
   python cpp/parity_check.py                 # both halves, whole corpus
   python cpp/parity_check.py --exe PATH      # a binary built somewhere else
   python cpp/parity_check.py --verbose       # print every case
+  python cpp/parity_check.py --jobs 1        # one launch at a time
 
 Exit 1 on any difference. Requires the binary, built with cpp/build.py since
 the source last changed (exit 2 otherwise, see newer_sources).
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -484,6 +486,50 @@ HOOK_CASES = [
 ]
 
 
+# Nearly all of this script's time is ~315 REFERENCE launches: the port starts
+# in 4-35 ms, an interpreter in 0.05 s in one phase of the author's machine and
+# 0.4-1.3 s in another (measured 2026-09-29; `python -I -S -c pass` the same,
+# stdin irrelevant), so one launch at a time the run took 215 s and 238 s in a
+# slow phase -- and 506-772 s on 2026-09-28 in a slot while a second tree ran
+# the same suite, which was read as a hang. Launches are independent, so they
+# share a pool. 8 and not more: in a slow phase 8 workers gave 0.59 s a launch
+# against 1.35 s for one and 0.42 s for 16 (32 launches each), the whole run
+# 101 s against 215-238 s, and the machine is usually running another suite.
+DEFAULT_JOBS = 8
+
+# Per launch, only to turn a hang into a failure that names its argv instead
+# of an endless test. The slowest launch measured 2026-09-29 was 6.6 s in the
+# pool of 8 (3.3 s one at a time); 16 concurrent launches had a MEDIAN of
+# 11.8 s, which is what a second suite on the same machine looks like.
+LAUNCH_TIMEOUT = 120
+
+
+def launch(argv: "list[str]", payload: "bytes | None" = None
+           ) -> "subprocess.CompletedProcess | None":
+    """One run of either half, None when it outlived LAUNCH_TIMEOUT.
+
+    stdin is the payload or closed, never inherited: an argv that one half
+    reads as "no command" puts it in hook mode, and an inherited stdin (a
+    console, or the pipe of whoever started this script) would keep it waiting
+    for a payload that never comes. The timeout does not cover writing
+    `payload` on Windows (communicate() writes it before the clock starts), so
+    it holds only because both halves read all of stdin before anything else.
+    """
+    stdin = {"input": payload} if payload is not None else {
+        "stdin": subprocess.DEVNULL}
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=LAUNCH_TIMEOUT,
+                              **stdin)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def timed_out(argv: "list[str]") -> "tuple[int, str]":
+    """The verdict of a launch that never finished; it names the argv, so the
+    report says which half hung on what rather than just that one did."""
+    return -1, f"<no answer in {LAUNCH_TIMEOUT} s from {ascii(argv)}>"
+
+
 def default_exe() -> str:
     name = "ask_user_gate.exe" if os.name == "nt" else "ask_user_gate"
     return os.path.join(HOOKS, name)
@@ -516,15 +562,17 @@ def check_verdict(argv: "list[str]", command: str, shell: str, tool: str,
     never got compared, and a real offset bug lived in that gap.
 
     --check-file and not --check: the corpus carries newlines and
-    10 000-character commands, and an argv is the wrong place for either.
+    10 000-character commands, and an argv is the wrong place for either. A
+    file per call, because calls run concurrently (see DEFAULT_JOBS).
     """
-    path = os.path.join(scratch, "command.txt")
-    with open(path, "w", encoding="utf-8", newline=newline) as handle:
-        handle.write(command)
-    result = subprocess.run(
-        argv + ["--check-file", path, "--shell", shell, "--tool", tool,
-                "--platform", "windows"],
-        capture_output=True)
+    descriptor, path = tempfile.mkstemp(suffix=".txt", dir=scratch)
+    with open(descriptor, "w", encoding="utf-8", newline=newline) as stream:
+        stream.write(command)
+    full = argv + ["--check-file", path, "--shell", shell, "--tool", tool,
+                   "--platform", "windows"]
+    result = launch(full)
+    if result is None:
+        return timed_out(full)
     if result.stderr:
         return result.returncode, ("<stderr> "
                                    + result.stderr.decode("utf-8", "replace"))
@@ -537,17 +585,11 @@ def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]"
     `--platform windows` goes FIRST so that a case can end on a bare --check.
     A usage error (exit 2) and the help keep only their code, see ARGV_CASES,
     and so does a passing self-test: the two halves count different checks.
-    stdin is closed because an argv that one half parses as "no command" puts
-    it in hook mode, reading a payload that would never come.
     """
-    try:
-        result = subprocess.run(argv + ["--platform", "windows"] + arguments,
-                                stdin=subprocess.DEVNULL, capture_output=True,
-                                # vs ~70 ms a run (the README's hook-mode
-                                # median): only tells a hang from a slow box
-                                timeout=60)
-    except subprocess.TimeoutExpired:
-        return -1, "<timeout>"
+    full = argv + ["--platform", "windows"] + arguments
+    result = launch(full)
+    if result is None:
+        return timed_out(full)
     if result.returncode == 2:
         return 2, "<usage error>"
     if result.stderr:
@@ -565,11 +607,9 @@ def hook_verdict(argv: "list[str]", payload: bytes) -> "tuple[int, str]":
     """One payload through one gate's HOOK mode -- the path that runs 100k times
     a month, and the only one that exercises the JSON reader, the tool_name
     routing, `cwd` and the escaping of the reason into the envelope."""
-    try:
-        result = subprocess.run(argv, input=payload, capture_output=True,
-                                timeout=60)
-    except subprocess.TimeoutExpired:
-        return -1, "<timeout>"
+    result = launch(argv, payload)
+    if result is None:
+        return timed_out(argv)
     body = result.stdout.decode("utf-8", "replace").strip()
     if not body:
         return result.returncode, "<no verdict>"
@@ -612,7 +652,11 @@ def main() -> int:
     parser.add_argument("--exe", default=default_exe(),
                         help="the built gate (default: next to hooks.json)")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS,
+                        help=f"launches at a time (default: {DEFAULT_JOBS})")
     options = parser.parse_args()
+    if options.jobs < 1:
+        parser.error("--jobs must be at least 1")
 
     if not os.path.isfile(options.exe):
         print(f"{options.exe} is not there -- build it with "
@@ -635,34 +679,52 @@ def main() -> int:
 
     failures = 0
     compared = 0
-    with tempfile.TemporaryDirectory() as scratch:
-        for newline, cases in (("", corpus), ("\r\n", CRLF_CASES)):
-            for command, shell, tool in cases:
-                compared += 1
-                py_code, py_text = check_verdict(reference_argv, command, shell,
-                                                 tool, scratch, newline)
-                cpp_code, cpp_text = check_verdict(gate_argv, command, shell,
-                                                   tool, scratch, newline)
-                shown = command if len(command) < 50 else command[:47] + "..."
-                shown = shown.replace("\n", "\\n").replace("\v", "\\v")
-                tag = f"{shell}/{tool}" + ("/crlf" if newline else "")
-                if (py_code == cpp_code
-                        and normalise(py_text) == normalise(cpp_text)):
-                    if options.verbose:
-                        print(f"ok   [{tag}] {shown!r} -> "
-                              f"{'denied' if py_code else 'allowed'}")
-                    continue
-                failures += 1
-                print(f"DIFF [{tag}] {shown!r}", file=sys.stderr)
-                print(f"  python (exit {py_code}):\n{normalise(py_text)}",
-                      file=sys.stderr)
-                print(f"  c++    (exit {cpp_code}):\n{normalise(cpp_text)}",
-                      file=sys.stderr)
+    # Every launch is queued up front and read back in corpus order, so the
+    # report is the one a sequential run prints. The pool is left before the
+    # scratch directory the --check-file cases write into.
+    with tempfile.TemporaryDirectory() as scratch, \
+            concurrent.futures.ThreadPoolExecutor(options.jobs) as pool:
+        def both(verdict, *args):
+            return (pool.submit(verdict, reference_argv, *args),
+                    pool.submit(verdict, gate_argv, *args))
 
-        for arguments, _, _ in ARGV_CASES:
+        check_runs = [(command, shell, tool, newline,
+                       both(check_verdict, command, shell, tool, scratch, newline))
+                      for newline, cases in (("", corpus), ("\r\n", CRLF_CASES))
+                      for command, shell, tool in cases]
+        argv_runs = [(arguments, both(argv_verdict, arguments))
+                     for arguments, _, _ in ARGV_CASES]
+        hook_runs = [(label, both(hook_verdict, payload))
+                     for label, payload in HOOK_CASES]
+        self_test_runs = [(label, command, pool.submit(launch, command))
+                          for label, command in (
+                              ("python", reference_argv + ["--self-test"]),
+                              ("c++", gate_argv + ["--self-test"]))]
+
+        for command, shell, tool, newline, (py_run, cpp_run) in check_runs:
             compared += 1
-            py_code, py_text = argv_verdict(reference_argv, arguments)
-            cpp_code, cpp_text = argv_verdict(gate_argv, arguments)
+            py_code, py_text = py_run.result()
+            cpp_code, cpp_text = cpp_run.result()
+            shown = command if len(command) < 50 else command[:47] + "..."
+            shown = shown.replace("\n", "\\n").replace("\v", "\\v")
+            tag = f"{shell}/{tool}" + ("/crlf" if newline else "")
+            if (py_code == cpp_code
+                    and normalise(py_text) == normalise(cpp_text)):
+                if options.verbose:
+                    print(f"ok   [{tag}] {shown!r} -> "
+                          f"{'denied' if py_code else 'allowed'}")
+                continue
+            failures += 1
+            print(f"DIFF [{tag}] {shown!r}", file=sys.stderr)
+            print(f"  python (exit {py_code}):\n{normalise(py_text)}",
+                  file=sys.stderr)
+            print(f"  c++    (exit {cpp_code}):\n{normalise(cpp_text)}",
+                  file=sys.stderr)
+
+        for arguments, (py_run, cpp_run) in argv_runs:
+            compared += 1
+            py_code, py_text = py_run.result()
+            cpp_code, cpp_text = cpp_run.result()
             if (py_code == cpp_code
                     and normalise(py_text) == normalise(cpp_text)):
                 # ascii(), not repr(): a case carries a non-ASCII digit, and a
@@ -676,15 +738,17 @@ def main() -> int:
                   f"  c++    (exit {cpp_code}):\n{normalise(cpp_text)}",
                   file=sys.stderr)
 
-        for label, payload in HOOK_CASES:
+        for label, (py_run, cpp_run) in hook_runs:
             compared += 1
-            py_code, py_text = hook_verdict(reference_argv, payload)
-            cpp_code, cpp_text = hook_verdict(gate_argv, payload)
+            py_code, py_text = py_run.result()
+            cpp_code, cpp_text = cpp_run.result()
             # Fail OPEN is the contract, so a crash or a hang is a failure even
             # when both halves manage it: `catch (...)` does not see a Windows
             # stack overflow, and a dead hook returns no verdict at all.
-            crashed = [name for name, code in (("python", py_code),
-                                               ("c++", cpp_code)) if code != 0]
+            crashed = [f"{name} {text}" if code == -1 else name
+                       for name, code, text in (("python", py_code, py_text),
+                                                ("c++", cpp_code, cpp_text))
+                       if code != 0]
             if crashed:
                 failures += 1
                 print(f"CRASH [hook] {label}: {', '.join(crashed)} exited "
@@ -701,18 +765,20 @@ def main() -> int:
             print(f"DIFF [hook] {label}\n  python:\n{normalise(py_text)}\n"
                   f"  c++:\n{normalise(cpp_text)}", file=sys.stderr)
 
-    # Both self-tests too: parity says the two agree, not that either is right.
-    # Two implementations can agree on a wrong answer, and the wiring and path
-    # checks live only in the self-tests -- nothing in the corpus reaches them.
-    broken = 0
-    for label, command in (("python", [sys.executable,
-                                       os.path.join(HOOKS, "ask_user_gate.py"),
-                                       "--self-test"]),
-                           ("c++", [options.exe, "--self-test"])):
-        result = subprocess.run(command, capture_output=True)
-        text = (result.stdout + result.stderr).decode("utf-8", "replace").strip()
-        print(f"{label} --self-test: {text}")
-        broken += 1 if result.returncode else 0
+        # Both self-tests too: parity says the two agree, not that either is
+        # right. Two implementations can agree on a wrong answer, and the
+        # wiring and path checks live only in the self-tests -- nothing in the
+        # corpus reaches them.
+        broken = 0
+        for label, command, run in self_test_runs:
+            result = run.result()
+            if result is None:
+                text = timed_out(command)[1]
+            else:
+                text = (result.stdout + result.stderr).decode("utf-8",
+                                                              "replace").strip()
+            print(f"{label} --self-test: {text}")
+            broken += 1 if result is None or result.returncode else 0
 
     print(f"{compared - failures}/{compared} parity cases agree")
     return 1 if (failures or broken) else 0

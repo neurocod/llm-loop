@@ -31,8 +31,10 @@ BINARY = os.path.join(PLUGIN, "hooks",
 
 
 def _run(argv):
+    # stdin closed, not pytest's: whatever this starts never waits on a payload.
     return subprocess.run([sys.executable] + argv, capture_output=True,
-                          text=True, encoding="utf-8", errors="replace")
+                          stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                          errors="replace")
 
 
 def test_reference_self_test():
@@ -92,6 +94,16 @@ def test_reference_command_line(argv, code, text):
     assert got_code == code, got_text
     if text is not None:
         assert _PARITY.normalise(got_text) == _PARITY.normalise(text)
+
+
+def test_a_launch_that_never_answers_is_a_verdict_naming_its_argv(monkeypatch):
+    """A hung half fails its case by name instead of hanging the suite."""
+    monkeypatch.setattr(_PARITY, "LAUNCH_TIMEOUT", 2)
+    sleeper = [sys.executable, "-c", "import time; time.sleep(600)"]
+    code, text = _PARITY.argv_verdict(sleeper, ["--check", "ls"])
+    assert code == -1, text
+    launched = sleeper + ["--platform", "windows", "--check", "ls"]
+    assert text == f"<no answer in 2 s from {ascii(launched)}>"
 
 
 def test_port_options_are_the_reference_options():
