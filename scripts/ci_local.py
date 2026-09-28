@@ -34,13 +34,25 @@ from typing import Dict, Iterator, List, NamedTuple, NoReturn, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "tests.yml"
-# Outside the checkout on purpose: a venv inside it would be walked by every
-# tool that walks the tree, and would be one more thing .gitignore must name.
-# Keyed on the checkout: two worktrees of this repository run at once, and a
-# shared venv is `uv venv --clear`ed by one under the other's tests, and holds
-# an editable install of whichever checkout ran `pip install -e` last.
-VENVS = (Path.home() / ".cache" / "llm-loop-ci"
-         / hashlib.sha256(str(ROOT).lower().encode()).hexdigest()[:12])
+
+
+def venv_root(checkout: Path, windows: bool = os.name == "nt") -> Path:
+    """Where one checkout's venvs live.
+
+    Outside the checkout on purpose: a venv inside it would be walked by every
+    tool that walks the tree, and would be one more thing .gitignore must name.
+    Keyed on the checkout: two worktrees of this repository run at once, and a
+    shared venv is `uv venv --clear`ed by one under the other's tests, and holds
+    an editable install of whichever checkout ran `pip install -e` last. Case
+    is folded only where the filesystem folds it: on POSIX `/Foo` and `/foo`
+    are two checkouts.
+    """
+    key = str(checkout).lower() if windows else str(checkout)
+    return (Path.home() / ".cache" / "llm-loop-ci"
+            / hashlib.sha256(key.encode()).hexdigest()[:12])
+
+
+VENVS = venv_root(ROOT)
 
 
 class WorkflowShapeError(ValueError):
@@ -384,6 +396,154 @@ def wrap_script(script: str) -> str:
     return script
 
 
+# How long a killed tree may take to leave its Windows job before the kill is
+# reported as incomplete. The job of a python child and grandchild measured
+# empty on the first query after TerminateJobObject (under 1 ms, 5 runs,
+# 2026-09-28); the bound only matters when something is wrong.
+TREE_EXIT_TIMEOUT = 30.0
+
+# run_tree polls in slices of this, sleeping in between, rather than calling
+# Popen.wait. On Windows an unbounded wait() blocks in WaitForSingleObject and
+# a Ctrl+C is not seen until the step ends by itself; wait(timeout) is worse on
+# 3.9: a Ctrl+C landing after the slice ran out makes its interrupt handler wait
+# a NEGATIVE time, which WaitForSingleObject reads as nearly forever (measured:
+# the interrupt was held until the step exited). time.sleep() is interruptible.
+_WAIT_SLICE = 0.1
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    _kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    _kernel32.QueryInformationJobObject.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD))
+    _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    class _JobAccounting(ctypes.Structure):
+        # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+        _fields_ = [("TotalUserTime", ctypes.c_int64),
+                    ("TotalKernelTime", ctypes.c_int64),
+                    ("ThisPeriodTotalUserTime", ctypes.c_int64),
+                    ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                    ("TotalPageFaultCount", wintypes.DWORD),
+                    ("TotalProcesses", wintypes.DWORD),
+                    ("ActiveProcesses", wintypes.DWORD),
+                    ("TotalTerminatedProcesses", wintypes.DWORD)]
+
+    _JOB_BASIC_ACCOUNTING = 1
+    _PROCESS_TERMINATE_AND_SET_QUOTA = 0x0001 | 0x0100
+
+    def _win_check(ok) -> None:
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    class _ProcessTree:
+        """A job object: every descendant of the step joins it, including one
+        whose parent has already exited, and it can be counted until empty.
+
+        The process is assigned right after CreateProcess returns, not
+        created suspended: a child spawned in that window would escape, and a
+        shell (or uv) is still loading its runtime then.
+        No kill-on-close: a normal step's leftovers outlive the step, as they
+        do on a runner.
+        """
+        POPEN: Dict[str, object] = {}
+
+        def __init__(self) -> None:
+            self.job = _kernel32.CreateJobObjectW(None, None)
+            _win_check(self.job)
+
+        def adopt(self, process: subprocess.Popen) -> None:
+            handle = _kernel32.OpenProcess(_PROCESS_TERMINATE_AND_SET_QUOTA, False,
+                                           process.pid)
+            _win_check(handle)
+            try:
+                _win_check(_kernel32.AssignProcessToJobObject(self.job, handle))
+            finally:
+                _kernel32.CloseHandle(handle)
+
+        def active(self) -> int:
+            info = _JobAccounting()
+            _win_check(_kernel32.QueryInformationJobObject(
+                self.job, _JOB_BASIC_ACCOUNTING, ctypes.byref(info),
+                ctypes.sizeof(info), None))
+            return info.ActiveProcesses
+
+        def kill(self, process: subprocess.Popen) -> None:
+            _kernel32.TerminateJobObject(self.job, 1)
+            process.kill()  # in case adopt() never ran or failed
+            process.wait()
+            deadline = time.monotonic() + TREE_EXIT_TIMEOUT
+            while self.active() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if self.active():
+                print(f"ci_local: {self.active()} process(es) of the interrupted "
+                      f"step still alive after {TREE_EXIT_TIMEOUT:.0f} s",
+                      file=sys.stderr)
+
+        def close(self) -> None:
+            _kernel32.CloseHandle(self.job)
+else:
+    import signal
+
+    class _ProcessTree:
+        """A session of its own: the step's shell leads a process group that
+        every descendant inherits unless it makes a session of its own.
+
+        SIGKILL to the group stops every member from running any more code at
+        once, so nothing of it writes to the venv after kill() returns; a
+        member left a zombie is reaped by init, not waited for here.
+        """
+        POPEN: Dict[str, object] = {"start_new_session": True}
+
+        def adopt(self, process: subprocess.Popen) -> None:
+            pass  # start_new_session made its group
+
+        def kill(self, process: subprocess.Popen) -> None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.kill()
+            process.wait()
+
+        def close(self) -> None:
+            pass
+
+
+def run_tree(argv: List[str], **popen) -> int:
+    """subprocess.run(argv, **popen).returncode, for the whole process TREE.
+
+    subprocess.run kills only its direct child when interrupted: a step's
+    shell dies, the python under it (one that ignores SIGINT, or a
+    grandchild) keeps running, and the caller's `exclusive()` then releases
+    the venv lock while it still runs in the venv -- the next waiting run
+    `--clear`s the venv under it. Here any exception, Ctrl+C included, kills
+    every descendant and waits for them BEFORE it propagates, so the lock is
+    released over a dead tree.
+    """
+    tree = _ProcessTree()
+    try:
+        process = subprocess.Popen(argv, **tree.POPEN, **popen)
+        try:
+            tree.adopt(process)
+            while process.poll() is None:
+                time.sleep(_WAIT_SLICE)
+            return process.returncode
+        except BaseException:
+            tree.kill(process)
+            raise
+    finally:
+        tree.close()
+
+
 def run_steps(steps: List[Step], env: Dict[str, str], log, cwd: Path = ROOT
               ) -> Optional[str]:
     """None when every step passed, else the name of the first that failed.
@@ -398,8 +558,8 @@ def run_steps(steps: List[Step], env: Dict[str, str], log, cwd: Path = ROOT
             argv = step_command(path)
             log.write(f"\n== {label}\n$ {' '.join(argv)}\n{step.script.rstrip()}\n--\n")
             log.flush()
-            code = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                  stdout=log, stderr=subprocess.STDOUT).returncode
+            code = run_tree(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=log, stderr=subprocess.STDOUT)
             if code:
                 log.write(f"-- exit {code}\n")
                 return f"{label} (exit {code})"
@@ -493,7 +653,7 @@ def run_version(version: str, steps: List[Step], log_path: Path) -> Optional[str
         create = ["uv", "venv", "--clear", "--seed", "--python", version, str(venv)]
         log.write("$ " + " ".join(create) + "\n")
         log.flush()
-        if subprocess.run(create, stdout=log, stderr=subprocess.STDOUT).returncode:
+        if run_tree(create, stdout=log, stderr=subprocess.STDOUT):
             return "create the venv"
         env = step_env(venv)
         wrong = check_interpreters(venv, env, steps, log)
