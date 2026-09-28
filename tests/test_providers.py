@@ -14,12 +14,13 @@ from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
                                    usage_source_for)
 
+from _runfixtures import isolated_run
+
 
 @pytest.fixture(autouse=True)
-def _restore_streams():
-    out, err = sys.stdout, sys.stderr
-    yield
-    sys.stdout, sys.stderr = out, err
+def _isolated_run(tmp_path, monkeypatch):
+    with isolated_run(monkeypatch, tmp_path):
+        yield
 
 
 @pytest.fixture

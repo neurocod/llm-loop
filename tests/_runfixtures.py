@@ -14,6 +14,7 @@ option reaches every pin the day it reaches `clispec`.
 """
 
 import argparse
+import atexit
 import logging
 import os
 import sys
@@ -40,7 +41,8 @@ def isolated_run(monkeypatch, tmp_path):
     `app_name` the run used, so a caller cannot name the wrong one.
 
     Called explicitly, from a thin autouse fixture in each file that stages runs;
-    `conftest.py` fails any test that leaves a record open without it.
+    `conftest.py` fails any test that leaves a record open, the root moved or
+    a stream replaced without it.
     """
     logs = tmp_path / "logs"
     monkeypatch.setattr(console, "LOG_DIR", logs)
@@ -50,10 +52,22 @@ def isolated_run(monkeypatch, tmp_path):
     try:
         yield logs
     finally:
-        exitlog.finish()
+        finish_record()
         sys.stdout, sys.stderr = streams
         projectroot.set_project_root(root)
         _drop_loggers_writing_under(logs)
+
+
+def finish_record(reason=None):
+    """Finish the process's open exit record, if any, and take its closing line
+    off `atexit` — else it would print again at interpreter exit for a run that
+    ended long ago. Returns the record it finished (None when there was none);
+    `exitlog._record` is left for the caller, who knows what belongs there."""
+    record = exitlog.current()
+    if record is not None:
+        atexit.unregister(record.finish)
+        record.finish(reason)
+    return record
 
 
 def _drop_loggers_writing_under(log_dir):
