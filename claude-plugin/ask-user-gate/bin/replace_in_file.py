@@ -83,7 +83,27 @@ def is_uniform_crlf(text: str) -> bool:
 
 def apply_replacement(text: str, old: str, new: str, regex: bool,
                       count: "int | None", crlf: bool) -> tuple[str, int]:
-    """Return (new_text, hits). `count` None means "any number, but > 0"."""
+    """Return (new_text, hits). `count` None means "any number, but > 0".
+
+    An empty `old` is refused here, in the engine, and not only by a CLI: it
+    matches between every two characters, so `--count any` turns `ab` into
+    `XaXbX` -- and an empty `old` is exactly what a value lost on the way looks
+    like (`--old=$x`, `--old "$x"` with $x unset). try_patch bypassed the CLI
+    check and certified such a run under --expect-fail (2026-09-27).
+
+    "Empty" means the empty STRING, in both modes, and not "a regex that can
+    match empty". `^`, `$`, `\\b` or a lookahead are zero-width on purpose --
+    the way to insert at every line start or before a word -- and are always
+    something the caller typed, never the residue of a lost value. A written
+    pattern that degenerately matches everywhere (`x*`, `(?:)`) is left to
+    the count: the default of 1 refuses it on any text longer than nothing,
+    and `--count any` is the caller saying any number is right.
+    """
+    if not old:
+        raise EditError(
+            "the text to find is empty, and an empty pattern matches between "
+            "every two characters (a value lost on the way looks the same); "
+            "nothing written")
     body = text.replace(CRLF, "\n") if crlf else text
     if regex:
         try:
@@ -163,10 +183,9 @@ def add_edit_arguments(parser: argparse.ArgumentParser) -> None:
     reported as success (exit 0). --remove says the operation by name, and a
     lost --remove value is a bare --remove, which argparse refuses.
 
-    try_patch.py keeps a bare --new as "" on purpose: it puts the file back
-    after the run, so there a lost value costs one misleading test run, not the
-    text. The gate's `--check` refuses its bare form for the same reason as
-    here -- ask_user_gate.py, at its add_argument.
+    try_patch.py refuses it too, for its own reason -- see its --new
+    add_argument. So does the gate's `--check` -- ask_user_gate.py, at its
+    add_argument.
 
     Every flag is collected with action="append" so that a repeat is refused in
     resolve_edit(); argparse's default keeps only the last one, and
@@ -195,8 +214,10 @@ def resolve_edit(parser: argparse.ArgumentParser,
 
     Refused rather than resolved, because a guess here writes a file: a flag
     given twice, --remove mixed with --old/--new, an empty --new (see
-    add_edit_arguments), and an empty TEXT to find, which matches between
-    every two characters.
+    add_edit_arguments), and an empty TEXT to find. The last one is
+    apply_replacement's rule and it refuses on its own; it is checked here as
+    well only so that this CLI calls it a usage error (exit 2, like its
+    siblings) and names the flag that came empty, --old or --remove.
     """
     for name in ("old", "new", "remove"):
         given = getattr(options, name) or []

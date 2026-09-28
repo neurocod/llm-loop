@@ -1074,8 +1074,8 @@ def build_parser() -> _Parser:
     # `--check ""` never arrives from Windows PowerShell 5.1, which drops an
     # empty argument to a native program; argparse then sees --check followed
     # by the next flag, or by nothing. Reading that bare --check as "" (what
-    # try_patch does for a bare --new) was declined: this CLI answers "is THIS
-    # command allowed?", and a value lost on the way -- an empty `$cmd`, a
+    # try_patch once did for a bare --new) was declined: this CLI answers "is
+    # THIS command allowed?", and a value lost on the way -- an empty `$cmd`, a
     # forgotten argument -- would come back "allowed", a verification that
     # cannot fail. An empty command is a corner worth checking, not an answer
     # worth defaulting to, so it gets a spelling that no shell can drop.

@@ -58,7 +58,7 @@ Usage:
   python try_patch.py --file a.ts --old X --new Y \\
                       --file a.ts --old P --new Q -- npm test
 
-  # deleting a line: --remove TEXT is --old TEXT --new ""
+  # deleting a line: --remove TEXT (an empty --new is refused)
   python try_patch.py --file a.ts --remove 'guard();' --expect-fail -- npm test
 
   python try_patch.py --selftest   # pins the restore contract, no repo
@@ -112,11 +112,15 @@ class Triple(argparse.Action):
         order = getattr(namespace, "_order")
         key = option_string.lstrip("-")
         if key == "remove":
-            # `--remove X` is `--old X --new ""`, filed as that pair so the
-            # zip in collect_edits keeps pairing by position.
+            # `--remove X` is filed as the pair (X, "") so the zip in
+            # collect_edits keeps pairing by position -- the one way an empty
+            # replacement gets in (see the --new add_argument).
             order.setdefault("old", []).append(values)
             order.setdefault("new", []).append("")
             return
+        if key == "new" and not values:
+            parser.error("--new got no text (a value lost on the way looks "
+                         "the same); to delete, use --remove TEXT")
         order.setdefault(key, []).append(values)
 
 
@@ -204,17 +208,27 @@ def main() -> int:
     parser.add_argument("--file", action=Triple, metavar="FILE",
                         help="file to edit (repeatable, with --old/--new)")
     parser.add_argument("--old", action=Triple, metavar="TEXT")
-    # A bare --new deletes --old. It exists because the obvious spelling,
-    # `--new ""`, never reaches us from Windows PowerShell 5.1: it drops an
-    # empty argument to a native program, and argparse then saw `--new` followed
-    # by the next flag -- 13 refused runs in three days of the agent loop's logs
-    # (2026-09-25..27). The printed diff still shows what was deleted.
+    # An empty --new -- bare, `--new ""`, `--new=` -- is refused; deleting is
+    # --remove TEXT. A bare --new used to delete, because PowerShell 5.1 drops
+    # the "" of `--new ""` and argparse then refused --new followed by the next
+    # flag (13 such runs in three days of the agent loop's logs, 2026-09-25..27).
+    # But every empty spelling is also what a value lost on the way looks like
+    # (`--new $x`, $x unset), and this script's usual run is --expect-fail:
+    # the lost replacement deletes, the deletion breaks the command, and the
+    # run reports "failed as expected" -- a pin certified by a mutation nobody
+    # chose. The restore does not undo that; the file comes back, the verdict
+    # stays. Refusing only under --expect-fail was declined: that is the main
+    # use, and a spelling that works until the flag is added teaches the wrong
+    # one. --remove names the operation and cannot be lost quietly (a bare
+    # --remove is argparse's error), so the price is one retry after a refusal
+    # that names it. nargs="?" with const None only so that a bare --new
+    # reaches Triple's refusal instead of argparse's vaguer one.
     parser.add_argument("--new", action=Triple, metavar="TEXT", nargs="?",
-                        const="",
-                        help="replacement; bare --new (or --new \"\") deletes")
+                        const=None,
+                        help="replacement; never empty -- to delete, use "
+                             "--remove")
     parser.add_argument("--remove", action=Triple, metavar="TEXT",
-                        help="delete TEXT: same as --old TEXT --new \"\" "
-                             "(a regex under --regex)")
+                        help="delete TEXT (a regex under --regex)")
     parser.add_argument("--regex", action="store_true",
                         help="treat every --old as a regex (MULTILINE)")
     parser.add_argument("--count", type=parse_count, default=1, metavar="N",
@@ -559,21 +573,52 @@ def _case_same_file_spelled_two_ways(work: Path) -> None:
     _expect_bytes(victim, GUARDS, result)
 
 
-def _case_a_bare_new_deletes(work: Path) -> None:
-    """`--new ""` as PowerShell 5.1 delivers it: the empty argument is gone.
+def _expect_refused_unrun(work: Path, victim: Path, args: "list[str]",
+                          names: str) -> None:
+    """`args` under --expect-fail with a FAILING command: exit 2, nothing run.
 
-    Both places it lands in practice: before the next flag and before the bare
-    `--`. The command sees neither guard, so both deletions reached it.
+    The failing command is the point: it is what made the vacuous pin pass --
+    a mutation nobody chose broke the command, and the run said "failed as
+    expected".
+    """
+    result = _run(work, "--expect-fail", *args, *CMD_FAIL)
+    shown = f"{args}: exit {result.returncode}\n{result.stdout}{result.stderr}"
+    _expect(result.returncode == 2, f"not refused -- {shown}")
+    _expect("try_patch: running" not in result.stdout,
+            f"the command ran -- {shown}")
+    _expect(names in " ".join(result.stderr.split()),
+            f"the refusal does not say {names!r} -- {shown}")
+    _expect_bytes(victim, GUARDS, result)
+    _expect_no_journal(work)
+
+
+def _case_an_empty_new_is_refused(work: Path) -> None:
+    """Every empty --new, including the bare one PowerShell 5.1 makes of
+    `--new ""` -- before the next flag and before the bare `--`, the two places
+    it lands. Deleting is --remove (see the --new add_argument).
     """
     victim = _victim(work)
-    result = _run(work, "--file", "victim.cpp", "--old", "guardA = true;\n",
-                  "--new", "--file", "victim.cpp", "--old", "guardB = true;\n",
-                  "--new", "--", sys.executable, "-c",
-                  "import pathlib, sys; t = pathlib.Path('victim.cpp').read_text();"
-                  " sys.exit(0 if t == 'guardC = true;\\n' else 9)")
-    _expect(result.returncode == 0,
-            f"exit {result.returncode}\n{result.stdout}{result.stderr}")
-    _expect_bytes(victim, GUARDS, result)
+    old = ["--file", "victim.cpp", "--old", "guardA = true;"]
+    for args in ([*old, "--new", *_flip("guardB")],
+                 [*_flip("guardB"), *old, "--new"],
+                 [*old, "--new="],
+                 [*old, "--new", ""]):
+        _expect_refused_unrun(work, victim, args, "use --remove TEXT")
+
+
+def _case_an_empty_old_is_refused(work: Path) -> None:
+    """The measured repro: `--old= --new X --count any` made `ab` `XaXbX`.
+
+    Refused by apply_replacement itself, so every spelling that ends in an
+    empty pattern is covered, --regex and --remove included.
+    """
+    victim = _victim(work)
+    edit = ["--file", "victim.cpp"]
+    for args in ([*edit, "--old=", "--new", "X", "--count", "any"],
+                 [*edit, "--regex", "--old=", "--new", "X", "--count", "any"],
+                 [*edit, "--remove=", "--count", "any"],
+                 [*_flip("guardA"), *edit, "--old", "", "--new", "X"]):
+        _expect_refused_unrun(work, victim, args, "the text to find is empty")
 
 
 def _case_remove_pairs_with_its_own_file(work: Path) -> None:
@@ -937,7 +982,8 @@ SELFTEST_CASES = (
     _case_stacked_edits_of_one_file,
     _case_stacked_edits_all_reach_the_command,
     _case_same_file_spelled_two_ways,
-    _case_a_bare_new_deletes,
+    _case_an_empty_new_is_refused,
+    _case_an_empty_old_is_refused,
     _case_remove_pairs_with_its_own_file,
     _case_failing_command_restores_and_reports,
     _case_expect_fail_accepts_a_failing_command,

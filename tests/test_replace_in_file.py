@@ -10,6 +10,7 @@ operator does, so the dropped token is the shell's doing rather than this
 file's assumption.
 """
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -107,12 +108,50 @@ def test_an_edit_still_needs_both_halves(tmp_path, edit):
     _assert_refused(_run(str(victim), *edit, "--count", "any"), victim)
 
 
-@pytest.mark.parametrize("edit", [["--remove", ""], ["--old", "", "--new", "x"]],
-                         ids=["remove", "old"])
+@pytest.mark.parametrize("edit", [["--remove", ""], ["--old", "", "--new", "x"],
+                                  ["--regex", "--old=", "--new", "x"]],
+                         ids=["remove", "old", "regex"])
 def test_an_empty_pattern_is_refused(tmp_path, edit):
     victim = _victim(tmp_path)
     _assert_refused(_run(str(victim), *edit, "--count", "any"), victim,
                     "got no text")
+
+
+# --- ... and the engine refuses it on its own, for its other caller (try_patch) ----
+
+def _engine():
+    """The script as a module: the CLI's own refusal shadows the engine's."""
+    spec = importlib.util.spec_from_file_location("replace_in_file_ref", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("regex", [False, True], ids=["literal", "regex"])
+def test_the_engine_refuses_an_empty_pattern(regex):
+    engine = _engine()
+    # `ab` -> `XaXbX` was the measured result before the refusal moved here.
+    with pytest.raises(engine.EditError, match="the text to find is empty"):
+        engine.apply_replacement("ab", "", "X", regex, None, False)
+
+
+def test_a_zero_width_regex_is_an_insertion(tmp_path):
+    # "Empty" is the empty string, not "can match empty": a lookahead (or ^, $,
+    # \b) is typed on purpose, and inserting there is its use.
+    victim = _victim(tmp_path)
+    _assert_wrote(_run(str(victim), "--regex", "--old", "(?=guard)",
+                       "--new", "no", "--count", "2"),
+                  victim, TEXT.replace("guard", "noguard"))
+
+
+def test_a_regex_matching_empty_everywhere_is_left_to_the_count(tmp_path):
+    # `x*` matches between every two characters like "" does; the default
+    # --count 1 is what refuses it (exit 1, not the usage error of exit 2).
+    victim = _victim(tmp_path)
+    result = _run(str(victim), "--regex", "--old", "x*", "--new", "Y")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "expected 1 occurrence(s)" in result.stderr
+    assert victim.read_bytes().decode("utf-8") == TEXT
 
 
 # --- a repeated flag is refused, not silently narrowed to its last value ----------
