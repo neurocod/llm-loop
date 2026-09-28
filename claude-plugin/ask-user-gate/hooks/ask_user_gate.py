@@ -1031,6 +1031,22 @@ class _Parser(argparse.ArgumentParser):
         return [(_AmbiguousOption(option_string, names), option_string)
                 + (None,) * (_option_tuple_fields() - 2)]
 
+    def _get_values(self, action, arg_strings):
+        # One more rule argparse moved: 3.9 and 3.10 strip the first `--` from
+        # an OPTION's values too, not only from a positional's, and the only
+        # way one reaches an option is glued: `--check=--`. The value then came
+        # back as [] -- a traceback, exit 1, which is "denied" -- where 3.11+
+        # and the port read the command `--` (and refuse `--shell=--` /
+        # `--platform=--` as no choice, where [] had passed as one). Pinned to
+        # the newer reading: the value, converted and checked as 3.11+ does.
+        # Measured on 3.9.25, 3.10.21, 3.11.16 and 3.14.7; parity_check's
+        # `=--` ARGV_CASES bite on 3.9/3.10 only.
+        if action.option_strings and action.nargs is None and arg_strings == ["--"]:
+            value = self._get_value(action, "--")
+            self._check_value(action, value)
+            return value
+        return super()._get_values(action, arg_strings)
+
     def error(self, message):
         if message.startswith("argument --check: expected one argument"):
             message += " (the empty command is --check=)"

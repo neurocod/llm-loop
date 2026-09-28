@@ -50,9 +50,24 @@ def test_reference_check_file_it_cannot_read_says_so(tmp_path):
 
 
 def _parity_module():
-    spec = importlib.util.spec_from_file_location("parity_check_ref", PARITY)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    """parity_check, loaded by path at collection (ARGV_CASES parametrizes).
+
+    As a script it puts hooks/ first on sys.path and imports ask_user_gate by
+    name; both are undone here, so the rest of the session resolves those names
+    as it would without this file. The module keeps its own reference.
+    """
+    saved_path = list(sys.path)
+    saved_module = sys.modules.get("ask_user_gate")
+    try:
+        spec = importlib.util.spec_from_file_location("parity_check_ref", PARITY)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.path[:] = saved_path
+        if saved_module is None:
+            sys.modules.pop("ask_user_gate", None)
+        else:
+            sys.modules["ask_user_gate"] = saved_module
     return module
 
 
@@ -68,10 +83,15 @@ def test_reference_command_line(argv, code, text):
     holds the reference to the table's own answers everywhere else, through
     the same argv_verdict, so both read one output the same way.
     """
+    # The table's rule, checked here rather than trusted to its comment: a
+    # verdict with no text would pass on a crash (exit 1) or on hook mode's
+    # silent pass-through (exit 0).
+    assert code == 2 or text is not None, "a verdict row must name its text"
     got_code, got_text = _PARITY.argv_verdict([sys.executable, SCRIPT], argv)
+    assert not got_text.startswith("<stderr>"), got_text
     assert got_code == code, got_text
     if text is not None:
-        assert got_text == text
+        assert _PARITY.normalise(got_text) == _PARITY.normalise(text)
 
 
 def test_port_options_are_the_reference_options():
@@ -88,8 +108,25 @@ def test_port_options_are_the_reference_options():
     block = re.search(r"constexpr CliOption kOptions\[\] = \{(.*?)\n\};", source,
                       re.DOTALL)
     assert block, "kOptions initializer not found in ask_user_gate.cpp"
-    port = {name: arity == "Value" for name, arity in
-            re.findall(r'\{"([^"]+)", Arity::(\w+)\}', block.group(1))}
+    # What the compiler reads: a commented-out entry is no entry.
+    body = re.sub(r"//[^\n]*|/\*.*?\*/", "", block.group(1), flags=re.DOTALL)
+    entry = r'\{\s*"([^"\\]+)"\s*,\s*Arity::(\w+)\s*\}'
+    # Every character is an entry, a comma or whitespace: an entry spelled
+    # some other way fails here instead of dropping out of the comparison.
+    leftover = re.sub(r"[\s,]+", " ", re.sub(entry, "", body)).strip()
+    assert not leftover, (f"kOptions holds something other than "
+                          f"{{\"name\", Arity::X}} entries: {leftover!r}")
+    entries = re.findall(entry, body)
+    names = [name for name, _ in entries]
+    # The port takes the FIRST match, and a second copy of a name makes every
+    # prefix of it ambiguous there -- a dict here would swallow it.
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    assert not duplicates, f"kOptions repeats {duplicates}"
+    arities = {arity for _, arity in entries}
+    assert arities <= {"None", "Value"}, (
+        f"kOptions uses arities {sorted(arities - {'None', 'Value'})} this "
+        f"test does not know; teach it what they take")
+    port = {name: arity == "Value" for name, arity in entries}
     assert port == _PARITY.reference_options()
 
 

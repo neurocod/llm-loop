@@ -194,6 +194,27 @@ SELF_TEST = "<self-test>"
 # sed -i is refused under bash and not under PowerShell, so this command tells
 # which shell an abbreviated --shell actually set.
 SED = "sed -i s/a/b/ f"
+# Refused on every host, with the Git Bash note on Windows only, so its text
+# tells which platform an abbreviated --platform actually set.
+CHAIN = "cd x && echo hi > out.txt"
+
+
+def denied(command: str, shell: str = "bash", tool: str = "Bash",
+           windows: bool = True) -> str:
+    """The refusal the reference prints for `command` under these options.
+
+    Computed in process, not copied: the refusal's wording is the corpus's to
+    pin (above), and what an ARGV_CASES row pins is which shell, tool and
+    platform its argv delivered to scan() -- the remedy for Monitor, the Git
+    Bash note, which of two repeated --check values won. It also keeps a crash
+    out of a row that expects a refusal: a traceback exits 1 as well.
+    """
+    findings = reference.scan(command, shell, windows, tool)
+    if not findings:
+        raise ValueError(f"{command!r} is allowed under {shell}/{tool}; "
+                         f"an exit-1 row needs a command that is refused")
+    return reference.render(findings) + "\n"
+
 
 # The command line itself: the corpus above goes in through --check-file, so it
 # never sees how a VALUE is found. These are the shapes an operator's shell
@@ -210,10 +231,12 @@ SED = "sed -i s/a/b/ f"
 # to the code and, where it is not None, to the text: that half needs no
 # binary, so it is the one every checkout and every CI interpreter runs. A row
 # added here is therefore pinned twice by construction, instead of being written
-# into a second list that nothing keeps in step. Text is None where it is a
-# refusal (pinned by the corpus above, not here) or a usage error (always
-# "<usage error>"); a 0 always names its text, since exit 0 with no output is
-# also what hook mode returns on the empty stdin argv_verdict gives it.
+# into a second list that nothing keeps in step. Text is None for a usage error
+# only (always "<usage error>"), and a verdict always names its text -- the
+# pytest reader refuses a row that does not: a 0 because exit 0 with no output
+# is also what hook mode returns on the empty stdin argv_verdict gives it, a 1
+# because a traceback exits 1 too. A refusal's text is denied(), compared
+# through normalise() as the halves are.
 ARGV_CASES = [
     (["--check="], 0, ALLOWED),
     (["--check=", "--shell", "powershell"], 0, ALLOWED),
@@ -254,7 +277,8 @@ ARGV_CASES = [
     (["--help", "-= x"], 0, HELP),
     (["-= x", "--help"], 2, None),
     (["--help", "--c"], 0, HELP),             # ... an ambiguous prefix as well
-    (["--check", "-n 1; cd y && ls"], 1, None),   # dash-led with a space: a value
+    # dash-led with a space: a value
+    (["--check", "-n 1; cd y && ls"], 1, denied("-n 1; cd y && ls")),
     (["--tool", "--check", "cd x && ls"], 2, None),
     (["--tool", "--check=cd x && ls"], 2, None),  # a flag, space or not
     (["--check", "--sh=a b"], 2, None),       # an abbreviation, space or not
@@ -269,9 +293,11 @@ ARGV_CASES = [
     # the verdict row shows WHICH option it set, not just that it parsed.
     (["--sh", "powershell", "--check", SED], 0, ALLOWED),
     (["--sh=powershell", "--check", SED], 0, ALLOWED),
-    (["--check", SED], 1, None),              # the control: bash refuses it
-    (["--t=Monitor", "--check", "sleep 5"], 1, None),
-    (["--pl", "posix", "--check", "ls"], 0, ALLOWED),
+    (["--check", SED], 1, denied(SED)),       # the control: bash refuses it
+    # Monitor's remedy for a sleep is not Bash's (see `--tool=--` below).
+    (["--t=Monitor", "--check", "sleep 5"], 1, denied("sleep 5", tool="Monitor")),
+    (["--pl", "posix", "--check", CHAIN], 1, denied(CHAIN, windows=False)),
+    (["--check", CHAIN], 1, denied(CHAIN)),   # the control: the Windows note
     (["--plat=bogus", "--check", "ls"], 2, None),
     (["--check-f", os.devnull], 0, ALLOWED),
     (["--check-fi=" + os.devnull], 0, ALLOWED),
@@ -312,11 +338,20 @@ ARGV_CASES = [
     (["--", "--check", "ls"], 2, None),
     (["--check", "--", "ls"], 2, None),
     (["--=x", "--help"], 2, None),            # `--` before `=`: every option
-    # Values that only look like flags, and repeats.
+    # ... but glued to an option it is that option's value: the command `--`, a
+    # path, a tool name, no choice. 3.9/3.10 argparse gave [] instead -- a
+    # traceback (exit 1: "denied") or a pass; _Parser._get_values pins 3.11+.
+    (["--check=--"], 0, ALLOWED),
+    (["--check-file=--"], 2, None),           # no file of that name
+    (["--tool=--", "--check", "sleep 5"], 1, denied("sleep 5", tool="--")),
+    (["--shell=--", "--check", "ls"], 2, None),
+    (["--platform=--", "--check", "ls"], 2, None),
+    # Values that only look like flags, and repeats: the last one wins.
     (["--check", "--zz x"], 0, ALLOWED),
     (["--check", "--sh x"], 0, ALLOWED),      # no `=`: the space decides
     (["--check", "-"], 0, ALLOWED),
-    (["--check=ls", "--check=pwd"], 0, ALLOWED),
+    (["--check=cd x && ls", "--check=ls"], 0, ALLOWED),
+    (["--check=ls", "--check=cd x && ls"], 1, denied("cd x && ls")),
 ]
 
 
