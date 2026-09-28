@@ -230,9 +230,8 @@ def warn_missing_dependencies() -> None:
     print("  WARNING: Not all dependencies are installed: 'rich' is missing. "
           "Some functionality is unavailable: Markdown formatting, colored "
           "output, and accurate Unicode display widths. Continuing in plain text.")
+    # Written for the shell of this OS (PowerShell on Windows, `& ` included).
     install = cmdline.quote([sys.executable, "-m", "pip", "install", "rich"])
-    if os.name == "nt":
-        install = "& " + install
     shell_hint = " (PowerShell)" if os.name == "nt" else ""
     print(f"  Install with{shell_hint}: {install}")
 
