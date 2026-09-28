@@ -10,7 +10,9 @@ import sys
 
 import pytest
 
+import _pwsh
 from _pwsh import invocation, needs_powershell, ps_quote, run_powershell
+from llm_loop import cmdline
 
 _ECHO = "import json, sys; print(json.dumps(sys.argv[1:]))"
 
@@ -26,6 +28,12 @@ def test_ps_quote_doubles_every_quote_powershell_ends_a_string_at(text,
     assert ps_quote(text) == expected
 
 
+def test_the_quote_set_is_cmdline_s():
+    # `_pwsh` keeps a copy rather than importing `llm_loop` (the main
+    # repository loads it by path); a quote found later goes into both.
+    assert _pwsh._PS_SINGLE_QUOTES == cmdline._PS_SINGLE_QUOTES
+
+
 @needs_powershell
 def test_ps_quote_round_trips_through_powershell():
     text = "it's \u2018a\u2019 \u201ab\u201b $x `y"
@@ -39,7 +47,7 @@ def test_ps_quote_round_trips_through_powershell():
 @pytest.mark.parametrize("line, expected", [
     ("& {py} -c 'import sys; sys.exit(3)'", 3),
     ("& {py} -c 'pass'", 0),
-    # Each of these used to come back as 0.
+    # A bare `; exit $LASTEXITCODE` tail reports 0 for each of these.
     ("& 'C:\\no\\such\\program.exe' a", 1),
     ("& {py} -c 'pass'; Write-Error boom", 1),
     ("Write-Output ran-no-native-program", 255),

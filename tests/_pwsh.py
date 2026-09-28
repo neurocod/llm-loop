@@ -33,8 +33,9 @@ needs_powershell = pytest.mark.skipif(
 
 # PowerShell reads these four as the single quote too, so inside '...' each
 # must be doubled like `'` itself or it ends the string. A copy of
-# `llm_loop.cmdline._PS_SINGLE_QUOTES`, not an import: see the module docstring.
-_PS_SINGLE_QUOTES = "'‘’‚‛"
+# `llm_loop.cmdline._PS_SINGLE_QUOTES`, not an import (see the module
+# docstring); test_pwsh_helper.py pins the two equal.
+_PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
 
 
 def ps_quote(text: str) -> str:
