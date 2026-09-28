@@ -844,9 +844,5 @@ def test_the_post_refusal_wait_answers_a_stop_request_too():
 def test_stop_file_path_follows_the_project_root(tmp_path):
     """The sentinel is resolved against the chosen root, not the cwd — otherwise
     a -C run would watch the wrong file (and the tests would pass by accident)."""
-    previous = projectroot.project_dir()
-    try:
-        projectroot.set_project_root(str(tmp_path))
-        assert stopchannel.stop_file_path() == os.path.join(str(tmp_path), "stop")
-    finally:
-        projectroot.set_project_root(previous)
+    projectroot.set_project_root(str(tmp_path))
+    assert stopchannel.stop_file_path() == os.path.join(str(tmp_path), "stop")
