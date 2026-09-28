@@ -2,8 +2,8 @@
 
 Three layers, pinned in that order:
 
-  * `ownership.OwnerThread` itself — order, drain, close, the bounded queue and
-    what a failing call costs;
+  * `ownership.OwnerThread` itself — order, drain, close, the bounded queue,
+    the idle hook and what a failing call costs;
   * the parallel runner's console lines — every write on the one owner thread,
     never two at once, all of them on screen before the run reports;
   * the status line — while the painter runs, nobody else renders or writes
@@ -366,6 +366,89 @@ def test_a_call_that_posts_from_the_owner_with_the_queue_full_runs_inline():
     returned, closed = _returns_within(WAIT_S, lambda: owner.close(WAIT_S))
     assert returned and closed, "the owner deadlocked on its own post"
     assert ran == ["nested", "outer done", "queued"]
+
+
+class _Idle:
+    """An `idle` hook that answers `delays` in turn (then None) and records
+    which thread called it and what had run by then."""
+
+    def __init__(self, ran, *delays):
+        self.ran = ran
+        self.delays = list(delays)
+        self.calls = []
+        self.called = threading.Event()
+
+    def __call__(self):
+        self.calls.append((threading.current_thread().name, list(self.ran)))
+        self.called.set()
+        return self.delays.pop(0) if self.delays else None
+
+
+def _wait_for(condition):
+    deadline = time.monotonic() + WAIT_S
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    return condition()
+
+
+def test_idle_runs_on_the_owner_once_the_queue_is_empty_then_on_its_own_delay():
+    """Due after posted calls — never between two of them — and again after
+    the delay it asked for; None waits for the next post."""
+    ran = []
+    idle = _Idle(ran, 0.01, 0.01)
+    owner = ownership.OwnerThread("pin-owner", idle=idle).start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    for n in range(3):
+        owner.post(ran.append, n)
+    stall.release.set()
+    # 1 after the batch, 2 and 3 on the delays it returned, then None.
+    assert _wait_for(lambda: len(idle.calls) >= 3)
+    assert idle.calls[0] == ("pin-owner", [0, 1, 2]), \
+        "idle ran before the queue was empty"
+    time.sleep(0.1)
+    assert len(idle.calls) == 3, "idle ran again after answering None"
+    owner.post(ran.append, 3)
+    assert _wait_for(lambda: len(idle.calls) == 4)
+    assert {name for name, _ran in idle.calls} == {"pin-owner"}
+    assert owner.close(WAIT_S)
+
+
+def test_idle_is_not_due_before_the_first_post_nor_while_closing():
+    """What the hook works on is set up by a post and handed back by the
+    backlog `close` runs: an idle pass on either side would touch a resource
+    that is not (or no longer) there."""
+    ran = []
+    idle = _Idle(ran, 0.0, 0.0, 0.0)
+    owner = ownership.OwnerThread("pin-owner", idle=idle).start()
+    assert not idle.called.wait(0.1), "idle ran before anything was posted"
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    owner.post(ran.append, "last")
+    assert not owner.close(timeout=0.05)
+    stall.release.set()
+    assert owner.close(WAIT_S)
+    assert ran == ["last"]
+    assert idle.calls == [], "idle ran on an owner that was closing"
+
+
+def test_a_failing_idle_is_reported_and_due_again_after_the_next_post(capsys):
+    ran = []
+
+    def idle():
+        ran.append("idle")
+        raise BrokenPipeError("closed")
+
+    owner = ownership.OwnerThread("pin-owner", idle=idle).start()
+    owner.post(ran.append, 1)
+    assert _wait_for(lambda: ran == [1, "idle"])
+    owner.post(ran.append, 2)
+    assert _wait_for(lambda: ran == [1, "idle", 2, "idle"])
+    assert owner.close(WAIT_S)
+    assert owner.failures == 2
+    assert capsys.readouterr().err.count("pin-owner: BrokenPipeError: closed") == 1
 
 
 # --- the parallel runner's console lines ----------------------------------------

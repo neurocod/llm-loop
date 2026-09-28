@@ -9,10 +9,10 @@ model without Qt: the value is not the syntax but that there is no shared
 mutable state left to guard.
 
 `OwnerThread` is that owner and nothing more — FIFO order, a bounded queue,
-`drain` to wait for what was posted so far, `close` to hand the resource back.
-What the resource IS lives with its user (`parallel` owns the console's worker
-lines with one of these). The status line's painter is a second owner built by
-hand, not on this class (`statusline.StatusApp._on_painter`).
+`drain` to wait for what was posted so far, `close` to hand the resource back,
+and an `idle` hook for the work an owner does on its own clock. What the
+resource IS lives with its user: `parallel` owns the console's worker lines
+with one of these, `statusline.StatusApp` the pinned rows.
 """
 
 import collections
@@ -57,12 +57,26 @@ class OwnerThread:
     waiting, and nothing holds its lock across a call or a blocking put — which
     is what lets `close(timeout)` and `drain(timeout)` keep their bound however
     stuck the resource is.
+
+    `idle` is the owner's own work — a periodic repaint, a frame coalesced over
+    a burst of posted calls. The owner calls it when its queue is empty and it
+    is due, and it returns in how many seconds it is due again, or None for
+    "not until something is posted". It is due after every posted call (the
+    call may have made work for it — asked for a frame) and once the delay it
+    last returned has passed; never before the first post, since what it works
+    on is usually set up by one, and never after `close()`: a closing owner
+    finishes the backlog and hands back, so nothing the hook does can land on a
+    resource the backlog has just handed back. It fails like a posted call does
+    (reported, then due again only after the next post) and is not counted by
+    `drain`, which waits for posted calls only.
     """
 
     def __init__(self, name: str, *, maxsize: int = DEFAULT_MAXSIZE,
-                 on_error: Optional[Callable[[BaseException], None]] = None):
+                 on_error: Optional[Callable[[BaseException], None]] = None,
+                 idle: Optional[Callable[[], Optional[float]]] = None):
         self.name = name
         self._maxsize = maxsize
+        self._idle = idle
         self._lock = threading.Lock()
         # One condition for every change a waiter can be waiting for: room in
         # the queue, a call finished, the state moved.
@@ -92,9 +106,18 @@ class OwnerThread:
     def start(self) -> "OwnerThread":
         """Open: a new owner thread, or the one still closing, kept on.
 
-        A `close` that timed out leaves its thread running the backlog; opening
-        again keeps THAT thread as the owner instead of starting a second one
-        beside it over the same resource.
+        The restart policy, and the only one in this package (the status line's
+        painter is one of these too): a `close` that timed out leaves its
+        thread running the backlog, and opening again keeps THAT thread as the
+        owner instead of starting a second one beside it. A second thread would
+        be two writers over one resource for as long as the first is stuck —
+        its stuck write landing after the new owner's first ones, its hand-back
+        undoing what the new owner set up. Kept on, the old window's last calls
+        and the new window's first run in the order they were posted. What it
+        costs is that the new window's first call waits for the stuck one; any
+        second writer would wait there too, on whatever lock the resource
+        itself holds across the write, and could only get ahead of it where the
+        resource has no such lock — which is the corruption, not a remedy.
         """
         with self._changed:
             if self._state == _OPEN:
@@ -210,25 +233,43 @@ class OwnerThread:
         self._changed.notify_all()
 
     def _run(self) -> None:
+        # When `idle` is next due (monotonic), or None: after the next post.
+        idle_due: Optional[float] = None
         try:
             while True:
                 with self._changed:
                     while not self._items and self._state == _OPEN:
-                        self._changed.wait()
-                    if not self._items:
+                        if idle_due is None:
+                            self._changed.wait()
+                            continue
+                        left = idle_due - time.monotonic()
+                        if left <= 0:
+                            break
+                        self._changed.wait(left)
+                    if self._items:
+                        call, args = self._items.popleft()
+                        self._changed.notify_all()  # room for a waiting poster
+                    elif self._state == _OPEN:
+                        call = None                 # nothing posted: idle is due
+                    else:
                         # Closing and nothing left: hand the resource back in
                         # the same locked step that saw the queue empty, so no
                         # post can land between the look and the hand-back.
                         self._close_locked()
                         return
-                    call, args = self._items.popleft()
-                    self._changed.notify_all()      # room for a waiting poster
+                if call is None:
+                    delay = self._invoke(self._idle, ())
+                    idle_due = (None if delay is None
+                                else time.monotonic() + max(0.0, delay))
+                    continue
                 try:
                     self._invoke(call, args)
                 finally:
                     with self._changed:
                         self._finished += 1
                         self._changed.notify_all()
+                if self._idle is not None:
+                    idle_due = time.monotonic()
         finally:
             # Only reachable still owning if something got past `_invoke` — the
             # owner must never die silently with posters left queueing into it.
@@ -252,15 +293,17 @@ class OwnerThread:
         self._thread = None
         self._changed.notify_all()
 
-    def _invoke(self, call: Callable, args: tuple) -> None:
+    def _invoke(self, call: Callable, args: tuple):
+        """`call(*args)`'s answer, or None once its failure is reported."""
         try:
-            call(*args)
+            return call(*args)
         except BaseException as exc:    # noqa: BLE001 - see the class docstring
             self.failures += 1
             try:
                 self._on_error(exc)
             except BaseException:       # noqa: BLE001 - the reporter may not end us
                 pass
+            return None
 
     def _report(self, exc: BaseException) -> None:
         """One stderr line per distinct failure, not one per failed call.
