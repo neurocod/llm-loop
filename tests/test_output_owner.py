@@ -451,6 +451,132 @@ def test_a_failing_idle_is_reported_and_due_again_after_the_next_post(capsys):
     assert capsys.readouterr().err.count("pin-owner: BrokenPipeError: closed") == 1
 
 
+def test_idle_is_not_due_in_a_reopened_window_before_its_first_post():
+    """Reopened while closing, the owner still runs the last window's backlog
+    first — and neither that backlog nor a delay the hook answered in the
+    last window makes it due in the new one."""
+    ran = []
+    idle = _Idle(ran, 0.5)                 # due again 0.5 s after its first pass
+    owner = ownership.OwnerThread("pin-owner", idle=idle).start()
+    owner.post(ran.append, "a")
+    assert _wait_for(lambda: len(idle.calls) == 1)
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    owner.post(ran.append, "old")          # last window's, behind the stall
+    assert not owner.close(timeout=0.05)
+    owner.start()                          # reopened while closing
+    stall.release.set()
+    assert owner.drain(WAIT_S)
+    time.sleep(0.8)                        # past the 0.5 s the hook asked for
+    assert len(idle.calls) == 1, "idle ran in the new window before its first post"
+    owner.post(ran.append, "new")
+    assert _wait_for(lambda: len(idle.calls) == 2)
+    assert idle.calls[1] == ("pin-owner", ["a", "old", "new"])
+    assert owner.close(WAIT_S)
+
+
+@pytest.mark.parametrize("answer, failure", [(float("inf"), None),
+                                             (10 ** 30, None),
+                                             (float("nan"), "TypeError"),
+                                             ("soon", "TypeError")])
+def test_an_idle_answer_that_is_not_a_delay_cannot_end_the_owner(
+        answer, failure, capsys):
+    """`inf` reached `Condition.wait` as an OverflowError and ended the owner,
+    after which every post ran on its caller. Too long a delay is clamped to
+    IDLE_DELAY_MAX; what is not a delay at all is the hook's failure."""
+    answered = threading.Event()
+
+    def idle():
+        answered.set()
+        return answer
+
+    owner = ownership.OwnerThread("pin-owner", idle=idle).start()
+    owner.post(lambda: None)
+    assert answered.wait(WAIT_S)
+    time.sleep(0.05)                       # for the owner to act on the answer
+    ran_on = []
+    owner.post(lambda: ran_on.append(threading.current_thread().name))
+    assert owner.drain(WAIT_S)
+    assert ran_on == ["pin-owner"], "the owner died of its idle hook's answer"
+    assert owner.close(WAIT_S)
+    err = capsys.readouterr().err
+    if failure is None:
+        assert owner.failures == 0 and err == ""
+    else:
+        assert owner.failures >= 1
+        assert f"pin-owner: {failure}: idle answered" in err
+
+
+def test_post_with_a_timeout_gives_up_on_a_full_queue_and_queues_nothing():
+    owner = ownership.OwnerThread("pin-owner", maxsize=1).start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    ran = []
+    assert owner.post(ran.append, 1, timeout=0.1) is True    # the one slot
+    try:
+        returned, answer = _returns_within(
+            0.1 + BOUND_SLACK_S, lambda: owner.post(ran.append, 2, timeout=0.1))
+        assert returned, "post(timeout=0.1) waited for the stuck call"
+        assert answer is False
+    finally:
+        stall.release.set()
+    assert owner.close(WAIT_S)
+    assert ran == [1], "a post that gave up was queued anyway"
+
+
+def test_close_hands_back_past_a_full_queue_on_the_owner_after_the_backlog():
+    """The hand-back may not wait for room behind a stuck resource.
+
+    StatusApp.stop() used to `post` its release before `close(timeout)`: with
+    the painter stuck and the queue full, that post blocked for as long as
+    the terminal did, and the bound after it was never reached.
+    """
+    owner = ownership.OwnerThread("pin-owner", maxsize=1).start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    ran = []
+    owner.post(lambda: ran.append(("queued", threading.current_thread().name)))
+    try:
+        returned, closed = _returns_within(
+            0.1 + BOUND_SLACK_S, lambda: owner.close(
+                timeout=0.1, final=lambda: ran.append(
+                    ("final", threading.current_thread().name))))
+        assert returned, "close(final=) waited for room in a full queue"
+        assert closed is False and ran == []
+    finally:
+        stall.release.set()
+    assert owner.close(WAIT_S)
+    assert ran == [("queued", "pin-owner"), ("final", "pin-owner")]
+    # No owner: `final` is the caller's, like a post.
+    owner.close(final=lambda: ran.append(("late", threading.current_thread().name)))
+    assert ran[-1] == ("late", threading.current_thread().name)
+
+
+def test_start_sets_up_past_a_full_queue_behind_the_last_window():
+    """The opening call joins a reopened owner behind the last window's
+    backlog — and like the hand-back, never waits for room there."""
+    owner = ownership.OwnerThread("pin-owner", maxsize=1).start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    ran = []
+    owner.post(ran.append, "old")          # the one slot
+    assert not owner.close(timeout=0.05)
+    try:
+        returned, _ = _returns_within(
+            BOUND_SLACK_S, lambda: owner.start(first=lambda: ran.append("first")))
+        assert returned, "start(first=) waited for room in a full queue"
+    finally:
+        stall.release.set()
+    owner.post(ran.append, "new")
+    assert owner.drain(WAIT_S)
+    assert ran == ["old", "first", "new"]
+    assert owner.close(WAIT_S)
+
+
 # --- the parallel runner's console lines ----------------------------------------
 
 
@@ -838,3 +964,4 @@ def test_a_paste_tail_posted_behind_its_enter_is_discarded_with_it():
     assert points.names == ("cleanup",)
     assert isinstance(mode, sl.NormalMode)
     assert not app.stop_requested_here and not app.paused
+

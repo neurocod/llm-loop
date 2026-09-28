@@ -10,9 +10,10 @@ mutable state left to guard.
 
 `OwnerThread` is that owner and nothing more — FIFO order, a bounded queue,
 `drain` to wait for what was posted so far, `close` to hand the resource back,
-and an `idle` hook for the work an owner does on its own clock. What the
-resource IS lives with its user: `parallel` owns the console's worker lines
-with one of these, `statusline.StatusApp` the pinned rows.
+`start(first=)` / `close(final=)` for the calls that set the resource up and
+put it back, and an `idle` hook for the work an owner does on its own clock.
+What the resource IS lives with its user: `parallel` owns the console's worker
+lines with one of these, `statusline.StatusApp` the pinned rows.
 """
 
 import collections
@@ -21,7 +22,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-__all__ = ["OwnerThread", "DEFAULT_MAXSIZE"]
+__all__ = ["OwnerThread", "DEFAULT_MAXSIZE", "IDLE_DELAY_MAX"]
 
 # How many posted calls may wait before `post` blocks. Not a throughput knob: it
 # is what keeps a stuck resource (a console the operator froze by selecting
@@ -31,6 +32,13 @@ __all__ = ["OwnerThread", "DEFAULT_MAXSIZE"]
 # write, so the worst case is the old behaviour, not a new one. A worker line is
 # a few hundred bytes, so the cap costs a few MB at most.
 DEFAULT_MAXSIZE = 10_000
+
+# The longest delay an `idle` answer is taken at. A clamp, not a policy: a hook
+# answering `inf` (or a year) means "not for a long while", and `Condition.wait`
+# refuses a timeout past `threading.TIMEOUT_MAX` with an OverflowError that
+# would end the owner. Being asked again after an hour costs a well-behaved hook
+# nothing — it answers its own delay again.
+IDLE_DELAY_MAX = 3600.0
 
 # The owner's three states. CLOSING is the one that matters: `close` has been
 # asked, but the thread is still running what was posted, so it still OWNS the
@@ -58,17 +66,27 @@ class OwnerThread:
     is what lets `close(timeout)` and `drain(timeout)` keep their bound however
     stuck the resource is.
 
+    The bounded queue holds back posters, never the owner's own life cycle:
+    `start(first=)` and `close(final=)` queue the call that sets the resource
+    up and the one that puts it back past `maxsize`, so neither a restart nor
+    a hand-back waits for room behind a stuck resource. One of each per window
+    is what they can add, so the bound still holds give or take two.
+
     `idle` is the owner's own work — a periodic repaint, a frame coalesced over
     a burst of posted calls. The owner calls it when its queue is empty and it
-    is due, and it returns in how many seconds it is due again, or None for
-    "not until something is posted". It is due after every posted call (the
-    call may have made work for it — asked for a frame) and once the delay it
-    last returned has passed; never before the first post, since what it works
-    on is usually set up by one, and never after `close()`: a closing owner
-    finishes the backlog and hands back, so nothing the hook does can land on a
-    resource the backlog has just handed back. It fails like a posted call does
-    (reported, then due again only after the next post) and is not counted by
-    `drain`, which waits for posted calls only.
+    is due, and it returns in how many seconds it is due again (clamped to
+    IDLE_DELAY_MAX), or None for "not until something is posted". It is due
+    after every call posted in the current window (the call may have made work
+    for it — asked for a frame) and once the delay it last returned has passed;
+    never before the window's first post — an owner reopened while closing
+    included, whose last window's backlog does not count — since what it works
+    on is usually set up by one. And it is never STARTED once the owner has seen
+    `close()`: a closing owner finishes the backlog and hands back. An idle pass
+    the owner had already begun when `close()` was asked finishes first, ahead
+    of the backlog, so it still cannot land after anything the backlog (a
+    `final` included) does. It fails like a posted call does — reported, then
+    due again only after the next post — and so does an answer that is not a
+    delay; it is not counted by `drain`, which waits for posted calls only.
     """
 
     def __init__(self, name: str, *, maxsize: int = DEFAULT_MAXSIZE,
@@ -84,6 +102,10 @@ class OwnerThread:
         self._items: collections.deque = collections.deque()
         self._state = _CLOSED
         self._thread: Optional[threading.Thread] = None
+        # Bumped by every `start()` that opens (a reopen included). A queued
+        # call carries the window it was posted in, and only the current
+        # window's calls make `idle` due (see the class docstring).
+        self._window = 0
         # Calls ever queued / ever finished (run or given up on). `drain` waits
         # for the second to reach what the first was when it was asked.
         self._queued = 0
@@ -103,8 +125,14 @@ class OwnerThread:
         thread = self._thread
         return thread is not None and threading.current_thread() is thread
 
-    def start(self) -> "OwnerThread":
+    def start(self, first: Optional[Callable[[], object]] = None
+              ) -> "OwnerThread":
         """Open: a new owner thread, or the one still closing, kept on.
+
+        `first` — the call that sets the resource up for this window — is
+        queued behind whatever an earlier window left and past `maxsize` (see
+        the class docstring), so opening never waits for room. Queued on an
+        owner that is already open too, as the next call.
 
         The restart policy, and the only one in this package (the status line's
         painter is one of these too): a `close` that timed out leaves its
@@ -120,37 +148,48 @@ class OwnerThread:
         resource has no such lock — which is the corruption, not a remedy.
         """
         with self._changed:
-            if self._state == _OPEN:
-                return self
             if self._state == _CLOSING:
                 self._state = _OPEN
+                self._window += 1
                 self._changed.notify_all()
-                return self
-            # A new window reports its own failures, even one worded like the
-            # last window's (see `_report`).
-            self._last_report = ""
-            self._thread = threading.Thread(target=self._run, name=self.name,
-                                            daemon=True)
-            self._state = _OPEN
-            self._thread.start()
+            elif self._state == _CLOSED:
+                # A new window reports its own failures, even one worded like
+                # the last window's (see `_report`).
+                self._last_report = ""
+                self._window += 1
+                self._thread = threading.Thread(target=self._run,
+                                                name=self.name, daemon=True)
+                self._state = _OPEN
+                self._thread.start()
+            if first is not None:
+                self._enqueue(first, ())
         return self
 
-    def post(self, call: Callable, *args) -> None:
-        """Run `call(*args)` on the owner; blocks only while the queue is full.
+    def post(self, call: Callable, *args,
+             timeout: Optional[float] = None) -> bool:
+        """Run `call(*args)` on the owner; waits only while the queue is full.
 
-        On the owner itself the call runs at once, inline: the owner cannot
-        wait for room in a queue only it empties.
+        True once the call is queued (or has run: with no owner, and on the
+        owner itself, where it runs at once, inline — the owner cannot wait for
+        room in a queue only it empties). With a `timeout`, False when the
+        queue had no room for that long, and the call is then NOT queued: for
+        a caller that must go on whether or not the resource ever comes back.
         """
         if self.owns_current_thread:
             call(*args)
-            return
+            return True
+        deadline = _deadline(timeout)
         with self._changed:
             while self._state != _CLOSED and len(self._items) >= self._maxsize:
-                self._changed.wait()
+                left = _remaining_or_none(deadline)
+                if left is not None and left <= 0:
+                    return False
+                self._changed.wait(left)
             if self._state != _CLOSED:
                 self._enqueue(call, args)
-                return
+                return True
         call(*args)     # no owner: the caller's call, and the caller's exception
+        return True
 
     def try_post(self, call: Callable, *args) -> bool:
         """`post` that never waits: False, with nothing run, when the queue is full.
@@ -193,7 +232,8 @@ class OwnerThread:
         finally:
             self._lock.release()
 
-    def close(self, timeout: Optional[float] = None) -> bool:
+    def close(self, timeout: Optional[float] = None, *,
+              final: Optional[Callable[[], object]] = None) -> bool:
         """Run what was posted, then stop owning. True once the thread has ended.
 
         Bounded by `timeout` as a whole. On a timeout the thread keeps owning
@@ -202,42 +242,66 @@ class OwnerThread:
         again, `close` answers for the same thread — True only once it is gone.
         Asked from the owner itself it only marks the close and returns False:
         the thread cannot wait for its own exit.
+
+        `final` — the call that puts the resource back — is queued behind the
+        backlog and past `maxsize` (see the class docstring), so the bound
+        holds however full the queue is and the hand-back still happens, on
+        the owner, whenever the resource returns. A post made while closing
+        still joins the queue and so runs after it: `final`'s own resource
+        must refuse what comes after it. With no owner, `final` runs here, on
+        the caller, exception included, as a `post` would.
         """
         deadline = _deadline(timeout)
-        if not self._lock.acquire(timeout=_remaining(deadline)):
+        if final is not None:
+            # Unbounded on purpose: losing `final` to a moment's contention
+            # would leave the resource set up for good, and no holder of this
+            # lock keeps it across a call or a wait, so the wait is a few
+            # instructions long.
+            self._lock.acquire()
+        elif not self._lock.acquire(timeout=_remaining(deadline)):
             return False
         try:
             thread = self._thread
+            if thread is not None and final is not None:
+                self._enqueue(final, ())
             if self._state == _OPEN:
                 self._state = _CLOSING
                 self._changed.notify_all()
-            if thread is None:
-                return True
-            if thread is threading.current_thread():
-                return False
-            self._changed.wait_for(lambda: self._state == _CLOSED,
-                                   _remaining_or_none(deadline))
-            if self._state != _CLOSED:
-                return False
+            if thread is not None:
+                if thread is threading.current_thread():
+                    return False
+                self._changed.wait_for(lambda: self._state == _CLOSED,
+                                       _remaining_or_none(deadline))
+                if self._state != _CLOSED:
+                    return False
         finally:
             self._lock.release()
+        if thread is None:
+            if final is not None:
+                final()
+            return True
         # CLOSED is set by the thread's last locked step; the join is for the
         # few instructions after it.
         thread.join(_remaining_or_none(deadline))
         return not thread.is_alive()
 
     def _enqueue(self, call: Callable, args: tuple) -> None:
-        """Queue one call (caller holds the lock)."""
-        self._items.append((call, args))
+        """Queue one call, tagged with its window (caller holds the lock)."""
+        self._items.append((call, args, self._window))
         self._queued += 1
         self._changed.notify_all()
 
     def _run(self) -> None:
         # When `idle` is next due (monotonic), or None: after the next post.
         idle_due: Optional[float] = None
+        window = None       # the window `idle_due` was worked out in
         try:
             while True:
                 with self._changed:
+                    if window != self._window:
+                        # Opened again while this thread was closing: what
+                        # the last window made due is not this one's.
+                        window, idle_due = self._window, None
                     while not self._items and self._state == _OPEN:
                         if idle_due is None:
                             self._changed.wait()
@@ -247,7 +311,7 @@ class OwnerThread:
                             break
                         self._changed.wait(left)
                     if self._items:
-                        call, args = self._items.popleft()
+                        call, args, posted_in = self._items.popleft()
                         self._changed.notify_all()  # room for a waiting poster
                     elif self._state == _OPEN:
                         call = None                 # nothing posted: idle is due
@@ -258,9 +322,8 @@ class OwnerThread:
                         self._close_locked()
                         return
                 if call is None:
-                    delay = self._invoke(self._idle, ())
-                    idle_due = (None if delay is None
-                                else time.monotonic() + max(0.0, delay))
+                    idle_due = self._idle_due_after(
+                        self._invoke(self._idle, ()))
                     continue
                 try:
                     self._invoke(call, args)
@@ -268,7 +331,8 @@ class OwnerThread:
                     with self._changed:
                         self._finished += 1
                         self._changed.notify_all()
-                if self._idle is not None:
+                        current = posted_in == self._window
+                if self._idle is not None and current:
                     idle_due = time.monotonic()
         finally:
             # Only reachable still owning if something got past `_invoke` — the
@@ -298,12 +362,31 @@ class OwnerThread:
         try:
             return call(*args)
         except BaseException as exc:    # noqa: BLE001 - see the class docstring
-            self.failures += 1
-            try:
-                self._on_error(exc)
-            except BaseException:       # noqa: BLE001 - the reporter may not end us
-                pass
+            self._fail(exc)
             return None
+
+    def _fail(self, exc: BaseException) -> None:
+        self.failures += 1
+        try:
+            self._on_error(exc)
+        except BaseException:           # noqa: BLE001 - the reporter may not end us
+            pass
+
+    def _idle_due_after(self, delay) -> Optional[float]:
+        """When `idle` is next due after it answered `delay` (monotonic).
+
+        An answer that is not a delay — a string, NaN — is the hook's failure
+        and is reported as one, rather than reaching `Condition.wait` and ending
+        the owner there; a delay past IDLE_DELAY_MAX (`inf` included) is
+        clamped to it.
+        """
+        if delay is None:
+            return None
+        if not isinstance(delay, (int, float)) or delay != delay:
+            self._fail(TypeError(f"idle answered {delay!r}, not a delay in "
+                                 f"seconds or None"))
+            return None
+        return time.monotonic() + min(max(0.0, float(delay)), IDLE_DELAY_MAX)
 
     def _report(self, exc: BaseException) -> None:
         """One stderr line per distinct failure, not one per failed call.
