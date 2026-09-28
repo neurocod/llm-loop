@@ -164,6 +164,17 @@ class _Stall:
         self.release.wait(WAIT_S)
 
 
+def _stuck_and_full(name):
+    """(owner, stall): an owner held by `stall`, its one queue slot taken —
+    a console that has stopped, until `stall.release` is set."""
+    owner = ownership.OwnerThread(name, maxsize=1).start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    owner.post(lambda: None)                  # fills the one slot
+    return owner, stall
+
+
 def _returns_within(seconds, call):
     """(returned in time, its answer) — for a call that may hang the old way."""
     answer = []
@@ -187,11 +198,7 @@ def test_close_and_drain_keep_their_timeout_over_a_full_queue_and_a_stuck_call(a
     before their timed wait, so with the queue full the put blocked until the
     resource came back — `close(timeout=0.1)` waited as long as the console did.
     """
-    owner = ownership.OwnerThread("pin-owner", maxsize=1).start()
-    stall = _Stall()
-    owner.post(stall)
-    assert stall.entered.wait(WAIT_S)
-    owner.post(lambda: None)                  # fills the one slot
+    owner, stall = _stuck_and_full("pin-owner")
     try:
         returned, answer = _returns_within(
             0.1 + BOUND_SLACK_S, lambda: getattr(owner, api)(timeout=0.1))
@@ -844,8 +851,8 @@ def test_ctrl_c_over_a_stuck_console_still_stops_the_workers_and_reports(
 class _ThreadedStdout:
     """A stdout that remembers which thread made each write.
 
-    Installed with rich switched off, so `print_markup` ends in a plain `print`
-    of the line's plain copy — one write per line, which is what is read here.
+    Installed by `_as_plain_stdout`, with rich switched off, so a console line
+    is one write of its plain copy — which is what is read here.
     """
 
     encoding = "utf-8"
@@ -878,6 +885,13 @@ class _ThreadedStdout:
         """Everything written, in order: what the terminal shows."""
         with self._lock:
             return "".join(text for _name, text in self.writes)
+
+
+def _as_plain_stdout(monkeypatch, out):
+    """`out` installed as `sys.stdout`, rich off; returns it."""
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    return out
 
 
 class _OnePushGit:
@@ -931,9 +945,7 @@ def test_quota_and_pusher_lines_are_written_by_the_owner_after_queued_worker_lin
     (`print_percents`) and the two plain ones of the hold (`print_line`). Their
     own order is part of the pin — routing only the first would reorder them.
     """
-    out = _ThreadedStdout()
-    monkeypatch.setattr(sys, "stdout", out)
-    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    out = _as_plain_stdout(monkeypatch, _ThreadedStdout())
     record_exit_pushes(monkeypatch)
     git = _OnePushGit()
     monkeypatch.setattr(gitpush, "subprocess", git)
@@ -997,14 +1009,8 @@ def test_a_route_whose_queue_stays_full_writes_the_line_itself_and_says_so(
     for as long as the console stays stuck. Staged with a one-slot queue that
     a stalled write keeps full.
     """
-    out = _ThreadedStdout()
-    monkeypatch.setattr(sys, "stdout", out)
-    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
-    owner = ownership.OwnerThread("pin-console", maxsize=1).start()
-    stall = _Stall()
-    owner.post(stall)
-    assert stall.entered.wait(WAIT_S)
-    owner.post(lambda: None)                # the one slot: full
+    out = _as_plain_stdout(monkeypatch, _ThreadedStdout())
+    owner, stall = _stuck_and_full("pin-console")
     try:
         with console.route_through(owner, post_timeout=0.05):
             returned, _ = _returns_within(
@@ -1048,9 +1054,7 @@ def test_a_line_written_past_a_stuck_route_never_lands_inside_the_owners(
     frozen between them, the poster's line used to land in the gap and the
     screen read "queueddirect" followed by two newlines.
     """
-    out = _StallsTheOwnersWrite("pin-console")
-    monkeypatch.setattr(sys, "stdout", out)
-    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    out = _as_plain_stdout(monkeypatch, _StallsTheOwnersWrite("pin-console"))
     owner = ownership.OwnerThread("pin-console", maxsize=1).start()
     try:
         with console.route_through(owner, post_timeout=0.05):
@@ -1078,14 +1082,8 @@ def test_past_one_timeout_a_route_stops_waiting_for_room_until_there_is_some(
     whole timeout before writing itself. Past the first, a poster takes only
     room that is free at once — and waits again once a post has found some.
     """
-    out = _ThreadedStdout()
-    monkeypatch.setattr(sys, "stdout", out)
-    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
-    owner = ownership.OwnerThread("pin-console", maxsize=1).start()
-    stall = _Stall()
-    owner.post(stall)
-    assert stall.entered.wait(WAIT_S)
-    owner.post(lambda: None)                    # the one slot: full
+    out = _as_plain_stdout(monkeypatch, _ThreadedStdout())
+    owner, stall = _stuck_and_full("pin-console")
     waits = []
     real_post = owner.post
 
@@ -1133,9 +1131,7 @@ def test_a_line_written_directly_after_the_window_closed_reports_itself(
         monkeypatch, capsys):
     """The close reports what was written directly by then; a poster still
     waiting at that moment is not in its count, and says so itself."""
-    out = _ThreadedStdout()
-    monkeypatch.setattr(sys, "stdout", out)
-    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    out = _as_plain_stdout(monkeypatch, _ThreadedStdout())
     owner = _PostHeldUntilTheWindowCloses()
     poster = threading.Thread(target=console.print_line, args=("late",),
                               name="pin-poster")
