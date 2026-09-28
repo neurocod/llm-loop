@@ -193,8 +193,8 @@ CRLF_CASES = [
 # or at the end. The contract (ask_user_gate.py, at the --check add_argument):
 # `--check=` is the empty command, a bare --check is a usage error (exit 2), and
 # a token argparse reads as a flag is never taken as a value. Only the exit code
-# is compared on a usage error and on the help: argparse and the port word both
-# differently.
+# is compared on a usage error and on the help: argparse and the port word each
+# of them differently.
 ARGV_CASES = [
     ["--check="],
     ["--check=", "--shell", "powershell"],
@@ -376,10 +376,9 @@ def argv_verdict(argv: "list[str]", arguments: "list[str]") -> "tuple[int, str]"
     """One ARGV_CASES entry through one gate's CLI, host fixed to Windows.
 
     `--platform windows` goes FIRST so that a case can end on a bare --check.
-    A usage error (exit 2) and the help keep only their code, see
-    ARGV_CASES. stdin is
-    closed because an argv that one half parses as "no command" puts it in
-    hook mode, reading a payload that would never come.
+    A usage error (exit 2) and the help keep only their code, see ARGV_CASES.
+    stdin is closed because an argv that one half parses as "no command" puts
+    it in hook mode, reading a payload that would never come.
     """
     try:
         result = subprocess.run(argv + ["--platform", "windows"] + arguments,
