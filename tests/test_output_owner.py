@@ -1301,7 +1301,7 @@ def test_stop_leaves_the_release_to_a_painter_stuck_in_its_frame(monkeypatch):
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
     app.start()
-    painter = app._painter._thread
+    painter = app.painter.thread
     _hold_a_frame(app, terminal)
     try:
         app.stop()
@@ -1331,7 +1331,7 @@ def test_a_restart_after_a_timed_out_stop_keeps_the_one_painter(monkeypatch):
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
     app.start()
-    old = app._painter._thread
+    old = app.painter.thread
     _hold_a_frame(app, terminal)
     try:
         app.stop()
@@ -1348,7 +1348,7 @@ def test_a_restart_after_a_timed_out_stop_keeps_the_one_painter(monkeypatch):
         app.handle_event(termio.Resize(terminal.columns, terminal.lines))
         app.update(iteration=2)
         _wait_for_frame(terminal, "iter 2")
-        assert app._painter._thread is old, "the restart started a second painter"
+        assert app.painter.thread is old, "the restart started a second painter"
         assert set(terminal.writers) == {sl.PAINTER_THREAD_NAME}
         # The old stop's release ran before the new region was pinned.
         assert terminal.releases == [sl.PAINTER_THREAD_NAME] and terminal.active
@@ -1424,11 +1424,11 @@ def test_a_stuck_painter_with_a_full_queue_holds_neither_stop_nor_the_key_reader
     """
     monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
     monkeypatch.setattr(sl, "POSTED_CALL_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(sl, "PAINTER_QUEUE_MAXSIZE", 3)  # "full" a few keys away
     terminal, keys = _paint_log(), KeysByHand()
     app = sl.StatusApp(terminal=terminal, input_source=keys, refresh=60)
     app.start()
-    app._painter._maxsize = 3              # "full" a few keys away
-    painter = app._painter._thread
+    painter = app.painter.thread
     _hold_a_frame(app, terminal)           # a frame, not a queued call: empty
     try:
         def type_eight():
@@ -1437,7 +1437,7 @@ def test_a_stuck_painter_with_a_full_queue_holds_neither_stop_nor_the_key_reader
 
         returned, _ = _returns_within(BOUND_SLACK_S, type_eight)
         assert returned, "the key reader waited for room behind a stuck frame"
-        assert app._keys_dropped == 5
+        assert app.painter.keys_dropped == 5
         returned, _ = _returns_within(
             0.05 + BOUND_SLACK_S, lambda: app.handle_event(termio.Key("y")))
         assert returned, "handle_event() waited for room behind a stuck frame"
@@ -1466,7 +1466,7 @@ def test_a_resize_posted_behind_a_timed_out_stop_does_not_re_pin_the_region(
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
     app.start()
-    painter = app._painter._thread
+    painter = app.painter.thread
     _hold_a_frame(app, terminal)
     resize = threading.Thread(
         target=app.handle_event,
@@ -1475,7 +1475,7 @@ def test_a_resize_posted_behind_a_timed_out_stop_does_not_re_pin_the_region(
         app.stop()
         resize.start()
         # Queued behind the release: the release and the resize.
-        assert _wait_for(lambda: app._painter.backlog == 2)
+        assert _wait_for(lambda: app.painter.backlog == 2)
     finally:
         terminal.unstall.set()
     resize.join(WAIT_S)
@@ -1493,7 +1493,7 @@ def test_ctrl_c_while_start_waits_for_its_first_frame_puts_the_terminal_back():
     terminal = _paint_log()
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
-    real_drain = app._painter.drain
+    real_drain = app.painter.drain
     restore_installed = []
 
     def interrupted(timeout=None):
@@ -1501,7 +1501,7 @@ def test_ctrl_c_while_start_waits_for_its_first_frame_puts_the_terminal_back():
         restore_installed.append(app._atexit_registered)
         raise KeyboardInterrupt
 
-    app._painter.drain = interrupted
+    app.painter.drain = interrupted
     with pytest.raises(KeyboardInterrupt):
         app.start()
     assert restore_installed == [True], \
@@ -1532,12 +1532,12 @@ def test_a_burst_behind_a_stuck_frame_is_one_request_and_one_frame_of_its_end():
             for thread in feeders:
                 thread.join(WAIT_S)
             app.update(iteration=999999)
-            queued = app._painter.backlog
+            queued = app.painter.backlog
         finally:
             terminal.unstall.set()
         _wait_for_frame(terminal, "iter 999999")
         frames = len(terminal.painted) - before
-        flag = app._frame_posted
+        flag = app.painter.frame_requested
 
     assert queued == 1, f"801 updates queued {queued} frame requests"
     assert frames == 2, f"the stuck frame and one more expected, got {frames}"
@@ -1551,8 +1551,9 @@ def test_a_frame_request_lost_before_the_queue_does_not_stop_the_frames():
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
     with app:
-        assert app._painter.drain(WAIT_S)
-        app._frame_posted = True           # as that poster left it
+        assert app.painter.drain(WAIT_S)
+        # As that poster left it: a state no public call leaves behind.
+        app.painter._frame_posted = True
         app.update(iteration=7)
         _wait_for_frame(terminal, "iter 7")
 

@@ -32,6 +32,7 @@ chain, adding a boolean to `LoopStatus`, or hard-coding a key into the legend.
 """
 
 import atexit
+import functools
 import os
 import re
 import sys
@@ -65,6 +66,7 @@ __all__ = [
     "NoteRow",
     "NormalMode",
     "NumberSetting",
+    "Painter",
     "PauseAction",
     "PauseSegment",
     "PercentSetting",
@@ -122,8 +124,14 @@ PAINTER_JOIN_SECONDS = 1.0
 # "written beside it" by it.
 PAINTER_THREAD_NAME = "statusline-paint"
 
-# The region's life, as `StatusApp._region` records it.
-#   UNOPENED — never started: nobody owns the terminal, and a caller driving
+# How many posted calls may wait for the painter before a post waits (or, for
+# `Painter.try_post` and `Painter.post_key`, is refused). The owner's own bound
+# and for its reasons (`ownership.DEFAULT_MAXSIZE`); named here, and read when a
+# Painter is built, so a pin can make "full" a few keys away.
+PAINTER_QUEUE_MAXSIZE = ownership.DEFAULT_MAXSIZE
+
+# The region's life, as `Painter._region` records it.
+#   UNOPENED — never opened: nobody owns the terminal, and a caller driving
 #     the app by hand (a pin, a run naming its window early) paints and
 #     resizes it itself.
 #   OPEN — between `_open_region` and `_close_region`: the idle hook ticks it.
@@ -2285,13 +2293,424 @@ def _call_name(call: Callable) -> str:
     return (getattr(call, "__name__", None) or type(call).__name__).lstrip("_")
 
 
+class Painter:
+    """The one thread that writes the status line's terminal, and its protocol.
+
+    While it is open every terminal write happens on it — the frames, the
+    region's pinning and release, a resize, a disable — and every other thread
+    posts (`request_frame`, `run_and_wait`, `try_post`, `post_key`) and goes
+    on. Before `open()` and once `close()` has handed back there is no painter
+    thread, and the caller writes itself: that is how a run names its window
+    before the region is pinned, and how a pin drives an app by hand.
+
+    The protocol, all of it here:
+
+      * one frame request in flight is the whole queue (`request_frame`), and
+        a burst of them is one frame, INPUT_REFRESH_SECONDS after its first
+        (`_schedule_frame`); the periodic frame comes every `refresh`
+        (`_on_idle`);
+      * nothing writes the terminal once the region is released, and a region
+        the last `close()` released is not re-pinned before the next `open()`
+        (`_REGION_CLOSED`): a frame, a resize and the idle hook all ask;
+      * a key the reader cannot post is dropped and counted, never waited for
+        (`post_key`), and the count is named once the painter is back.
+
+    WHAT is painted is the app's, handed in as callables and only ever called
+    by the terminal's owner: `render(width)` the rows as plain text, `title()`
+    the window title, `row_count()` how many rows the region needs,
+    `tick(count)` the app's checks that ride on the periodic frame, and
+    `note(text)` where a report of dropped keys goes.
+    """
+
+    def __init__(self, terminal: termio.Terminal, *,
+                 render: Callable[[int], List[str]],
+                 title: Callable[[], str],
+                 row_count: Callable[[], int],
+                 tick: Callable[[int], None],
+                 note: Callable[[str], None],
+                 refresh: float = REFRESH_SECONDS):
+        # Swapped for a NullTerminal by `disable`, for good.
+        self.terminal = terminal
+        self.refresh = refresh
+        self._render = render
+        self._title = title
+        self._row_count = row_count
+        self._app_tick = tick
+        self._note = note
+        self._owner = ownership.OwnerThread(
+            PAINTER_THREAD_NAME, maxsize=PAINTER_QUEUE_MAXSIZE,
+            idle=self._on_idle)
+        # Set while a frame request is posted and not yet run: one in flight
+        # is the whole queue, because every request asks for the same thing —
+        # "draw the state as it is NOW" — so ten before the painter gets to the
+        # first are one frame, not ten. Cleared by the request itself BEFORE
+        # the frame it asks for is drawn, so a request that saw it set is
+        # always covered by a frame drawn after it.
+        self._frame_posted = False
+        # Keys the reader could not post because the queue was full (see
+        # `post_key`), and how many of them `_report_dropped_keys` has named.
+        self._keys_dropped = 0
+        self._keys_reported = 0
+        # The last stderr line `_warn` wrote, so a stuck painter is named once
+        # rather than once per caller that gave up on it.
+        self._last_warning = ""
+        # Painter-only from here down. When the requested frame is due (a
+        # monotonic time, None: none requested) — INPUT_REFRESH_SECONDS after
+        # the first request of a burst, so the burst is one frame.
+        self._frame_due: Optional[float] = None
+        # Where the region is in its life (`_REGION_*`), moved by
+        # `_open_region`, `_close_region` and `disable`.
+        self._region = _REGION_UNOPENED
+        self._next_tick = 0.0          # when the periodic frame is next due
+        self._ticks = 0
+        self._last_size = (0, 0)       # the terminal size the region was cut for
+        # Rows the region is pinned at. Written only by `reserve`, which only
+        # the terminal's owner calls.
+        self._reserved = 0
+
+    # --- reads -------------------------------------------------------------
+
+    @property
+    def owns_current_thread(self) -> bool:
+        return self._owner.owns_current_thread
+
+    @property
+    def thread(self) -> Optional[threading.Thread]:
+        """The painter thread (a closing one included), None while there is none."""
+        return self._owner.thread
+
+    @property
+    def backlog(self) -> int:
+        """Posted calls not yet finished, the one running included."""
+        return self._owner.backlog
+
+    @property
+    def frame_requested(self) -> bool:
+        """True while a frame request is posted and not yet taken."""
+        return self._frame_posted
+
+    @property
+    def keys_dropped(self) -> int:
+        """Keys `post_key` found no room for, since this painter was built."""
+        return self._keys_dropped
+
+    # --- lifecycle ---------------------------------------------------------
+
+    def open(self, timeout: float, *, on_refused: Callable[[], None]) -> None:
+        """Pin the region and draw the first frame, on the painter; waits for
+        it at most `timeout`, and names a wait that timed out on stderr.
+
+        A painter an earlier `close()` gave up waiting for is still closing,
+        and this reopens THAT one (the policy: `OwnerThread.start`): the region
+        is pinned after its last frame and release, not beside it — and queued
+        past the queue's bound, so a full one cannot hold this thread.
+        `on_refused` runs on the painter when the terminal refuses the region,
+        whenever that lands (see `_open_region`).
+        """
+        self._frame_posted = False
+        self._owner.start(first=functools.partial(self._open_region, on_refused))
+        if not self.drain(timeout):
+            self._warn_stuck("the first frame", timeout)
+
+    def close(self, timeout: float) -> bool:
+        """The last frame and the release, on the painter, then no painter;
+        True once it has handed back within `timeout` (a timeout is named on
+        stderr).
+
+        The release is the owner's `final`, behind everything posted before it
+        and past the queue's bound, so this wait keeps its bound however full
+        the queue is. A painter stuck in a frame outlives the wait still owning
+        the terminal (closing), and releases it itself once the write returns:
+        nothing is released from here beside a live write.
+        """
+        if self._owner.close(timeout, final=self._close_region):
+            return True
+        self._warn_stuck("the last frame and the release", timeout)
+        return False
+
+    def drain(self, timeout: Optional[float] = None) -> bool:
+        """Wait until every call posted before this one has run."""
+        return self._owner.drain(timeout)
+
+    # --- posting -----------------------------------------------------------
+
+    def try_post(self, call: Callable, *args) -> bool:
+        """`call(*args)` on the painter, never waiting; False when the queue
+        is full (see `ownership.OwnerThread.try_post`)."""
+        return self._owner.try_post(call, *args)
+
+    def post_key(self, call: Callable, *args) -> None:
+        """The key reader's post: never waits for room.
+
+        The queue is full only while a terminal write is stuck, and a reader
+        held there could not read the Ctrl+C that Windows delivers as a key
+        (`TerminalInput._emit`). So a key that finds it full is dropped and
+        counted, and `_report_dropped_keys` names the count once the painter
+        is back.
+        """
+        if not self._owner.try_post(call, *args):
+            self._keys_dropped += 1
+
+    def run_and_wait(self, call: Callable, *args) -> None:
+        """`call(*args)` on the thread that owns the terminal, waited for.
+
+        On the painter itself, and with no painter running, that is here and
+        now. From any other thread it is posted, and the caller — which reads
+        its effect next — waits for it, for at most POSTED_CALL_WAIT_SECONDS
+        in all: queueing it included, so a full queue behind a stuck write
+        costs the call (named on stderr), never an unbounded wait.
+        """
+        if self._owner.owns_current_thread:
+            call(*args)
+            return
+        deadline = time.monotonic() + POSTED_CALL_WAIT_SECONDS
+        if not self._owner.post(call, *args,
+                                timeout=POSTED_CALL_WAIT_SECONDS):
+            self._warn_stuck(f"{_call_name(call)} (not queued, dropped)",
+                             POSTED_CALL_WAIT_SECONDS)
+            return
+        if not self.drain(max(0.0, deadline - time.monotonic())):
+            self._warn_stuck(_call_name(call), POSTED_CALL_WAIT_SECONDS)
+
+    def request_frame(self) -> None:
+        """Ask for a frame of the state as it is now — drawn on the painter
+        while one runs.
+
+        While the painter runs it is the one thread that renders and writes the
+        terminal; a worker's `update`, a key, a quota poll only post a request
+        and return, so the renderers never run on two threads at once and no
+        caller waits for a slow terminal. On the painter itself the request is
+        folded into the frame it draws once the calls queued behind it have run
+        (see `_on_idle`). With no painter running the caller draws itself.
+        """
+        if self._owner.owns_current_thread:
+            self._schedule_frame()
+            return
+        # A set flag with nothing queued is a request that never got there —
+        # this thread's twin interrupted between flag and post, or a queue the
+        # owner dropped dying — so it is posted again rather than trusted. A
+        # second request racing the first is harmless: both are one frame.
+        if self._frame_posted and self._owner.backlog:
+            return
+        self._frame_posted = True
+        try:
+            queued = self._owner.try_post(self._take_frame_request)
+        except BaseException:
+            self._frame_posted = False
+            raise
+        if not queued:
+            # Queue full: the periodic frame draws this state instead.
+            self._frame_posted = False
+
+    # --- the terminal's owner only (the painter, or the caller with none) --
+
+    def reserve(self, rows: int) -> bool:
+        """True when the region has the requested shape (or there is none to keep)."""
+        if isinstance(self.terminal, termio.NullTerminal):
+            return True
+        if self.terminal.reserve(rows):
+            self._reserved = rows
+            return True
+        return False
+
+    def resize(self) -> None:
+        """Re-cut the region for the terminal's size now, and repaint it."""
+        if self._region == _REGION_CLOSED:
+            return      # released: nothing to re-cut (see _REGION_*)
+        # A refused reserve() leaves the OLD geometry in place, so carrying on
+        # would paint absolute rows outside the new screen with the region set
+        # for the old one. Disable instead — `_open_region` answers the same
+        # refusal the same way.
+        if not self.reserve(self._row_count()):
+            self.disable()
+            return
+        self.request_frame()
+
+    def disable(self) -> None:
+        """Release the region and swap in a NullTerminal, for good."""
+        self._region = _REGION_CLOSED   # nothing left for the idle hook to tick
+        try:
+            self.terminal.release()
+        except Exception:
+            pass
+        self.terminal = termio.NullTerminal()
+
+    # --- frames --------------------------------------------------------------
+
+    def _take_frame_request(self) -> None:
+        """A posted frame request, or with no painter the frame itself."""
+        self._frame_posted = False
+        if self._owner.owns_current_thread:
+            self._schedule_frame()
+        else:
+            self._draw()
+
+    def _schedule_frame(self) -> None:
+        """(painter) A burst's first request sets its frame's time; the rest of
+        the burst lands in that frame."""
+        if self._frame_due is None:
+            self._frame_due = time.monotonic() + INPUT_REFRESH_SECONDS
+
+    def _draw(self, *, reassert: bool = False) -> None:
+        """One frame: the title, then the rows. On the painter, or on the
+        caller when there is none (see `request_frame`). None once the region
+        is closed (see `_REGION_CLOSED`)."""
+        self._frame_due = None
+        if self._region == _REGION_CLOSED:
+            return
+        # Before the `active` gate, and on the same path as the rows: the title
+        # is what a person sees while the terminal is behind another window, so
+        # it must follow every state change the rows follow — including the ones
+        # that arrive before any region is pinned (a run names its window as
+        # soon as `update` gives it a state, which is before `start()`).
+        # Once the terminal has been released it refuses the write, so a late
+        # painter cannot re-name a window nobody will clean up again.
+        try:
+            self.terminal.set_title(self._title(), reassert=reassert)
+        except Exception:
+            pass
+        if not self.terminal.active:
+            return
+        try:
+            columns, _lines = self.terminal.size()
+            # The bottom-right cell can immediately scroll a Windows console.
+            # Budget the margin BEFORE windowing the editor, or its caret is cut.
+            rows = self._render(max(0, columns - textwidth.LINE_RIGHT_MARGIN))
+            if len(rows) != self._reserved:
+                # A Mode added or dropped a row: resize the region rather than
+                # painting into lines the terminal is still scrolling.
+                if not self.reserve(len(rows)):
+                    return
+            self.terminal.paint([colorize(line) for line in rows],
+                                reassert=reassert)
+        except Exception:
+            self.disable()
+
+    # --- the painter's own calls -------------------------------------------
+
+    def _open_region(self, on_refused: Callable[[], None]) -> None:
+        """(painter) Pin the region and draw the first frame — `open()`'s
+        `first`, run after whatever an earlier close left queued.
+
+        A refusal disables the terminal and calls `on_refused`: the app stops
+        a key reader it may already have started while this waited behind a
+        stuck write — a refused region means no keys, whenever it lands.
+        """
+        try:
+            self._last_size = self.terminal.size()
+            self._ticks = 0
+            self._next_tick = time.monotonic() + self.refresh
+            self._frame_due = None
+            self._region = _REGION_OPEN
+            if not self.reserve(self._row_count()):
+                self.disable()
+                on_refused()
+                return
+            self._draw()
+        except Exception:
+            self.disable()
+
+    def _close_region(self) -> None:
+        """(painter) The last frame, then the release — `close()`'s `final`.
+
+        It runs behind everything posted before close(); a call posted after
+        it (a `run_and_wait` from a thread close() did not wait for) still
+        runs, after the release, and finds the region closed (`_REGION_CLOSED`).
+
+        The frame is drawn whether or not one is due: the state a caller set
+        right before close() — the run's final `phase="idle"` — is still inside
+        its burst window, and would otherwise never reach the screen.
+        """
+        try:
+            # Keys lost behind the stuck write close() gave up on: no tick is
+            # left to name them.
+            self._report_dropped_keys()
+            self._draw()
+        finally:
+            self._region = _REGION_CLOSED
+            try:
+                self.terminal.release()
+            except Exception:
+                pass
+
+    def _on_idle(self) -> Optional[float]:
+        """(painter) The `idle` hook: a requested frame once its burst window
+        has passed, the periodic one every `refresh`; answers when it is due
+        next. Nothing outside an open region (see `_REGION_OPEN`): a
+        reopened painter's first idle pass, before `_open_region` has run,
+        must not tick — and re-pin — the region the last close released.
+        """
+        if self._region != _REGION_OPEN:
+            return None
+        try:
+            now = time.monotonic()
+            if now >= self._next_tick:
+                self._next_tick = now + self.refresh
+                self._tick()
+            elif self._frame_due is not None and now >= self._frame_due:
+                self._draw()
+        except Exception:
+            self.disable()
+        due = self._next_tick
+        if self._frame_due is not None:
+            due = min(due, self._frame_due)
+        return max(0.0, due - time.monotonic())
+
+    def _tick(self) -> None:
+        """(painter) The periodic frame and the checks that ride on it."""
+        self._ticks += 1
+        size = self.terminal.size()
+        if size != self._last_size:
+            self._last_size = size
+            try:
+                self.resize()
+            except Exception:
+                self.disable()
+        self._report_dropped_keys()
+        self._app_tick(self._ticks)
+        # Re-assert the region on the periodic repaint: see
+        # termio.Terminal.paint.
+        self._draw(reassert=True)
+
+    def _report_dropped_keys(self) -> None:
+        """(painter) Say so once keys were lost to a full queue (see
+        `post_key`): on the note row, and on stderr for the log."""
+        dropped = self._keys_dropped
+        if dropped == self._keys_reported:
+            return
+        self._keys_reported = dropped
+        text = (f"{dropped} key(s) dropped so far — the terminal was not "
+                f"keeping up; press them again")
+        self._warn(text)
+        self._note(text)
+
+    def _warn_stuck(self, what: str, seconds: float) -> None:
+        """Name a wait on the painter that timed out: a stuck painter is
+        otherwise invisible, since its own frames are what is stuck."""
+        self._warn(f"{what} not done within {seconds:g} s — a terminal write "
+                   f"is stuck; the painter carries on once it returns")
+
+    def _warn(self, text: str) -> None:
+        """One stderr line, not repeated back to back."""
+        line = f"{PAINTER_THREAD_NAME}: {text}"
+        if line == self._last_warning:
+            return
+        self._last_warning = line
+        try:
+            print(line, file=sys.stderr)
+        except Exception:
+            pass
+
+
 class StatusApp:
-    """Owns the Terminal, the Layout, the input, the Mode stack, the Actions, the
-    SettingsRegistry, the repaint thread and the LoopStatus.
+    """Owns the Layout, the input, the Mode stack, the Actions, the
+    SettingsRegistry, the LoopStatus and the `Painter` — which owns the
+    Terminal and the repaint thread.
 
     Public surface the loops use: start()/stop() (or `with`), update(**fields),
-    note(text), register_action(a), job(job_id). Everything else is an internal
-    detail that a later wave extends by registering something.
+    note(text), register_action(a), job(job_id). `painter` is exposed for the
+    pins that watch its protocol. Everything else is an internal detail that a
+    later wave extends by registering something.
     """
 
     def __init__(self, *, status: Optional[LoopStatus] = None,
@@ -2309,56 +2728,34 @@ class StatusApp:
         # address (a dry run). Registering the key on the same condition keeps
         # the legend from offering what it cannot do.
         self.messages = messages
-        self.terminal = terminal if terminal is not None else termio.terminal_for(
-            enabled=enabled)
+        # The one thread that owns the terminal and the mode stack while the
+        # app is started; everybody else posts to it (see `Painter`,
+        # `_handle_input`). Before `start()` and once it has handed back there
+        # is no owner, and a call runs on its caller.
+        self.painter = Painter(
+            terminal if terminal is not None
+            else termio.terminal_for(enabled=enabled),
+            render=self.render,
+            title=lambda: title_text(self.status),
+            row_count=lambda: len(self.rows()),
+            tick=self._tick,
+            note=self.note,
+            refresh=refresh)
         self.layout = layout or Layout(self.legend_entries)
         self.actions: List[Action] = []
         self.modes: List[Mode] = [NormalMode(self)]
-        self.refresh = refresh
         self._stop_file = stop_file
         self._input = input_source
-        # The one thread that owns the terminal and the mode stack while the
-        # app is started; everybody else posts to it (see `_paint`,
-        # `_run_on_painter`, `_handle_input`). Before `start()` and once it has
-        # handed back there is no owner, and a call runs on its caller.
-        self._painter = ownership.OwnerThread(PAINTER_THREAD_NAME,
-                                              idle=self._on_idle)
-        # Set while a frame request is posted and not yet run: one in flight
-        # is the whole queue, because every request asks for the same thing —
-        # "draw the state as it is NOW" — so ten before the painter gets to the
-        # first are one frame, not ten. Cleared by the request itself BEFORE
-        # the frame it asks for is drawn, so a request that saw it set is
-        # always covered by a frame drawn after it.
-        self._frame_posted = False
-        # Keys the reader could not post because the painter's queue was full
-        # (see `_handle_input`), and how many of them `_tick` has reported.
-        self._keys_dropped = 0
-        self._keys_reported = 0
-        # The last stderr line `_warn` wrote, so a stuck painter is named once
-        # rather than once per caller that gave up on it.
-        self._last_warning = ""
         # Orders "is the region live, so start the key reader" in `start()`
-        # against a delayed `_open_region` refusing it (see there).
+        # against a delayed `Painter._open_region` refusing it (see there).
         self._input_lock = threading.Lock()
-        # Painter-only from here down. When the requested frame is due (a
-        # monotonic time, None: none requested) — INPUT_REFRESH_SECONDS after
-        # the first request of a burst, so the burst is one frame.
-        self._frame_due: Optional[float] = None
-        # Where the region is in its life (`_REGION_*`), moved by
-        # `_open_region`, `_close_region` and `_disable`.
-        self._region = _REGION_UNOPENED
-        self._next_tick = 0.0          # when the periodic frame is next due
-        self._ticks = 0
-        self._last_size = (0, 0)       # the terminal size the region was cut for
         # Bumped by `pop_mode(discard_pending=True)`: a key posted under an
         # older epoch is the tail of the burst being discarded (`_apply_key`).
         self._key_epoch = 0
         # (note text, when it was set) — what the periodic repaint expires
-        # after NOTE_TTL (see `note`).
+        # after NOTE_TTL (see `note`). Written on the painter only
+        # (`_stamp_note`, `_tick`).
         self._note_stamp: Tuple[str, float] = ("", 0.0)
-        # Rows the region is pinned at. Written only by `_reserve`, which only
-        # the terminal's owner calls.
-        self._reserved = 0
         self._started = False
         self._services: List[object] = []
         self._requested_stop = False      # has `s` been pressed here? (see below)
@@ -2383,6 +2780,11 @@ class StatusApp:
             self.register_action(HelpAction())
 
     # --- lifecycle ---------------------------------------------------------
+
+    @property
+    def terminal(self) -> termio.Terminal:
+        """The painter's terminal: a NullTerminal once anything disabled it."""
+        return self.painter.terminal
 
     @property
     def enabled(self) -> bool:
@@ -2415,19 +2817,11 @@ class StatusApp:
             # Before the region is asked for, so a signal from here on finds
             # a restore in place; stop() removes it whichever way this ends.
             self._install_emergency_restore()
-            # A painter an earlier stop() gave up waiting for is still closing,
-            # and this reopens THAT one (the policy: `OwnerThread.start`): the
-            # region is pinned after its last frame and release, not beside it
-            # — and queued past the queue's bound, so a full one cannot hold
-            # this thread.
-            self._frame_posted = False
-            self._painter.start(first=self._open_region)
-            if not self._painter.drain(PAINTER_JOIN_SECONDS):
-                self._warn_stuck("the first frame", PAINTER_JOIN_SECONDS)
+            self.painter.open(PAINTER_JOIN_SECONDS, on_refused=self._stop_input)
             with self._input_lock:
-                # Past a drain that timed out the region is not decided yet;
+                # Past a wait that timed out the region is not decided yet;
                 # a refusal still to come stops the reader started here (see
-                # `_open_region`), which is what the lock orders.
+                # `Painter._open_region`), which is what the lock orders.
                 refused = isinstance(self.terminal, termio.NullTerminal)
                 if not refused:
                     if self._input is None:
@@ -2435,14 +2829,17 @@ class StatusApp:
                         self._input = termio.TerminalInput()
                     self._input.start(self._handle_input)
             if refused:
-                # Nothing to paint, no keys to read.
-                self._painter.close(PAINTER_JOIN_SECONDS)
+                # Nothing to paint, no keys to read. The terminal is a
+                # NullTerminal by now, so the release close() ends with writes
+                # nothing.
+                self.painter.close(PAINTER_JOIN_SECONDS)
                 return self
         except Exception:
             self.disable()
         except BaseException:
-            # Ctrl+C in the drain above. `with app:` runs no `__exit__` for a
-            # start() that raised, so this is the only stop the region gets.
+            # Ctrl+C in `open`'s wait for the first frame. `with app:` runs
+            # no `__exit__` for a start() that raised, so this is the only
+            # stop the region gets.
             self.stop()
             raise
         for service in self._services:
@@ -2533,15 +2930,7 @@ class StatusApp:
         # Keys first: a key read after the painter hands back would be handled
         # — and painted — on the key reader's own thread.
         self._stop_input()
-        # The release is the painter's `final`, behind everything posted before
-        # it and past the queue's bound, so this wait keeps its bound however
-        # full the queue is. A painter stuck in a frame outlives the wait still
-        # owning the terminal (closing), and releases it itself once the write
-        # returns: nothing is released from here beside a live write.
-        if not self._painter.close(PAINTER_JOIN_SECONDS,
-                                   final=self._close_region):
-            self._warn_stuck("the last frame and the release",
-                             PAINTER_JOIN_SECONDS)
+        self.painter.close(PAINTER_JOIN_SECONDS)
 
     def _stop_input(self) -> None:
         with self._input_lock:
@@ -2563,23 +2952,15 @@ class StatusApp:
 
         Releasing and swapping the terminal is a terminal write, so while a
         painter owns it this runs ON the painter; from any other thread it is
-        handed over and waited for (see `_run_on_painter`).
+        handed over and waited for (see `Painter.run_and_wait`).
         """
-        self._run_on_painter(self._disable)
-
-    def _disable(self) -> None:
-        self._region = _REGION_CLOSED   # nothing left for the idle hook to tick
-        try:
-            self.terminal.release()
-        except Exception:
-            pass
-        self.terminal = termio.NullTerminal()
+        self.painter.run_and_wait(self.painter.disable)
 
     # --- state -------------------------------------------------------------
 
     def update(self, **fields) -> None:
         self.status.update(**fields)
-        self._paint()
+        self.painter.request_frame()
 
     def note(self, text: str) -> None:
         """Show `text` on the note row until NOTE_TTL passes or another note
@@ -2589,7 +2970,7 @@ class StatusApp:
         starts the clock of a note it holds no stamp for."""
         stamp = (text, time.time())
         self.update(note=text)
-        self._painter.try_post(self._stamp_note, stamp)
+        self.painter.try_post(self._stamp_note, stamp)
 
     def _stamp_note(self, stamp: Tuple[str, float]) -> None:
         self._note_stamp = stamp
@@ -2700,7 +3081,7 @@ class StatusApp:
 
     def push_mode(self, mode: Mode) -> None:
         self.modes.append(mode)
-        self._paint()
+        self.painter.request_frame()
 
     def pop_mode(self, *, discard_pending: bool = False) -> None:
         if len(self.modes) > 1:
@@ -2712,7 +3093,7 @@ class StatusApp:
                 # and a new epoch is what `_apply_key` drops them by.
                 self._key_epoch += 1
             self.modes.pop()
-            self._paint()
+            self.painter.request_frame()
 
     @property
     def mode(self) -> Mode:
@@ -2723,90 +3104,37 @@ class StatusApp:
 
         The mode stack and the region are the painter's, like the terminal:
         while a painter runs this executes ON it, and a call from any other
-        thread is handed over and waited for (see `_run_on_painter`). Before
-        `start()` and after the painter hands back it runs on the caller, which
-        is how most pins drive an app.
+        thread is handed over and waited for (see `Painter.run_and_wait`).
+        Before `start()` and after the painter hands back it runs on the
+        caller, which is how most pins drive an app.
         """
-        self._run_on_painter(self._handle_event, event)
+        self.painter.run_and_wait(self._handle_event, event)
 
     def _handle_event(self, event: termio.InputEvent) -> None:
         try:
             if isinstance(event, termio.Resize):
-                if self._region == _REGION_CLOSED:
-                    return      # released: nothing to re-cut (see _REGION_*)
-                # A refused reserve() leaves the OLD geometry in place, so
-                # carrying on would paint absolute rows outside the new screen
-                # with the region set for the old one. Disable instead —
-                # start() answers the same refusal the same way.
-                if not self._reserve(len(self.rows())):
-                    self._disable()
-                    return
-                self._paint()
+                self.painter.resize()
                 return
             for mode in reversed(self.modes):
                 if mode.handle(event):
                     break
-            self._paint()
+            self.painter.request_frame()
         except Exception:
-            self._disable()
+            self.painter.disable()
 
     def _handle_input(self, event: termio.InputEvent) -> None:
         """The key reader's entry: post the event to the painter and go back to
         reading at once — a slow terminal delays when a key takes effect, never
-        whether it is read. A key that arrives with no app running is dropped:
-        nobody is listening for it any more.
-
-        Never waits for room either. The painter's queue is full only while a
-        terminal write is stuck, and a reader held there could not read the
-        Ctrl+C that Windows delivers as a key (`TerminalInput._emit`). So a
-        key that finds it full is dropped and counted, and `_tick` names the
-        count once the painter is back."""
-        if self._started and not self._painter.try_post(
-                self._apply_key, self._key_epoch, event):
-            self._keys_dropped += 1
+        whether it is read, and a full queue drops the key rather than holding
+        the reader (`Painter.post_key`). A key that arrives with no app running
+        is dropped: nobody is listening for it any more."""
+        if self._started:
+            self.painter.post_key(self._apply_key, self._key_epoch, event)
 
     def _apply_key(self, epoch: int, event: termio.InputEvent) -> None:
         """A key the reader posted — unless a discard came between (`pop_mode`)."""
         if epoch == self._key_epoch:
             self._handle_event(event)
-
-    def _run_on_painter(self, call: Callable, *args) -> None:
-        """`call(*args)` on the thread that owns the terminal, waited for.
-
-        On the painter itself, and with no painter running, that is here and
-        now. From any other thread it is posted, and the caller — which reads
-        its effect next — waits for it, for at most POSTED_CALL_WAIT_SECONDS
-        in all: queueing it included, so a full queue behind a stuck write
-        costs the call (named on stderr), never an unbounded wait.
-        """
-        if self._painter.owns_current_thread:
-            call(*args)
-            return
-        deadline = time.monotonic() + POSTED_CALL_WAIT_SECONDS
-        if not self._painter.post(call, *args,
-                                  timeout=POSTED_CALL_WAIT_SECONDS):
-            self._warn_stuck(f"{_call_name(call)} (not queued, dropped)",
-                             POSTED_CALL_WAIT_SECONDS)
-            return
-        if not self._painter.drain(max(0.0, deadline - time.monotonic())):
-            self._warn_stuck(_call_name(call), POSTED_CALL_WAIT_SECONDS)
-
-    def _warn_stuck(self, what: str, seconds: float) -> None:
-        """Name a wait on the painter that timed out: a stuck painter is
-        otherwise invisible, since its own frames are what is stuck."""
-        self._warn(f"{what} not done within {seconds:g} s — a terminal write "
-                   f"is stuck; the painter carries on once it returns")
-
-    def _warn(self, text: str) -> None:
-        """One stderr line, not repeated back to back."""
-        line = f"{PAINTER_THREAD_NAME}: {text}"
-        if line == self._last_warning:
-            return
-        self._last_warning = line
-        try:
-            print(line, file=sys.stderr)
-        except Exception:
-            pass
 
     # --- rendering ---------------------------------------------------------
 
@@ -2823,174 +3151,10 @@ class StatusApp:
         rows = self.layout.rows(snapshot) + self.mode.rows(snapshot)
         return [row.render(snapshot, width, now) for row in rows]
 
-    def _reserve(self, rows: int) -> bool:
-        """True when the region has the requested shape (or there is none to keep)."""
-        if isinstance(self.terminal, termio.NullTerminal):
-            return True
-        if self.terminal.reserve(rows):
-            self._reserved = rows
-            return True
-        return False
-
-    def _paint(self) -> None:
-        """Ask for a frame of the state as it is now — drawn on the painter
-        while one runs.
-
-        While the painter runs it is the one thread that renders and writes the
-        terminal; a worker's `update`, a key, a quota poll only post a request
-        and return, so the renderers never run on two threads at once and no
-        caller waits for a slow terminal. On the painter itself the request is
-        folded into the frame it draws once the calls queued behind it have run
-        (see `_on_idle`). Before `start()` and once the painter has handed back
-        there is no owner, and the caller paints itself: that is how a run
-        names its window before the region is pinned.
-        """
-        if self._painter.owns_current_thread:
-            self._schedule_frame()
-            return
-        # A set flag with nothing queued is a request that never got there —
-        # this thread's twin interrupted between flag and post, or a queue the
-        # owner dropped dying — so it is posted again rather than trusted. A
-        # second request racing the first is harmless: both are one frame.
-        if self._frame_posted and self._painter.backlog:
-            return
-        self._frame_posted = True
-        try:
-            queued = self._painter.try_post(self._take_frame_request)
-        except BaseException:
-            self._frame_posted = False
-            raise
-        if not queued:
-            # Queue full: the periodic frame draws this state instead.
-            self._frame_posted = False
-
-    def _take_frame_request(self) -> None:
-        """A posted frame request, or with no painter the frame itself."""
-        self._frame_posted = False
-        if self._painter.owns_current_thread:
-            self._schedule_frame()
-        else:
-            self._draw()
-
-    def _schedule_frame(self) -> None:
-        """(painter) A burst's first request sets its frame's time; the rest of
-        the burst lands in that frame."""
-        if self._frame_due is None:
-            self._frame_due = time.monotonic() + INPUT_REFRESH_SECONDS
-
-    def _draw(self, *, reassert: bool = False) -> None:
-        """One frame: the title, then the rows. On the painter, or on the
-        caller when there is none (see `_paint`). None once the region is
-        closed (see `_REGION_CLOSED`)."""
-        self._frame_due = None
-        if self._region == _REGION_CLOSED:
-            return
-        # Before the `active` gate, and on the same path as the rows: the title
-        # is what a person sees while the terminal is behind another window, so
-        # it must follow every state change the rows follow — including the ones
-        # that arrive before any region is pinned (a run names its window as
-        # soon as `update` gives it a state, which is before `start()`).
-        # Once the terminal has been released it refuses the write, so a late
-        # painter cannot re-name a window nobody will clean up again.
-        try:
-            self.terminal.set_title(title_text(self.status), reassert=reassert)
-        except Exception:
-            pass
-        if not self.terminal.active:
-            return
-        try:
-            columns, _lines = self.terminal.size()
-            # The bottom-right cell can immediately scroll a Windows console.
-            # Budget the margin BEFORE windowing the editor, or its caret is cut.
-            rows = self.render(max(0, columns - textwidth.LINE_RIGHT_MARGIN))
-            if len(rows) != self._reserved:
-                # A Mode added or dropped a row: resize the region rather than
-                # painting into lines the terminal is still scrolling.
-                if not self._reserve(len(rows)):
-                    return
-            self.terminal.paint([colorize(line) for line in rows],
-                                reassert=reassert)
-        except Exception:
-            self._disable()
-
-    # --- the painter's own calls -------------------------------------------
-
-    def _open_region(self) -> None:
-        """(painter) Pin the region and draw the first frame — `start()`'s
-        `first`, run after whatever an earlier stop left queued.
-
-        A refusal disables the app, and stops a key reader `start()` may
-        already have started while this waited behind a stuck write: a
-        refused region means no keys, whenever the refusal lands.
-        """
-        try:
-            self._last_size = self.terminal.size()
-            self._ticks = 0
-            self._next_tick = time.monotonic() + self.refresh
-            self._frame_due = None
-            self._region = _REGION_OPEN
-            if not self._reserve(len(self.rows())):
-                self._disable()
-                self._stop_input()
-                return
-            self._draw()
-        except Exception:
-            self._disable()
-
-    def _close_region(self) -> None:
-        """(painter) The last frame, then the release — `stop()`'s `final`.
-
-        It runs behind everything posted before stop(); a call posted after it
-        (a `handle_event` from a thread stop() did not wait for) still runs,
-        after the release, and finds the region closed (`_REGION_CLOSED`).
-
-        The frame is drawn whether or not one is due: the state a caller set
-        right before stop() — the run's final `phase="idle"` — is still inside
-        its burst window, and would otherwise never reach the screen.
-        """
-        try:
-            # Keys lost behind the stuck write stop() gave up on: no tick is
-            # left to name them.
-            self._report_dropped_keys()
-            self._draw()
-        finally:
-            self._region = _REGION_CLOSED
-            try:
-                self.terminal.release()
-            except Exception:
-                pass
-
-    def _on_idle(self) -> Optional[float]:
-        """(painter) The `idle` hook: a requested frame once its burst window
-        has passed, the periodic one every `refresh`; answers when it is due
-        next. Nothing outside an open region (see `_REGION_OPEN`): a
-        reopened painter's first idle pass, before `_open_region` has run,
-        must not tick — and re-pin — the region the last stop released.
-        """
-        if self._region != _REGION_OPEN:
-            return None
-        try:
-            now = time.monotonic()
-            if now >= self._next_tick:
-                self._next_tick = now + self.refresh
-                self._tick()
-            elif self._frame_due is not None and now >= self._frame_due:
-                self._draw()
-        except Exception:
-            self._disable()
-        due = self._next_tick
-        if self._frame_due is not None:
-            due = min(due, self._frame_due)
-        return max(0.0, due - time.monotonic())
-
-    def _tick(self) -> None:
-        """(painter) The periodic frame and the checks that ride on it."""
-        self._ticks += 1
-        size = self.terminal.size()
-        if size != self._last_size:
-            self._last_size = size
-            self._handle_event(termio.Resize(size[0], size[1]))
-        self._report_dropped_keys()
+    def _tick(self, count: int) -> None:
+        """(painter) The app's checks that ride on the periodic frame
+        (`Painter._tick`, which passes its `count` since the region opened):
+        the note's expiry, and every fourth tick the stop sentinel."""
         note, noted_at = self._note_stamp
         shown = self.status.note
         if shown and shown != note:
@@ -3003,7 +3167,7 @@ class StatusApp:
             # stamp on the way.
             if self.status.note == note:
                 self.status.update(note="")
-        if self._ticks % 4 == 0:
+        if count % 4 == 0:
             # Catches a sentinel created by hand (`touch stop`) or by a
             # neighbouring run. It never touches `_requested_stop`: the key's
             # request is this process's own and outlives whatever anyone does
@@ -3015,18 +3179,3 @@ class StatusApp:
                            else self._sentinel_pending())
                 if pending != self.status.stop_pending:
                     self.status.update(stop_pending=pending)
-        # Re-assert the region on the periodic repaint: see
-        # termio.Terminal.paint.
-        self._draw(reassert=True)
-
-    def _report_dropped_keys(self) -> None:
-        """(painter) Say so once keys were lost to a full queue (see
-        `_handle_input`): on the note row, and on stderr for the log."""
-        dropped = self._keys_dropped
-        if dropped == self._keys_reported:
-            return
-        self._keys_reported = dropped
-        text = (f"{dropped} key(s) dropped so far — the terminal was not "
-                f"keeping up; press them again")
-        self._warn(text)
-        self.note(text)

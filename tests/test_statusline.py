@@ -737,7 +737,7 @@ def test_a_pinned_terminal_writes_its_rows_to_the_real_stream(monkeypatch):
         app.update(iteration=4, phase="running")
 
     # Read after the `with`: the painter draws the update, and stop() is what
-    # waits for its last frame (see `StatusApp._close_region`).
+    # waits for its last frame (see `Painter._close_region`).
     assert "iter 4" in stream.getvalue()
     assert app.enabled is False   # region released on the way out
 
@@ -867,7 +867,7 @@ def test_the_window_keeps_its_name_when_something_else_takes_it(monkeypatch):
 
 
 def test_disabling_mid_paint_cannot_leave_a_name_on_the_window(monkeypatch):
-    """`_paint` reads `self.terminal`, then writes to it — and another thread
+    """A frame reads its terminal, then writes to it — and another thread
     may release that very terminal in between (a resize the screen cannot fit,
     any painting error). The released terminal has to refuse the write."""
     stream = _FakeStream(True)

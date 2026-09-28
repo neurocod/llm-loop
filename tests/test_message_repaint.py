@@ -15,14 +15,14 @@ from _termfixtures import KeysByHand, RecordingTerminal
 def test_painted_long_note_scrolls_without_touching_the_last_column(text):
     terminal = RecordingTerminal()
     app = sl.StatusApp(terminal=terminal, messages=operator.Mailbox())
-    assert app._reserve(len(app.rows()))
+    assert app.painter.reserve(len(app.rows()))
     try:
         app.handle_event(termio.Key("m"))
         app.mode.editor.set(text)
         for columns in (80, 40, 120):
             terminal.columns = columns
             app.handle_event(termio.Resize(columns, 30))
-            app._paint()
+            app.painter.request_frame()
             frames = []
             while not terminal.frames.empty():
                 frames = terminal.frames.get_nowait()

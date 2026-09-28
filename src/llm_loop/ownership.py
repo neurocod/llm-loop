@@ -13,7 +13,7 @@ mutable state left to guard.
 `start(first=)` / `close(final=)` for the calls that set the resource up and
 put it back, and an `idle` hook for the work an owner does on its own clock.
 What the resource IS lives with its user: `parallel` owns the console's worker
-lines with one of these, `statusline.StatusApp` the pinned rows.
+lines with one of these, `statusline.Painter` the pinned rows.
 """
 
 import collections
@@ -121,6 +121,11 @@ class OwnerThread:
         """Calls posted and not yet finished, the one running included."""
         with self._changed:
             return self._queued - self._finished
+
+    @property
+    def thread(self) -> Optional[threading.Thread]:
+        """The owner thread (a closing one included), None while there is none."""
+        return self._thread
 
     @property
     def owns_current_thread(self) -> bool:
