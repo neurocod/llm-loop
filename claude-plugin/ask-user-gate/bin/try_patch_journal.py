@@ -11,7 +11,7 @@ commit.py, in the landing that bumps the submodule. A checkout without this
 file is one whose try_patch cannot be read by it; commit.py says so rather
 than guessing.
 
-The selftest stays in try_patch.py: every case runs the CLI as a subprocess.
+The selftest stays in try_patch.py.
 """
 
 import json

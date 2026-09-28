@@ -465,10 +465,12 @@ def restore(touched: "dict[Path, Touched]") -> bool:
 # `python try_patch.py --selftest`, no arguments, no fixtures, nothing touched
 # outside a temp directory.
 #
-# Every case runs THIS FILE as a subprocess. That is deliberate: the defect
-# these pin -- several edits of one file restoring the file to a half-mutated
-# state -- lived in the seam between collecting edits and restoring them, and
-# an in-process call to a helper would have stepped straight over it. What is
+# Every case of an edit and its restore runs THIS FILE as a subprocess; only
+# the journal's line parser and one race window are poked in-process. That is
+# deliberate: the defect these pin -- several edits of one file restoring the
+# file to a half-mutated state -- lived in the seam between collecting edits
+# and restoring them, and an in-process call to a helper would have stepped
+# straight over it. What is
 # asserted is the only thing a caller can see: the exit code, and the bytes on
 # disk afterwards.
 # --------------------------------------------------------------------------
