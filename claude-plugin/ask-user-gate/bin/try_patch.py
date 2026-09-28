@@ -119,8 +119,13 @@ class Triple(argparse.Action):
             order.setdefault("new", []).append("")
             return
         if key == "new" and not values:
+            # A bare --new (None) is also `--new -x`: argparse takes a token
+            # starting with '-' for the next flag, so the caller's text never
+            # arrives and the refusal must not claim they gave none.
+            dash = ("; a value starting with '-' needs --new=TEXT"
+                    if values is None else "")
             parser.error("--new got no text (a value lost on the way looks "
-                         "the same); to delete, use --remove TEXT")
+                         f"the same); to delete, use --remove TEXT{dash}")
         order.setdefault(key, []).append(values)
 
 
@@ -294,7 +299,7 @@ def main() -> int:
     # order the caller named them.
     plans: dict[Path, Touched] = {}
     try:
-        for path, old, new in edits:
+        for number, (path, old, new) in enumerate(edits, start=1):
             key = path.resolve()
             plan = plans.get(key)
             if plan is None:
@@ -303,8 +308,18 @@ def main() -> int:
             # `before` already carries any earlier edit of the same file, which
             # is what makes stacked edits compose.
             before = plan.expected
-            after, hits = apply_replacement(before, old, new, options.regex,
-                                            options.count, is_uniform_crlf(before))
+            try:
+                after, hits = apply_replacement(before, old, new, options.regex,
+                                                options.count,
+                                                is_uniform_crlf(before))
+            except EditError as exc:
+                # The engine's refusal names no flag, and with stacked edits
+                # "the text to find is empty" does not say WHICH. An empty
+                # replacement only ever comes from --remove (an empty --new is
+                # refused by Triple), so `new` tells the two spellings apart.
+                flag = "--remove" if not new else "--old"
+                raise EditError(
+                    f"edit {number} ({flag} in {path}): {exc}") from exc
             plan.expected = after
             print(f"try_patch: {path}: {hits} occurrence(s) mutated")
             for line in changed_lines(before, after, limit=4):
@@ -606,19 +621,52 @@ def _case_an_empty_new_is_refused(work: Path) -> None:
         _expect_refused_unrun(work, victim, args, "use --remove TEXT")
 
 
+def _case_a_dash_new_value_names_the_equals_spelling(work: Path) -> None:
+    """`--new -x` arrives bare -- argparse takes `-x` for a flag -- so the
+    refusal must say how to pass it, not only that the text was missing.
+    """
+    victim = _victim(work)
+    _expect_refused_unrun(
+        work, victim,
+        ["--file", "victim.cpp", "--old", "guardA = true;", "--new", "-x"],
+        "a value starting with '-' needs --new=TEXT")
+
+
 def _case_an_empty_old_is_refused(work: Path) -> None:
     """The measured repro: `--old= --new X --count any` made `ab` `XaXbX`.
 
     Refused by apply_replacement itself, so every spelling that ends in an
-    empty pattern is covered, --regex and --remove included.
+    empty pattern is covered, --regex and --remove included; the refusal
+    names the edit, because with stacked edits the engine's words alone do
+    not say which one came empty.
     """
     victim = _victim(work)
     edit = ["--file", "victim.cpp"]
-    for args in ([*edit, "--old=", "--new", "X", "--count", "any"],
-                 [*edit, "--regex", "--old=", "--new", "X", "--count", "any"],
-                 [*edit, "--remove=", "--count", "any"],
-                 [*_flip("guardA"), *edit, "--old", "", "--new", "X"]):
-        _expect_refused_unrun(work, victim, args, "the text to find is empty")
+    for args, which in (
+            ([*edit, "--old=", "--new", "X", "--count", "any"], "edit 1 (--old"),
+            ([*edit, "--regex", "--old=", "--new", "X", "--count", "any"],
+             "edit 1 (--old"),
+            ([*edit, "--remove=", "--count", "any"], "edit 1 (--remove"),
+            ([*_flip("guardA"), *edit, "--old", "", "--new", "X"],
+             "edit 2 (--old")):
+        _expect_refused_unrun(work, victim, args,
+                              f"{which} in victim.cpp): the text to find is "
+                              "empty")
+
+
+def _case_a_regex_residue_of_a_lost_value_is_refused(work: Path) -> None:
+    """What a lost value leaves inside a typed regex: `"($x)"` -> `()`,
+    `"(?i)$x"` -> `(?i)`. Each matches empty at every position -- the empty
+    pattern's signature, which apply_replacement refuses -- and under
+    --count any --expect-fail each used to be a vacuous "failed as expected".
+    """
+    victim = _victim(work)
+    for residue in ("()", "(?:)", "(?i)", "(?x)"):
+        _expect_refused_unrun(
+            work, victim,
+            ["--file", "victim.cpp", "--regex", "--old", residue,
+             "--new", "X", "--count", "any"],
+            "matches the empty string at every position")
 
 
 def _case_remove_pairs_with_its_own_file(work: Path) -> None:
@@ -983,7 +1031,9 @@ SELFTEST_CASES = (
     _case_stacked_edits_all_reach_the_command,
     _case_same_file_spelled_two_ways,
     _case_an_empty_new_is_refused,
+    _case_a_dash_new_value_names_the_equals_spelling,
     _case_an_empty_old_is_refused,
+    _case_a_regex_residue_of_a_lost_value_is_refused,
     _case_remove_pairs_with_its_own_file,
     _case_failing_command_restores_and_reports,
     _case_expect_fail_accepts_a_failing_command,

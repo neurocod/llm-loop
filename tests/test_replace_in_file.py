@@ -10,7 +10,9 @@ operator does, so the dropped token is the shell's doing rather than this
 file's assumption.
 """
 
+import functools
 import importlib.util
+import io
 import subprocess
 import sys
 from pathlib import Path
@@ -119,11 +121,23 @@ def test_an_empty_pattern_is_refused(tmp_path, edit):
 
 # --- ... and the engine refuses it on its own, for its other caller (try_patch) ----
 
+@functools.lru_cache(maxsize=None)
 def _engine():
-    """The script as a module: the CLI's own refusal shadows the engine's."""
+    """The script as a module: the CLI's own refusal shadows the engine's.
+
+    Loaded once, with the std streams swapped for StringIO while it runs: the
+    module reconfigures sys.stdout/stderr to UTF-8 at import, and that would
+    otherwise land on pytest's own capture streams. StringIO has no
+    reconfigure, which the module already shrugs off.
+    """
     spec = importlib.util.spec_from_file_location("replace_in_file_ref", SCRIPT)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.stdout, sys.stderr = saved
     return module
 
 
@@ -135,6 +149,49 @@ def test_the_engine_refuses_an_empty_pattern(regex):
         engine.apply_replacement("ab", "", "X", regex, None, False)
 
 
+# What a lost value leaves inside a typed regex -- `"($x)"`, `"(?i)$x"` -- and
+# the degenerate `x*`: each does on the text exactly what "" does (an empty
+# match at every position), so each is refused whatever the count.
+@pytest.mark.parametrize("pattern, text", [
+    ("()", TEXT), ("(?:)", TEXT), ("(?i)", TEXT), ("(?x)", TEXT),
+    ("x*", TEXT), ("z?", TEXT),
+    ("^", "\n\n"),     # a typed ^ on blank lines hits every position
+    ("^", ""),         # the empty file: one position, one match
+], ids=["group", "noncapturing", "flag-i", "flag-x", "x-star", "z-optional",
+        "caret-on-blank-lines", "caret-on-empty-file"])
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_the_engine_refuses_a_regex_that_acts_as_the_empty_one(pattern, text,
+                                                                crlf):
+    engine = _engine()
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    with pytest.raises(engine.EditError,
+                       match="matches the empty string at every position"):
+        engine.apply_replacement(text, pattern, "X", True, None, crlf)
+
+
+# Zero-width patterns that PICK positions are insertions, which is their use.
+@pytest.mark.parametrize("pattern, expected", [
+    ("^", "#a = 1; guard();\n#b = 2; guard();\n#"),
+    ("$", "a = 1; guard();#\nb = 2; guard();#\n#"),
+    (r"\b", "#a# = #1#; #guard#();\n#b# = #2#; #guard#();\n"),
+    ("(?=guard)", "a = 1; #guard();\nb = 2; #guard();\n"),
+    ("(?m)^", "#a = 1; guard();\n#b = 2; guard();\n#"),
+], ids=["caret", "dollar", "word-boundary", "lookahead", "inline-multiline"])
+def test_the_engine_inserts_at_a_zero_width_regex(pattern, expected):
+    after, _ = _engine().apply_replacement(TEXT, pattern, "#", True, None,
+                                           False)
+    assert after == expected
+
+
+def test_a_star_that_matches_somewhere_is_left_to_the_count():
+    # Not every match is empty, so it is not the empty pattern's signature:
+    # the count decides, and the default of 1 refuses it.
+    engine = _engine()
+    with pytest.raises(engine.EditError, match="expected 1 occurrence"):
+        engine.apply_replacement("axb", "x*", "Y", True, 1, False)
+
+
 def test_a_zero_width_regex_is_an_insertion(tmp_path):
     # "Empty" is the empty string, not "can match empty": a lookahead (or ^, $,
     # \b) is typed on purpose, and inserting there is its use.
@@ -144,13 +201,14 @@ def test_a_zero_width_regex_is_an_insertion(tmp_path):
                   victim, TEXT.replace("guard", "noguard"))
 
 
-def test_a_regex_matching_empty_everywhere_is_left_to_the_count(tmp_path):
-    # `x*` matches between every two characters like "" does; the default
-    # --count 1 is what refuses it (exit 1, not the usage error of exit 2).
+def test_a_regex_residue_is_refused_by_the_script(tmp_path):
+    # Through the CLI, --count any included: an engine refusal, exit 1 (the
+    # usage errors of exit 2 are for what argparse can see).
     victim = _victim(tmp_path)
-    result = _run(str(victim), "--regex", "--old", "x*", "--new", "Y")
+    result = _run(str(victim), "--regex", "--old", "()", "--new", "Y",
+                  "--count", "any")
     assert result.returncode == 1, result.stdout + result.stderr
-    assert "expected 1 occurrence(s)" in result.stderr
+    assert "matches the empty string at every position" in _flat(result.stderr)
     assert victim.read_bytes().decode("utf-8") == TEXT
 
 
