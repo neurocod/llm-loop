@@ -2840,7 +2840,7 @@ class StatusApp:
         names its window before the region is pinned.
         """
         if self._painter.owns_current_thread:
-            self._frame_wanted()
+            self._schedule_frame()
             return
         # A set flag with nothing queued is a request that never got there —
         # this thread's twin interrupted between flag and post, or a queue the
@@ -2850,7 +2850,7 @@ class StatusApp:
             return
         self._frame_posted = True
         try:
-            queued = self._painter.try_post(self._want_frame)
+            queued = self._painter.try_post(self._take_frame_request)
         except BaseException:
             self._frame_posted = False
             raise
@@ -2858,15 +2858,15 @@ class StatusApp:
             # Queue full: the periodic frame draws this state instead.
             self._frame_posted = False
 
-    def _want_frame(self) -> None:
+    def _take_frame_request(self) -> None:
         """A posted frame request, or with no painter the frame itself."""
         self._frame_posted = False
         if self._painter.owns_current_thread:
-            self._frame_wanted()
+            self._schedule_frame()
         else:
             self._draw()
 
-    def _frame_wanted(self) -> None:
+    def _schedule_frame(self) -> None:
         """(painter) A burst's first request sets its frame's time; the rest of
         the burst lands in that frame."""
         if self._frame_due is None:
