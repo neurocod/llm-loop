@@ -163,18 +163,13 @@ class Driver:
         """Add this wrapper's own options to the shared --help. Default: none.
 
         Called by main() and main_parallel() with the parser that is about to
-        run, so an entry point can document (or genuinely add) options the
-        engine knows nothing about. The usual case is a MODE switch — one the
-        wrapper must read out of argv itself, because it decides which of the
-        two parsers runs at all, and which therefore can never be a plain option
-        of either. Undocumented, such a flag exists only in prose, and `--help`
-        answers "there is no such option" to a user who is looking straight at
-        the one they want.
-
-        Both entry points call it, so a flag spelled the same in both modes is
-        documented in both --helps from one override. Build the option strings
-        from the same constants the wrapper's argv scan uses; a second spelling
-        typed out here is a spelling that can drift.
+        run, so an entry point can add options the engine knows nothing about.
+        The usual case is a MODE switch — one the wrapper scans argv for,
+        because it decides which of the two parsers runs at all. Declare those
+        as a `modeswitch.ModeSwitch` table and call `modeswitch.register` here:
+        the same table drives the scan, so a spelling cannot drift between
+        what is listed and what is recognised, and the parser then reads the
+        whole line, switches included.
         """
 
     def next_command(self) -> Optional[AgentCommand]:

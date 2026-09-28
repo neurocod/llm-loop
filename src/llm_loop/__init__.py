@@ -37,8 +37,9 @@ cyclecore for the sequential engine, streamrender for one provider run shown
 live and wire for the words that stream is made of,
 drivers for the two ready made Drivers,
 parallel for the concurrent list runner, projectroot for the root itself,
-usage/codex_usage for the provider quota query layers, and limits for the
-pausing policy.
+usage/codex_usage for the provider quota query layers, limits for the
+pausing policy, and modeswitch for a wrapper's own mode switches (the flags
+that choose between the two runners' parsers).
 """
 
 # The single source of truth for the version: pyproject.toml reads it back out
@@ -51,8 +52,9 @@ __version__ = "0.1.0"
 from . import cmdline
 from . import exitlog
 from . import stopchannel
+from . import modeswitch
+from .modeswitch import ModeSwitch
 from .cyclecore import (
-    ConsumedByWrapperAction,
     is_report,
     parse_args,
     run_loop,
@@ -175,7 +177,6 @@ __all__ = [
     "AgentCommand",
     "ClaudeCommand",
     "CodexUsageSource",
-    "ConsumedByWrapperAction",
     "DayNightLimit",
     "Driver",
     "GitPushPolicy",
@@ -192,6 +193,7 @@ __all__ = [
     "MailboxSet",
     "LoopStop",
     "Mode",
+    "ModeSwitch",
     "NumberSetting",
     "PROVIDERS",
     "PROVIDER_NAMES",
@@ -226,6 +228,7 @@ __all__ = [
     "last_rate_limit_event",
     "latched_stop",
     "log_file_path",
+    "modeswitch",
     "oauth_token",
     "parse_args",
     "parse_parallel_args",

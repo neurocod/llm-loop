@@ -366,26 +366,27 @@ if __name__ == "__main__":
 
 ### Wrapper options in `--help`
 
-A wrapper that offers a mode of its own has to read it out of `argv` itself —
-the two parsers have disjoint option sets, so the flag choosing between them
-cannot be an option of either. `add_cli_options` is where such a flag gets
-documented, and both entry points call it, so one override covers both `--help`
-texts:
+A wrapper that offers a mode of its own has to scan `argv` for it — the two
+parsers have disjoint option sets, so the flag choosing between them decides
+which parser runs. Declare such flags once, as a
+[`modeswitch`](src/llm_loop/modeswitch.py) table: `scan` picks the parser,
+`register` (called from `add_cli_options`, which both entry points call) puts
+the switches into it, and `refuse_disagreement` exits 2 when an abbreviation
+made the two readings differ:
 
 ```python
+SWITCHES = (ModeSwitch(("-p", "--parallel"), "parallel", False,
+                       "run N workers", listed_in=frozenset({"sequential"})),)
+
 class FileListDriver(ListFileDriver):
     @classmethod
     def add_cli_options(cls, parser):
-        group = parser.add_argument_group("modes", "read before the options above")
-        group.add_argument(MY_FLAG, action=ConsumedByWrapperAction,
-                           help="what it switches on")
+        modeswitch.register(parser, SWITCHES, "sequential")
 ```
 
-`ConsumedByWrapperAction` documents without parsing: it errors if the option
-ever reaches the parser, which means the wrapper's own scan missed a spelling
-(an abbreviation argparse resolves and a plain `argv` scan does not) and the run
-would otherwise have gone ahead in the default mode. Anything the engine *should*
-parse is an ordinary `add_argument` here instead.
+The switches stay in `argv`: the chosen parser reads the whole line, so a value
+flag followed by a switch is a usage error instead of the switch's neighbour
+quietly becoming the value.
 
 Hold the hook to [`clispec.unstrippable_flags`](src/llm_loop/clispec.py) in a
 test of your own, over every parser your entry points build.

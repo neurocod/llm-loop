@@ -18,9 +18,10 @@ So `OPTIONS` below is the single table, and everything else is DERIVED from it:
     it) is the same table projected down to what an argv rewriter needs: every
     spelling of a flag, and whether it eats the next token.
 
-A row that no parser offers is legitimate and carries `kwargs=None`: the wrapper
-reads `--parallel`/`--grow-kit`/`--random`/`--finish` out of argv
-before either parser exists, and `--session-limit`/`--weekly-limit` are ceilings
+A row that no parser offers is legitimate and carries `kwargs=None`:
+`--parallel`/`--grow-kit`/`--random`/`--finish` are a wrapper's mode switches,
+which the wrapper declares and registers itself (`modeswitch`) into whichever
+parser its argv scan picks, and `--session-limit`/`--weekly-limit` are ceilings
 the status line can edit into a command line that has no parser yet. The alias
 table must know those spellings anyway — it is what stops their values from
 being misread as free-standing tokens.
@@ -254,9 +255,9 @@ OPTIONS: Dict[str, Option] = {
     # already express an edited ceiling as a command line.
     "--session-limit": Option(aliases=("--session-limit",), takes_value=True),
     "--weekly-limit": Option(aliases=("--weekly-limit",), takes_value=True),
-    # Wrapper-only: runGenerateModels reads this out of argv before either
-    # parser. It takes a value, which is the reason it must be listed even
-    # though nothing here parses it: an unlisted value-taking flag has its
+    # Wrapper-only: runGenerateModels' mode switch, registered by the wrapper
+    # (`modeswitch`), not by `build_parser`. It takes a value, which is the
+    # reason it must be listed here anyway: an unlisted value-taking flag has its
     # VALUE read as a free-standing token, and a folder or a count that happens
     # to spell `-m` is then stripped along with the token after it.
     "--finish": Option(aliases=("--finish",), takes_value=True),
@@ -403,10 +404,11 @@ def build_parser(mode: str, *, prog: str, description: Optional[str] = None,
     impossible while the only way to reach a parser is to hand it an argv and
     have it call `sys.exit`.
 
-    `extra_options` is handed the finished parser and is how a wrapper documents
-    the flags IT consumes before this parser ever runs (a mode switch that
-    decides WHICH parser to use cannot be one of that parser's options). It runs
-    last so a wrapper's flags print after the family's.
+    `extra_options` is handed the finished parser and is how a wrapper adds
+    options of its own — its mode switches above all (`modeswitch.register`):
+    the wrapper's argv scan reads them to choose THIS parser, which then parses
+    them with the rest of the line. It runs last so a wrapper's flags print
+    after the family's.
     """
     parser = argparse.ArgumentParser(
         prog=prog,

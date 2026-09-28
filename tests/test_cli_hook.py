@@ -1,23 +1,25 @@
 """Tests for the wrapper's seam into the shared --help.
 
-A wrapper mode switch is read out of argv before either parser exists, so
-nothing lists it unless `Driver.add_cli_options` puts it there — and a flag that
-`--help` does not mention is a flag its user concludes does not exist. These
-pin the two halves: the hook reaches both entry points, and the documenting
-action refuses to be a silent no-op.
+A wrapper mode switch is scanned off argv to choose a parser, so nothing lists
+it unless `Driver.add_cli_options` puts it there — and a flag that `--help` does
+not mention is a flag its user concludes does not exist. These pin that the
+hook reaches both entry points; what a registered switch then does (parsed with
+the rest of the line, a disagreeing scan refused) is test_modeswitch.py's.
 """
 
 import pytest
 
-from llm_loop import ConsumedByWrapperAction, ListFileDriver, cyclecore, parallel
+from llm_loop import ListFileDriver, ModeSwitch, cyclecore, modeswitch, parallel
 
 
 MODE_FLAG = "--grow-kit"
+SWITCHES = (ModeSwitch((MODE_FLAG,), "grow_kit", False,
+                       "a mode this wrapper scans for",
+                       listed_in=frozenset({"any"})),)
 
 
 def add_mode(parser):
-    parser.add_argument(MODE_FLAG, action=ConsumedByWrapperAction,
-                        help="a mode this wrapper reads itself")
+    modeswitch.register(parser, SWITCHES, "any")
 
 
 class HookedDriver(ListFileDriver):
@@ -61,32 +63,9 @@ def test_a_driver_without_the_hook_gets_the_help_it_always_had(capsys):
     assert MODE_FLAG not in _help_of(PlainDriver.main, capsys)
 
 
-# --- the documenting action ----------------------------------------------------
-
-def test_a_documented_switch_stays_out_of_the_parsed_namespace():
-    # The wrapper acted on it long before this parser ran; leaving a stale copy
-    # in the namespace invites a second, disagreeing reader of the same flag.
-    args = cyclecore.parse_args([], extra_options=add_mode)
-
-    assert not hasattr(args, "grow_kit")
-
-
-def test_reaching_the_parser_is_an_error_naming_the_option(capsys):
-    # argparse resolves `--grow-k`; the wrapper's argv scan does not. Accepted
-    # here, it would run the DEFAULT mode while looking like it worked.
-    with pytest.raises(SystemExit) as exit_info:
-        cyclecore.parse_args(["--grow-k"], extra_options=add_mode)
-
-    assert exit_info.value.code == 2
-    assert MODE_FLAG in capsys.readouterr().err
-
-
-def test_a_value_taking_switch_shows_its_argument(capsys):
-    def add_batched(parser):
-        parser.add_argument("--batches-of", action=ConsumedByWrapperAction,
-                            nargs=1, metavar="N", help="batches of N")
-
-    with pytest.raises(SystemExit):
-        cyclecore.parse_args(["--help"], extra_options=add_batched)
-
-    assert "--batches-of N" in capsys.readouterr().out
+@pytest.mark.parametrize("parse", [cyclecore.parse_args, parallel.parse_args])
+def test_a_registered_switch_is_parsed_with_the_line(parse):
+    # The switch is no longer taken out of argv first: the parser the scan
+    # picked reads it, so it lands in the namespace under its own dest.
+    assert parse([MODE_FLAG], extra_options=add_mode).grow_kit is True
+    assert parse([], extra_options=add_mode).grow_kit is False
