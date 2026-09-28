@@ -956,6 +956,18 @@ class _Parser(argparse.ArgumentParser):
         super().__init__(*args, **kwargs)
         self._negative_number_matcher = self.NEGATIVE_NUMBER
 
+    def _parse_optional(self, arg_string):
+        # A token led by `-=` is a flag -- ours too, for the same reason: a
+        # single dash is matched by the text before `=`, which here is just `-`,
+        # a prefix of every option. 3.13 reads it that way (ambiguous, but a
+        # flag); 3.10 took the whole token as the prefix, matched nothing, and
+        # its space rule made `--check "-= x"` a verdict. The port's
+        # looksLikeOption has the 3.13 shape, so this pins the reference to it.
+        if arg_string.startswith("-="):
+            self.error(f"argument {arg_string!r}: `-` before `=` abbreviates "
+                       f"every option, so this is a flag, not a value")
+        return super()._parse_optional(arg_string)
+
     def error(self, message):
         if message.startswith("argument --check: expected one argument"):
             message += " (the empty command is --check=)"
