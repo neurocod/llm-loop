@@ -86,8 +86,36 @@ def test_the_closing_snapshot_answers_the_opening_one():
         (source, "at start (claude)", True),
         # Fresh, not cached: the closing figures are the post-run state.
         (source, "at end (claude)", False),
-        (source, "at end (interrupted)", False),
+        # The ending beside the name, not over it: closed per account, a bare
+        # `at end (interrupted)` twice would not say whose figures are whose.
+        (source, "at end (claude: interrupted)", False),
     ]
+
+
+def test_closing_a_run_answers_every_usage_it_opened(exit_pushes):
+    """`close_run` closes each usage handed to it, not only the last one.
+
+    A mixed-provider sequential run opens one usage per account it selects;
+    closing only the one it ended on left the others' `at start (…)` lines
+    unanswered in the log. A None is an account without a usage endpoint and
+    closes nothing.
+    """
+    policy = _RecordingPolicy()
+    claude = runlifecycle.RunUsage("claude-source", policy, "claude")
+    codex = runlifecycle.RunUsage("codex-source", policy, "codex")
+    ctx = runlifecycle.RunContext(
+        provider="claude", spec=None, dry_run=False, progress=None,
+        settings=runlifecycle.RunSettings(), registry=None,
+        status_enabled=False)
+
+    runlifecycle.close_run(ctx, usages=[claude, None, codex],
+                           ending="interrupted")
+
+    assert [(source, label) for source, label, _fresh in policy.snapshots] == [
+        ("claude-source", "at end (claude: interrupted)"),
+        ("codex-source", "at end (codex: interrupted)"),
+    ]
+    assert len(exit_pushes) == 1, "the housekeeping around the snapshots ran"
 
 
 def test_a_sequential_run_that_returns_closes_the_usage_it_opened(

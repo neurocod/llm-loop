@@ -482,6 +482,17 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # Usage pairs and fallback session clocks belong to accounts, not the whole
     # mixed-provider run. Populate lazily: the launch default may never run.
     usage_states = {}
+
+    def opened_usages() -> list:
+        """Every account's usage this run opened, for the closing snapshots.
+
+        All of them, not the selected one: each `at start (…)` is answered.
+        The selected `usage` is always the object stored here — it is only
+        ever assigned FROM `usage_states` — so nothing has to be written back
+        first; only the session clock beside it moves, and closing ignores it.
+        """
+        return [opened for opened, _session_start in usage_states.values()]
+
     provider_refusals = {}
     quota_refresher = None
     last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
@@ -666,7 +677,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                         f"{stop.message.splitlines()[0]}",
                         iterations=iteration, completed=completed)
                     runlifecycle.close_run(
-                        ctx, usage=usage, ending="driver stopped the run",
+                        ctx, usages=opened_usages(),
+                        ending="driver stopped the run",
                         mailbox=mailbox)
                     sys.exit(stop.exit_code)
                 stop_reason = stopchannel.RunStopReason.DRIVER_STOP
@@ -924,7 +936,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     f"(last exit code {returncode})",
                     iterations=iteration, completed=completed)
                 runlifecycle.close_run(
-                    ctx, usage=usage, ending="provider errors in a row",
+                    ctx, usages=opened_usages(),
+                    ending="provider errors in a row",
                     mailbox=mailbox)
                 sys.exit(returncode)
 
@@ -940,4 +953,4 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # threads rather than to the call.
     return runlifecycle.end_run(
         ctx, stopchannel.RunResult(stop_reason, iteration, completed),
-        usage=usage, mailbox=mailbox)
+        usages=opened_usages(), mailbox=mailbox)

@@ -40,7 +40,7 @@ rather than to tidy it:
 import contextlib
 import os
 import sys
-from typing import Any, NamedTuple, Optional, Tuple
+from typing import Any, Iterable, NamedTuple, Optional, Tuple
 
 from . import (console, exitlog, limits, operator, projectroot, statusline,
                stopchannel)
@@ -279,10 +279,8 @@ class RunUsage:
 
     `name` is what the snapshots are labelled with, and it is what makes the
     opening snapshot and the closing one a pair in the log: `at start (name)` is
-    answered by `at end (name)` unless the run ended somewhere worth naming
-    instead (see `close`). Only the usage a run ENDS on is closed: a
-    mixed-provider sequential run opens one per provider it selects, and the
-    others' openings stay unanswered.
+    answered by `at end (name)`, or by `at end (name: ending)` when the run
+    ended somewhere worth naming (see `close`).
     """
 
     __slots__ = ("source", "policy", "name")
@@ -304,9 +302,13 @@ class RunUsage:
 
         Forced fresh (cache_value=False) so it reflects the true post-run state
         rather than a possibly-recent cached reading from the last limit check.
-        `ending` names an abnormal ending in place of the usage's own name.
+        `ending` names an abnormal ending NEXT TO the usage's own name, not in
+        place of it: a mixed-provider run closes one usage per account under the
+        same ending, and two bare `at end (interrupted)` lines would not say
+        which account each figure belongs to.
         """
-        self.policy.log_snapshot(self.source, f"at end ({ending or self.name})",
+        label = self.name if ending is None else f"{self.name}: {ending}"
+        self.policy.log_snapshot(self.source, f"at end ({label})",
                                  cache_value=False)
 
 
@@ -343,7 +345,7 @@ def usage_halves(usage: Optional[RunUsage]
 
 
 def close_run(ctx: RunContext, *,
-              usage: Optional[RunUsage] = None,
+              usages: Iterable[Optional[RunUsage]],
               ending: Optional[str] = None,
               mailbox=None,
               push_lock=None) -> None:
@@ -369,6 +371,12 @@ def close_run(ctx: RunContext, *,
     and `gitpush.final_git_push` deliberately does not lock for itself (see its
     docstring). The policy is read INSIDE that lock, off the live settings — a
     knob edited while a pusher is mid-push must not be read half-applied.
+
+    `usages` is EVERY usage the run opened, not the one it ended on: a
+    mixed-provider sequential run opens one per account it selects, and each
+    `at start (…)` it logged is answered. Required, so a runner states what it
+    opened rather than defaulting to closing nothing. A None in it is an account
+    without a usage endpoint (see `open_usage`) and has nothing to close.
     """
     if not ctx.dry_run:
         # No lock is the SINGLE-THREADED case, not a missing one: the runner with
@@ -376,17 +384,19 @@ def close_run(ctx: RunContext, *,
         with push_lock if push_lock is not None else contextlib.nullcontext():
             final_git_push(ctx.settings.git_push, projectroot.project_dir())
 
-    # End-of-run usage snapshot, answering the one `open_usage` logged — so each
-    # run records where it finished. `ending` names the abnormal endings; a
-    # normal one closes under the usage's own name (see RunUsage.close).
-    if not ctx.dry_run and usage is not None:
-        usage.close(ending)
+    # End-of-run usage snapshots, one answering each `open_usage` that logged —
+    # so each run records where every account it used finished. `ending` names
+    # the abnormal endings (see RunUsage.close).
+    if not ctx.dry_run:
+        for usage in usages:
+            if usage is not None:
+                usage.close(ending)
 
     operator.report_undelivered_notes(mailbox)
 
 
 def end_run(ctx: RunContext, result: RunResult, *,
-            usage: Optional[RunUsage] = None,
+            usages: Iterable[Optional[RunUsage]],
             mailbox=None,
             push_lock=None) -> RunResult:
     """Everything both runners do when the work is over and they RETURN.
@@ -398,7 +408,7 @@ def end_run(ctx: RunContext, result: RunResult, *,
     runners, the `=== run ended: … ===` line belongs to the process, so the last
     reason set wins and exitlog prints it on the way out.
     """
-    close_run(ctx, usage=usage, mailbox=mailbox, push_lock=push_lock)
+    close_run(ctx, usages=usages, mailbox=mailbox, push_lock=push_lock)
     reason = result.reason
     exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
                        iterations=result.attempted, completed=result.completed)

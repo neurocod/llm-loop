@@ -1336,7 +1336,10 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         stopchannel.wait_for_stop_file_clear()
 
     # Usage gate: one account's RunUsage (see runlifecycle.open_usage), shared by
-    # every worker. --ignore-usage leaves it unopened, so there is no source to
+    # every worker. One is the whole set this run closes: `ListFileDriver.
+    # command_for` stamps every command with `driver.provider`, which
+    # `begin_run` settled, so a fleet never switches accounts the way the
+    # sequential loop does. --ignore-usage leaves it unopened, so there is no source to
     # gate on and no policy to gate with.
     usage = (None if args.ignore_usage
              else runlifecycle.open_usage(driver, provider, name="parallel",
@@ -1532,7 +1535,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         exitlog.set_reason("interrupted by the operator (Ctrl+C)",
                            iterations=shared.claimed, completed=shared.done)
         runlifecycle.close_run(
-            ctx, usage=usage, ending="interrupted", mailbox=mailboxes,
+            ctx, usages=[usage], ending="interrupted", mailbox=mailboxes,
             push_lock=push_lock)
         sys.exit(130)
 
@@ -1555,4 +1558,4 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # PUSHER_JOIN_TIMEOUT_S, and `end_run` for the rest of why.
     return runlifecycle.end_run(
         ctx, RunResult(reason, shared.claimed, shared.done, remaining),
-        usage=usage, mailbox=mailboxes, push_lock=push_lock)
+        usages=[usage], mailbox=mailboxes, push_lock=push_lock)

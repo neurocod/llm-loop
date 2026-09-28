@@ -186,7 +186,7 @@ def test_five_provider_errors_in_a_row_still_close_the_run_down(
     assert len(calls) == 5, "the brake is five errors in a row"
     _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
-        snapshot="at end (provider errors in a row)",
+        snapshot="at end (claude: provider errors in a row)",
         reason="5 provider errors in a row (last exit code 7)")
 
 
@@ -211,7 +211,7 @@ def test_a_driver_that_stops_the_run_still_closes_it_down(
     assert exit_info.value.code == 3
     _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
-        snapshot="at end (driver stopped the run)" if commands else None,
+        snapshot="at end (claude: driver stopped the run)" if commands else None,
         # The FIRST line of the driver's message, so a multi-line diagnosis does
         # not turn the one-line ending into a paragraph.
         reason="the driver stopped the run (exit 3): state file says: error")
@@ -272,7 +272,7 @@ def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(
     assert exit_info.value.code == 130
     _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
-        snapshot="at end (interrupted)",
+        snapshot="at end (parallel: interrupted)",
         reason="interrupted by the operator (Ctrl+C)")
 
 

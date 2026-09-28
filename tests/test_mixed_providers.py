@@ -7,7 +7,7 @@ import pytest
 
 from llm_loop import (cyclecore, projectroot, providers, runlifecycle,
                       statusline, stopchannel)
-from llm_loop.agentwork import AgentCommand, Driver
+from llm_loop.agentwork import AgentCommand, Driver, LoopStop
 from llm_loop.drivers import StateFileDriver
 from llm_loop.usage import RateLimitEvent
 
@@ -23,15 +23,17 @@ class Source:
 
 
 class Policy:
-    def __init__(self, provider, events):
+    def __init__(self, provider, events, snapshots):
         self.provider = provider
         self.events = events
+        self.snapshots = snapshots
 
     def describe(self):
         return self.provider
 
-    def log_snapshot(self, source, *args, **kwargs):
+    def log_snapshot(self, source, label="", cache_value=True):
         assert source.provider == self.provider
+        self.snapshots.append(label)
 
     def check_and_wait(self, source, session_start, **kwargs):
         assert source.provider == self.provider
@@ -41,7 +43,7 @@ class Policy:
 
 @pytest.fixture
 def runtime(monkeypatch, tmp_path):
-    events, sources, apps, refreshers = [], [], [], []
+    events, sources, apps, refreshers, snapshots = [], [], [], [], []
     previous_root = projectroot.project_dir()
     real_app = statusline.StatusApp
 
@@ -70,13 +72,13 @@ def runtime(monkeypatch, tmp_path):
             self.selections.append(provider)
 
     monkeypatch.setattr(runlifecycle, "usage_source_for", source_for)
-    monkeypatch.setattr(runlifecycle.limits, "default_policy", lambda p: Policy(p, events))
+    monkeypatch.setattr(runlifecycle.limits, "default_policy", lambda p: Policy(p, events, snapshots))
     monkeypatch.setattr(statusline, "StatusApp", make_app)
     monkeypatch.setattr(statusline, "QuotaRefresher", Refresher)
     monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
     args = seq_args(tmp_path, no_statusline=True, provider="claude")
     yield SimpleNamespace(args=args, events=events, sources=sources, apps=apps,
-                          refreshers=refreshers)
+                          refreshers=refreshers, snapshots=snapshots)
     projectroot.set_project_root(previous_root)
 
 
@@ -161,6 +163,50 @@ def test_bare_command_provider_uses_launch_default_after_explicit_step(monkeypat
                         lambda *a, **k: calls.append("claude") or 0)
     run(Queue(), runtime)
     assert calls == ["codex", "claude"]
+
+
+def _two_account_queue(ending):
+    """codex, then claude, then `ending` — a None or a raised LoopStop."""
+    commands = iter([AgentCommand("first", provider="codex"),
+                     AgentCommand("second", "opus", provider="claude")])
+
+    class Queue(Driver):
+        def next_command(self):
+            command = next(commands, None)
+            if command is None and ending is not None:
+                raise ending
+            return command
+
+    return Queue()
+
+
+def test_a_mixed_run_that_returns_closes_every_account_it_opened(
+        monkeypatch, runtime):
+    """Each `at start (…)` is answered, not only the account the run ended on."""
+    monkeypatch.setattr(cyclecore, "run_agent_streaming", lambda *a, **k: 0)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **k: 0)
+
+    result = run(_two_account_queue(None), runtime)
+
+    assert result.reason == stopchannel.RunStopReason.NO_WORK
+    assert runtime.snapshots == ["at start (codex)", "at start (claude)",
+                                 "at end (codex)", "at end (claude)"]
+
+
+def test_a_mixed_run_that_exits_closes_every_account_it_opened(
+        monkeypatch, runtime):
+    """The `sys.exit` door closes each account too, each under its own name."""
+    monkeypatch.setattr(cyclecore, "run_agent_streaming", lambda *a, **k: 0)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **k: 0)
+
+    with pytest.raises(SystemExit) as stopped:
+        run(_two_account_queue(LoopStop("state file says: error", exit_code=3)),
+            runtime)
+
+    assert stopped.value.code == 3
+    assert runtime.snapshots == ["at start (codex)", "at start (claude)",
+                                 "at end (codex: driver stopped the run)",
+                                 "at end (claude: driver stopped the run)"]
 
 
 def test_dry_run_uses_step_provider_without_querying_quota(monkeypatch, runtime, capsys):
