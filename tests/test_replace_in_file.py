@@ -10,21 +10,17 @@ operator does, so the dropped token is the shell's doing rather than this
 file's assumption.
 """
 
-import base64
-import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from _pwsh import (TIMEOUT_S, invocation, needs_powershell, ps_quote,
+                   run_powershell)
+
 SCRIPT = (Path(__file__).resolve().parents[1] / "claude-plugin" / "ask-user-gate"
           / "bin" / "replace_in_file.py")
-POWERSHELL = shutil.which("powershell.exe") if os.name == "nt" else None
-# One run is 0.06 s direct and 0.18-0.20 s through powershell.exe (three runs,
-# measured 2026-09-27); the budget only has to tell a hang from a slow box.
-TIMEOUT_S = 60
 
 TEXT = "a = 1; guard();\nb = 2; guard();\n"
 DELETED = "a = 1;\nb = 2;\n"
@@ -141,28 +137,9 @@ def test_help_names_the_delete_spelling():
 
 # --- the operator's shell ------------------------------------------------------
 
-def _ps_quote(text: str) -> str:
-    return "'" + text.replace("'", "''") + "'"
-
-
 def powershell(*words: str) -> subprocess.CompletedProcess:
-    """Run `& python SCRIPT <words>` in Windows PowerShell 5.1, words verbatim.
-
-    Each word is PowerShell source, so `''` is PowerShell's own empty string --
-    the one it drops on the way to a native program. -EncodedCommand keeps
-    Python's own command-line quoting out of what PowerShell parses.
-    """
-    line = " ".join(["&", _ps_quote(sys.executable), _ps_quote(str(SCRIPT)),
-                     *words]) + "; exit $LASTEXITCODE"
-    encoded = base64.b64encode(line.encode("utf-16-le")).decode("ascii")
-    return subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive",
-                           "-EncodedCommand", encoded],
-                          capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=TIMEOUT_S)
-
-
-needs_powershell = pytest.mark.skipif(
-    POWERSHELL is None, reason="Windows PowerShell 5.1 is the shell that drops ''")
+    """`& python SCRIPT <words>` in Windows PowerShell 5.1; each word PS source."""
+    return run_powershell(invocation([sys.executable, str(SCRIPT)], *words))
 
 
 @needs_powershell
@@ -175,12 +152,12 @@ needs_powershell = pytest.mark.skipif(
                               "unset-variable"])
 def test_powershell_empty_new_is_refused(tmp_path, tail):
     victim = _victim(tmp_path)
-    _assert_refused(powershell(_ps_quote(str(victim)), "--old", "' guard();'",
+    _assert_refused(powershell(ps_quote(str(victim)), "--old", "' guard();'",
                                *tail), victim, "use --remove TEXT")
 
 
 @needs_powershell
 def test_powershell_remove_deletes(tmp_path):
     victim = _victim(tmp_path)
-    _assert_wrote(powershell(_ps_quote(str(victim)), "--remove", "' guard();'",
+    _assert_wrote(powershell(ps_quote(str(victim)), "--remove", "' guard();'",
                              "--count", "2"), victim, DELETED)

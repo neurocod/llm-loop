@@ -10,26 +10,20 @@ never a verdict. (The contract and why it is not "bare --check means empty":
 ask_user_gate.py, at the --check add_argument.)
 """
 
-import base64
 import os
-import shutil
 import subprocess
 import sys
 
 import pytest
+
+from _pwsh import invocation, needs_powershell, run_powershell
 
 PLUGIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "claude-plugin", "ask-user-gate")
 SCRIPT = os.path.join(PLUGIN, "hooks", "ask_user_gate.py")
 BINARY = os.path.join(PLUGIN, "hooks",
                       "ask_user_gate.exe" if os.name == "nt" else "ask_user_gate")
-POWERSHELL = shutil.which("powershell.exe") if os.name == "nt" else None
-# 0.18-0.20 s per PowerShell round trip into Python (three runs, measured
-# 2026-09-27); the budget only has to tell a hang from a slow box.
-TIMEOUT_S = 60
-
-pytestmark = pytest.mark.skipif(
-    POWERSHELL is None, reason="Windows PowerShell 5.1 is the shell that drops ''")
+pytestmark = needs_powershell
 
 IMPLEMENTATIONS = [
     pytest.param([sys.executable, SCRIPT], id="python"),
@@ -39,22 +33,9 @@ IMPLEMENTATIONS = [
 ]
 
 
-def _ps_quote(text: str) -> str:
-    return "'" + text.replace("'", "''") + "'"
-
-
 def powershell(gate, *words: str) -> subprocess.CompletedProcess:
-    """`& <gate> <words>` in PowerShell 5.1; each word is PowerShell source.
-
-    -EncodedCommand keeps Python's own command-line quoting out of what
-    PowerShell parses, so `''` is PowerShell's empty string and nothing else.
-    """
-    line = " ".join(["&", *map(_ps_quote, gate), *words]) + "; exit $LASTEXITCODE"
-    encoded = base64.b64encode(line.encode("utf-16-le")).decode("ascii")
-    return subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive",
-                           "-EncodedCommand", encoded],
-                          capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=TIMEOUT_S)
+    """`& <gate> <words>` in PowerShell 5.1; each word is PowerShell source."""
+    return run_powershell(invocation(gate, *words))
 
 
 @pytest.mark.parametrize("gate", IMPLEMENTATIONS)

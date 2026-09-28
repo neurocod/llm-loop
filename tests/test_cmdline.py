@@ -5,15 +5,13 @@ value", so most of these tests are one spelling each: a missed spelling leaves
 the old value on the line next to the new one, which reads as correct and is not.
 """
 
-import base64
 import json
 import os
-import shutil
-import subprocess
 import sys
 
 import pytest
 
+from _pwsh import needs_powershell, run_powershell
 from llm_loop import clispec, cmdline
 from llm_loop.cmdline import quote, rebuild_argv, render
 
@@ -214,15 +212,10 @@ def test_render_defaults_the_script_to_argv0(monkeypatch):
     assert render(["-m", "5"], {}, executable="python") == "python runCycle.py -m 5"
 
 
-POWERSHELL = shutil.which("powershell.exe") if os.name == "nt" else None
-# 2.4-6.6 s per case (two runs of the three cases, measured 2026-09-27); the
-# budget only has to tell a hang from a slow box.
-PS_TIMEOUT_S = 60
 _ECHO_ARGV = "import json, sys\nprint(json.dumps(sys.argv[1:]))\n"
 
 
-@pytest.mark.skipif(POWERSHELL is None,
-                    reason="Windows PowerShell 5.1 is the shell that drops \"\"")
+@needs_powershell
 @pytest.mark.parametrize("argv, overrides", [
     (["-m", "5"], {"--project-dir": ""}),
     (["-C", "", "-m", "5"], {"--max-runs": 2}),
@@ -248,12 +241,7 @@ def test_the_rendered_line_round_trips_through_powershell(
     # `& ` because PowerShell reads a QUOTED first token (an interpreter under
     # "Program Files") as a string expression, not a command; the rendered line
     # does not carry it, since cmd.exe would reject it.
-    source = "& " + line + "; exit $LASTEXITCODE"
-    encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
-    result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive",
-                             "-EncodedCommand", encoded],
-                            capture_output=True, text=True, encoding="utf-8",
-                            errors="replace", timeout=PS_TIMEOUT_S)
+    result = run_powershell("& " + line)
     assert result.returncode == 0, result.stdout + result.stderr
     delivered = json.loads(result.stdout)
     assert delivered == rebuild_argv(argv, overrides), line
