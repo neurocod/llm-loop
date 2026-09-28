@@ -137,12 +137,21 @@ class _MirrorLogHandler(RotatingFileHandler):
 
 
 def setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
-    """Configure the rotating file logger at log_file_path(app_name)."""
+    """Configure the rotating file logger at log_file_path(app_name).
+
+    Idempotent per logger: a second call finds this module's own mirror and
+    adds none. The test is for OUR handler, not for any handler: a host may hang
+    its own on the logger (pytest 9.1 attaches capture handlers to every
+    non-propagating logger at the start of each phase), and "has handlers" then
+    silently left the run without a log file. Pinned by
+    `tests/test_mirror_log.py::test_a_foreign_handler_does_not_switch_the_mirror_off`.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(f"runCycle.{app_name}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    if not logger.handlers:  # avoid duplicate handlers if called twice
+    if not any(isinstance(handler, _MirrorLogHandler)
+               for handler in logger.handlers):
         handler = _MirrorLogHandler(
             log_file_path(app_name), maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT, encoding="utf-8",

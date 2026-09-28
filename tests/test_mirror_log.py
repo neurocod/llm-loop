@@ -218,6 +218,33 @@ def test_a_real_run_still_mirrors_to_the_shared_log(tmp_path, log_dir):
     assert "logging to" in written
 
 
+def test_a_foreign_handler_does_not_switch_the_mirror_off(log_dir):
+    """A handler someone else hung on the run's logger is not our mirror.
+
+    `setup_file_logging` used to add the mirror only to a logger with no
+    handlers at all, so any host's handler there — pytest 9.1 attaches its
+    capture handlers to every non-propagating logger — left the run with no
+    log file and nothing said. Called twice, so the other half of the rule
+    (one mirror, not a second) is held by the same pin.
+    """
+    app_name = "pytest-foreign-handler"
+    logger = logging.getLogger(f"runCycle.{app_name}")
+    foreign = logging.NullHandler()
+    logger.addHandler(foreign)
+    try:
+        console.setup_file_logging(app_name).info("first line")
+        console.setup_file_logging(app_name).info("second line")
+        mirrors = [handler for handler in logger.handlers
+                   if isinstance(handler, console._MirrorLogHandler)]
+    finally:
+        logger.removeHandler(foreign)
+
+    assert len(mirrors) == 1, f"expected one mirror, got {len(mirrors)}"
+    mirrors[0].flush()
+    written = console.log_file_path(app_name).read_text(encoding="utf-8")
+    assert "first line" in written and "second line" in written
+
+
 def test_a_projects_log_is_named_after_that_project(tmp_path, log_dir):
     """Two projects must not end up writing to one log — the folder name in the
     file name is the whole of what keeps them apart.

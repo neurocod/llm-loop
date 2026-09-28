@@ -43,8 +43,8 @@ def isolated_run(monkeypatch, tmp_path):
 
     Every mirror handler is closed on the way in AND out, whatever `app_name`
     the run used, so a caller cannot name the wrong one:
-    `console.setup_file_logging` attaches a handler only to a logger that has
-    none, so one left open would carry the next run's output into an earlier
+    `console.setup_file_logging` adds no mirror to a logger that already has
+    one, so one left open would carry the next run's output into an earlier
     test's (deleted) file while this run's own path is merely printed — and on
     Windows keep that directory from being removed.
 
@@ -83,29 +83,17 @@ def finish_record(reason=None):
 
 def _close_mirror_handlers():
     """Close and detach every mirror handler (`console._MirrorLogHandler`), on
-    whichever logger holds it, and let that logger propagate again.
-
-    The propagate flag is half of it. pytest (9.1 here) attaches its capture
-    handlers, at the start of every phase, to each logger that does NOT
-    propagate — and `setup_file_logging` adds a mirror only to a logger with no
-    handlers at all. A mirror logger left non-propagating therefore gets no
-    mirror the next time a run uses its app name: measured, the vanished-run
-    pin in test_exit_reason found no log file once an earlier test there had
-    run "pytest-exit". A logger that propagates is what
-    `setup_file_logging` finds on a name nobody used yet.
+    whichever logger holds it.
 
     Loggers are read from the registry as they are: `logging.getLogger` on a
     placeholder name would create one."""
     for logger in list(logging.Logger.manager.loggerDict.values()):
         if not isinstance(logger, logging.Logger):
             continue
-        mirrors = [handler for handler in logger.handlers
-                   if isinstance(handler, console._MirrorLogHandler)]
-        for handler in mirrors:
+        for handler in [handler for handler in logger.handlers
+                        if isinstance(handler, console._MirrorLogHandler)]:
             handler.close()
             logger.removeHandler(handler)
-        if mirrors:
-            logger.propagate = True
 
 
 def record_exit_pushes(monkeypatch) -> list:
