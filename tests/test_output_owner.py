@@ -841,6 +841,22 @@ def _paint_log():
     return RecordingTerminal(columns=100)
 
 
+def _hold_a_frame(app, terminal):
+    """Return once the painter is held inside a frame: a terminal write that
+    does not come back until `terminal.unstall` is set."""
+    terminal.arm_stall(WAIT_S)
+    app.update(iteration=1)
+    assert terminal.stalled.wait(WAIT_S)
+
+
+def _wait_for_frame(terminal, text):
+    """Return once a painted frame shows `text` (raises queue.Empty past WAIT_S)."""
+    deadline = time.monotonic() + WAIT_S
+    while not any(text in row for row in terminal.frames.get(
+            timeout=max(0, deadline - time.monotonic()))):
+        pass
+
+
 class _RecordingMode(sl.Mode):
     """Consumes every key and remembers which thread handled it."""
 
@@ -869,10 +885,7 @@ def test_while_started_only_the_painter_writes_the_terminal():
         for thread in feeders:
             thread.join(WAIT_S)
         app.note("the LAST note")
-        deadline = time.monotonic() + WAIT_S
-        while "the LAST note" not in " ".join(terminal.frames.get(
-                timeout=max(0, deadline - time.monotonic()))):
-            pass
+        _wait_for_frame(terminal, "the LAST note")
         writers = set(terminal.writers)
 
     assert writers == {sl.PAINTER_THREAD_NAME}
@@ -941,9 +954,7 @@ def test_stop_leaves_the_release_to_a_painter_stuck_in_its_frame(monkeypatch):
                        refresh=60)
     app.start()
     painter = app._painter._thread
-    terminal.arm_stall(WAIT_S)
-    app.update(iteration=1)
-    assert terminal.stalled.wait(WAIT_S)
+    _hold_a_frame(app, terminal)
     try:
         app.stop()
         assert painter.is_alive()
@@ -973,9 +984,7 @@ def test_a_restart_after_a_timed_out_stop_keeps_the_one_painter(monkeypatch):
                        refresh=60)
     app.start()
     old = app._painter._thread
-    terminal.arm_stall(WAIT_S)
-    app.update(iteration=1)
-    assert terminal.stalled.wait(WAIT_S)
+    _hold_a_frame(app, terminal)
     try:
         app.stop()
         assert old.is_alive()
@@ -990,10 +999,7 @@ def test_a_restart_after_a_timed_out_stop_keeps_the_one_painter(monkeypatch):
         # Waited for, behind the old frame, the old release and the new region.
         app.handle_event(termio.Resize(terminal.columns, terminal.lines))
         app.update(iteration=2)
-        deadline = time.monotonic() + WAIT_S
-        while not any("iter 2" in row for row in terminal.frames.get(
-                timeout=max(0, deadline - time.monotonic()))):
-            pass
+        _wait_for_frame(terminal, "iter 2")
         assert app._painter._thread is old, "the restart started a second painter"
         assert set(terminal.writers) == {sl.PAINTER_THREAD_NAME}
         # The old stop's release ran before the new region was pinned.
@@ -1045,9 +1051,7 @@ def test_a_paste_tail_posted_behind_its_enter_is_discarded_with_it():
     app.register_action(sl.BreakpointAction(points))
     with app:
         app.handle_event(termio.Key("b"))
-        terminal.arm_stall(WAIT_S)
-        app.update(iteration=1)
-        assert terminal.stalled.wait(WAIT_S)     # the painter is held in a frame
+        _hold_a_frame(app, terminal)
         try:
             for char in "cleanup\rspm":
                 reader._emit(app._handle_input, char)
@@ -1077,9 +1081,7 @@ def test_a_stuck_painter_with_a_full_queue_holds_neither_stop_nor_the_key_reader
     app.start()
     app._painter._maxsize = 3              # "full" a few keys away
     painter = app._painter._thread
-    terminal.arm_stall(WAIT_S)
-    app.update(iteration=1)
-    assert terminal.stalled.wait(WAIT_S)   # a frame, not a queued call: empty
+    _hold_a_frame(app, terminal)           # a frame, not a queued call: empty
     try:
         def type_eight():
             for _ in range(8):
@@ -1117,9 +1119,7 @@ def test_a_resize_posted_behind_a_timed_out_stop_does_not_re_pin_the_region(
                        refresh=60)
     app.start()
     painter = app._painter._thread
-    terminal.arm_stall(WAIT_S)
-    app.update(iteration=1)
-    assert terminal.stalled.wait(WAIT_S)
+    _hold_a_frame(app, terminal)
     resize = threading.Thread(
         target=app.handle_event,
         args=(termio.Resize(terminal.columns, terminal.lines),), daemon=True)
@@ -1171,9 +1171,7 @@ def test_a_burst_behind_a_stuck_frame_is_one_request_and_one_frame_of_its_end():
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
     with app:
-        terminal.arm_stall(WAIT_S)
-        app.update(iteration=1)
-        assert terminal.stalled.wait(WAIT_S)
+        _hold_a_frame(app, terminal)
         before = len(terminal.painted)
         try:
             def feed(k):
@@ -1189,10 +1187,7 @@ def test_a_burst_behind_a_stuck_frame_is_one_request_and_one_frame_of_its_end():
             queued = app._painter.backlog
         finally:
             terminal.unstall.set()
-        deadline = time.monotonic() + WAIT_S
-        while not any("iter 999999" in row for row in terminal.frames.get(
-                timeout=max(0, deadline - time.monotonic()))):
-            pass
+        _wait_for_frame(terminal, "iter 999999")
         frames = len(terminal.painted) - before
         flag = app._frame_posted
 
@@ -1211,10 +1206,7 @@ def test_a_frame_request_lost_before_the_queue_does_not_stop_the_frames():
         assert app._painter.drain(WAIT_S)
         app._frame_posted = True           # as that poster left it
         app.update(iteration=7)
-        deadline = time.monotonic() + WAIT_S
-        while not any("iter 7" in row for row in terminal.frames.get(
-                timeout=max(0, deadline - time.monotonic()))):
-            pass
+        _wait_for_frame(terminal, "iter 7")
 
 
 class _StartStopInput(termio.NullInputSource):
@@ -1238,9 +1230,7 @@ def test_a_region_refused_behind_a_stuck_restart_leaves_no_key_reader(monkeypatc
     terminal, keys = _paint_log(), _StartStopInput()
     app = sl.StatusApp(terminal=terminal, input_source=keys, refresh=60)
     app.start()
-    terminal.arm_stall(WAIT_S)
-    app.update(iteration=1)
-    assert terminal.stalled.wait(WAIT_S)
+    _hold_a_frame(app, terminal)
     try:
         app.stop()
         terminal.lines = 4                 # no room for the region any more
