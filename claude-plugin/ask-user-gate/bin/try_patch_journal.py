@@ -7,9 +7,7 @@ from whatever commit its submodule sits at -- not try_patch.py, whose CLI,
 `replace_in_file` import and path setup it has no use for. So
 `JOURNAL_DIR_NAME`, `scan_journal(folder, recover=False)` and the `Finding`
 fields it reads (`who` among them) are an interface: change them together with
-commit.py, in the landing that bumps the submodule. A checkout without this
-file is one whose try_patch cannot be read by it; commit.py says so rather
-than guessing.
+commit.py, in the landing that bumps the submodule.
 
 The selftest stays in try_patch.py.
 """
@@ -112,7 +110,7 @@ def invalidate_bytecode(path: Path) -> None:
             cached.unlink()
         except OSError:
             # A held or read-only .pyc is not worth failing the run over: the
-            # command below still gets the source we wrote, and the stale entry
+            # command still gets the source just written, and the stale entry
             # is the next run's problem, which this line at least keeps rare.
             pass
 

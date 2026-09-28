@@ -470,9 +470,8 @@ def restore(touched: "dict[Path, Touched]") -> bool:
 # deliberate: the defect these pin -- several edits of one file restoring the
 # file to a half-mutated state -- lived in the seam between collecting edits
 # and restoring them, and an in-process call to a helper would have stepped
-# straight over it. What is
-# asserted is the only thing a caller can see: the exit code, and the bytes on
-# disk afterwards.
+# straight over it. What is asserted is the only thing a caller can see: the
+# exit code, and the bytes on disk afterwards.
 # --------------------------------------------------------------------------
 
 GUARDS = b"guardA = true;\nguardB = true;\nguardC = true;\n"
