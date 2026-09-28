@@ -50,7 +50,7 @@ from typing import NamedTuple, Optional
 # not that wording — it is the "Aug 15, 6:19pm" of the usage summary lines, whose
 # exact text is a contract with LimitPolicy.log_snapshot — so the verdict's
 # `describe()` borrows the console's spelling rather than growing a third.
-from .console import fmt_moment
+from .console import fmt_moment, print_line
 # One event of the provider stream reaches this module — the rate-limit verdict —
 # and the word the stream calls it by lives with the rest of that vocabulary.
 from . import wire
@@ -258,15 +258,15 @@ def oauth_token() -> Optional[str]:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        print(f"  · no usage figures: {path} not found (is this machine signed "
-              f"in with an OAuth login?)")
+        print_line(f"  · no usage figures: {path} not found (is this machine "
+                   f"signed in with an OAuth login?)")
         return None
     except (OSError, ValueError) as e:
-        print(f"  · no usage figures: could not read {path} ({e})")
+        print_line(f"  · no usage figures: could not read {path} ({e})")
         return None
     token = (data.get("claudeAiOauth") or {}).get("accessToken")
     if not token:
-        print(f"  · no usage figures: no OAuth access token in {path}")
+        print_line(f"  · no usage figures: no OAuth access token in {path}")
         return None
     return token
 
@@ -388,16 +388,16 @@ class UsageSource:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as e:
                 if e.code == 401:
-                    print("  · no usage figures: the stored OAuth token was "
-                          "rejected (401) — it should refresh on the next "
-                          "`claude` run.")
+                    print_line("  · no usage figures: the stored OAuth token "
+                               "was rejected (401) — it should refresh on the "
+                               "next `claude` run.")
                     return None
                 last = f"HTTP {e.code} {e.reason}"
             except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
                 last = str(e)
             if attempt + 1 < HTTP_ATTEMPTS:
                 time.sleep(1)
-        print(f"  · no usage figures: {self._url()} did not answer ({last})")
+        print_line(f"  · no usage figures: {self._url()} did not answer ({last})")
         return None
 
     def get_usage(self, cache_value: bool = True) -> Usage:

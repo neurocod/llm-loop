@@ -18,6 +18,7 @@ import time
 from typing import Optional
 
 from . import wire
+from .console import print_line
 from .usage import EMPTY_READING, EMPTY_USAGE, Usage, UsageReading, summary_line
 
 APP_SERVER_TIMEOUT = 15.0
@@ -141,7 +142,7 @@ class CodexUsageSource:
                 errors="replace", bufsize=1,
             )
         except (FileNotFoundError, OSError) as exc:
-            print(f"  · no Codex usage figures: could not start 'codex app-server' ({exc})")
+            print_line(f"  · no Codex usage figures: could not start 'codex app-server' ({exc})")
             return None
 
         timed_out = threading.Event()
@@ -163,7 +164,7 @@ class CodexUsageSource:
             self._write(proc, wire.codex_app_rate_limits_read(1))
             return self._read_response(proc, 1, timed_out)
         except (BrokenPipeError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
-            print(f"  · no Codex usage figures: {exc}")
+            print_line(f"  · no Codex usage figures: {exc}")
             return None
         finally:
             timer.cancel()

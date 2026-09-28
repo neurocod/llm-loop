@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from llm_loop import exitlog, projectroot
+from llm_loop import console, exitlog, ownership, projectroot
 
 
 @pytest.fixture
@@ -43,6 +43,14 @@ def test_moves_the_project_root(tmp_path):
 
 def test_replaces_stdout():
     sys.stdout = io.StringIO()
+
+
+def test_leaves_the_console_routed():
+    # Held by the module: a context manager collected unexited closes itself.
+    global _unexited
+    _unexited = console.route_through(ownership.OwnerThread("leaked-owner"),
+                                      post_timeout=1.0)
+    _unexited.__enter__()
 '''
 
 
@@ -62,15 +70,18 @@ def test_each_leak_fails_its_own_test_even_after_a_teardown_that_raised(
     equal to the "before" the guard had taken."""
     result = _run(pytester, _LEAKY)
 
-    result.assert_outcomes(passed=5, errors=4)
+    result.assert_outcomes(passed=6, errors=5)
     result.stdout.fnmatch_lines_random([
         "*ERROR at teardown of test_leaks_a_record_and_its_teardown_raises*",
         "*ERROR at teardown of test_leaks_a_record_plainly*",
         "*ERROR at teardown of test_moves_the_project_root*",
         "*ERROR at teardown of test_replaces_stdout*",
+        "*ERROR at teardown of test_leaves_the_console_routed*",
         "*test_leaks_a_record_plainly left an exit record open*",
         "*test_moves_the_project_root left the project root moved to*",
         "*test_replaces_stdout left sys.stdout replaced by*",
+        "*test_leaves_the_console_routed left the console routed through "
+        "'leaked-owner'*",
     ])
 
 

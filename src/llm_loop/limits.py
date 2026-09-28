@@ -40,7 +40,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from .console import fmt_clock, fmt_left, print_percents
+from .console import fmt_clock, fmt_left, print_line, print_percents
 from .stopchannel import sleep_unless
 from .usage import (CLAUDE_SESSION_DURATION, QUOTA_BY_FIELD, Usage,
                     UsageReading)
@@ -296,7 +296,7 @@ class LimitPolicy:
 
         for r, rd, c in status:
             if rd.percent is None:
-                print(f"  · {r.label}: no figure in the usage report{note}")
+                print_line(f"  · {r.label}: no figure in the usage report{note}")
             else:
                 # How long the window still has to run: the other half of what a
                 # percentage means (10% with four hours left is a different
@@ -330,13 +330,13 @@ class LimitPolicy:
         usage = source.get_usage()  # snapshot, frozen until a window refreshes
         labels = ", ".join(r.label for r, _, _ in
                            self._violations(self._status(usage, time.time())))
-        print(f"  ⏳ Over usage limit on: {labels} — holding until it clears or "
-              f"the window resets…")
+        print_line(f"  ⏳ Over usage limit on: {labels} — holding until it "
+                   f"clears or the window resets…")
         try:
             while True:
                 if should_stop is not None and should_stop():
-                    print("  ⏹ Stop requested while over the usage limit — "
-                          "leaving the wait without resuming.")
+                    print_line("  ⏹ Stop requested while over the usage limit — "
+                               "leaving the wait without resuming.")
                     return True, session_start
                 now = time.time()
                 status = self._status(usage, now)
@@ -344,8 +344,8 @@ class LimitPolicy:
                 if not violated:
                     # About to resume; force a fresh reading on the next check.
                     source.invalidate()
-                    print(f"  ▶ Back under all usage limits (now {fmt_clock(now)}) "
-                          f"— resuming.")
+                    print_line(f"  ▶ Back under all usage limits "
+                               f"(now {fmt_clock(now)}) — resuming.")
                     return True, session_start
 
                 # When will the next window refresh? Watch the soonest reset among
@@ -357,8 +357,9 @@ class LimitPolicy:
 
                 if now >= next_reset:
                     # A window refreshed — the frozen percentages are stale.
-                    print(f"  ▶ A usage window reset (now {fmt_clock(now)}) — "
-                          f"re-checking with fresh figures.")
+                    print_line(f"  ▶ A usage window reset (now "
+                               f"{fmt_clock(now)}) — re-checking with fresh "
+                               f"figures.")
                     # If it was the session window, restart the session clock.
                     session = usage.session
                     if session.reset_ts is not None and now >= session.reset_ts:
@@ -374,7 +375,7 @@ class LimitPolicy:
                                f"to next reset (now {fmt_clock(now)})")
                 sleep_unless(min(next_reset - now, 60), should_stop)
         except KeyboardInterrupt:
-            print("\nWait interrupted by user (Ctrl+C).")
+            print_line("\nWait interrupted by user (Ctrl+C).")
             sys.exit(130)
 
     def log_snapshot(self, source, label: str = "",
@@ -392,9 +393,9 @@ class LimitPolicy:
         lines = [ln for ln in usage.summary_lines
                  if any(ln.lower().startswith(w) for w in wanted)]
         if not lines:
-            print(f"{head} (no matching figures in the usage report)")
+            print_line(f"{head} (no matching figures in the usage report)")
             return
-        print(head)
+        print_line(head)
         for ln in lines:
             print_percents(f"      {ln}")
 

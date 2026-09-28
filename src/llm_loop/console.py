@@ -37,6 +37,7 @@ pushed a copy in here), and the copy is what made the handover a thing that
 could silently stop happening.
 """
 
+import contextlib
 import logging
 import os
 import re
@@ -352,6 +353,129 @@ def render_markdown_block(text: str) -> None:
         print(f"\n💬 {text}")
 
 
+# --- routing: who writes the console while an owner holds it ---------------
+
+
+class _Route:
+    """One `route_through` window: its owner, and what it could not take."""
+
+    def __init__(self, owner, post_timeout: float):
+        self.owner = owner
+        self.post_timeout = post_timeout
+        # Lines written on their caller's thread because the owner's queue had
+        # no room for `post_timeout` (see `route_through`). Under `_ROUTE_LOCK`.
+        self.written_directly = 0
+
+
+# Guards installing and removing the route, and its counter. Never held across
+# a write or a post: a reader takes `_route` with one plain read (atomic), so a
+# console that is stuck cannot hold up the install, the removal or a poster.
+_ROUTE_LOCK = threading.Lock()
+_route: Optional[_Route] = None
+
+
+@contextlib.contextmanager
+def route_through(owner, *, post_timeout: float):
+    """While inside, every console write of this module is run by `owner`.
+
+    `owner` is an `ownership.OwnerThread`. `print_markup` and `print_line` —
+    and so the whole print_* family and `LINES` — post their write to it
+    instead of making it, so a line printed by a thread the runner does not own
+    (the usage gate on a worker, the background git pusher, a usage source on
+    the status line's refresher) lands in the one stream the owner writes, after
+    every line already queued there, and never inside another write. Why this
+    lives here and not with the runner: those threads reach the console through
+    this module's names, imported by value, which the runner cannot intercept
+    without patching another module's globals.
+
+    The window may be opened before `owner.start()` and closed after
+    `owner.close()`: with no owner thread a post runs on its caller (see
+    `OwnerThread.post`), which is exactly what a write did before the route.
+    `parallel.run_parallel` opens it that way round, so there is no moment in
+    which a line is routed to an owner that has not yet, or no longer, got the
+    lines before it. On the owner's own thread a write is made at once — the
+    owner cannot wait for a queue only it empties.
+
+    THE BLOCKING POLICY — a poster waits at most `post_timeout` for room in the
+    owner's queue, and past it writes the line ITSELF, out of order, counting
+    it. Chosen over the two alternatives:
+
+      * over an unbounded `post`: a poster must never wait for the owner
+        indefinitely. The gate holds `usage_lock` and the pusher `push_lock`
+        while they print, and the exit push waits for `push_lock`;
+      * over `try_post` with a counted drop: these lines are the run's record —
+        the mirror log is written by the same call — and a quota pause or a
+        failed push missing from it is worse than one that is out of order. A
+        drop is the right answer for a diagnostic repeated per event (backlog
+        0763), not for a line said once.
+
+    A queue full for the whole of `post_timeout` means the console itself is
+    stuck, so the direct write may block there as well — which is where the
+    write blocked before this route existed, so the worst case is the old
+    behaviour after a bounded wait, not a new hang. The count is reported to
+    stderr once the window closes.
+
+    A write that raises on the owner costs that line only and is reported by
+    the owner (`OwnerThread._report`); it no longer unwinds the thread that
+    printed. Refused if a route is already open: two owners would each believe
+    they order the console.
+    """
+    route = _Route(owner, post_timeout)
+    global _route
+    with _ROUTE_LOCK:
+        if _route is not None:
+            raise RuntimeError(f"the console is already routed through "
+                               f"{_route.owner.name!r}")
+        _route = route
+    try:
+        yield
+    finally:
+        with _ROUTE_LOCK:
+            _route = None
+            direct = route.written_directly
+        if direct:
+            print(f"  ⚠ {owner.name}: {direct} line(s) written directly, out of "
+                  f"order — its queue stayed full for {post_timeout:g} s.",
+                  file=sys.stderr)
+
+
+def _on_console(call, *args) -> None:
+    """Make one console write — on the route's owner while one is open.
+
+    `call` is the write itself (never `print_markup`, which would route again
+    on the owner's side and recurse there).
+    """
+    route = _route
+    if route is not None and not route.owner.owns_current_thread:
+        if route.owner.post(call, *args, timeout=route.post_timeout):
+            return
+        with _ROUTE_LOCK:
+            route.written_directly += 1
+    call(*args)
+
+
+def _render_markup(plain: str, markup: str) -> None:
+    """The write behind `print_markup`, on whichever thread makes it.
+
+    Flushed on both paths, because a line may be the once-a-minute countdown of
+    a run paused on a limit (`print_percents`) — the one place output has to
+    appear as it is written rather than when a buffer happens to fill — and the
+    flush has to be made by the thread that wrote the line, after it: a flush on
+    the poster's side would run before a routed line was written at all. Rich
+    flushes its own writes; `print` is told to.
+    """
+    if RICH_AVAILABLE:
+        _RichConsole(file=real_stream()).print(markup)
+        _log_plain(plain)
+    else:
+        print(plain, flush=True)
+
+
+def _print_flushed(text: str) -> None:
+    """The write behind `print_line` (flushed for `_render_markup`'s reason)."""
+    print(text, flush=True)
+
+
 def print_markup(plain: str, markup: str) -> None:
     """Print a status line from hand-written Rich markup: styled on screen, plain
     in the log. The low-level core of the print_* family — use `print_styled`
@@ -364,12 +488,21 @@ def print_markup(plain: str, markup: str) -> None:
     up in the log. Without Rich it degrades to a plain `print` (screen + log via
     the tee). Note: terminals can't switch *font family*; only colour and the
     bold/italic/underline attributes are available.
+
+    Inside `route_through` the write is the owner's, not the caller's.
     """
-    if RICH_AVAILABLE:
-        _RichConsole(file=real_stream()).print(markup)
-        _log_plain(plain)
-    else:
-        print(plain)
+    _on_console(_render_markup, plain, markup)
+
+
+def print_line(text: str) -> None:
+    """`print(text)`, but inside `route_through` written by the owner.
+
+    For the plain lines of code that can run beside a parallel run's workers —
+    the usage gate, the usage sources. A bare `print` there would be written
+    past the owner, and ahead of the gate's own `print_percents` lines queued a
+    moment earlier.
+    """
+    _on_console(_print_flushed, text)
 
 
 # This runner's compact lines: no job tag, straight to the console. The sink is
@@ -437,12 +570,11 @@ def print_percents(text: str) -> None:
     """Print a line whose percentages are colour-coded on screen (plain in the
     log). A no-op difference from `print` when Rich is unavailable.
 
-    Flushed, because these lines include the once-a-minute countdown printed
-    while a run is paused on a limit — the one place output has to appear as it
-    is written rather than when a buffer happens to fill.
+    These lines include the once-a-minute countdown printed while a run is
+    paused on a limit, which is why every `print_markup` write is flushed (see
+    `_render_markup`).
     """
     print_markup(text, markup_percents(text))
-    sys.stdout.flush()
 
 
 # Named single-style specialisations, each delegating to print_styled. Centralise

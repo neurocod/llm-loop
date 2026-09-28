@@ -72,7 +72,7 @@ from .agentwork import (
     AgentCommand,
     build_agent_argv,
 )
-from .console import print_markup
+from .console import print_markup, route_through
 # Only the per-turn call: the exit push (and the policy enum with it) belongs to
 # the shared epilogue, `runlifecycle.end_run`, which is where both runners close
 # a run down and therefore the one place that decides how the exit push is
@@ -133,13 +133,9 @@ DRY_RUN_LIST_LIMIT = 10
 # test driving `run_job` directly, or a worker a Ctrl+C gave up joining that
 # outlives the owner too.
 #
-# NOT every console write of a run goes through it. Two writers still call
-# `console.print_markup` on their own threads while it is open: the usage gate
-# (`limits.LimitPolicy.check_and_wait` / `_wait`, on a worker under
-# `usage_lock`, through `console.print_percents`) and the background pusher
-# (`gitpush.git_push`, through `print_done` / `print_error` / `LINES`). Both
-# reach the console through module-level imports of their own, which `_console`
-# does not intercept.
+# The workers post to it by name (`_emit_markup`); every other console write of
+# the run — the usage gate on a worker, the background pusher — reaches it
+# through `console.route_through`, which `run_parallel` holds open around it.
 _console = ownership.OwnerThread("console-lines")
 
 # How long `run_parallel` waits for `_console` to write what the workers posted
@@ -1459,47 +1455,54 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # the region, and its `close` in the `finally` is what puts every line the
     # workers posted on screen BEFORE the closing report below (within
     # CONSOLE_CLOSE_TIMEOUT_S — see there for a console that never comes back).
-    _console.start()
-    try:
-        with app:
-            if source is not None:
-                # Inside `with`, not before it: push_quotas is silent until
-                # start() has marked the app enabled. The reading is already
-                # paid for by the start-of-run snapshot above, so this costs no
-                # round-trip. The refresher only runs for a run that talks to
-                # the usage endpoint at all — with --ignore-usage `source` is
-                # None and nothing polls.
-                statusline.push_quotas(app, source, policy)
-                app.add_service(statusline.QuotaRefresher(
-                    app, source, policy, provider=provider))
-            threads.start_initial()
-            pusher.start()
+    #
+    # The route is opened before the owner starts and closed after it has been
+    # closed, so no write is routed to an owner that has not got, or no longer
+    # has, the lines before it (see `console.route_through`). A poster waits for
+    # room as long as the close waits for the whole backlog: both are "this
+    # console is stuck", from the same measurement.
+    with route_through(_console, post_timeout=CONSOLE_CLOSE_TIMEOUT_S):
+        _console.start()
+        try:
+            with app:
+                if source is not None:
+                    # Inside `with`, not before it: push_quotas is silent until
+                    # start() has marked the app enabled. The reading is
+                    # already paid for by the start-of-run snapshot above, so
+                    # this costs no round-trip. The refresher only runs for a
+                    # run that talks to the usage endpoint at all — with
+                    # --ignore-usage `source` is None and nothing polls.
+                    statusline.push_quotas(app, source, policy)
+                    app.add_service(statusline.QuotaRefresher(
+                        app, source, policy, provider=provider))
+                threads.start_initial()
+                pusher.start()
 
-            try:
-                join_workers(threads)
-            except KeyboardInterrupt:
-                # Signal first, talk second: nothing about the console — a
-                # stalled one included — may stand between Ctrl+C and the
-                # workers hearing it.
-                interrupted = True
-                threads.close()
-                shared.stop.set()
-                # Queued, not printed, so the line lands after what the workers
-                # had already said — and never waited for: a queue that is full
-                # is a console that is not being written, and this line is then
-                # deferred to the closing report below rather than blocking the
-                # interrupt behind it.
-                if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
-                    announce_later = INTERRUPT_ANNOUNCEMENT
-                for t in threads:
-                    t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
+                try:
+                    join_workers(threads)
+                except KeyboardInterrupt:
+                    # Signal first, talk second: nothing about the console — a
+                    # stalled one included — may stand between Ctrl+C and the
+                    # workers hearing it.
+                    interrupted = True
+                    threads.close()
+                    shared.stop.set()
+                    # Queued, not printed, so the line lands after what the
+                    # workers had already said — and never waited for: a queue
+                    # that is full is a console that is not being written, and
+                    # this line is then deferred to the closing report below
+                    # rather than blocking the interrupt behind it.
+                    if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
+                        announce_later = INTERRUPT_ANNOUNCEMENT
+                    for t in threads:
+                        t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
 
-            if not interrupted:
-                shared.stop.set()  # release the pusher's wait()
-                pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
-            app.update(phase="idle")
-    finally:
-        _close_console()
+                if not interrupted:
+                    shared.stop.set()  # release the pusher's wait()
+                    pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
+                app.update(phase="idle")
+        finally:
+            _close_console()
 
     if announce_later is not None:
         print(announce_later)

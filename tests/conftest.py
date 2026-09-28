@@ -1,13 +1,13 @@
 """Suite-wide guards: real runner locks local to each test, and nothing a staged
 run leaves in the process — an exit record, a moved project root, a replaced
-stream — outliving the test that left it."""
+stream, an open console route — outliving the test that left it."""
 
 import atexit
 import sys
 
 import pytest
 
-from llm_loop import exitlog, projectroot, scriptlock
+from llm_loop import console, exitlog, projectroot, scriptlock
 
 from _runfixtures import finish_record
 
@@ -30,7 +30,8 @@ def pytest_runtest_setup(item):
     fixture); it is closed and this test fails naming it.
     """
     stale = finish_record("leaked before a test began")
-    item.stash[_BEFORE] = (projectroot.project_dir(), sys.stdout, sys.stderr)
+    item.stash[_BEFORE] = (projectroot.project_dir(), sys.stdout, sys.stderr,
+                           console._route)
     if stale is not None:
         exitlog._record = None
         pytest.fail(f"an exit record was already open when {item.nodeid} "
@@ -86,7 +87,7 @@ def _put_back(item) -> list:
     if finish_record("leaked by a test") is not None:
         exitlog._record = None
         leaks.append("an exit record open")
-    root, out, err = item.stash.get(_BEFORE, (None, None, None))
+    root, out, err, route = item.stash.get(_BEFORE, (None, None, None, None))
     if root is not None and projectroot.project_dir() != root:
         leaks.append(f"the project root moved to {projectroot.project_dir()}")
         projectroot.set_project_root(root)
@@ -96,6 +97,11 @@ def _put_back(item) -> list:
     if err is not None and sys.stderr is not err:
         leaks.append(f"sys.stderr replaced by {sys.stderr!r}")
         sys.stderr = err
+    # Every later run would refuse to open its own (`console.route_through`).
+    if console._route is not route:
+        leaks.append(f"the console routed through {console._route.owner.name!r}"
+                     if console._route is not None else "the console route removed")
+        console._route = route
     return leaks
 
 

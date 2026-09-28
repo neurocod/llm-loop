@@ -5,23 +5,28 @@ Three layers, pinned in that order:
   * `ownership.OwnerThread` itself — order, drain, close, the bounded queue,
     the idle hook and what a failing call costs;
   * the parallel runner's console lines — every write on the one owner thread,
-    never two at once, all of them on screen before the run reports;
+    never two at once, all of them on screen before the run reports; the lines
+    of the threads the runner does not own (the usage gate, the pusher) reach
+    that thread through `console.route_through`;
   * the status line — while the painter runs, nobody else renders or writes
     the terminal or touches the mode stack; everybody else's paint is a
     request, and a key, a resize or a `disable` is a call posted to it.
 """
 
+import subprocess
 import sys
 import threading
 import time
 
 import pytest
 
-from llm_loop import ownership, parallel, termio
+from llm_loop import console, gitpush, ownership, parallel, termio, usage
 from llm_loop import statusline as sl
 from llm_loop.breakpoints import Breakpoints
+from llm_loop.limits import LimitPolicy, SessionLimit
 
-from _runfixtures import MemListDriver, isolated_run, par_args
+from _runfixtures import (MemListDriver, isolated_run, par_args,
+                          record_exit_pushes)
 from _termfixtures import KeysByHand, RecordingTerminal
 
 # Upper bound on every wait below, and on every painter stall a pin arms (so a
@@ -830,6 +835,209 @@ def test_ctrl_c_over_a_stuck_console_still_stops_the_workers_and_reports(
     # No room in the queue: the line is deferred to the report, not dropped.
     assert parallel.INTERRUPT_ANNOUNCEMENT.strip() in captured.out
     assert "console-lines: 2 line(s) still unwritten" in captured.err
+    assert console._route is None, "the interrupted run left the console routed"
+
+
+# --- the lines of threads the runner does not own: console.route_through --------
+
+
+class _ThreadedStdout:
+    """A stdout that remembers which thread made each write.
+
+    Installed with rich switched off, so `print_markup` ends in a plain `print`
+    of the line's plain copy — one write per line, which is what is read here.
+    """
+
+    encoding = "utf-8"
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.writes = []
+
+    def write(self, text):
+        with self._lock:
+            self.writes.append((threading.current_thread().name, text))
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+    def lines(self):
+        """(thread, text) of every write that is a line, not a bare newline."""
+        with self._lock:
+            return [(name, text) for name, text in self.writes if text != "\n"]
+
+
+class _OnePushGit:
+    """`gitpush.subprocess` for a pusher that pushes exactly once, when let.
+
+    `rev-list` answers one commit ahead until the push has happened and none
+    after it, so the pump's later turns find nothing to push; `git push` waits
+    for `let_push`, which is what puts the pusher's line behind the worker's.
+    """
+
+    PIPE = subprocess.PIPE
+    STDOUT = subprocess.STDOUT
+    TimeoutExpired = subprocess.TimeoutExpired
+
+    def __init__(self):
+        self.let_push = threading.Event()
+        self.pushed = False
+
+    def run(self, argv, **kwargs):
+        if tuple(argv)[:2] == ("git", "push"):
+            assert self.let_push.wait(WAIT_S), "the pin never let the pusher push"
+            self.pushed = True
+            return subprocess.CompletedProcess(argv, 0, stdout="")
+        return subprocess.CompletedProcess(argv, 0,
+                                           stdout="0" if self.pushed else "1")
+
+
+class _OverTheCeiling:
+    """A usage source whose session is over any ceiling the pin sets."""
+
+    def get_usage(self, cache_value=True):
+        return usage.parse_usage({"five_hour": {"utilization": 90.0}})
+
+    def invalidate(self):
+        pass
+
+
+def test_quota_and_pusher_lines_are_written_by_the_owner_after_queued_worker_lines(
+        tmp_path, monkeypatch):
+    """The gate and the pusher print through `console`, not through `_console`.
+
+    Both used to write on their own threads while worker lines were still
+    queued, so a quota pause or a push could appear ahead of lines said before
+    it, and between two writes of the owner. Staged with the owner held by a
+    stalled write: whatever is queued behind it is written only once it is
+    released, so a line written EARLIER than the worker lines, or by any other
+    thread, was not routed.
+
+    The gate is the real `LimitPolicy`, over its ceiling and told to stop at
+    once, so it prints all three of its kinds of line: the percentage reading
+    (`print_percents`) and the two plain ones of the hold (`print_line`). Their
+    own order is part of the pin — routing only the first would reorder them.
+    """
+    out = _ThreadedStdout()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    record_exit_pushes(monkeypatch)
+    git = _OnePushGit()
+    monkeypatch.setattr(gitpush, "subprocess", git)
+    monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
+    stall = _Stall()
+    reached = []
+
+    def run_job(job_id, command, mailbox=None):
+        parallel._console.post(stall)
+        assert stall.entered.wait(WAIT_S)
+        try:
+            lines = parallel.job_lines(job_id)
+            for n in range(3):
+                lines.line(f"worker line {n}")
+            LimitPolicy([SessionLimit(5)]).check_and_wait(
+                _OverTheCeiling(), time.time(), should_stop=lambda: True)
+            git.let_push.set()
+            # The stall, three worker lines, three gate lines, one push line —
+            # a line that is not routed never arrives, and is asserted on below.
+            reached.append(_wait_for(lambda: parallel._console.backlog >= 8))
+        finally:
+            stall.release.set()
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", run_job)
+
+    result = parallel.run_parallel(
+        MemListDriver(["products/a.md"]),
+        par_args(tmp_path, jobs=1, git_push="after_new_commits"),
+        app_name="pytest-output-owner", setup_logging=False,
+        wait_on_start=False)
+    console.print_markup("after the run", "after the run")
+
+    assert result.completed == 1
+    lines = out.lines()
+    markers = ["worker line 0", "worker line 1", "worker line 2",
+               "usage: 90%", "⏳ Over usage limit", "⏹ Stop requested",
+               "git push: done"]
+    found = []
+    for marker in markers:
+        hits = [(i, name) for i, (name, text) in enumerate(lines)
+                if marker in text]
+        assert len(hits) == 1, f"{marker!r} written {len(hits)} time(s): {lines}"
+        found.append(hits[0])
+    assert {name for _i, name in found} == {"console-lines"}, \
+        f"a line was written off the owner: {list(zip(markers, found))}"
+    assert [i for i, _name in found] == sorted(i for i, _name in found), \
+        f"the lines were written out of the order they were said: {lines}"
+    assert reached == [True]
+    # The phase over, the route is gone and a line is its caller's again.
+    assert lines[-1] == (threading.current_thread().name, "after the run")
+    assert console._route is None
+
+
+def test_a_route_whose_queue_stays_full_writes_the_line_itself_and_says_so(
+        monkeypatch, capsys):
+    """The blocking policy: a poster waits `post_timeout` for room, no longer.
+
+    Past it the line is written on the poster's own thread — out of order, and
+    counted on stderr when the window closes — rather than dropped, or waited
+    for as long as the console stays stuck. Staged with a one-slot queue that
+    a stalled write keeps full.
+    """
+    out = _ThreadedStdout()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    owner = ownership.OwnerThread("pin-console", maxsize=1).start()
+    stall = _Stall()
+    owner.post(stall)
+    assert stall.entered.wait(WAIT_S)
+    owner.post(lambda: None)                # the one slot: full
+    try:
+        with console.route_through(owner, post_timeout=0.05):
+            returned, _ = _returns_within(
+                0.05 + BOUND_SLACK_S,
+                lambda: console.print_markup("past a full queue", "x"))
+    finally:
+        stall.release.set()
+        assert owner.close(WAIT_S)
+
+    assert returned, "a poster waited for room past its post_timeout"
+    written = out.lines()
+    assert [text for _name, text in written] == ["past a full queue"]
+    assert written[0][0] != "pin-console", "the line waited for the owner"
+    assert "pin-console: 1 line(s) written directly" in capsys.readouterr().err
+
+
+def test_one_route_at_a_time():
+    owner = ownership.OwnerThread("pin-console")
+    with console.route_through(owner, post_timeout=1.0):
+        with pytest.raises(RuntimeError, match="already routed"):
+            with console.route_through(owner, post_timeout=1.0):
+                pass
+        assert console._route is not None, "the refusal removed the open route"
+    assert console._route is None
+
+
+def test_a_phase_that_raises_leaves_the_console_unrouted(tmp_path, monkeypatch):
+    """Whatever ends the worker phase early — a second Ctrl+C, a failing
+    status line — the route is closed on the way out, not left behind to send
+    the next run's lines to an owner nobody runs."""
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None: (0, 0.0, 0.01))
+
+    def blow_up(threads):
+        raise RuntimeError("the phase failed")
+
+    monkeypatch.setattr(parallel, "join_workers", blow_up)
+
+    with pytest.raises(RuntimeError, match="the phase failed"):
+        _run(tmp_path, ["products/a.md"], jobs=1)
+
+    assert console._route is None
 
 
 # --- the status line's painter --------------------------------------------------
