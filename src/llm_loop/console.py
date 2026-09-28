@@ -230,9 +230,22 @@ def warn_missing_dependencies() -> None:
     print("  WARNING: Not all dependencies are installed: 'rich' is missing. "
           "Some functionality is unavailable: Markdown formatting, colored "
           "output, and accurate Unicode display widths. Continuing in plain text.")
-    # Written for the shell of this OS (PowerShell on Windows, `& ` included).
-    install = cmdline.quote([sys.executable, "-m", "pip", "install", "rich"])
-    shell_hint = " (PowerShell)" if os.name == "nt" else ""
+    # Written for the shell this console most likely is (`& ` included for
+    # PowerShell). An embedded or frozen interpreter has sys.executable == "",
+    # which no line can name; this runs at startup, so that must not raise.
+    shell = cmdline.paste_shell()
+    install = None
+    if sys.executable:
+        try:
+            install = cmdline.quote(
+                [sys.executable, "-m", "pip", "install", "rich"], shell)
+        except cmdline.NotPasteable:
+            pass
+    if install is None:
+        print("  Install with: pip install rich "
+              "(into the Python that runs this program)")
+        return
+    shell_hint = " (PowerShell)" if shell == cmdline.POWERSHELL else ""
     print(f"  Install with{shell_hint}: {install}")
 
 

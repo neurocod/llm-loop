@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import sys
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 # The flag table this module strips an argv with, and the record type it is made
@@ -189,21 +190,43 @@ class NotPasteable(ValueError):
     """
 
 
+def _shell_for(os_name: str, environ) -> str:
+    """`paste_shell`'s decision, on the values it reads (a table to pin)."""
+    if os_name != "nt":
+        return POSIX
+    # Git Bash and the MSYS2 shells set MSYSTEM (MINGW64, UCRT64, MSYS, ...)
+    # and hand it to the native Windows Python they start (measured
+    # 2026-09-28: `python` from Git Bash sees MSYSTEM=MINGW64, from
+    # PowerShell sees none). SHELL is not used: Git Bash exports it too, but
+    # it is also set machine-wide by tools and editor setups that never make
+    # bash the console, so it would flip lines typed in PowerShell to POSIX.
+    # The miss that remains: a PowerShell started FROM Git Bash inherits
+    # MSYSTEM and gets the POSIX line.
+    if environ.get("MSYSTEM"):
+        return POSIX
+    return POWERSHELL
+
+
 def paste_shell() -> str:
     """The shell a line printed by this process is most likely pasted into.
 
     PowerShell on Windows (the console the author and the project's docs use;
-    cmd.exe is not supported - see `render`), a POSIX sh everywhere else.
+    cmd.exe is not supported - see `render`), unless the process was started
+    from Git Bash / MSYS2 (MSYSTEM set), and a POSIX sh everywhere else. A
+    POSIX line pasted into Git Bash still passes through MSYS's path
+    conversion on its way to a native program (`/foo` becomes
+    `C:/Program Files/Git/foo`); the run's own argv, when it came from Git
+    Bash, already holds the converted Windows forms, which MSYS leaves alone.
     """
-    return POWERSHELL if os.name == "nt" else POSIX
+    return _shell_for(os.name, os.environ)
 
 
 # A word PowerShell delivers to a native program exactly as written, measured
 # against Windows PowerShell 5.1 on 2026-09-28 (bare `1e5`, `0x10`, `1kb`,
-# `--x=a.b`, `-C:foo`, `--`, `--flag=` all arrive verbatim; argument mode does
-# not turn number-like words into numbers). Everything else is single-quoted:
-# `$`, backtick, `;`, `&`, `|`, `@` (splatting: a bare `@a` delivers nothing),
-# `(`, `{`, `,`, `#`, `%`, quotes and whitespace.
+# `--x=a.b`, `--`, `--flag=` all arrive verbatim; argument mode does not turn
+# number-like words into numbers). Everything else is single-quoted: `$`,
+# backtick, `;`, `&`, `|`, `@` (splatting: a bare `@a` delivers nothing), `(`,
+# `{`, `,`, `#`, `%`, quotes and whitespace.
 _PS_BARE = re.compile(r"[A-Za-z0-9_\-./\\:=]+")
 # PowerShell reads these four as the single quote too, so inside '...' each
 # must be doubled like `'` itself or it ends the string.
@@ -243,13 +266,58 @@ def _powershell_word(arg: str) -> str:
         raise NotPasteable(
             f"PowerShell 5.1 turns the trailing backslash of {arg!r} into an "
             f"escaped quote")
-    # `-foo.bar` and `-a=b.c` arrive split at the dot (5.1, measured), so a
-    # dash word with a dot is quoted even though every character is plain -
-    # `--x=a.b` too, measured intact: one rule is easier to trust than two.
-    if _PS_BARE.fullmatch(arg) and not (arg.startswith("-") and "." in arg):
+    # `-foo.bar` and `-a=b.c` arrive split at the dot (5.1, measured), and so
+    # do `-C:foo`, `-a=b:c` and `-CD:/proj` at the colon - but only once a bare
+    # `--` precedes them on the line (`-C:` `foo`; before it, and first after
+    # the program, they arrive whole; measured 2026-09-28). So a dash word
+    # with a dot or a colon is quoted even though every character is plain,
+    # wherever it stands - `--x=a.b` and `--x:y` too, measured intact: one
+    # rule is easier to trust than a rule per position.
+    if _PS_BARE.fullmatch(arg) and not (
+            arg.startswith("-") and ("." in arg or ":" in arg)):
         return arg
     return "'" + "".join(ch * 2 if ch in _PS_SINGLE_QUOTES else ch
                          for ch in arg) + "'"
+
+
+def _refuse_unprintable(arg: str) -> None:
+    """NotPasteable unless every character of `arg` prints as itself.
+
+    For either shell, because the line is PRINTED before it is pasted. A NUL
+    ends the program's command line there (5.1 delivered `["a\\0b",
+    "SENTINEL"]` as `["a"]`, exit 0; POSIX argv cannot hold one at all). A
+    line feed, CR or U+2028 breaks the one printed line into several, a tab
+    is a completion key when pasted into PSReadLine, and ESC turns the status
+    line that prints the command into a terminal escape sequence (`\\x1b[2J`
+    clears the screen). Refused by class rather than by list:
+    `str.isprintable` is false for control (Cc), format (Cf: zero-width and
+    bidi overrides, which make the line read differently from what it runs),
+    line/paragraph separator, private-use, surrogate and unassigned
+    characters. The one class let through is Zs, the space separators
+    (U+00A0, U+3000, ...): they print as a space, both shells quote them
+    (`shlex` quotes any non-ASCII-word character; `_PS_BARE` is ASCII), and
+    5.1 delivered them intact (measured 2026-09-28).
+    """
+    for ch in arg:
+        if ch == "\0":
+            raise NotPasteable(
+                f"{arg!r} holds a NUL, which ends a program's command line")
+        if not ch.isprintable() and unicodedata.category(ch) != "Zs":
+            raise NotPasteable(
+                f"{arg!r} holds {ch!r}, which does not print as itself on a "
+                f"one-line command")
+
+
+def _posix_word(arg: str) -> str:
+    """`shlex.quote`, plus quoting for a leading `=`.
+
+    zsh (EQUALS, on by default) expands a word starting with `=` into the path
+    of the command it names (`=python` -> `/usr/bin/python`), and `=` is in
+    `shlex`'s safe set, so such a word gets single quotes of its own.
+    """
+    if arg.startswith("="):
+        return "'" + arg.replace("'", "'\"'\"'") + "'"
+    return shlex.quote(arg)
 
 
 def quote(parts: List[str], shell: Optional[str] = None) -> str:
@@ -259,16 +327,21 @@ def quote(parts: List[str], shell: Optional[str] = None) -> str:
     PowerShell line starts with the call operator `& `: without it a quoted
     first word (an interpreter under "Program Files") is a string expression
     and the paste fails with "Unexpected token". It raises NotPasteable for an
-    argument no PowerShell line delivers intact (see `_powershell_word`). The
-    POSIX line is `shlex.join`, which quotes every argument, however written,
-    for sh, bash and zsh alike.
+    argument no PowerShell line delivers intact (see `_powershell_word`), and
+    for either shell for one that does not print as one line
+    (`_refuse_unprintable`). The POSIX line is `shlex.join`'s quoting, which
+    quotes every argument, however written, for sh, bash and zsh alike, plus
+    `_posix_word`'s rule for zsh.
     """
     shell = paste_shell() if shell is None else shell
+    if shell not in (POWERSHELL, POSIX):
+        raise ValueError(
+            f"unknown shell {shell!r}; known: {POWERSHELL}, {POSIX}")
+    for part in parts:
+        _refuse_unprintable(part)
     if shell == POWERSHELL:
         return " ".join(["&", *map(_powershell_word, parts)])
-    if shell == POSIX:
-        return shlex.join(parts)
-    raise ValueError(f"unknown shell {shell!r}; known: {POWERSHELL}, {POSIX}")
+    return " ".join(map(_posix_word, parts))
 
 
 def render(argv: List[str], overrides: Dict[str, Any], *,
@@ -291,8 +364,8 @@ def render(argv: List[str], overrides: Dict[str, Any], *,
     the author's machine has no pwsh. cmd.exe is not a target: it would reject
     the leading `& ` and read `%` and `^` in values; the older CreateProcess-only
     line (`list2cmdline`) worked there and in no shell the author uses. Raises
-    NotPasteable when an argument cannot be written for PowerShell; the caller
-    shows that message instead of a line.
+    NotPasteable when an argument cannot be written for the shell (see
+    `quote`); the caller shows that message instead of a line.
     """
     if script is None:
         script = sys.argv[0] if sys.argv else ""

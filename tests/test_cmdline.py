@@ -222,7 +222,25 @@ def test_render_defaults_the_script_to_argv0(monkeypatch):
                   shell=POSIX) == "python runCycle.py -m 5"
 
 
-def test_the_default_shell_is_this_os_s_console():
+@pytest.mark.parametrize("os_name, environ, expected", [
+    ("nt", {}, POWERSHELL),
+    ("nt", {"MSYSTEM": "MINGW64"}, POSIX),          # Git Bash
+    ("nt", {"MSYSTEM": "UCRT64"}, POSIX),           # an MSYS2 shell
+    ("nt", {"MSYSTEM": ""}, POWERSHELL),
+    ("nt", {"SHELL": "/usr/bin/bash"}, POWERSHELL),  # not a console signal
+    ("posix", {}, POSIX),
+    ("posix", {"MSYSTEM": "MINGW64"}, POSIX),
+])
+def test_the_paste_shell_decision_table(os_name, environ, expected):
+    assert cmdline._shell_for(os_name, environ) == expected
+
+
+def test_the_default_shell_reads_this_process_s_environment(monkeypatch):
+    # Native Windows Python started from Git Bash sees MSYSTEM (measured); bash
+    # rejects the PowerShell line's leading `& `.
+    monkeypatch.setenv("MSYSTEM", "MINGW64")
+    assert paste_shell() == POSIX
+    monkeypatch.delenv("MSYSTEM")
     assert paste_shell() == (POWERSHELL if os.name == "nt" else POSIX)
     parts = ["python", "a b.py", "--max-runs", "5"]
     assert quote(parts) == quote(parts, paste_shell())
@@ -246,6 +264,9 @@ def test_an_unknown_shell_is_refused():
     ("a|b", "'a|b'"), ("@a", "'@a'"), ("(a)", "'(a)'"), ("{a}", "'{a}'"),
     ("a,b", "'a,b'"), ("#a", "'#a'"), ("--%x", "'--%x'"), ("a b", "'a b'"),
     ("-foo.bar", "'-foo.bar'"), ("\u043f\u0440\u043e", "'\u043f\u0440\u043e'"),
+    # Split at the colon after a bare `--` (measured), so quoted everywhere.
+    ("-C:foo", "'-C:foo'"), ("-a:b", "'-a:b'"), ("--x:y", "'--x:y'"),
+    ("-CD:/proj", "'-CD:/proj'"), ("C:foo", "C:foo"),
     # Every quote PowerShell ends a '...' string at is doubled.
     ("it's", "'it''s'"), ("it\u2019s", "'it\u2019\u2019s'"),
 ])
@@ -261,6 +282,40 @@ def test_an_argument_powershell_cannot_deliver_is_refused(word):
         quote(["python", word], POWERSHELL)
     # The POSIX line has a spelling for each of them.
     assert shlex.split(quote(["python", word], POSIX)) == ["python", word]
+
+
+@pytest.mark.parametrize("shell", [POWERSHELL, POSIX])
+@pytest.mark.parametrize("word", [
+    "a\0b", "a\nb", "a\rb", "a\tb", "a\x1b[2Jb", "a\x7fb", "a\x85b",
+    "a b", "a​b", "a‮b", "a\udcffb"],
+    ids=["nul", "lf", "cr", "tab", "esc", "del", "nel", "line-separator",
+         "zero-width-space", "bidi-override", "lone-surrogate"])
+def test_an_argument_that_does_not_print_as_one_line_is_refused(shell, word):
+    with pytest.raises(NotPasteable):
+        quote(["python", word, "SENTINEL"], shell)
+    with pytest.raises(NotPasteable):
+        quote([word, "SENTINEL"], shell)     # the program's own path too
+
+
+def test_a_nul_is_refused_by_its_name():
+    # 5.1 delivered ["a\0b", "SENTINEL"] as ["a"] with exit 0: the silent cut
+    # is the reason the message has to say what happened.
+    with pytest.raises(NotPasteable, match="NUL"):
+        quote(["python", "a\0b", "SENTINEL"], POWERSHELL)
+
+
+@pytest.mark.parametrize("shell", [POWERSHELL, POSIX])
+@pytest.mark.parametrize("word", ["a b", "a　b"],
+                         ids=["no-break-space", "ideographic-space"])
+def test_a_space_separator_is_quoted_not_refused(shell, word):
+    line = quote(["python", word], shell)
+    assert word in line and line.endswith("b'")
+
+
+def test_a_posix_word_starting_with_equals_is_quoted_for_zsh():
+    # zsh's EQUALS expands a bare `=foo` into the path of the command `foo`.
+    assert quote(["python", "=foo", "a=b"], POSIX) == "python '=foo' a=b"
+    assert shlex.split(quote(["python", "=it's"], POSIX)) == ["python", "=it's"]
 
 
 def test_an_empty_value_after_dashdash_is_refused_for_powershell():
@@ -283,13 +338,38 @@ def _msys_bash():
     """A bash that runs this interpreter, or None.
 
     On Windows only an MSYS one (Git Bash) qualifies: `bash` there may be WSL's
-    launcher, which runs a different machine that has no such path.
+    launcher, which runs a different machine that has no such path. Git's
+    `Git/bin/bash.exe` is a launcher for `Git/usr/bin/bash.exe`, the one with
+    `msys-2.0.dll` beside it, so it is resolved to that before the check.
     """
     bash = shutil.which("bash")
-    if bash and os.name == "nt" and not os.path.isfile(
-            os.path.join(os.path.dirname(bash), "msys-2.0.dll")):
-        return None
-    return bash
+    if not bash or os.name != "nt":
+        return bash
+    beside_usr = os.path.join(os.path.dirname(os.path.dirname(bash)),
+                              "usr", "bin", os.path.basename(bash))
+    for candidate in (bash, beside_usr):
+        if os.path.isfile(os.path.join(os.path.dirname(candidate),
+                                       "msys-2.0.dll")) \
+                and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the MSYS check is Windows-only")
+def test_git_s_bash_launcher_counts_as_git_bash_and_wsl_s_does_not(
+        tmp_path, monkeypatch):
+    for name in ("Git/bin/bash.exe", "Git/usr/bin/bash.exe",
+                 "Git/usr/bin/msys-2.0.dll", "System32/bash.exe"):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(b"")
+    found = {}
+    monkeypatch.setattr(shutil, "which", lambda name: found["bash"])
+    found["bash"] = str(tmp_path / "Git" / "bin" / "bash.exe")
+    assert _msys_bash() == str(tmp_path / "Git" / "usr" / "bin" / "bash.exe")
+    found["bash"] = str(tmp_path / "Git" / "usr" / "bin" / "bash.exe")
+    assert _msys_bash() == found["bash"]
+    found["bash"] = str(tmp_path / "System32" / "bash.exe")
+    assert _msys_bash() is None
 
 
 BASH = _msys_bash()
@@ -305,7 +385,9 @@ def _deliver_by_powershell(line, tmp_path):
 def _deliver_by_bash(line, tmp_path):
     # From a file, not `bash -c`: the line then reaches bash untouched by any
     # command-line quoting of our own. MSYS rewrites POSIX-looking arguments to
-    # a native program as Windows paths unless told not to.
+    # a native program as Windows paths unless told not to - so this pins the
+    # QUOTING only; a real Git Bash paste of `/foo` delivers
+    # `C:/Program Files/Git/foo` (see `cmdline.paste_shell`).
     script = tmp_path / "line.sh"
     script.write_text(line + "\n", encoding="utf-8")
     env = dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")
@@ -322,7 +404,8 @@ SHELLS = [
         BASH is None, reason="no bash to paste into (on Windows: no Git Bash)")),
 ]
 
-_METACHARACTERS = "C:\\a$b `c;d&e|f@g(h){i}[j],k#l%m'n\u2019o \u043f\u0440\u043e"
+_METACHARACTERS = ("C:\\a$b `c;d&e|f@g(h){i}[j],k#l%m'n\u2019o \u043f\u0440\u043e"
+                   "\u00a0p=q")
 
 
 def _interpreter_under_a_space(tmp_path):
@@ -332,14 +415,16 @@ def _interpreter_under_a_space(tmp_path):
     runtime beside it. The base interpreter, not a venv's: a Windows venv
     launcher looks for its pyvenv.cfg next to the path it was started by.
     """
-    real = os.path.dirname(getattr(sys, "_base_executable", sys.executable))
+    base = getattr(sys, "_base_executable", sys.executable)
     link = tmp_path / "Program Files x"
     if os.name == "nt":
         import _winapi
-        _winapi.CreateJunction(real, str(link))
+        _winapi.CreateJunction(os.path.dirname(base), str(link))
     else:
-        os.symlink(real, str(link))
-    return str(link / os.path.basename(sys.executable))
+        os.symlink(os.path.dirname(base), str(link))
+    # The base's own name: a Linux venv's `python` may have no namesake in
+    # the base directory (/usr/bin holds `python3` only).
+    return str(link / os.path.basename(base))
 
 
 @pytest.mark.parametrize("shell, deliver", SHELLS)
@@ -353,9 +438,14 @@ def _interpreter_under_a_space(tmp_path):
     (["-m", "5"], {"--project-dir": _METACHARACTERS}, False),
     (["-m", "5", "--", "-foo.bar", "--%x", "@a", "a,b", "$x", "it's"], {},
      False),
+    # 5.1 splits a dash word at its colon only after a bare `--`; both sides.
+    (["-a:b", "-CD:/proj", "--", "-C:foo", "-a:b", "-CD:/proj", "--x:y"], {},
+     False),
+    (["-m", "5", "--", "=foo", "--x=a:b"], {}, False),
     (["-m", "5"], {"--project-dir": r"C:\my project\sub"}, True),
 ], ids=["empty-override", "copied-empty", "empty-among-values",
-        "metacharacters", "tail-words", "interpreter-under-a-space"])
+        "metacharacters", "tail-words", "colon-words", "equals-words",
+        "interpreter-under-a-space"])
 def test_the_rendered_line_round_trips_through_its_shell(
         tmp_path, shell, deliver, argv, overrides, spaced_interpreter):
     echo = tmp_path / "echo_argv.py"
@@ -375,3 +465,39 @@ def test_the_rendered_line_round_trips_through_its_shell(
     for flag, value in overrides.items():
         pairs += [flag, str(value)]
     assert parser.parse_known_args(delivered) == parser.parse_known_args(pairs)
+
+
+# --- the one production caller: the rich-install hint at startup ---------------
+
+def _missing_rich_hint(monkeypatch, capsys):
+    from llm_loop import console
+    monkeypatch.setattr(console, "RICH_AVAILABLE", False)
+    monkeypatch.setattr(console, "_DEPENDENCY_WARNING_SHOWN", False)
+    console.warn_missing_dependencies()
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("msystem, shell, label", [
+    (None, POWERSHELL if os.name == "nt" else POSIX,
+     " (PowerShell)" if os.name == "nt" else ""),
+    ("MINGW64", POSIX, ""),
+])
+def test_the_rich_hint_is_a_line_for_the_paste_shell(monkeypatch, capsys,
+                                                     msystem, shell, label):
+    if msystem is None:
+        monkeypatch.delenv("MSYSTEM", raising=False)
+    else:
+        monkeypatch.setenv("MSYSTEM", msystem)
+    monkeypatch.setattr(sys, "executable", r"C:\Program Files\Py\python.exe")
+    out = _missing_rich_hint(monkeypatch, capsys)
+    install = quote([sys.executable, "-m", "pip", "install", "rich"], shell)
+    assert f"  Install with{label}: {install}\n" in out
+
+
+def test_the_rich_hint_survives_an_interpreter_with_no_path(monkeypatch,
+                                                            capsys):
+    # Embedded / frozen: sys.executable is "", which no line can name. This
+    # runs at startup; raising here would stop the run over a missing extra.
+    monkeypatch.setattr(sys, "executable", "")
+    out = _missing_rich_hint(monkeypatch, capsys)
+    assert "Install with: pip install rich" in out
