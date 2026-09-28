@@ -965,3 +965,196 @@ def test_a_paste_tail_posted_behind_its_enter_is_discarded_with_it():
     assert isinstance(mode, sl.NormalMode)
     assert not app.stop_requested_here and not app.paused
 
+
+def test_a_stuck_painter_with_a_full_queue_holds_neither_stop_nor_the_key_reader(
+        monkeypatch, capsys):
+    """Every wait on the painter keeps its bound, the wait for room included.
+
+    stop() used to post its release before its bounded close: with the frame
+    stuck and the queue full of keys, the post blocked for as long as the
+    terminal did. So did the key reader's own post — and on Windows the
+    reader is what turns Ctrl+C into an interrupt.
+    """
+    monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
+    monkeypatch.setattr(sl, "POSTED_CALL_WAIT_SECONDS", 0.05)
+    terminal, keys = _paint_log(), KeysByHand()
+    app = sl.StatusApp(terminal=terminal, input_source=keys, refresh=60)
+    app.start()
+    app._painter._maxsize = 3              # "full" a few keys away
+    painter = app._painter._thread
+    terminal.arm_stall(WAIT_S)
+    app.update(iteration=1)
+    assert terminal.stalled.wait(WAIT_S)   # a frame, not a queued call: empty
+    try:
+        def type_eight():
+            for _ in range(8):
+                keys.handler(termio.Key("x"))
+
+        returned, _ = _returns_within(BOUND_SLACK_S, type_eight)
+        assert returned, "the key reader waited for room behind a stuck frame"
+        assert app._keys_dropped == 5
+        returned, _ = _returns_within(
+            0.05 + BOUND_SLACK_S, lambda: app.handle_event(termio.Key("y")))
+        assert returned, "handle_event() waited for room behind a stuck frame"
+        returned, _ = _returns_within(0.05 + BOUND_SLACK_S, app.stop)
+        assert returned, "stop() waited for room behind a stuck frame"
+        assert terminal.releases == [], "stop() released under a live painter"
+    finally:
+        terminal.unstall.set()
+    painter.join(WAIT_S)
+    assert not painter.is_alive()
+    assert terminal.releases == [sl.PAINTER_THREAD_NAME], \
+        "the release queued past the bound never ran"
+    err = capsys.readouterr().err
+    assert "handle_event (not queued, dropped) not done within" in err
+    assert "the last frame and the release not done within" in err
+    assert "5 key(s) dropped so far" in err
+
+
+def test_a_resize_posted_behind_a_timed_out_stop_does_not_re_pin_the_region(
+        monkeypatch):
+    """What is posted after stop() still runs on the painter, after the
+    release — and a Resize there used to reserve the region again, with
+    nobody left to release it."""
+    monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
+    terminal = _paint_log()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    app.start()
+    painter = app._painter._thread
+    terminal.arm_stall(WAIT_S)
+    app.update(iteration=1)
+    assert terminal.stalled.wait(WAIT_S)
+    resize = threading.Thread(
+        target=app.handle_event,
+        args=(termio.Resize(terminal.columns, terminal.lines),), daemon=True)
+    try:
+        app.stop()
+        resize.start()
+        # Queued behind the release: the release and the resize.
+        assert _wait_for(lambda: app._painter.backlog == 2)
+    finally:
+        terminal.unstall.set()
+    resize.join(WAIT_S)
+    painter.join(WAIT_S)
+    assert terminal.releases == [sl.PAINTER_THREAD_NAME]
+    assert not terminal.active, "a Resize run after the release re-pinned the region"
+
+
+def test_ctrl_c_while_start_waits_for_its_first_frame_puts_the_terminal_back():
+    """`with app:` runs no `__exit__` for a start() that raised.
+
+    A Ctrl+C in start()'s wait for the first frame left the painter open and
+    the region pinned, with the signal restore not yet installed either.
+    """
+    terminal = _paint_log()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    real_drain = app._painter.drain
+    restore_installed = []
+
+    def interrupted(timeout=None):
+        real_drain(WAIT_S)         # the region is pinned: there is something to undo
+        restore_installed.append(app._atexit_registered)
+        raise KeyboardInterrupt
+
+    app._painter.drain = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        app.start()
+    assert restore_installed == [True], \
+        "a signal during start()'s wait found no restore installed"
+    assert _wait_for(lambda: terminal.releases), "the region was never released"
+    assert terminal.releases == [sl.PAINTER_THREAD_NAME]
+    assert not terminal.active
+    assert not app._atexit_registered
+
+
+def test_a_burst_behind_a_stuck_frame_is_one_request_and_one_frame_of_its_end():
+    """Every paint request asks for "the state as it is now", so one in flight
+    is the whole queue, and the frame after the stall shows the burst's end."""
+    terminal = _paint_log()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    with app:
+        terminal.arm_stall(WAIT_S)
+        app.update(iteration=1)
+        assert terminal.stalled.wait(WAIT_S)
+        before = len(terminal.painted)
+        try:
+            def feed(k):
+                for n in range(200):
+                    app.update(iteration=k * 1000 + n)
+
+            feeders = [threading.Thread(target=feed, args=(k,)) for k in range(4)]
+            for thread in feeders:
+                thread.start()
+            for thread in feeders:
+                thread.join(WAIT_S)
+            app.update(iteration=999999)
+            queued = app._painter.backlog
+        finally:
+            terminal.unstall.set()
+        deadline = time.monotonic() + WAIT_S
+        while not any("iter 999999" in row for row in terminal.frames.get(
+                timeout=max(0, deadline - time.monotonic()))):
+            pass
+        frames = len(terminal.painted) - before
+        flag = app._frame_posted
+
+    assert queued == 1, f"801 updates queued {queued} frame requests"
+    assert frames == 2, f"the stuck frame and one more expected, got {frames}"
+    assert flag is False
+
+
+def test_a_frame_request_lost_before_the_queue_does_not_stop_the_frames():
+    """The one-in-flight flag, set by a request that never got queued (its
+    poster interrupted in between), used to silence every later paint."""
+    terminal = _paint_log()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    with app:
+        assert app._painter.drain(WAIT_S)
+        app._frame_posted = True           # as that poster left it
+        app.update(iteration=7)
+        deadline = time.monotonic() + WAIT_S
+        while not any("iter 7" in row for row in terminal.frames.get(
+                timeout=max(0, deadline - time.monotonic()))):
+            pass
+
+
+class _StartStopInput(termio.NullInputSource):
+    """Remembers the order it was started and stopped in."""
+
+    def __init__(self):
+        self.events = []
+
+    def start(self, handler):
+        self.events.append("start")
+
+    def stop(self):
+        self.events.append("stop")
+
+
+def test_a_region_refused_behind_a_stuck_restart_leaves_no_key_reader(monkeypatch):
+    """A refused region means no keys, as it always did at start() — also when
+    the refusal lands after start() has given up waiting for it and started
+    the reader."""
+    monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
+    terminal, keys = _paint_log(), _StartStopInput()
+    app = sl.StatusApp(terminal=terminal, input_source=keys, refresh=60)
+    app.start()
+    terminal.arm_stall(WAIT_S)
+    app.update(iteration=1)
+    assert terminal.stalled.wait(WAIT_S)
+    try:
+        app.stop()
+        terminal.lines = 4                 # no room for the region any more
+        app.start()                        # returns with the region undecided
+    finally:
+        terminal.unstall.set()
+    try:
+        assert _wait_for(lambda: isinstance(app.terminal, termio.NullTerminal))
+        assert _wait_for(lambda: keys.events == ["start", "stop", "start", "stop"]), \
+            f"the reader outlived the refused region: {keys.events}"
+    finally:
+        app.stop()
