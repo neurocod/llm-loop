@@ -1336,13 +1336,16 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         stopchannel.wait_for_stop_file_clear()
 
     # Usage gate: one account's RunUsage (see runlifecycle.open_usage), shared by
-    # every worker. One is the whole set this run closes: `ListFileDriver.
-    # command_for` stamps every command with `driver.provider`, which
-    # `begin_run` settled, so a fleet never switches accounts the way the
-    # sequential loop does. --ignore-usage leaves it unopened, so there is no source to
-    # gate on and no policy to gate with.
+    # every worker. One is the whole set this run closes:
+    # `ListFileDriver.command_for` stamps every command with `driver.provider`,
+    # which `begin_run` settled, so a fleet never switches accounts the way the
+    # sequential loop does. Named after the runner AND the account, so its
+    # `at end (…)` line says whose figures it holds the way a sequential run's
+    # does. --ignore-usage leaves it unopened, so there is no source to gate on
+    # and no policy to gate with.
     usage = (None if args.ignore_usage
-             else runlifecycle.open_usage(driver, provider, name="parallel",
+             else runlifecycle.open_usage(driver, provider,
+                                          name=f"parallel {provider}",
                                           dry_run=dry_run))
     source, policy = runlifecycle.usage_halves(usage)
     usage_lock = threading.Lock()

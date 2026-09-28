@@ -11,7 +11,7 @@ import inspect
 
 import pytest
 
-from llm_loop import cyclecore, limits, parallel, runlifecycle
+from llm_loop import cyclecore, limits, operator, parallel, runlifecycle
 from llm_loop.stopchannel import RunStopReason
 # The staged-run scaffolding of the abnormal endings; `_isolated_run` is autouse
 # there, and importing it makes it autouse here too (own log dir, exit record).
@@ -118,6 +118,37 @@ def test_closing_a_run_answers_every_usage_it_opened(exit_pushes):
     assert len(exit_pushes) == 1, "the housekeeping around the snapshots ran"
 
 
+def test_one_failing_close_costs_only_its_own_line(exit_pushes, capsys):
+    """A snapshot that raises must not skip the accounts after it, nor the notes.
+
+    The closes run one after another, so an unguarded one that raised took every
+    later account's `at end` line and `report_undelivered_notes` with it.
+    """
+    class _BrokenSource:
+        def get_usage(self, cache_value=True):
+            raise OSError("usage endpoint unreachable")
+
+    policy = _RecordingPolicy()
+    broken = runlifecycle.RunUsage(_BrokenSource(), limits.default_policy("claude"),
+                                   "claude")
+    codex = runlifecycle.RunUsage("codex-source", policy, "codex")
+    mailbox = operator.Mailbox()
+    mailbox.submit("look at the third file")
+    ctx = runlifecycle.RunContext(
+        provider="claude", spec=None, dry_run=False, progress=None,
+        settings=runlifecycle.RunSettings(), registry=None,
+        status_enabled=False)
+
+    runlifecycle.close_run(ctx, usages=[broken, codex], mailbox=mailbox)
+
+    assert [label for _source, label, _fresh in policy.snapshots] == [
+        "at end (codex)"]
+    out = capsys.readouterr().out
+    assert "usage at end (claude) could not be read" in out
+    assert "usage endpoint unreachable" in out
+    assert "look at the third file" in out, "the undelivered note was skipped"
+
+
 def test_a_sequential_run_that_returns_closes_the_usage_it_opened(
         tmp_path, monkeypatch, exit_pushes):
     """The normal ending is the common one; the abnormal three are pinned in
@@ -147,8 +178,10 @@ def test_a_parallel_run_that_returns_closes_the_usage_it_opened(
                                    app_name="pytest-abnormal", wait_on_start=False)
 
     assert result.reason is RunStopReason.NO_WORK
-    assert driver.limit_policy.snapshots == ["at start (parallel)",
-                                             "at end (parallel)"]
+    # The account in the name, as a sequential run's lines have it: `parallel`
+    # alone would not say whose figures the pair holds.
+    assert driver.limit_policy.snapshots == ["at start (parallel claude)",
+                                             "at end (parallel claude)"]
 
 
 @pytest.mark.parametrize("runner", [cyclecore.run_loop, parallel.run_parallel])

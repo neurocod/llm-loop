@@ -60,8 +60,8 @@ class RunSettings:
     """The script's own knobs, held in one MUTABLE object the run re-reads.
 
     Plain locals froze these at startup, which made "edit the limits while the
-    run goes" (the status line's `l` key) impossible without touching the runner
-    body. Both runners read this object where the value is USED — the sequential
+    run goes" (through `knob_registry`'s setters) impossible without touching the
+    runner body. Both runners read this object where the value is USED — the sequential
     one at every iteration boundary, the parallel one from its claim loop and
     from its pusher — so moving `--max-runs` from 40 to 60 mid-run takes effect
     at the next boundary and nothing else has to change.
@@ -280,7 +280,8 @@ class RunUsage:
     `name` is what the snapshots are labelled with, and it is what makes the
     opening snapshot and the closing one a pair in the log: `at start (name)` is
     answered by `at end (name)`, or by `at end (name: ending)` when the run
-    ended somewhere worth naming (see `close`).
+    ended somewhere worth naming (see `close`) — on the endings that reach
+    `close_run`, which names the ones that do not.
     """
 
     __slots__ = ("source", "policy", "name")
@@ -373,10 +374,22 @@ def close_run(ctx: RunContext, *,
     knob edited while a pusher is mid-push must not be read half-applied.
 
     `usages` is EVERY usage the run opened, not the one it ended on: a
-    mixed-provider sequential run opens one per account it selects, and each
-    `at start (…)` it logged is answered. Required, so a runner states what it
-    opened rather than defaulting to closing nothing. A None in it is an account
-    without a usage endpoint (see `open_usage`) and has nothing to close.
+    mixed-provider sequential run opens one per account it selects, and each is
+    closed here. Required, so a runner states what it opened rather than
+    defaulting to closing nothing. A None in it is an account without a usage
+    endpoint (see `open_usage`) and has nothing to close. Each close is guarded
+    on its own: a snapshot that raises costs its own `at end` line, not the
+    other accounts' lines and not the report of undelivered notes after them.
+
+    Every `at start (…)` is answered only on the endings that REACH this
+    function: a return through `end_run`, and the three `sys.exit` endings
+    above. The rest leave their openings unanswered, and a missing `at end` line
+    is the trace they leave: Ctrl+C in the sequential runner (the
+    `sys.exit(130)` in `streamrender`, `cyclecore._count_down_to`, `limits` and
+    `stopchannel`), a provider executable that is not installed
+    (`streamrender`'s `sys.exit(2)`), and an exception raised out of the driver
+    or the runner body, `driver.final_summary` included — the parallel runner's
+    `finally` closes only its console.
     """
     if not ctx.dry_run:
         # No lock is the SINGLE-THREADED case, not a missing one: the runner with
@@ -389,8 +402,14 @@ def close_run(ctx: RunContext, *,
     # the abnormal endings (see RunUsage.close).
     if not ctx.dry_run:
         for usage in usages:
-            if usage is not None:
+            if usage is None:
+                continue
+            try:
                 usage.close(ending)
+            # Exception, not BaseException: a Ctrl+C here still ends the run.
+            except Exception as error:
+                print(f"  ⚠ usage at end ({usage.name}) could not be read: "
+                      f"{type(error).__name__}: {error}")
 
     operator.report_undelivered_notes(mailbox)
 

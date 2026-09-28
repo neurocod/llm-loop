@@ -272,7 +272,7 @@ def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(
     assert exit_info.value.code == 130
     _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
-        snapshot="at end (parallel: interrupted)",
+        snapshot="at end (parallel claude: interrupted)",
         reason="interrupted by the operator (Ctrl+C)")
 
 

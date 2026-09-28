@@ -486,10 +486,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     def opened_usages() -> list:
         """Every account's usage this run opened, for the closing snapshots.
 
-        All of them, not the selected one: each `at start (…)` is answered.
-        The selected `usage` is always the object stored here — it is only
-        ever assigned FROM `usage_states` — so nothing has to be written back
-        first; only the session clock beside it moves, and closing ignores it.
+        All of them, not the selected one, so an ending that reaches
+        `runlifecycle.close_run` answers every `at start (…)` — see there for
+        the endings that do not. The selected `usage` is always the object
+        stored here — it is only ever assigned FROM `usage_states` — so nothing
+        has to be written back first; only the session clock beside it moves,
+        and closing ignores it.
         """
         return [opened for opened, _session_start in usage_states.values()]
 
