@@ -199,17 +199,7 @@ class OwnerThread:
         For a caller that must not be held by the resource at all (an
         interrupt handler); what to do with a refused call is its decision.
         """
-        if self.owns_current_thread:
-            call(*args)
-            return True
-        with self._changed:
-            if self._state != _CLOSED:
-                if len(self._items) >= self._maxsize:
-                    return False
-                self._enqueue(call, args)
-                return True
-        call(*args)
-        return True
+        return self.post(call, *args, timeout=0)
 
     def drain(self, timeout: Optional[float] = None) -> bool:
         """Wait until every call posted before this one has run.
