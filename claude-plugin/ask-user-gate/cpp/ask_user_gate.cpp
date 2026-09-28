@@ -1461,11 +1461,9 @@ given. Exit 1 when a checked command is denied.
 //
 //   * An unambiguous prefix of a long option IS that option (`--sh bash`,
 //     `--t=Monitor`); a prefix of several, and any `-=`-led token, is refused
-//     where parsing reaches it. The other way to one contract -- turning
-//     abbreviations off in the reference -- is closed: _Parser refuses
-//     allow_abbrev=False, because newer argparse then reads `-= x` as a value
-//     and the pinned rule would be contradicted, and it would also narrow a
-//     public CLI that people already type abbreviated.
+//     where parsing reaches it. Abbreviations stay on in the reference, not
+//     off in both halves: off would narrow a public CLI people already type
+//     abbreviated, and _Parser.__init__ refuses it for its pinned rules' sake.
 //   * A token nothing claims is collected and reported AFTER the loop, as
 //     argparse's "unrecognized arguments" is, while every other refusal (a
 //     missing or rejected value, an ambiguous prefix) stops at its position.
@@ -1482,10 +1480,7 @@ given. Exit 1 when a checked command is denied.
 //     has no row for it. (`-h=` is the `=` rule above, where 3.9.25 raises an
 //     IndexError instead.) Measured on 3.9 to 3.14, 2026-09-28.
 //
-// parity_check's ARGV_CASES carry one row per option (generated from the
-// reference's parser, so an option added there reaches the port without
-// anyone remembering to), the leading abbreviation of each, and the ordering
-// and `=` shapes above.
+// Pinned by parity_check's ARGV_CASES, per option by its _option_rows.
 
 // One entry per reference option string, with whether it takes a value.
 // tests/test_ask_user_gate_parity.py reads this initializer and compares it with
@@ -1579,16 +1574,27 @@ CliToken classifyArgument(std::string_view token) {
 	return {Kind::Unknown};
 }
 
-int run(int argc, char** argv) {
-	using Kind = CliToken::Kind;
+// What the command line asked for; the defaults are the reference's.
+struct CommandLine {
 	std::optional<std::string> checkCommand;
 	std::optional<std::string> checkFile;
 	std::string shell = "bash";
 	std::string tool = "Bash";
 	std::string platform = "auto";
-	bool wantSelfTest = false;
-	std::vector<std::string> unrecognised;
+	bool selfTest = false;
+};
 
+int refuseUnhandledOption(std::string_view name) {
+	std::fprintf(stderr, "ask_user_gate: %.*s is in kOptions but not handled\n",
+		static_cast<int>(name.size()), name.data());
+	return 2;
+}
+
+// argparse's parse_args by the rules above kOptions. Returns the exit code when
+// the command line itself ends the run: 0 after the help, 2 on a usage error.
+std::optional<int> parseCommandLine(int argc, char** argv, CommandLine& options) {
+	using Kind = CliToken::Kind;
+	std::vector<std::string> unrecognised;
 	for (int i = 1; i < argc; ++i) {
 		const CliToken token = classifyArgument(argv[i]);
 		if (token.kind == Kind::EndOfOptions) {
@@ -1611,16 +1617,14 @@ int run(int argc, char** argv) {
 				return 2;
 			}
 			if (name == "--self-test") {
-				wantSelfTest = true;
+				options.selfTest = true;
 				continue;
 			}
 			if (name == "-h" || name == "--help") {
 				writeStdout(kUsage);
 				return 0;
 			}
-			std::fprintf(stderr, "ask_user_gate: %.*s is in kOptions but not handled\n",
-				static_cast<int>(name.size()), name.data());
-			return 2;
+			return refuseUnhandledOption(name);
 		}
 		std::string value;
 		if (token.inlineValue) {
@@ -1636,27 +1640,25 @@ int run(int argc, char** argv) {
 			return 2;
 		}
 		if (name == "--check") {
-			checkCommand = value;
+			options.checkCommand = value;
 		} else if (name == "--check-file") {
-			checkFile = value;
+			options.checkFile = value;
 		} else if (name == "--shell") {
 			if (value != "bash" && value != "powershell") {
 				std::fprintf(stderr, "ask_user_gate: --shell must be bash or powershell\n");
 				return 2;
 			}
-			shell = value;
+			options.shell = value;
 		} else if (name == "--tool") {
-			tool = value;
+			options.tool = value;
 		} else if (name == "--platform") {
 			if (value != "auto" && value != "windows" && value != "posix") {
 				std::fprintf(stderr, "ask_user_gate: --platform must be auto, windows or posix\n");
 				return 2;
 			}
-			platform = value;
+			options.platform = value;
 		} else {
-			std::fprintf(stderr, "ask_user_gate: %.*s is in kOptions but not handled\n",
-				static_cast<int>(name.size()), name.data());
-			return 2;
+			return refuseUnhandledOption(name);
 		}
 	}
 	if (!unrecognised.empty()) {
@@ -1667,17 +1669,25 @@ int run(int argc, char** argv) {
 		writeStdout(kUsage);
 		return 2;
 	}
+	return std::nullopt;
+}
 
-	if (wantSelfTest)
+int run(int argc, char** argv) {
+	CommandLine options;
+	if (const std::optional<int> exitCode = parseCommandLine(argc, argv, options))
+		return *exitCode;
+
+	if (options.selfTest)
 		return selfTest();
 
-	const bool windows = (platform == "auto") ? isWindowsHost() : (platform == "windows");
+	const bool windows = (options.platform == "auto") ? isWindowsHost()
+		: (options.platform == "windows");
 
-	std::optional<std::string> command = checkCommand;
-	if (checkFile) {
-		const std::optional<std::string> content = readFile(pathFromUtf8(*checkFile));
+	std::optional<std::string> command = options.checkCommand;
+	if (options.checkFile) {
+		const std::optional<std::string> content = readFile(pathFromUtf8(*options.checkFile));
 		if (!content) {
-			std::fprintf(stderr, "ask_user_gate: cannot read %s\n", checkFile->c_str());
+			std::fprintf(stderr, "ask_user_gate: cannot read %s\n", options.checkFile->c_str());
 			return 2;
 		}
 		// Universal newlines, because the reference opens this file in TEXT
@@ -1697,7 +1707,7 @@ int run(int argc, char** argv) {
 		command = std::move(text);
 	}
 	if (command) {
-		const std::vector<Finding> findings = scan(*command, shell, windows, tool);
+		const std::vector<Finding> findings = scan(*command, options.shell, windows, options.tool);
 		if (findings.empty()) {
 			writeStdout("allowed\n");
 			return 0;

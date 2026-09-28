@@ -971,7 +971,15 @@ def _option_tuple_fields() -> int:
 
 
 class _Parser(argparse.ArgumentParser):
-    """argparse, with the value-or-flag rule pinned and one hint added.
+    """argparse, with the rules it moved between 3.9 and 3.14 pinned to one
+    reading -- the one the port has -- and one hint added.
+
+    Each rule, and what it overrides of argparse's private API:
+      NEGATIVE_NUMBER      which dash-led tokens are values (3.14 widened it)
+      _get_option_tuples   `-=`-led tokens, deferred ambiguity (3.9-3.11, early 3.12)
+      _get_values          a glued `=--` value (3.9, 3.10)
+    The versions and measurements are at each member; _option_tuple_fields
+    covers the tuple layout _get_option_tuples returns in each.
 
     The hint: argparse's refusal of a bare --check is what `--check ""` looks
     like after PowerShell 5.1, and the usage line it prints does not name the
@@ -1006,7 +1014,7 @@ class _Parser(argparse.ArgumentParser):
 
     def _get_option_tuples(self, option_string):
         # Two more rules argparse moved, pinned to the newer shape the port
-        # (classifyArgument, and the loop in its run()) already has:
+        # (classifyArgument and parseCommandLine) already has:
         #
         # - A token led by `-=` abbreviates EVERY option: a single dash is
         #   matched by the text before `=`, which here is just `-`. 3.9-3.11 (and
