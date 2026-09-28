@@ -719,7 +719,7 @@ def test_stop_leaves_the_release_to_a_painter_stuck_in_its_frame(monkeypatch):
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
     app.start()
-    painter = app._paint_thread
+    painter = app._painter._thread
     terminal.arm_stall(WAIT_S)
     app.update(iteration=1)
     assert terminal.stalled.wait(WAIT_S)
@@ -735,33 +735,48 @@ def test_stop_leaves_the_release_to_a_painter_stuck_in_its_frame(monkeypatch):
         "the painter did not release the terminal on its way out"
 
 
-def test_a_restart_after_a_timed_out_stop_does_not_revive_the_old_painter(
-        monkeypatch):
-    """Every start gets its own stop event; the old painter keeps its own.
+def test_a_restart_after_a_timed_out_stop_keeps_the_one_painter(monkeypatch):
+    """A restart reopens the painter the last stop() gave up on — the one
+    restart policy, `ownership.OwnerThread.start` — and writes nothing beside it.
 
-    start() used to CLEAR the one shared event, so a painter the last stop()
-    had given up on woke up running again next to the new one — stealing its
-    wake-ups and re-pinning the region from its periodic resize check.
+    It used to start a SECOND painter and pin the new region from its own
+    thread while the old one was still inside its frame: that frame then
+    landed over the new region, and with the write stuck inside the terminal's
+    lock start() itself hung on it. (Before that, the one shared stop event was
+    cleared and the old painter revived next to the new one.) Kept on, the old
+    frame, the old release and the new region run in the order they were asked.
     """
     monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
     terminal = _paint_log()
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
     app.start()
-    old = app._paint_thread
+    old = app._painter._thread
     terminal.arm_stall(WAIT_S)
     app.update(iteration=1)
     assert terminal.stalled.wait(WAIT_S)
     try:
         app.stop()
         assert old.is_alive()
-        app.start()
+        del terminal.writers[:]
+        returned, _ = _returns_within(0.05 + BOUND_SLACK_S, app.start)
+        assert returned, "start() waited for the stuck frame"
+        assert terminal.writers == [], \
+            "the restart wrote the terminal beside the painter still in its frame"
     finally:
         terminal.unstall.set()
-    old.join(WAIT_S)
     try:
-        assert not old.is_alive(), "the old painter was revived by the restart"
-        assert app._paint_thread is not old and app._paint_thread.is_alive()
+        # Waited for, behind the old frame, the old release and the new region.
+        app.handle_event(termio.Resize(terminal.columns, terminal.lines))
+        app.update(iteration=2)
+        deadline = time.monotonic() + WAIT_S
+        while not any("iter 2" in row for row in terminal.frames.get(
+                timeout=max(0, deadline - time.monotonic()))):
+            pass
+        assert app._painter._thread is old, "the restart started a second painter"
+        assert set(terminal.writers) == {sl.PAINTER_THREAD_NAME}
+        # The old stop's release ran before the new region was pinned.
+        assert terminal.releases == [sl.PAINTER_THREAD_NAME] and terminal.active
     finally:
         app.stop()
 

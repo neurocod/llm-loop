@@ -32,7 +32,6 @@ chain, adding a boolean to `LoopStatus`, or hard-coding a key into the legend.
 """
 
 import atexit
-import collections
 import os
 import re
 import sys
@@ -40,10 +39,10 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import (Callable, Deque, List, NamedTuple, Optional, Sequence,
-                    Tuple)
+from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import cmdline, console, gitpush, stopchannel, termio, textwidth, wire
+from . import (cmdline, console, gitpush, ownership, stopchannel, termio,
+               textwidth, wire)
 
 __all__ = [
     "Action",
@@ -109,10 +108,10 @@ INPUT_REFRESH_SECONDS = 1 / 30
 # How long a key-feedback note stays on screen before the row goes quiet again.
 NOTE_TTL = 8.0
 
-# How long `StatusApp.stop()` waits for the painter's last frame, and `start()`
-# for a painter an earlier stop() gave up on. The painter's last frame is one
-# paint; a join that times out means the terminal write itself is stuck, and
-# the painter then releases the terminal as its own last act (see `stop`).
+# How long `StatusApp.stop()` waits for the painter's last frame and release,
+# and `start()` for its first frame. Either is one paint; a wait that times out
+# means the terminal write itself is stuck, and the painter then carries out the
+# rest on its own once the write returns (see `stop`).
 PAINTER_JOIN_SECONDS = 1.0
 
 # The painter thread's name: the pins tell "written on the painter" from
@@ -122,10 +121,12 @@ PAINTER_THREAD_NAME = "statusline-paint"
 # How long a thread that hands the painter a call AND needs its effect before
 # going on (`handle_event` / `disable` called directly while the app is started)
 # waits for the painter to run it. A round trip is one wake-up of the painter,
-# plus the INPUT_REFRESH_SECONDS burst window when it lands inside one: 20-23 ms
-# median, 48 ms worst, three runs of 200 calls (measured 2026-09-25). Only a
-# painter stuck in a terminal write gets near this, and the call still runs
-# once it is free — the caller merely stops waiting for it.
+# plus a frame when it lands behind one: 20-23 ms median, 48 ms worst, three
+# runs of 200 calls (measured 2026-09-25, before the painter moved onto
+# `ownership.OwnerThread`, when a posted call also waited out the
+# INPUT_REFRESH_SECONDS burst window). Only a painter stuck in a terminal write
+# gets near this, and the call still runs once it is free — the caller merely
+# stops waiting for it.
 POSTED_CALL_WAIT_SECONDS = 5.0
 
 # Quota refresh cadence. Claude's UsageSource is one cached HTTP GET (~0.3 s);
@@ -2289,35 +2290,36 @@ class StatusApp:
         self.refresh = refresh
         self._stop_file = stop_file
         self._input = input_source
-        # This start's stop and wake events. NEW on every start() and handed to
-        # that start's painter, so a painter an earlier stop() gave up joining
-        # keeps the events it was stopped with and can never be revived.
-        self._paint_stop = threading.Event()
-        # The painter's paint request. One slot is the whole queue because every
-        # request asks for the same thing — "draw the state as it is NOW" — so
-        # ten requests before the painter wakes are one frame, not ten. It is
-        # also the doorbell for `_posted` and stop()'s wake-up.
-        self._paint_requested = threading.Event()
-        self._paint_thread: Optional[threading.Thread] = None
-        # A painter stop() gave up joining; start() gives it one more join.
-        self._retired_painter: Optional[threading.Thread] = None
-        # The thread that owns the terminal and the mode stack while the app is
-        # started: the thread inside `start()` until its painter runs, then the
-        # painter until its loop hands back (see `_on_painter`,
-        # `_hand_terminal_to_callers`).
-        # Written under `_owner_lock`; read bare, because a stale read only
-        # turns a paint into a request or the other way round.
-        self._painter: Optional[threading.Thread] = None
-        self._owner_lock = threading.Lock()
-        # The painter's other mailbox: calls posted to it, run in order.
-        # Entries are (call, args, done event or None, is a key event).
-        self._posted: Deque[Tuple[Callable, tuple, Optional[threading.Event],
-                                  bool]] = collections.deque()
-        # Painter-only: inside a batch of posted calls, whose paints are folded
-        # into the one frame the painter draws after the batch.
-        self._running_posted = False
-        # Painter-only while one runs: (note text, when it was set) — what the
-        # periodic repaint expires after NOTE_TTL (see `note`).
+        # The one thread that owns the terminal and the mode stack while the
+        # app is started; everybody else posts to it (see `_paint`,
+        # `_run_on_painter`, `_handle_input`). Before `start()` and once it has
+        # handed back there is no owner, and a call runs on its caller.
+        self._painter = ownership.OwnerThread(PAINTER_THREAD_NAME,
+                                              idle=self._on_idle)
+        # Set while a frame request is posted and not yet run: one in flight
+        # is the whole queue, because every request asks for the same thing —
+        # "draw the state as it is NOW" — so ten before the painter gets to the
+        # first are one frame, not ten. Cleared by the request itself BEFORE
+        # the frame it asks for is drawn, so a request that saw it set is
+        # always covered by a frame drawn after it.
+        self._frame_posted = False
+        # Painter-only from here down. When the requested frame is due (a
+        # monotonic time, None: none requested) — INPUT_REFRESH_SECONDS after
+        # the first request of a burst, so the burst is one frame.
+        self._frame_due: Optional[float] = None
+        # Between `_open_region` and `_close_region`: whether the idle hook has
+        # a region to tick. Off, it does nothing — which is what keeps a
+        # reopened painter's first idle pass, before `_open_region` has run,
+        # from re-pinning a region the last stop released.
+        self._region_open = False
+        self._next_tick = 0.0          # when the periodic frame is next due
+        self._ticks = 0
+        self._last_size = (0, 0)       # the terminal size the region was cut for
+        # Bumped by `pop_mode(discard_pending=True)`: a key posted under an
+        # older epoch is the tail of the burst being discarded (`_apply_key`).
+        self._key_epoch = 0
+        # (note text, when it was set) — what the periodic repaint expires
+        # after NOTE_TTL (see `note`).
         self._note_stamp: Tuple[str, float] = ("", 0.0)
         # Rows the region is pinned at. Written only by `_reserve`, which only
         # the terminal's owner calls.
@@ -2369,46 +2371,33 @@ class StatusApp:
     def start(self) -> "StatusApp":
         if self._started:
             return self
-        retired, self._retired_painter = self._retired_painter, None
-        if retired is not None:
-            retired.join(timeout=PAINTER_JOIN_SECONDS)
-        # New events, not the old ones cleared: clearing the old stop event is
-        # what used to revive a painter the last stop() had given up joining.
-        self._paint_stop = threading.Event()
-        self._paint_requested = threading.Event()
-        # This thread owns the terminal until its painter takes over — taken
-        # from any older painter still winding down, which from here on only
-        # requests paints and hands nothing back.
-        self._take_terminal(threading.current_thread())
         self._started = True
         try:
             with self._stop_lock:
                 self.status.update(stop_pending=self._sentinel_pending())
             if isinstance(self.terminal, termio.NullTerminal):
                 return self   # disabled: no region to pin, no keys to read
-            if not self._reserve(len(self.rows())):
-                self.disable()
+            # A painter an earlier stop() gave up waiting for is still closing,
+            # and this reopens THAT one (the policy: `OwnerThread.start`): the
+            # region is pinned after its last frame and release, not beside it.
+            self._frame_posted = False
+            self._painter.start()
+            self._painter.post(self._open_region)
+            self._painter.drain(PAINTER_JOIN_SECONDS)
+            if isinstance(self.terminal, termio.NullTerminal):
+                # The region was refused: nothing to paint, no keys to read.
+                self._painter.close(PAINTER_JOIN_SECONDS)
                 return self
-            self._paint()
             if self._input is None:
-                self._input = (termio.TerminalInput() if self.terminal.active
-                               else termio.NullInputSource())
-            self._paint_thread = threading.Thread(
-                target=self._repaint_loop,
-                args=(self._paint_stop, self._paint_requested),
-                name=PAINTER_THREAD_NAME, daemon=True)
-            # Owner from before its first instruction, so no paint in between
-            # runs on the caller's thread beside it.
-            self._take_terminal(self._paint_thread)
-            self._paint_thread.start()
+                # Not asked of `terminal.active`: past the check above it is
+                # False only while the painter is still behind a slow write,
+                # and the keys must not be lost for the run over that.
+                # `TerminalInput.start` reads nothing without a tty anyway.
+                self._input = termio.TerminalInput()
             self._input.start(self._handle_input)
             self._install_emergency_restore()
         except Exception:
             self.disable()
-        finally:
-            # A no-op once the painter has taken over; otherwise no painter
-            # came of this start, and calls are the callers' own again.
-            self._hand_terminal_to_callers()
         for service in self._services:
             self._start_service(service)
         return self
@@ -2501,21 +2490,12 @@ class StatusApp:
                 self._input.stop()
             except Exception:
                 pass
-        self._paint_stop.set()
-        self._paint_requested.set()
-        thread, self._paint_thread = self._paint_thread, None
-        if thread is not None:
-            thread.join(timeout=PAINTER_JOIN_SECONDS)
-            if thread.is_alive():
-                # Still inside its last frame (a stuck terminal write). The
-                # terminal is still its to write, so it is not released from
-                # here: the painter releases it as its own last act.
-                self._retired_painter = thread
-                return
-        try:
-            self.terminal.release()
-        except Exception:
-            pass
+        # The release is the painter's last call, behind everything posted
+        # before it. A painter stuck in a frame outlives the wait below still
+        # owning the terminal (closing), and releases it itself once the write
+        # returns: nothing is released from here beside a live write.
+        self._painter.post(self._close_region)
+        self._painter.close(PAINTER_JOIN_SECONDS)
 
     def __enter__(self) -> "StatusApp":
         return self.start()
@@ -2529,10 +2509,12 @@ class StatusApp:
 
         Releasing and swapping the terminal is a terminal write, so while a
         painter owns it this runs ON the painter; from any other thread it is
-        handed over and waited for (see `_on_painter`).
+        handed over and waited for (see `_run_on_painter`).
         """
-        if self._on_painter(self.disable, wait=True):
-            return
+        self._run_on_painter(self._disable)
+
+    def _disable(self) -> None:
+        self._region_open = False       # nothing left for the idle hook to tick
         try:
             self.terminal.release()
         except Exception:
@@ -2551,8 +2533,7 @@ class StatusApp:
         painter's, which is the thread that expires it."""
         stamp = (text, time.time())
         self.update(note=text)
-        if not self._on_painter(self._stamp_note, stamp, wait=False):
-            self._stamp_note(stamp)
+        self._painter.post(self._stamp_note, stamp)
 
     def _stamp_note(self, stamp: Tuple[str, float]) -> None:
         self._note_stamp = stamp
@@ -2671,8 +2652,9 @@ class StatusApp:
                 if self._input is not None:
                     self._input.discard_pending()
                 # The reader's flag covers keys it has not read yet; keys it
-                # already read and posted behind this one are the same paste.
-                self._discard_posted_keys()
+                # already read and posted behind this one are the same paste,
+                # and a new epoch is what `_apply_key` drops them by.
+                self._key_epoch += 1
             self.modes.pop()
             self._paint()
 
@@ -2685,12 +2667,13 @@ class StatusApp:
 
         The mode stack and the region are the painter's, like the terminal:
         while a painter runs this executes ON it, and a call from any other
-        thread is handed over and waited for (see `_on_painter`). Before
+        thread is handed over and waited for (see `_run_on_painter`). Before
         `start()` and after the painter hands back it runs on the caller, which
         is how most pins drive an app.
         """
-        if self._on_painter(self.handle_event, event, wait=True):
-            return
+        self._run_on_painter(self._handle_event, event)
+
+    def _handle_event(self, event: termio.InputEvent) -> None:
         try:
             if isinstance(event, termio.Resize):
                 # A refused reserve() leaves the OLD geometry in place, so
@@ -2698,7 +2681,7 @@ class StatusApp:
                 # with the region set for the old one. Disable instead —
                 # start() answers the same refusal the same way.
                 if not self._reserve(len(self.rows())):
-                    self.disable()
+                    self._disable()
                     return
                 self._paint()
                 return
@@ -2707,103 +2690,31 @@ class StatusApp:
                     break
             self._paint()
         except Exception:
-            self.disable()
+            self._disable()
 
     def _handle_input(self, event: termio.InputEvent) -> None:
         """The key reader's entry: post the event to the painter and go back to
         reading at once — a slow terminal delays when a key takes effect, never
         whether it is read. A key that arrives with no app running is dropped:
         nobody is listening for it any more."""
-        if self._on_painter(self.handle_event, event, wait=False, is_key=True):
-            return
         if self._started:
-            self.handle_event(event)
+            self._painter.post(self._apply_key, self._key_epoch, event)
 
-    # --- the painter's mailbox ---------------------------------------------
+    def _apply_key(self, epoch: int, event: termio.InputEvent) -> None:
+        """A key the reader posted — unless a discard came between (`pop_mode`)."""
+        if epoch == self._key_epoch:
+            self._handle_event(event)
 
-    def _on_painter(self, call: Callable, *args, wait: bool,
-                    is_key: bool = False) -> bool:
-        """Hand `call(*args)` to the thread that owns the terminal.
+    def _run_on_painter(self, call: Callable, *args) -> None:
+        """`call(*args)` on the thread that owns the terminal, waited for.
 
-        False when there is no such thread or the caller is it: the caller then
-        runs the call itself. `wait` blocks until the owner has run it, for at
-        most POSTED_CALL_WAIT_SECONDS — for callers that read its effect next.
+        On the painter itself, and with no painter running, that is here and
+        now. From any other thread it is posted, and the caller — which reads
+        its effect next — waits for it, for at most POSTED_CALL_WAIT_SECONDS.
         """
-        with self._owner_lock:
-            owner = self._painter
-            if owner is None or owner is threading.current_thread():
-                return False
-            done = threading.Event() if wait else None
-            self._posted.append((call, args, done, is_key))
-            wake = self._paint_requested
-        wake.set()
-        if done is not None:
-            done.wait(POSTED_CALL_WAIT_SECONDS)
-        return True
-
-    def _take_terminal(self, owner: threading.Thread) -> None:
-        with self._owner_lock:
-            self._painter = owner
-
-    def _run_posted(self) -> None:
-        """Run what was posted, in order, while this thread still owns it."""
-        me = threading.current_thread()
-        self._running_posted = True
-        try:
-            while True:
-                with self._owner_lock:
-                    if self._painter is not me or not self._posted:
-                        return
-                    call, args, done, _is_key = self._posted.popleft()
-                try:
-                    call(*args)
-                finally:
-                    if done is not None:
-                        done.set()
-        finally:
-            self._running_posted = False
-
-    def _discard_posted_keys(self) -> None:
-        with self._owner_lock:
-            kept = collections.deque()
-            for entry in self._posted:
-                if entry[3]:
-                    if entry[2] is not None:
-                        entry[2].set()
-                else:
-                    kept.append(entry)
-            self._posted = kept
-
-    def _hand_terminal_to_callers(self, *, release: bool = False) -> None:
-        """No owner from here: every call runs on its caller again.
-
-        Only from the current owner — a thread that has been taken over (an
-        old painter a restart replaced) has nothing left to hand back. With
-        `release` the terminal is released first, while this thread still owns
-        it, so no caller can paint into a region that is about to go.
-
-        Anything still posted was posted to an owner that is gone, and runs
-        here, on the thread handing back — the one thread that was about to
-        run it anyway.
-        """
-        with self._owner_lock:
-            if self._painter is not threading.current_thread():
-                return
-            if release:
-                try:
-                    self.terminal.release()
-                except Exception:
-                    pass
-            self._painter = None
-            leftovers, self._posted = self._posted, collections.deque()
-        for call, args, done, _is_key in leftovers:
-            try:
-                call(*args)
-            except Exception:
-                pass
-            finally:
-                if done is not None:
-                    done.set()
+        self._painter.post(call, *args)
+        if not self._painter.owns_current_thread:
+            self._painter.drain(POSTED_CALL_WAIT_SECONDS)
 
     # --- rendering ---------------------------------------------------------
 
@@ -2829,24 +2740,47 @@ class StatusApp:
             return True
         return False
 
-    def _paint(self, *, reassert: bool = False) -> None:
-        """Draw the rows and the title — on the painter while one runs.
+    def _paint(self) -> None:
+        """Ask for a frame of the state as it is now — drawn on the painter
+        while one runs.
 
         While the painter runs it is the one thread that renders and writes the
         terminal; a worker's `update`, a key, a quota poll only post a request
         and return, so the renderers never run on two threads at once and no
-        caller waits for a slow terminal. Before `start()` and once the painter
-        has ended there is no owner, and the caller paints itself: that is how
-        a run names its window before the region is pinned.
+        caller waits for a slow terminal. On the painter itself the request is
+        folded into the frame it draws once the calls queued behind it have run
+        (see `_on_idle`). Before `start()` and once the painter has handed back
+        there is no owner, and the caller paints itself: that is how a run
+        names its window before the region is pinned.
         """
-        painter = self._painter
-        if painter is not None and threading.current_thread() is not painter:
-            self._paint_requested.set()
+        if self._painter.owns_current_thread:
+            self._frame_wanted()
             return
-        if painter is not None and self._running_posted:
-            # The painter, inside a batch of posted calls: folded into the one
-            # frame it draws right after the batch (see `_serve_paints`).
+        if self._frame_posted:
             return
+        self._frame_posted = True
+        if not self._painter.try_post(self._want_frame):
+            # Queue full: the periodic frame draws this state instead.
+            self._frame_posted = False
+
+    def _want_frame(self) -> None:
+        """A posted frame request, or with no painter the frame itself."""
+        self._frame_posted = False
+        if self._painter.owns_current_thread:
+            self._frame_wanted()
+        else:
+            self._draw()
+
+    def _frame_wanted(self) -> None:
+        """(painter) A burst's first request sets its frame's time; the rest of
+        the burst lands in that frame."""
+        if self._frame_due is None:
+            self._frame_due = time.monotonic() + INPUT_REFRESH_SECONDS
+
+    def _draw(self, *, reassert: bool = False) -> None:
+        """One frame: the title, then the rows. On the painter, or on the
+        caller when there is none (see `_paint`)."""
+        self._frame_due = None
         # Before the `active` gate, and on the same path as the rows: the title
         # is what a person sees while the terminal is behind another window, so
         # it must follow every state change the rows follow — including the ones
@@ -2873,87 +2807,88 @@ class StatusApp:
             self.terminal.paint([colorize(line) for line in rows],
                                 reassert=reassert)
         except Exception:
-            self.disable()
+            self._disable()
 
-    def _repaint_loop(self, stop: threading.Event,
-                      wake: threading.Event) -> None:
-        """The painter: `stop` and `wake` are this start's own (see `start`)."""
+    # --- the painter's own calls -------------------------------------------
+
+    def _open_region(self) -> None:
+        """(painter) Pin the region and draw the first frame — `start()`'s
+        first post, run after whatever an earlier stop left queued."""
         try:
-            if self._serve_paints(stop, wake):
-                # The last frame, drawn whether or not a request was pending:
-                # stop() sets the same event to wake the painter, so a real
-                # request cannot be told from the wake-up. Without it the state
-                # a caller set right before stop() — the run's final
-                # `phase="idle"` — never reaches the screen, because the painter
-                # was woken to exit rather than to draw. Only while the terminal
-                # is still ours: a restart may have taken it over.
-                self._run_posted()
-                if self._painter is threading.current_thread():
-                    self._paint()
-        finally:
-            # Handing the terminal back: a paint asked for after this is the
-            # caller's own again, so nothing waits on a painter that is gone.
-            # A stopped painter releases the terminal itself, as its last act
-            # while it still owns it — stop() does not, once it has given up
-            # joining (see there).
-            try:
-                self._run_posted()
-            finally:
-                self._hand_terminal_to_callers(release=stop.is_set())
+            self._last_size = self.terminal.size()
+            self._ticks = 0
+            self._next_tick = time.monotonic() + self.refresh
+            if not self._reserve(len(self.rows())):
+                self._disable()
+                return
+            self._region_open = True
+            self._draw()
+        except Exception:
+            self._disable()
 
-    def _serve_paints(self, stop: threading.Event,
-                      wake: threading.Event) -> bool:
-        """Serve paints and posted calls until `stop`. True when stopped; False
-        when a failure disabled the terminal (and there is nothing to draw)."""
-        last_size = self.terminal.size()
-        ticks = 0
-        next_refresh = time.monotonic() + self.refresh
-        while not stop.is_set():
-            requested = wake.wait(max(0, next_refresh - time.monotonic()))
+    def _close_region(self) -> None:
+        """(painter) The last frame, then the release — `stop()`'s last post.
+
+        The frame is drawn whether or not one is due: the state a caller set
+        right before stop() — the run's final `phase="idle"` — is still inside
+        its burst window, and would otherwise never reach the screen.
+        """
+        self._region_open = False
+        try:
+            self._draw()
+        finally:
             try:
-                if requested:
-                    # Posted calls at once — a key takes effect when it is
-                    # read; only its FRAME is coalesced over the burst below.
-                    self._run_posted()
-                    if stop.wait(INPUT_REFRESH_SECONDS):
-                        return True
-                wake.clear()
-                self._run_posted()
-                if stop.is_set():
-                    return True
-                periodic = time.monotonic() >= next_refresh
-                if not periodic:
-                    self._paint()
-                    continue
-                next_refresh = time.monotonic() + self.refresh
-                ticks += 1
-                size = self.terminal.size()
-                if size != last_size:
-                    last_size = size
-                    self.handle_event(termio.Resize(size[0], size[1]))
-                note, noted_at = self._note_stamp
-                if note and time.time() - noted_at > NOTE_TTL:
-                    self._note_stamp = ("", 0.0)
-                    # Only the note that was stamped: a newer one set since
-                    # has its own stamp on the way.
-                    if self.status.note == note:
-                        self.status.update(note="")
-                if ticks % 4 == 0:
-                    # Catches a sentinel created by hand (`touch stop`) or by a
-                    # neighbouring run. It never touches `_requested_stop`: the
-                    # key's request is this process's own and outlives whatever
-                    # anyone does to the file. Under the same lock as the key
-                    # press so the flag and the row cannot disagree.
-                    with self._stop_lock:
-                        pending = (stopchannel.StopSource.KEY.value
-                                   if self._requested_stop
-                                   else self._sentinel_pending())
-                        if pending != self.status.stop_pending:
-                            self.status.update(stop_pending=pending)
-                # Re-assert the region on the periodic repaint: see
-                # termio.Terminal.paint.
-                self._paint(reassert=True)
+                self.terminal.release()
             except Exception:
-                self.disable()
-                return False
-        return True
+                pass
+
+    def _on_idle(self) -> Optional[float]:
+        """(painter) The `idle` hook: a requested frame once its burst window
+        has passed, the periodic one every `refresh`; answers when it is due
+        next. Nothing between a close and the next open (see `_region_open`).
+        """
+        if not self._region_open:
+            return None
+        try:
+            now = time.monotonic()
+            if now >= self._next_tick:
+                self._next_tick = now + self.refresh
+                self._tick()
+            elif self._frame_due is not None and now >= self._frame_due:
+                self._draw()
+        except Exception:
+            self._disable()
+        due = self._next_tick
+        if self._frame_due is not None:
+            due = min(due, self._frame_due)
+        return max(0.0, due - time.monotonic())
+
+    def _tick(self) -> None:
+        """(painter) The periodic frame and the checks that ride on it."""
+        self._ticks += 1
+        size = self.terminal.size()
+        if size != self._last_size:
+            self._last_size = size
+            self._handle_event(termio.Resize(size[0], size[1]))
+        note, noted_at = self._note_stamp
+        if note and time.time() - noted_at > NOTE_TTL:
+            self._note_stamp = ("", 0.0)
+            # Only the note that was stamped: a newer one set since has its own
+            # stamp on the way.
+            if self.status.note == note:
+                self.status.update(note="")
+        if self._ticks % 4 == 0:
+            # Catches a sentinel created by hand (`touch stop`) or by a
+            # neighbouring run. It never touches `_requested_stop`: the key's
+            # request is this process's own and outlives whatever anyone does
+            # to the file. Under the same lock as the key press so the flag
+            # and the row cannot disagree.
+            with self._stop_lock:
+                pending = (stopchannel.StopSource.KEY.value
+                           if self._requested_stop
+                           else self._sentinel_pending())
+                if pending != self.status.stop_pending:
+                    self.status.update(stop_pending=pending)
+        # Re-assert the region on the periodic repaint: see
+        # termio.Terminal.paint.
+        self._draw(reassert=True)

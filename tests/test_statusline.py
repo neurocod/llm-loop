@@ -737,7 +737,7 @@ def test_a_pinned_terminal_writes_its_rows_to_the_real_stream(monkeypatch):
         app.update(iteration=4, phase="running")
 
     # Read after the `with`: the painter draws the update, and stop() is what
-    # waits for its last frame (see `StatusApp._repaint_loop`).
+    # waits for its last frame (see `StatusApp._close_region`).
     assert "iter 4" in stream.getvalue()
     assert app.enabled is False   # region released on the way out
 
