@@ -20,7 +20,8 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, gitpush, parallel, statusline
+from llm_loop import cyclecore, gitpush, parallel, runlifecycle, statusline
+from llm_loop.stopchannel import RunStopReason
 
 from _runfixtures import (MemListDriver, OneShotDriver, isolated_run, par_args,
                           root_not_cwd, seq_args)
@@ -171,10 +172,10 @@ def test_the_parallel_pusher_pushes_the_project_it_was_pointed_at(
 
     This is where a long run's pushing actually happens; the exit push only
     mops up what the last interval left. It is also the only one of the four
-    handovers that a normal run cannot reach in a test: the pump asks
-    `shared.stop.wait(PUSH_PUMP_INTERVAL_S)` BEFORE pushing, so with the shipped
-    minute a run that ends in under a second never enters the body at all — and
-    a pin over it was green with `os.getcwd()` substituted.
+    handovers that a normal run cannot reach in a test: the pump's first turn
+    only arms its PUSH_PUMP_INTERVAL_S clock, so with the shipped minute a run
+    that ends in under a second never reaches its push at all — and a pin over
+    it was green with `os.getcwd()` substituted.
 
     The interval is shortened and the worker is held until the pusher has
     actually pushed, which is a handshake rather than a sleep: the run cannot
@@ -275,23 +276,26 @@ def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
 
 
 class _OverlapWatchingGit(_FakeGitModule):
-    """`_FakeGitModule` that HOLDS each `git push` and records concurrency.
+    """`_FakeGitModule` that HOLDS each `git push` and records who ran what.
 
-    `max_live` is the most pushes ever in flight at once. git is not safe to call
-    concurrently, so the whole point of the run's push lock is that this number
-    is 1; without the lock around the exit push it is 2.
+    `threads` is the name of the thread each git call ran on. The run's git has
+    one owner (the `pusher`), so the whole of this pin's claim is that this set
+    is `{"pusher"}`: one thread cannot run two pushes at once. An exit push
+    made anywhere else — the main thread, as it was before the owner — puts a
+    second name here whether or not the staging below got the timing right.
 
-    `beside_a_push` is the narrower question, and it is what pins the SCOPE of
-    that lock rather than its presence: every git command — `rev-list` included —
-    that started while a push was in flight. The exit push takes the lock around
-    the WHOLE of `final_git_push`, so the count it reads to decide "is there
-    anything to push?" is inside too; reading it outside is how "nothing to push"
-    could be printed about a repository that was being pushed at that moment, and
-    `max_live` cannot see that at all — a lone `rev-list` is not a second push.
+    `max_live` is the most pushes ever in flight at once, and `beside_a_push`
+    every git command — `rev-list` included — that started while a push was in
+    flight: the exit push is the WHOLE of `final_git_push`, so the count it reads
+    to decide "is there anything to push?" must not run beside a push either;
+    that is how "nothing to push" could be printed about a repository that was
+    being pushed at that moment, and `max_live` cannot see it — a lone
+    `rev-list` is not a second push. They are what an exclusion that is not by
+    thread (a lock, once) would have to answer for.
 
-    The first push blocks on `release` instead of sleeping, so the overlap is
-    staged rather than raced: the pusher is provably still inside `git push` when
-    the main thread reaches the exit push.
+    A push blocks on `release` instead of sleeping, so the overlap is staged
+    rather than raced; `held` is whether each held push was released by
+    `release` rather than by the timeout.
     """
 
     def __init__(self):
@@ -300,10 +304,13 @@ class _OverlapWatchingGit(_FakeGitModule):
         self.live = 0
         self.max_live = 0
         self.beside_a_push = []
+        self.threads = set()
+        self.held = []
         self._live_lock = threading.Lock()
 
     def run(self, argv, **kwargs):
         with self._live_lock:
+            self.threads.add(threading.current_thread().name)
             if self.live:
                 self.beside_a_push.append(tuple(argv)[:2])
         if tuple(argv)[:2] != ("git", "push"):
@@ -316,7 +323,7 @@ class _OverlapWatchingGit(_FakeGitModule):
         finally:
             # A bounded wait: a broken staging must fail the assertions, not
             # hang the suite.
-            self.release.wait(timeout=HELD_PUSH_TIMEOUT_S)
+            self.held.append(self.release.wait(timeout=HELD_PUSH_TIMEOUT_S))
             with self._live_lock:
                 self.live -= 1
 
@@ -325,123 +332,48 @@ class _OverlapWatchingGit(_FakeGitModule):
 HELD_PUSH_TIMEOUT_S = 10.0
 
 
-class _LockWaitLog:
-    """Every lock acquire in the run that had to WAIT, and who was holding it.
+def _signal_on_close_run(monkeypatch, event: threading.Event) -> None:
+    """Set `event` the moment the run enters its epilogue's housekeeping.
 
-    The one observation the pin below cannot make from outside the runner:
-    whether the main thread was BLOCKED on `push_lock`. Timing cannot answer it
-    — "the exit push ran after the pusher's" looks identical whether it waited
-    or simply arrived late — and arriving late is exactly what a loaded machine
-    produces.
+    Wrapped on `runlifecycle`, where both doors resolve the name: `end_run`
+    calls `close_run` through the module, and the interrupt calls it directly.
     """
+    real_close_run = runlifecycle.close_run
 
-    def __init__(self):
-        self.waits = []
-        self.main_waited_for_pusher = threading.Event()
+    def close_run(*args, **kwargs):
+        event.set()
+        return real_close_run(*args, **kwargs)
 
-    def note(self, waiter: str, holder) -> None:
-        self.waits.append((waiter, holder))
-        if waiter == "MainThread" and holder == "pusher":
-            self.main_waited_for_pusher.set()
+    monkeypatch.setattr(runlifecycle, "close_run", close_run)
 
 
-class _WatchedLock:
-    """A `threading.Lock` that reports a blocking acquire to a `_LockWaitLog`.
-
-    `acquire` first tries non-blocking: succeeding means there was no contention
-    and nothing to report. Only the failing try is a wait, and the owner recorded
-    at the last successful acquire says who it waited for.
-    """
-
-    def __init__(self, real, log: _LockWaitLog):
-        self._real = real
-        self._log = log
-        self._owner = None
-
-    def acquire(self, blocking=True, timeout=-1):
-        if self._real.acquire(blocking=False):
-            self._owner = threading.current_thread().name
-            return True
-        self._log.note(threading.current_thread().name, self._owner)
-        got = self._real.acquire(blocking, timeout)
-        if got:
-            self._owner = threading.current_thread().name
-        return got
-
-    def release(self):
-        self._owner = None
-        self._real.release()
-
-    def __enter__(self):
-        self.acquire()
-        return self
-
-    def __exit__(self, *exc):
-        self.release()
-
-
-class _LockWatchingThreading:
-    """Stands in for `parallel.threading`, handing out `_WatchedLock`s.
-
-    A replacement MODULE for one importer, the same trick `_FakeGitModule` plays
-    on `gitpush.subprocess` and for the same reason: patching `threading.Lock`
-    itself would instrument every lock in the process, including pytest's own.
-    Everything else (`Event`, `Thread`, …) is forwarded untouched.
-    """
-
-    def __init__(self, real, log: _LockWaitLog):
-        self._real = real
-        self._log = log
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-    def Lock(self):
-        return _WatchedLock(self._real.Lock(), self._log)
-
-
-def test_the_exit_push_never_runs_beside_the_background_pusher(
+def test_every_git_call_of_a_parallel_run_is_made_by_the_pusher(
         tmp_path, monkeypatch):
-    """Two `git push`es at once is the thing the run's push lock exists to stop.
+    """Two `git push`es at once is the thing the run's pusher exists to stop.
 
-    The exit push takes that lock because the join before it CAN TIME OUT: a
-    `git push` gets a 300 s subprocess timeout and the join waits
-    PUSHER_JOIN_TIMEOUT_S, so "the pusher has been joined" is not a fact the exit
-    push may assume. Both constants are shortened here so the timed-out case is
-    reachable at all — with the shipped five seconds the pusher always finishes
-    first and this pin would be green whatever the exit push did.
+    The exit push is handed to the pusher (`runlifecycle.close_run`) rather
+    than made beside it, because a `git push` gets a 300 s subprocess timeout
+    and the run must not race a second `git` against one still in flight. That
+    case is STAGED here, not hoped for: the pusher's periodic push is held until
+    the run has entered `close_run`, so the exit push is asked for while the
+    pusher is provably inside `git push`. A handshake, not a sleep — an earlier
+    version of this pin slept 0.5 s, which on a loaded box degrades to a silent
+    vacuous pass.
 
-    A handshake, not a sleep, and the difference is the whole pin. The pusher's
-    push blocks until the stager releases it, and the stager waits for the main
-    thread to be observed WAITING on the lock the pusher holds. So the overlap is
-    not hoped for on a timer — a first draft slept 0.5 s here, which on a loaded
-    box degrades to a silent vacuous pass, and closing that window (sleep 0) made
-    the missing lock invisible while the test still said PASS.
-
-    Remove the `with push_lock:` around the exit push and `max_live` reads 2.
+    Make the exit push on the calling thread instead and `threads` names
+    `MainThread`, whatever the timing did.
     """
     fake = _OverlapWatchingGit()
-    waits = _LockWaitLog()
+    exit_asked = fake.release
+    _signal_on_close_run(monkeypatch, exit_asked)
     monkeypatch.setattr(gitpush, "subprocess", fake)
-    monkeypatch.setattr(parallel, "threading",
-                        _LockWatchingThreading(threading, waits))
     monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
-    monkeypatch.setattr(parallel, "PUSHER_JOIN_TIMEOUT_S", 0.01)
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, command, mailbox=None:
                             (fake.pushed.wait(timeout=PUMP_WAIT_S),
                              (0, None, None))[1])
     root = root_not_cwd(tmp_path)
 
-    def stage_the_handover():
-        # Bounded: if the main thread never waits for the pusher the run must
-        # end and the assertions report it, not hang the suite.
-        waits.main_waited_for_pusher.wait(timeout=PUMP_WAIT_S)
-        fake.release.set()
-
-    stager = threading.Thread(target=stage_the_handover, name="stager",
-                              daemon=True)
-    stager.start()
     try:
         parallel.run_parallel(MemListDriver(["products/only.md"]),
                               par_args(root, jobs=1, git_push=PUSHING),
@@ -450,17 +382,45 @@ def test_the_exit_push_never_runs_beside_the_background_pusher(
         pass
     finally:
         fake.release.set()
-        stager.join(timeout=PUMP_WAIT_S)
 
-    assert waits.main_waited_for_pusher.is_set(), (
-        "the exit push never waited for the pusher, so this run measured "
-        f"nothing about their mutual exclusion; lock waits seen: {waits.waits}")
+    assert fake.held[:1] == [True], (
+        "the pusher's push was not still in flight when the run asked for its "
+        f"exit push, so this run measured nothing about the two: {fake.held}")
+    assert len(fake.pushes) >= 2, \
+        f"the periodic push and the exit push did not both happen: {fake.calls}"
+    assert fake.threads == {"pusher"}, (
+        f"git ran on a thread other than the run's pusher: {fake.threads}")
     assert fake.max_live == 1, \
         f"two git pushes were in flight at once: {fake.calls}"
-    # The SCOPE, not just the presence: `git_unpushed_count` is inside the lock
-    # too, so no git call of any kind may start while a push is in flight. Move
-    # that count out from under the lock and this list holds a `rev-list` while
-    # `max_live` still reads 1 — the defect the wide scope was chosen against.
+    # The SCOPE, not just the push: `git_unpushed_count` is part of the exit
+    # push too, so no git call of any kind may start while a push is in flight.
     assert fake.beside_a_push == [], (
-        "a git command ran while a push was in flight, so the exit push's lock "
-        f"does not cover the whole of final_git_push: {fake.beside_a_push}")
+        "a git command ran while a push was in flight, so the exit push was not "
+        f"made whole behind the pusher's: {fake.beside_a_push}")
+
+
+def test_an_exit_push_that_raises_does_not_cost_a_parallel_run_its_ending(
+        tmp_path, monkeypatch, capsys):
+    """On the pusher, a failed exit push is reported, and the run still returns.
+
+    Made on the main thread it unwound `close_run` and `end_run` with it: no
+    closing usage snapshot, no report of undelivered notes, no recorded
+    reason — a push failing is not what ended the run, and it must not be what
+    its record says. The owner reports what a call raised on stderr and goes on
+    (`ownership.OwnerThread`), which is the behaviour pinned here.
+    """
+    def exit_push_fails(policy, project_dir):
+        raise OSError("staged: the repository is not reachable")
+
+    monkeypatch.setattr(runlifecycle, "final_git_push", exit_push_fails)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None: (0, None, None))
+
+    result = parallel.run_parallel(MemListDriver(["products/only.md"]),
+                                   par_args(root_not_cwd(tmp_path), jobs=1,
+                                            git_push=PUSHING),
+                                   app_name="pytest-gitpush")
+
+    assert result.reason == RunStopReason.NO_WORK
+    assert "pusher: OSError: staged: the repository is not reachable" in \
+        capsys.readouterr().err

@@ -914,10 +914,10 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     summary = driver.final_summary()
     if summary:
         print(f"\n{summary}")
-    # `runlifecycle.end_run` is the epilogue both runners share. No `push_lock`,
+    # `runlifecycle.end_run` is the epilogue both runners share. No `pusher`,
     # because this runner has one thread and nothing to exclude — see
-    # `gitpush.final_git_push` for why the lock belongs to the caller that has
-    # threads rather than to the call.
+    # `gitpush.final_git_push` for why the exclusion belongs to the caller that
+    # has threads rather than to the call.
     return runlifecycle.end_run(
         ctx, stopchannel.RunResult(stop_reason, iteration, completed),
         usages=opened_usages(), mailbox=mailbox)

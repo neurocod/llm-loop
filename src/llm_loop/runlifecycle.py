@@ -29,15 +29,14 @@ rather than to tidy it:
     mirror log whose abrupt end it explains. Swap them and the report goes to a
     terminal nobody is reading any more. Pinned by
     `tests/test_exit_reason.py::test_the_report_of_a_vanished_run_lands_in_the_log`;
-  * the exit push takes the caller's lock around the WHOLE of `final_git_push`,
-    the `git_unpushed_count` inside it included, because the runner with threads
-    may still have a pusher inside `git push` (see `parallel.PUSHER_JOIN_TIMEOUT_S`).
-    Reading the count outside the lock is how "nothing to push" could be printed
-    about a repository that was being pushed at that moment. Pinned by
+  * the exit push is the WHOLE of `final_git_push`, the `git_unpushed_count`
+    inside it included, made by the caller's pusher when it has one, because
+    the runner with threads may still have that pusher inside `git push`.
+    Reading the count beside it is how "nothing to push" could be printed about
+    a repository that was being pushed at that moment. Pinned by
     `tests/test_git_push.py`.
 """
 
-import contextlib
 import os
 import sys
 from typing import Any, Iterable, NamedTuple, Optional, Tuple
@@ -50,6 +49,7 @@ from .gitpush import (
     GitPushPolicy,
     final_git_push,
 )
+from .ownership import OwnerThread
 from .providers import provider_spec, set_live_messages, usage_source_for
 from .stopchannel import RunResult
 from .scriptlock import ensure_script_lock
@@ -349,7 +349,7 @@ def close_run(ctx: RunContext, *,
               usages: Iterable[Optional[RunUsage]],
               ending: Optional[str] = None,
               mailbox=None,
-              push_lock=None) -> None:
+              pusher: Optional[OwnerThread] = None) -> None:
     """The housekeeping half of the epilogue, for every ending a run can have.
 
     Push what is still local, record where the quotas finished, report the notes
@@ -366,12 +366,16 @@ def close_run(ctx: RunContext, *,
     the least behind, and an operator's commits sat local until some later run
     happened to push them. Each of those now calls this and then exits.
 
-    `push_lock` is the caller's mutual exclusion, and it wraps the WHOLE of
-    `final_git_push`, the `git_unpushed_count` inside it included. Only the
-    runner with threads passes one: the sequential runner has nothing to exclude,
-    and `gitpush.final_git_push` deliberately does not lock for itself (see its
-    docstring). The policy is read INSIDE that lock, off the live settings — a
-    knob edited while a pusher is mid-push must not be read half-applied.
+    `pusher` is the thread that owns the caller's git (`parallel.run_parallel`
+    has one), and the exit push is handed to it as its `final` — queued behind
+    a push it has in flight, and waited for, however long that push takes: the
+    exit push is the WHOLE of `final_git_push`, `git_unpushed_count` included,
+    so no git call of it can run beside that push. The pusher is closed here on
+    every ending, a dry run's included. Without one (the sequential runner,
+    which has nothing to exclude) the push is made here, on the caller. The
+    policy is read AT the push, off the live settings, either way. On the pusher
+    a push that raises is reported by it (`OwnerThread`) and the housekeeping
+    below still runs; made here it propagates, as it always has.
 
     `usages` is EVERY usage the run opened, not the one it ended on: a
     mixed-provider sequential run opens one per account it selects, and each is
@@ -391,11 +395,14 @@ def close_run(ctx: RunContext, *,
     or the runner body, `driver.final_summary` included — the parallel runner's
     `finally` closes only its console.
     """
-    if not ctx.dry_run:
-        # No lock is the SINGLE-THREADED case, not a missing one: the runner with
-        # threads is the only caller with anything to exclude.
-        with push_lock if push_lock is not None else contextlib.nullcontext():
-            final_git_push(ctx.settings.git_push, projectroot.project_dir())
+    def exit_push():
+        final_git_push(ctx.settings.git_push, projectroot.project_dir())
+
+    push = None if ctx.dry_run else exit_push
+    if pusher is not None:
+        pusher.close(final=push)
+    elif push is not None:
+        push()
 
     # End-of-run usage snapshots, one answering each `open_usage` that logged —
     # so each run records where every account it used finished. `ending` names
@@ -417,7 +424,7 @@ def close_run(ctx: RunContext, *,
 def end_run(ctx: RunContext, result: RunResult, *,
             usages: Iterable[Optional[RunUsage]],
             mailbox=None,
-            push_lock=None) -> RunResult:
+            pusher: Optional[OwnerThread] = None) -> RunResult:
     """Everything both runners do when the work is over and they RETURN.
 
     The housekeeping is `close_run`; this adds what only a normal ending has — a
@@ -427,7 +434,7 @@ def end_run(ctx: RunContext, result: RunResult, *,
     runners, the `=== run ended: … ===` line belongs to the process, so the last
     reason set wins and exitlog prints it on the way out.
     """
-    close_run(ctx, usages=usages, mailbox=mailbox, push_lock=push_lock)
+    close_run(ctx, usages=usages, mailbox=mailbox, pusher=pusher)
     reason = result.reason
     exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
                        iterations=result.attempted, completed=result.completed)

@@ -120,12 +120,11 @@ def final_git_push(policy: GitPushPolicy, cwd: str) -> None:
     "nothing to push" case says so rather than staying silent, because a run that
     printed nothing about pushing reads like a run whose push failed.
 
-    THIS FUNCTION DOES NOT LOCK, and that is the answer to "who owns the mutual
-    exclusion of the exit push". Both runners end with this call and only one of
-    them has threads: the parallel one wraps it in the same `push_lock` its
-    background pusher takes, and the sequential one has nothing to exclude. Put
-    the lock in here instead and it becomes a lock the single-threaded caller
-    pays for and a lock the threaded caller cannot see it depends on — while a
+    THIS FUNCTION DOES NOT EXCLUDE ANYTHING, and that is the answer to "who owns
+    the mutual exclusion of the exit push": the caller does. Both runners end
+    with this call and only one of them has threads: the parallel one has it
+    made by the same thread that makes its periodic pushes (see
+    `runlifecycle.close_run`), and the sequential one has nothing to exclude. A
     function that pushes A REPOSITORY has no business knowing whether its caller
     is threaded (the same argument that made `cwd` a parameter; see the header).
     """

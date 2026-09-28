@@ -88,23 +88,13 @@ from .drivers import ListFileDriver
 # is what keeps a chatty one from growing a long-running worker.
 FAILURE_TAIL_LINES = 5
 
-# How often the background pusher wakes to apply the git-push policy. Not the
+# How often the pusher applies the git-push policy while the workers run. Not the
 # cadence of pushing — EACH_HOUR's hour is its own — but how finely that cadence
 # is checked, which is why a minute is plenty. A named constant rather than a
-# literal in `push_pump` so a test can shorten it: without that, the pump's body
-# is unreachable in a run that lasts less than one interval, and the handover it
+# literal in the pump so a test can shorten it: without that, the pump's push is
+# unreachable in a run that lasts less than one interval, and the handover it
 # makes (which repository to push) had no pin at all.
 PUSH_PUMP_INTERVAL_S = 60
-
-# How long the run waits for the background pusher to finish its current turn
-# before going on to the exit push. Short on purpose — a run that has done its
-# work should not sit here — which is exactly why it is not a guarantee that the
-# pusher has stopped: `git push` gets a 300 s subprocess timeout, so a pusher
-# caught mid-push is still running (and still holding `push_lock`) when this
-# returns. That is what makes the lock around the exit push load-bearing rather
-# than decorative, and the reason this is a named constant is the same as
-# PUSH_PUMP_INTERVAL_S's: a test cannot otherwise reach the timed-out case.
-PUSHER_JOIN_TIMEOUT_S = 5
 
 # How long an interrupted run waits for each worker to notice `shared.stop` and
 # come back before it closes the run down anyway. Bounded because the operator
@@ -244,8 +234,8 @@ def join_workers(threads) -> None:
     and the interrupt's own ending (record the reason, push, snapshot, report the
     undelivered notes, exit 130) cannot be pinned unless a test can stage the
     interrupt HERE. Staging it by patching `threading.Thread.join` instead would
-    also hit the bounded re-join inside the handler and the pusher's, i.e. it
-    would break the code under test on its way in.
+    also hit the bounded re-join inside the handler, i.e. it would break the
+    code under test on its way in.
     """
     join_all = getattr(threads, "join_all", None)
     if join_all is not None:
@@ -1364,33 +1354,39 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     app.register_action(statusline.WeeklyLimitAction(
         lambda: policy))
 
-    # A background pusher applies the policy on its own cadence while the
-    # workers run; the workers never push. git is not thread-safe to call
-    # concurrently, so every push in the run goes through one thread and one
-    # lock — including the exit push below, which takes it because the join
-    # before it CAN TIME OUT (see PUSHER_JOIN_TIMEOUT_S). The old wording here
-    # said that push "runs after this thread is joined but takes the lock
-    # anyway", i.e. that the lock was decorative; a `git push` may sit in a
-    # subprocess for five minutes, the join waits five seconds, so it is the
-    # only thing standing between two concurrent pushes.
+    # The run's git has ONE owner, and every git call of the run is made on it:
+    # the periodic pushes as its `idle` work, and the exit push as its `final`,
+    # which `runlifecycle.close_run` hands it. The workers never push. git is
+    # not safe to call concurrently, and one thread cannot run two pushes at
+    # once — so the exit push queues behind a push in flight (`git push` has a
+    # 300 s subprocess timeout) by construction, where it used to take a lock
+    # after a join that could time out on exactly that push. Pinned by
+    # `test_git_push.test_every_git_call_of_a_parallel_run_is_made_by_the_pusher`.
     #
-    # The first push is one interval in, not up front: the loop asks
-    # `shared.stop.wait` BEFORE pushing, so a run shorter than the interval
-    # pushes only on the way out.
-    last_push_box = [0.0]
-    push_lock = threading.Lock()
+    # Its life is the run's, not the fleet's: it keeps its cadence while the
+    # workers wind down after a latched stop, and there is no wait for it
+    # between the workers' end and `close_run` for a Ctrl+C to land in outside
+    # the interrupt handler (the old join there was one).
+    #
+    # The first push is one interval in, not up front: the owner asks `idle`
+    # right after the window's first post (see `pusher.start` below), and that
+    # turn only sets the clock — so a run shorter than the interval pushes only
+    # on the way out.
+    last_push = 0.0
+    pump_armed = False
 
-    def push_pump():
-        while not shared.stop.wait(PUSH_PUMP_INTERVAL_S):
-            with push_lock:
-                # The policy is read HERE, inside the lock, off the live knobs —
-                # never captured in this closure. A run launched `--git-push
-                # none` whose operator later turns pushing on must start
-                # pushing, and a run turned off mid-push must not have its
-                # policy read half-applied beside a push already in flight.
-                last_push_box[0] = maybe_git_push(run_settings.git_push,
-                                                  last_push_box[0],
-                                                  projectroot.project_dir())
+    def push_turn() -> float:
+        nonlocal last_push, pump_armed
+        if pump_armed:
+            # The policy is read HERE, at the push, off the live knobs — never
+            # captured in this closure. A run launched `--git-push none` whose
+            # operator later turns pushing on must start pushing.
+            last_push = maybe_git_push(run_settings.git_push, last_push,
+                                       projectroot.project_dir())
+        pump_armed = True
+        return PUSH_PUMP_INTERVAL_S
+
+    pusher = ownership.OwnerThread("pusher", idle=push_turn)
 
     def retirement_requested(j):
         return threads.retirement_requested(j)
@@ -1428,12 +1424,6 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         [make_worker(j) for j in range(1, jobs + 1)],
         make_worker, prepare_worker, remove_worker, finish_removal)
     app.register_action(ResizeWorkerPoolAction(threads))
-    # Started for EVERY run, including one launched with `--git-push none`: the
-    # policy is a knob now, so "there is nothing to push on" is a fact about this
-    # instant, not about the run. `maybe_git_push` is a no-op for NONE, so the
-    # cost of a pump nobody has switched on is one thread asleep in `wait`.
-    pusher = threading.Thread(target=push_pump, name="pusher", daemon=True)
-
     # Set by the Ctrl+C branch below and read after the status region has been
     # released. The interrupt does NOT exit from inside the `with app:`: the
     # closing report and the exit push would then be written over a pinned status
@@ -1476,7 +1466,14 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                     app.add_service(statusline.QuotaRefresher(
                         app, source, policy, provider=provider))
                 threads.start_initial()
-                pusher.start()
+                # Started for EVERY run, including one launched with
+                # `--git-push none`: the policy is a knob, so "there is nothing
+                # to push on" is a fact about this instant, not about the run.
+                # `maybe_git_push` is a no-op for NONE, so the cost of a pump
+                # nobody has switched on is one thread asleep between turns.
+                # The no-op `first` is what makes `idle` due at all (an owner
+                # never runs it before its window's first post).
+                pusher.start(first=lambda: None)
 
                 try:
                     join_workers(threads)
@@ -1497,9 +1494,6 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                     for t in threads:
                         t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
 
-                if not interrupted:
-                    shared.stop.set()  # release the pusher's wait()
-                    pusher.join(timeout=PUSHER_JOIN_TIMEOUT_S)
                 app.update(phase="idle")
         finally:
             _close_console()
@@ -1529,20 +1523,18 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # Ctrl+C.
         #
         # THE COST, NAMED because an operator feels it: this can take minutes.
-        # `close_run` takes `push_lock`, and an interrupt that lands while
-        # `push_pump` is inside `git push` waits for a subprocess with a 300 s
-        # timeout (`gitpush.git_push`), on top of `jobs` × INTERRUPT_JOIN_TIMEOUT_S
-        # for the workers. Waited out rather than bounded, and that is the
-        # decision: the thread holding the lock is PUSHING, so the alternative to
-        # waiting is not a faster exit with the same result, it is racing a
-        # second `git` against the first one. `pusher.join` is skipped for the
-        # same reason it would be pointless — `shared.stop` is already set, the
-        # pusher is a daemon, and the lock is what actually excludes it.
+        # `close_run` hands the exit push to the pusher, and an interrupt that
+        # lands while the pusher is inside `git push` waits for a subprocess
+        # with a 300 s timeout (`gitpush.git_push`), on top of `jobs` ×
+        # INTERRUPT_JOIN_TIMEOUT_S for the workers. Waited out rather than
+        # bounded, and that is the decision: the pusher is PUSHING, so the
+        # alternative to waiting is not a faster exit with the same result, it
+        # is racing a second `git` against the first one.
         exitlog.set_reason("interrupted by the operator (Ctrl+C)",
                            iterations=shared.claimed, completed=shared.done)
         runlifecycle.close_run(
             ctx, usages=[usage], ending="interrupted", mailbox=mailboxes,
-            push_lock=push_lock)
+            pusher=pusher)
         sys.exit(130)
 
     # `stop_reason` unset means no worker ever reached a verdict about the run:
@@ -1557,11 +1549,9 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         print(f"  ⚠ every worker thread ended before the queue drained; "
               f"{remaining} file(s) left unclaimed.")
 
-    # `runlifecycle.end_run` is the epilogue both runners share. `push_lock` is
-    # this runner's, and it wraps the WHOLE exit push (`git_unpushed_count`
-    # included, and the reading of the policy with it) because the join above
-    # may have given up on a pusher that is still inside `git push` — see
-    # PUSHER_JOIN_TIMEOUT_S, and `end_run` for the rest of why.
+    # `runlifecycle.end_run` is the epilogue both runners share; the exit push
+    # in it is made by this run's pusher, behind whatever push it has in flight
+    # (see `pusher` above, and `close_run`).
     return runlifecycle.end_run(
         ctx, RunResult(reason, shared.claimed, shared.done, remaining),
-        usages=[usage], mailbox=mailboxes, push_lock=push_lock)
+        usages=[usage], mailbox=mailboxes, pusher=pusher)
