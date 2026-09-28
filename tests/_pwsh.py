@@ -8,7 +8,7 @@ fix made to one of four copies (a closed stdin, an execution policy, the output
 codec) reads as a flaky test on whichever machine the other three meet it.
 
 The main repository's `tools/tests/test_replace_in_file_forward.py` imports
-this file too, through `sys.path`: keep it free of imports from `llm_loop`.
+this file too, by its path: keep it free of imports from `llm_loop`.
 """
 
 import base64
@@ -31,9 +31,16 @@ needs_powershell = pytest.mark.skipif(
            "re-parses the pasted line)")
 
 
+# PowerShell reads these four as the single quote too, so inside '...' each
+# must be doubled like `'` itself or it ends the string. A copy of
+# `llm_loop.cmdline._PS_SINGLE_QUOTES`, not an import: see the module docstring.
+_PS_SINGLE_QUOTES = "'‘’‚‛"
+
+
 def ps_quote(text: str) -> str:
     """`text` as a PowerShell single-quoted literal: nothing inside expands."""
-    return "'" + text.replace("'", "''") + "'"
+    return "'" + "".join(ch * 2 if ch in _PS_SINGLE_QUOTES else ch
+                         for ch in text) + "'"
 
 
 def invocation(program: Sequence[str], *words: str) -> str:
@@ -48,7 +55,21 @@ def invocation(program: Sequence[str], *words: str) -> str:
 
 def run_powershell(line: str, *,
                    timeout: float = TIMEOUT_S) -> subprocess.CompletedProcess:
-    """Run one line of PowerShell source; the exit code is the native one's.
+    """Run one line of PowerShell source that calls a native program.
+
+    The exit code is the native program's. Anything else is a failure, never
+    0: a native program that never ran (the name not found) or a failing
+    cmdlet stops the line with exit 1 ($ErrorActionPreference = 'Stop'), and
+    a line that ran no native program at all exits 255 rather than
+    `exit $null`, which is 0 (all three measured 2026-09-28 on 5.1).
+
+    Native-command-oriented in its output too: a native program's stdout and
+    stderr reach the caller as the bytes it wrote, but text written by
+    PowerShell itself - a cmdlet's output, or its own error, which arrives on
+    stderr as a `#< CLIXML` document - is encoded in the console code page
+    (`Write-Output 'e-acute'` came back as U+FFFD, measured 2026-09-28).
+    Setting [Console]::OutputEncoding here would repair that by switching the
+    code page of the console powershell.exe shares with the test runner.
 
     -EncodedCommand (base64 of UTF-16LE) keeps Python's own command-line
     quoting out of what PowerShell parses. stdin is closed: a program that
@@ -56,7 +77,9 @@ def run_powershell(line: str, *,
     wait for input that never comes, until the timeout.
     """
     assert POWERSHELL is not None, "mark the test with needs_powershell"
-    source = line + "; exit $LASTEXITCODE"
+    source = ("$ErrorActionPreference = 'Stop'; " + line
+              + "; exit $(if ($null -eq $LASTEXITCODE) { 255 } "
+                "else { $LASTEXITCODE })")
     encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
     return subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive",
                            "-EncodedCommand", encoded],
