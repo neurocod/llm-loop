@@ -2329,8 +2329,8 @@ class Painter:
                  tick: Callable[[int], None],
                  note: Callable[[str], None],
                  refresh: float = REFRESH_SECONDS):
-        # Swapped for a NullTerminal by `disable`, for good.
-        self.terminal = terminal
+        # Swapped for a NullTerminal by `disable`, for good (read: `terminal`).
+        self._terminal = terminal
         self.refresh = refresh
         self._render = render
         self._title = title
@@ -2364,11 +2364,21 @@ class Painter:
         self._next_tick = 0.0          # when the periodic frame is next due
         self._ticks = 0
         self._last_size = (0, 0)       # the terminal size the region was cut for
-        # Rows the region is pinned at. Written only by `reserve`, which only
+        # Rows the region is pinned at. Written only by `_reserve`, which only
         # the terminal's owner calls.
         self._reserved = 0
 
     # --- reads -------------------------------------------------------------
+
+    @property
+    def terminal(self) -> termio.Terminal:
+        """The terminal the frames go to: a NullTerminal once `disable` ran.
+
+        Read-only: swapping it is `disable`'s, on the terminal's owner. Any
+        thread may read it (the app's `enabled`, the emergency restore), but
+        a write through it from outside the owner lands beside a live frame.
+        """
+        return self._terminal
 
     @property
     def owns_current_thread(self) -> bool:
@@ -2504,8 +2514,41 @@ class Painter:
 
     # --- the terminal's owner only (the painter, or the caller with none) --
 
+    # The public three check the caller (`_check_owner`); the painter's own
+    # paths call the unchecked `_reserve` / `_resize` / `_disable`, so a frame
+    # drawn inline while a painter is just starting fails no worse than before.
+
+    def _check_owner(self, method: str) -> None:
+        """Raise unless this thread owns the terminal: the painter while one
+        runs (a closing one included), any caller while there is none.
+
+        `StatusApp.painter` is public, so `app.painter.disable()` from a worker
+        would otherwise skip `run_and_wait` and write next to a live frame.
+        A RuntimeError rather than an `assert`, which `python -O` strips.
+        """
+        if self._owner.thread is None or self._owner.owns_current_thread:
+            return
+        raise RuntimeError(
+            f"Painter.{method}() called on {threading.current_thread().name!r} "
+            f"while {PAINTER_THREAD_NAME} owns the terminal; hand it over with "
+            f"run_and_wait")
+
     def reserve(self, rows: int) -> bool:
         """True when the region has the requested shape (or there is none to keep)."""
+        self._check_owner("reserve")
+        return self._reserve(rows)
+
+    def resize(self) -> None:
+        """Re-cut the region for the terminal's size now, and repaint it."""
+        self._check_owner("resize")
+        self._resize()
+
+    def disable(self) -> None:
+        """Release the region and swap in a NullTerminal, for good."""
+        self._check_owner("disable")
+        self._disable()
+
+    def _reserve(self, rows: int) -> bool:
         if isinstance(self.terminal, termio.NullTerminal):
             return True
         if self.terminal.reserve(rows):
@@ -2513,27 +2556,25 @@ class Painter:
             return True
         return False
 
-    def resize(self) -> None:
-        """Re-cut the region for the terminal's size now, and repaint it."""
+    def _resize(self) -> None:
         if self._region == _REGION_CLOSED:
             return      # released: nothing to re-cut (see _REGION_*)
         # A refused reserve() leaves the OLD geometry in place, so carrying on
         # would paint absolute rows outside the new screen with the region set
         # for the old one. Disable instead — `_open_region` answers the same
         # refusal the same way.
-        if not self.reserve(self._row_count()):
-            self.disable()
+        if not self._reserve(self._row_count()):
+            self._disable()
             return
         self.request_frame()
 
-    def disable(self) -> None:
-        """Release the region and swap in a NullTerminal, for good."""
+    def _disable(self) -> None:
         self._region = _REGION_CLOSED   # nothing left for the idle hook to tick
         try:
-            self.terminal.release()
+            self._terminal.release()
         except Exception:
             pass
-        self.terminal = termio.NullTerminal()
+        self._terminal = termio.NullTerminal()
 
     # --- frames --------------------------------------------------------------
 
@@ -2579,12 +2620,12 @@ class Painter:
             if len(rows) != self._reserved:
                 # A Mode added or dropped a row: resize the region rather than
                 # painting into lines the terminal is still scrolling.
-                if not self.reserve(len(rows)):
+                if not self._reserve(len(rows)):
                     return
             self.terminal.paint([colorize(line) for line in rows],
                                 reassert=reassert)
         except Exception:
-            self.disable()
+            self._disable()
 
     # --- the painter's own calls -------------------------------------------
 
@@ -2602,13 +2643,13 @@ class Painter:
             self._next_tick = time.monotonic() + self.refresh
             self._frame_due = None
             self._region = _REGION_OPEN
-            if not self.reserve(self._row_count()):
-                self.disable()
+            if not self._reserve(self._row_count()):
+                self._disable()
                 on_refused()
                 return
             self._draw()
         except Exception:
-            self.disable()
+            self._disable()
 
     def _close_region(self) -> None:
         """(painter) The last frame, then the release — `close()`'s `final`.
@@ -2650,7 +2691,7 @@ class Painter:
             elif self._frame_due is not None and now >= self._frame_due:
                 self._draw()
         except Exception:
-            self.disable()
+            self._disable()
         due = self._next_tick
         if self._frame_due is not None:
             due = min(due, self._frame_due)
@@ -2663,9 +2704,9 @@ class Painter:
         if size != self._last_size:
             self._last_size = size
             try:
-                self.resize()
+                self._resize()
             except Exception:
-                self.disable()
+                self._disable()
         self._report_dropped_keys()
         self._app_tick(self._ticks)
         # Re-assert the region on the periodic repaint: see
@@ -2731,15 +2772,17 @@ class StatusApp:
         # The one thread that owns the terminal and the mode stack while the
         # app is started; everybody else posts to it (see `Painter`,
         # `_handle_input`). Before `start()` and once it has handed back there
-        # is no owner, and a call runs on its caller.
+        # is no owner, and a call runs on its caller. The callables look the
+        # app's methods up per call, so a patch of `app.render` (or of the
+        # class) made after construction still reaches the painter.
         self.painter = Painter(
             terminal if terminal is not None
             else termio.terminal_for(enabled=enabled),
-            render=self.render,
+            render=lambda width: self.render(width),
             title=lambda: title_text(self.status),
             row_count=lambda: len(self.rows()),
-            tick=self._tick,
-            note=self.note,
+            tick=lambda count: self._tick(count),
+            note=lambda text: self.note(text),
             refresh=refresh)
         self.layout = layout or Layout(self.legend_entries)
         self.actions: List[Action] = []

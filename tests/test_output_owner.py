@@ -1289,6 +1289,35 @@ def test_disabling_from_another_thread_is_carried_out_by_the_painter():
     assert isinstance(app.terminal, termio.NullTerminal)
 
 
+def test_the_painters_owner_only_calls_refuse_another_thread():
+    """`app.painter` is public: calling its terminal writes directly from a
+    worker must fail loudly, not write beside a live frame."""
+    terminal = _paint_log()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    with app:
+        assert app.painter.drain(WAIT_S)
+        for name, call in (("disable", app.painter.disable),
+                           ("resize", app.painter.resize),
+                           ("reserve", lambda: app.painter.reserve(3))):
+            with pytest.raises(RuntimeError, match=rf"Painter\.{name}\(\)"):
+                call()
+        with pytest.raises(AttributeError):
+            app.painter.terminal = termio.NullTerminal()
+        assert terminal.releases == []
+        assert app.terminal is terminal
+
+
+def test_the_painter_calls_the_apps_methods_as_they_are_now():
+    """A patch of `app.render` after construction reaches the painter."""
+    terminal = _paint_log()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    app.render = lambda width=None, now=None: ["patched render"]
+    with app:
+        _wait_for_frame(terminal, "patched render")
+
+
 def test_stop_leaves_the_release_to_a_painter_stuck_in_its_frame(monkeypatch):
     """stop() gives up joining a stuck painter; it may not write beside it.
 
