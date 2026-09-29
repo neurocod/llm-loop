@@ -520,19 +520,24 @@ def _sleeping_owner(delay):
     """An open owner asleep after one post and one idle pass that answered
     `delay`, held there (see `_HeldWake`); (owner, its condition, ran, idle
     calls)."""
-    ran, calls = [], []
+    ran, calls, idled = [], [], threading.Event()
 
     def idle():
         calls.append(list(ran))
         if len(calls) == 1:
             held.hold.set()             # every wake from here on waits for us
             held.asleep.clear()         # and the next wait is the one we want
+            idled.set()
         return delay
 
     owner = ownership.OwnerThread("pin-owner", idle=idle)
     owner._changed = held = _HeldWake(owner._lock)
     owner.start()
     owner.post(ran.append, "a")
+    # The owner may already sleep awaiting this post, and that sleep sets
+    # `asleep` too (seen on windows-latest CI): only after the idle pass has
+    # cleared it is `asleep` the sleep we want.
+    assert idled.wait(WAIT_S)
     assert held.asleep.wait(WAIT_S)
     return owner, held, ran, calls
 
