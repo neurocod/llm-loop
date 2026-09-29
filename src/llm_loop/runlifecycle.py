@@ -39,6 +39,8 @@ rather than to tidy it:
 
 import os
 import sys
+import threading
+import traceback
 from typing import Any, Iterable, NamedTuple, Optional, Tuple
 
 from . import (console, exitlog, limits, operator, projectroot, statusline,
@@ -371,11 +373,16 @@ def close_run(ctx: RunContext, *,
     a push it has in flight, and waited for, however long that push takes: the
     exit push is the WHOLE of `final_git_push`, `git_unpushed_count` included,
     so no git call of it can run beside that push. The pusher is closed here on
-    every ending, a dry run's included. Without one (the sequential runner,
+    every ending that reaches this function, a dry run's included (the runner
+    closes it on the ones that do not). Without one (the sequential runner,
     which has nothing to exclude) the push is made here, on the caller. The
     policy is read AT the push, off the live settings, either way. On the pusher
-    a push that raises is reported by it (`OwnerThread`) and the housekeeping
-    below still runs; made here it propagates, as it always has.
+    a push that raises is reported with its traceback on stderr and the
+    housekeeping below still runs; made here it propagates, as it always has.
+
+    Ctrl+C while the exit push is waited for — on the pusher or here — gives
+    up the push, not the housekeeping: see the body for the order, and
+    `gitpush.final_git_push` for what happens to a git call already running.
 
     `usages` is EVERY usage the run opened, not the one it ended on: a
     mixed-provider sequential run opens one per account it selects, and each is
@@ -393,32 +400,87 @@ def close_run(ctx: RunContext, *,
     `stopchannel`), a provider executable that is not installed
     (`streamrender`'s `sys.exit(2)`), and an exception raised out of the driver
     or the runner body, `driver.final_summary` included — the parallel runner's
-    `finally` closes only its console.
+    `finally` closes only its console and its pusher.
     """
-    def exit_push():
-        final_git_push(ctx.settings.git_push, projectroot.project_dir())
+    abort = threading.Event()
 
-    push = None if ctx.dry_run else exit_push
-    if pusher is not None:
-        pusher.close(final=push)
-    elif push is not None:
-        push()
+    def exit_push():
+        final_git_push(ctx.settings.git_push, projectroot.project_dir(),
+                       abort=abort)
+
+    def exit_push_on_pusher():
+        # Reported here, whole, rather than by the owner: `OwnerThread._report`
+        # is one line with no traceback, and it drops a failure worded like one
+        # it already reported — a periodic push that failed the same way would
+        # silence the exit push's. stderr is teed to the mirror log.
+        try:
+            exit_push()
+        except Exception:
+            print("  ⚠ the exit push failed; what is still local stays local:",
+                  file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+    # A Ctrl+C while the exit push runs abandons the PUSH, not the ending: the
+    # push starts no further git (`abort`), the snapshots and the notes below
+    # still happen, and the interrupt is raised again once they have — so it
+    # still ends the run, only after its housekeeping. A Ctrl+C inside that
+    # housekeeping skips what is left of the snapshots, never the notes.
+    interrupt: Optional[KeyboardInterrupt] = None
+    try:
+        if ctx.dry_run:
+            if pusher is not None:
+                pusher.close()
+        elif pusher is not None:
+            _wait_for_exit_push(pusher, exit_push_on_pusher)
+        else:
+            exit_push()
+    except KeyboardInterrupt as caught:
+        interrupt = caught
+        abort.set()
+        print("  ⚠ Ctrl+C: the exit push is abandoned — what is still local "
+              "stays local until a later run pushes it.")
 
     # End-of-run usage snapshots, one answering each `open_usage` that logged —
     # so each run records where every account it used finished. `ending` names
     # the abnormal endings (see RunUsage.close).
     if not ctx.dry_run:
-        for usage in usages:
-            if usage is None:
-                continue
-            try:
-                usage.close(ending)
-            # Exception, not BaseException: a Ctrl+C here still ends the run.
-            except Exception as error:
-                print(f"  ⚠ usage at end ({usage.name}) could not be read: "
-                      f"{type(error).__name__}: {error}")
+        try:
+            for usage in usages:
+                if usage is None:
+                    continue
+                try:
+                    usage.close(ending)
+                except Exception as error:
+                    print(f"  ⚠ usage at end ({usage.name}) could not be read: "
+                          f"{type(error).__name__}: {error}")
+        except KeyboardInterrupt as caught:
+            interrupt = interrupt or caught
 
     operator.report_undelivered_notes(mailbox)
+    if interrupt is not None:
+        raise interrupt
+
+
+# How often the wait for the exit push wakes up. Not a bound on the push — that
+# is waited for however long it takes — but how late a Ctrl+C can be heard: up
+# to Python 3.13 a lock wait cannot be interrupted, so an unbounded one kept the
+# operator waiting for the whole `git push` (300 s subprocess timeout). A
+# quarter of a second is below what a person notices, and a wake-up that finds
+# nothing to do costs a few instructions.
+EXIT_PUSH_POLL_S = 0.25
+
+
+def _wait_for_exit_push(pusher: OwnerThread, push) -> None:
+    """Hand `push` to `pusher` as its `final` and wait until the owner has ended.
+
+    Queued behind a push the owner has in flight, and waited for in short
+    slices (EXIT_PUSH_POLL_S) so a Ctrl+C lands here on every Python, where
+    the caller turns it into an abandoned push.
+    """
+    if pusher.close(timeout=0, final=push):
+        return
+    while not pusher.close(timeout=EXIT_PUSH_POLL_S):
+        pass
 
 
 def end_run(ctx: RunContext, result: RunResult, *,
@@ -434,8 +496,14 @@ def end_run(ctx: RunContext, result: RunResult, *,
     runners, the `=== run ended: … ===` line belongs to the process, so the last
     reason set wins and exitlog prints it on the way out.
     """
-    close_run(ctx, usages=usages, mailbox=mailbox, pusher=pusher)
     reason = result.reason
-    exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
-                       iterations=result.attempted, completed=result.completed)
+    try:
+        close_run(ctx, usages=usages, mailbox=mailbox, pusher=pusher)
+    finally:
+        # Recorded whether or not the housekeeping got through: a Ctrl+C that
+        # abandoned the exit push is raised on from `close_run`, and the
+        # excepthook then records it over this — the last reason set wins.
+        exitlog.set_reason(
+            stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
+            iterations=result.attempted, completed=result.completed)
     return result

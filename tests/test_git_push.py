@@ -15,15 +15,19 @@ that is provably not the directory pytest is standing in — and asserts the
 directory git was actually handed, never merely that a push happened.
 """
 
+import _thread
 import subprocess
 import threading
+import time
 
 import pytest
 
-from llm_loop import cyclecore, gitpush, parallel, runlifecycle, statusline
+from llm_loop import (cyclecore, exitlog, gitpush, operator, ownership,
+                      parallel, projectroot, runlifecycle, statusline)
 from llm_loop.stopchannel import RunStopReason
 
-from _runfixtures import (MemListDriver, OneShotDriver, isolated_run, par_args,
+from _runfixtures import (MemListDriver, OneShotDriver, StubPolicy, StubSource,
+                          isolated_run, par_args, record_exit_pushes,
                           root_not_cwd, seq_args)
 
 
@@ -296,6 +300,11 @@ class _OverlapWatchingGit(_FakeGitModule):
     A push blocks on `release` instead of sleeping, so the overlap is staged
     rather than raced; `held` is whether each held push was released by
     `release` rather than by the timeout.
+
+    Every push after the first starts LATE_EXIT_PUSH_S late. The pin's second
+    push is the exit push, and the delay is what makes "close_run returned
+    before it" observable: a close_run that does not wait would otherwise
+    usually lose the race to a push that costs nothing, and pass.
     """
 
     def __init__(self):
@@ -315,6 +324,8 @@ class _OverlapWatchingGit(_FakeGitModule):
                 self.beside_a_push.append(tuple(argv)[:2])
         if tuple(argv)[:2] != ("git", "push"):
             return super().run(argv, **kwargs)
+        if self.pushed.is_set():
+            time.sleep(LATE_EXIT_PUSH_S)
         with self._live_lock:
             self.live += 1
             self.max_live = max(self.max_live, self.live)
@@ -331,9 +342,16 @@ class _OverlapWatchingGit(_FakeGitModule):
 # Upper bound on how long a staged push is held if nothing releases it.
 HELD_PUSH_TIMEOUT_S = 10.0
 
+# How late `_OverlapWatchingGit` starts every push after the first. Only the
+# failing case depends on it (a close_run returning before the exit push has
+# run); a passing run merely waits it out once.
+LATE_EXIT_PUSH_S = 0.2
 
-def _signal_on_close_run(monkeypatch, event: threading.Event) -> None:
-    """Set `event` the moment the run enters its epilogue's housekeeping.
+
+def _signal_on_close_run(monkeypatch, event: threading.Event,
+                         on_return=None) -> None:
+    """Set `event` the moment the run enters its epilogue's housekeeping, and
+    call `on_return` (if given) the moment that housekeeping returns.
 
     Wrapped on `runlifecycle`, where both doors resolve the name: `end_run`
     calls `close_run` through the module, and the interrupt calls it directly.
@@ -342,7 +360,10 @@ def _signal_on_close_run(monkeypatch, event: threading.Event) -> None:
 
     def close_run(*args, **kwargs):
         event.set()
-        return real_close_run(*args, **kwargs)
+        result = real_close_run(*args, **kwargs)
+        if on_return is not None:
+            on_return()
+        return result
 
     monkeypatch.setattr(runlifecycle, "close_run", close_run)
 
@@ -361,11 +382,17 @@ def test_every_git_call_of_a_parallel_run_is_made_by_the_pusher(
     vacuous pass.
 
     Make the exit push on the calling thread instead and `threads` names
-    `MainThread`, whatever the timing did.
+    `MainThread`, whatever the timing did. And `close_run` must WAIT for the
+    exit push, not merely hand it over: the process may exit the moment it
+    returns, and the pusher is a daemon.
     """
     fake = _OverlapWatchingGit()
     exit_asked = fake.release
-    _signal_on_close_run(monkeypatch, exit_asked)
+    pushes_when_close_run_returned = []
+    _signal_on_close_run(
+        monkeypatch, exit_asked,
+        on_return=lambda: pushes_when_close_run_returned.append(
+            len(fake.pushes)))
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
     monkeypatch.setattr(parallel, "run_job",
@@ -388,6 +415,11 @@ def test_every_git_call_of_a_parallel_run_is_made_by_the_pusher(
         f"exit push, so this run measured nothing about the two: {fake.held}")
     assert len(fake.pushes) >= 2, \
         f"the periodic push and the exit push did not both happen: {fake.calls}"
+    # The whole count, not 2: a periodic turn may slip in between the held
+    # push's release and the close, and the exit push then comes third.
+    assert pushes_when_close_run_returned == [len(fake.pushes)], (
+        "close_run returned before the exit push had run — it handed the push "
+        f"over without waiting for it: {pushes_when_close_run_returned}")
     assert fake.threads == {"pusher"}, (
         f"git ran on a thread other than the run's pusher: {fake.threads}")
     assert fake.max_live == 1, \
@@ -406,21 +438,279 @@ def test_an_exit_push_that_raises_does_not_cost_a_parallel_run_its_ending(
     Made on the main thread it unwound `close_run` and `end_run` with it: no
     closing usage snapshot, no report of undelivered notes, no recorded
     reason — a push failing is not what ended the run, and it must not be what
-    its record says. The owner reports what a call raised on stderr and goes on
-    (`ownership.OwnerThread`), which is the behaviour pinned here.
+    its record says. So the run here HAS all three to lose: a usage source (its
+    closing snapshot), a note nobody delivered, and a reason to record.
+
+    The failure is reported whole — with its traceback, on stderr, which the
+    tee carries to the mirror log — and not through the owner's one-line
+    report, which drops a failure worded like one it already reported.
     """
-    def exit_push_fails(policy, project_dir):
+    def exit_push_fails(policy, project_dir, abort=None):
         raise OSError("staged: the repository is not reachable")
 
     monkeypatch.setattr(runlifecycle, "final_git_push", exit_push_fails)
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
+                        lambda provider: StubSource())
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, command, mailbox=None: (0, None, None))
+    box = _undelivered_note(monkeypatch)
+    driver = MemListDriver(["products/only.md"])
 
-    result = parallel.run_parallel(MemListDriver(["products/only.md"]),
+    result = parallel.run_parallel(driver,
                                    par_args(root_not_cwd(tmp_path), jobs=1,
-                                            git_push=PUSHING),
+                                            git_push=PUSHING,
+                                            ignore_usage=False,
+                                            no_statusline=True),
                                    app_name="pytest-gitpush")
 
     assert result.reason == RunStopReason.NO_WORK
-    assert "pusher: OSError: staged: the repository is not reachable" in \
-        capsys.readouterr().err
+    assert driver.limit_policy.snapshots[-1] == "at end (parallel claude)", (
+        f"the closing usage snapshot was lost: {driver.limit_policy.snapshots}")
+    captured = capsys.readouterr()
+    assert "undelivered operator note" in captured.out and NOTE in captured.out, \
+        "the note nobody delivered was never reported"
+    assert box.submitted, "the staged note was never typed"
+    assert "the exit push failed" in captured.err
+    assert "Traceback" in captured.err, "the failed exit push lost its traceback"
+    assert "OSError: staged: the repository is not reachable" in captured.err
+    exitlog.finish()
+    assert "=== run ended: no more work in the queue" in capsys.readouterr().out
+
+
+# What the operator typed and nobody delivered (see `_undelivered_note`).
+NOTE = "please look at the third file"
+
+
+class _NoteBox:
+    """The run's one mailbox, with NOTE typed after the workers have ended.
+
+    Typed then, not before the run: a note in the mailbox while a worker still
+    claims is spliced into that worker's prompt, and is delivered after all.
+    """
+
+    def __init__(self):
+        self.box = operator.Mailbox()
+        self.submitted = False
+
+    def type_note(self):
+        self.box.submit(NOTE)
+        self.submitted = True
+
+
+def _undelivered_note(monkeypatch) -> _NoteBox:
+    """Give the run one mailbox holding NOTE once `join_workers` has returned."""
+    note = _NoteBox()
+    monkeypatch.setattr(operator, "Mailbox", lambda: note.box)
+    real_join = parallel.join_workers
+
+    def join_then_type(threads):
+        real_join(threads)
+        note.type_note()
+
+    monkeypatch.setattr(parallel, "join_workers", join_then_type)
+    return note
+
+
+# How long the Ctrl+C pin lets the main thread settle into its wait before it
+# interrupts it, and afterwards lets a late interrupt land. Only the failing
+# cases depend on it (an unbounded wait, a close_run that does not wait).
+CTRL_C_SETTLE_S = 0.1
+
+
+class _HeldCountGit(_FakeGitModule):
+    """`_FakeGitModule` whose `rev-list` — the exit push's first git call —
+    waits for `release`; `counting` says it has started."""
+
+    def __init__(self):
+        super().__init__()
+        self.counting = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, argv, **kwargs):
+        if tuple(argv)[:2] == ("git", "rev-list"):
+            self.counting.set()
+            self.release.wait(timeout=HELD_PUSH_TIMEOUT_S)
+        return super().run(argv, **kwargs)
+
+
+def test_ctrl_c_while_the_exit_push_is_waited_for_gives_up_the_push_only(
+        tmp_path, monkeypatch, capsys):
+    """Ctrl+C during the exit push abandons the push, not the run's ending.
+
+    The wait for the pusher is where a parallel run sits when its operator
+    loses patience with a slow `git push`. Unguarded, the interrupt unwound
+    `close_run` there — no closing snapshot, no report of the notes nobody
+    delivered — while the exit push went on as a daemon, free to start a
+    `git push` nobody wanted any more. Pinned: the snapshot and the notes
+    still happen, the push starts no further git, and the interrupt is raised
+    again afterwards, so it still ends the run.
+
+    The Ctrl+C is `_thread.interrupt_main`, which — measured 2026-09-29 on
+    3.13 and 3.14 alike — does not wake an unbounded lock wait, just as a real
+    Ctrl+C does not up to 3.13. So a close_run that waited on the pusher in
+    one unbounded wait hears it only after the push, on every version — and
+    here the push is held until the interrupt has been handled.
+    """
+    fake = _HeldCountGit()
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    projectroot.set_project_root(root_not_cwd(tmp_path))
+    policy = StubPolicy()
+    usage = runlifecycle.RunUsage(StubSource(), policy, "parallel claude")
+    mailbox = operator.Mailbox()
+    mailbox.submit(NOTE)
+    ctx = runlifecycle.RunContext(
+        provider="claude", spec=None, dry_run=False, progress=None,
+        settings=runlifecycle.RunSettings(
+            git_push=gitpush.GitPushPolicy(PUSHING)),
+        registry=None, status_enabled=False)
+    pusher = ownership.OwnerThread("pusher").start()
+
+    def ctrl_c_once_the_exit_push_runs():
+        if fake.counting.wait(timeout=HELD_PUSH_TIMEOUT_S):
+            # Settled into its wait first: an interrupt landing before the
+            # wait starts would pass an unbounded wait too.
+            time.sleep(CTRL_C_SETTLE_S)
+            _thread.interrupt_main()
+
+    interrupter = threading.Thread(target=ctrl_c_once_the_exit_push_runs,
+                                   daemon=True)
+    interrupter.start()
+    raised = []
+    try:
+        try:
+            runlifecycle.close_run(ctx, usages=[usage], ending="interrupted",
+                                   mailbox=mailbox, pusher=pusher)
+        except KeyboardInterrupt:
+            raised.append("from close_run")
+        # A close_run that did not wait returns before the Ctrl+C is sent; it
+        # lands here, not in the pytest machinery after the test.
+        interrupter.join(timeout=HELD_PUSH_TIMEOUT_S)
+        time.sleep(CTRL_C_SETTLE_S)
+    except KeyboardInterrupt:
+        raised.append("after close_run returned")
+    finally:
+        fake.release.set()
+
+    assert raised == ["from close_run"], (
+        "the Ctrl+C did not come back out of close_run once its housekeeping "
+        f"was done: {raised}")
+    assert pusher.close(timeout=HELD_PUSH_TIMEOUT_S), \
+        "the abandoned exit push never finished"
+    assert fake.pushes == [], (
+        f"the abandoned exit push still ran `git push`: {fake.calls}")
+    assert policy.snapshots == ["at end (parallel claude: interrupted)"], (
+        f"Ctrl+C cost the closing usage snapshot: {policy.snapshots}")
+    out = capsys.readouterr().out
+    assert "the exit push is abandoned" in out
+    assert "undelivered operator note" in out and NOTE in out, \
+        "Ctrl+C cost the report of the notes nobody delivered"
+
+
+# How long the Ctrl+C pin below stretches the run's wind-down (the console's
+# close) so that a pump still running would push in it: at a 0.01 s interval,
+# dozens of turns. Only the failing case depends on it.
+WIND_DOWN_S = 0.5
+
+
+def test_no_periodic_push_starts_once_the_operator_pressed_ctrl_c(
+        tmp_path, monkeypatch):
+    """After Ctrl+C the pump stops; only the exit push is still to come.
+
+    The wind-down after an interrupt — the workers re-joined, the console
+    closed — can take a while, and a periodic push begun in it is one more
+    `git push` for the exit push to queue behind while the operator waits.
+    One turn may already be under way when the interrupt lands; none may start
+    after it.
+    """
+    fake = _FakeGitModule()
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
+    record_exit_pushes(monkeypatch)
+    at_interrupt = []
+
+    def interrupt_once_the_pump_pushed(threads):
+        for t in threads:
+            t.join()
+        at_interrupt.append(fake.pushed.wait(timeout=PUMP_WAIT_S))
+        at_interrupt.append(len(fake.pushes))
+        raise KeyboardInterrupt
+
+    real_close_console = parallel._close_console
+
+    def slow_wind_down():
+        time.sleep(WIND_DOWN_S)
+        real_close_console()
+
+    monkeypatch.setattr(parallel, "join_workers", interrupt_once_the_pump_pushed)
+    monkeypatch.setattr(parallel, "_close_console", slow_wind_down)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None: (0, None, None))
+
+    with pytest.raises(SystemExit):
+        parallel.run_parallel(MemListDriver(["products/only.md"]),
+                              par_args(root_not_cwd(tmp_path), jobs=1,
+                                       git_push=PUSHING, no_statusline=True),
+                              app_name="pytest-gitpush")
+
+    pumped, before = at_interrupt
+    assert pumped, "the pump never pushed before the interrupt — nothing measured"
+    assert len(fake.pushes) - before <= 1, (
+        f"the pump went on pushing after Ctrl+C: {before} push(es) before it, "
+        f"{len(fake.pushes)} in all")
+
+
+def test_a_run_that_unwinds_past_its_epilogue_closes_its_pusher(
+        tmp_path, monkeypatch):
+    """An exception after the fleet must not leave the run's pusher pushing.
+
+    `close_run` closes the pusher on every ending that reaches it; one that
+    does not — here the closing report's `pending_total` raising — used to
+    leave it open, pushing every minute for the rest of the process, beside
+    the next run's pusher under a batching wrapper.
+    """
+    owners = []
+    real_owner = ownership.OwnerThread
+
+    def recording_owner(name, **kwargs):
+        owner = real_owner(name, **kwargs)
+        if name == "pusher":
+            owners.append(owner)
+        return owner
+
+    class _ReportFails(MemListDriver):
+        fleet_done = False
+
+        def pending_total(self):
+            if self.fleet_done:
+                raise RuntimeError("staged: the list file vanished")
+            return super().pending_total()
+
+    driver = _ReportFails(["products/only.md"])
+    real_join = parallel.join_workers
+
+    def join_then_break_the_list(threads):
+        real_join(threads)
+        driver.fleet_done = True
+
+    monkeypatch.setattr(ownership, "OwnerThread", recording_owner)
+    monkeypatch.setattr(parallel, "join_workers", join_then_break_the_list)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None: (0, None, None))
+    record_exit_pushes(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="staged: the list file vanished"):
+        parallel.run_parallel(driver,
+                              par_args(root_not_cwd(tmp_path), jobs=1,
+                                       no_statusline=True),
+                              app_name="pytest-gitpush")
+
+    [pusher] = owners
+    ran_on = []
+    try:
+        # A closed owner runs a post on its caller, at once; an open one
+        # queues it for its own thread.
+        pusher.post(lambda: ran_on.append(threading.current_thread().name))
+        assert ran_on == [threading.current_thread().name], (
+            "the run unwound and left its pusher open")
+    finally:
+        pusher.close(timeout=HELD_PUSH_TIMEOUT_S)

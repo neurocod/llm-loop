@@ -154,6 +154,29 @@ def _close_console() -> None:
           file=sys.stderr)
 
 
+# How long an unwinding run gives its pusher to hand back. Long enough for an
+# idle one — between turns it closes in 0.1 ms median, 0.98 / 0.43 ms at worst
+# (300 closes each, measured 2026-09-29) — and far too short to sit out a
+# `git push`, which is the point: see `_abandon_pusher`.
+PUSHER_ABANDON_TIMEOUT_S = 0.5
+
+
+def _abandon_pusher(pusher: ownership.OwnerThread) -> None:
+    """Close a run's pusher that the epilogue never took over — no exit push.
+
+    Reached only when an exception or a Ctrl+C unwinds `run_parallel` past its
+    epilogue, so it does not wait for a push: the owner starts no further
+    periodic push once it has seen `close`, and a push it is already inside
+    finishes on its own, as a daemon, within its subprocess timeout — said on
+    stderr, because until then it is a git writer the next run in this process
+    can meet.
+    """
+    if pusher.close(timeout=PUSHER_ABANDON_TIMEOUT_S):
+        return
+    print(f"  ⚠ {pusher.name}: a git push was still running when the run "
+          f"unwound; it finishes on its own.", file=sys.stderr)
+
+
 def parse_args(argv=None, *, prog: str = "parallel",
                description: Optional[str] = None,
                extra_options: Optional[Callable[[argparse.ArgumentParser],
@@ -1372,11 +1395,18 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # right after the window's first post (see `pusher.start` below), and that
     # turn only sets the clock — so a run shorter than the interval pushes only
     # on the way out.
+    #
+    # And none once the operator has pressed Ctrl+C (`interrupted`, below): the
+    # run is leaving, the exit push is still to come, and a periodic push begun
+    # in the wind-down is one more `git push` for the exit push to queue behind
+    # while the operator waits.
     last_push = 0.0
     pump_armed = False
 
-    def push_turn() -> float:
+    def push_turn() -> Optional[float]:
         nonlocal last_push, pump_armed
+        if interrupted.is_set():
+            return None
         if pump_armed:
             # The policy is read HERE, at the push, off the live knobs — never
             # captured in this closure. A run launched `--git-push none` whose
@@ -1434,7 +1464,13 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # the area on every iteration and pushes there on every pass, so a few more
     # lines are what that area is already carrying. Here the workers' output is
     # the area, and this is the one moment it stops being written to.
-    interrupted = False
+    #
+    # An Event rather than a flag because the pusher reads it (`push_turn`).
+    # Set too by a Ctrl+C that lands later in the wind-down — the re-join of
+    # the workers, the console's close, the closing report: each of those gives
+    # up its own wait and the run takes this same ending, rather than the
+    # interrupt unwinding past the epilogue.
+    interrupted = threading.Event()
     # The Ctrl+C line when the console's queue had no room for it (see there).
     announce_later: Optional[str] = None
 
@@ -1451,107 +1487,150 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # has, the lines before it (see `console.route_through`). A poster waits for
     # room as long as the close waits for the whole backlog: both are "this
     # console is stuck", from the same measurement.
-    with route_through(_console, post_timeout=CONSOLE_CLOSE_TIMEOUT_S):
-        _console.start()
-        try:
-            with app:
-                if source is not None:
-                    # Inside `with`, not before it: push_quotas is silent until
-                    # start() has marked the app enabled. The reading is
-                    # already paid for by the start-of-run snapshot above, so
-                    # this costs no round-trip. The refresher only runs for a
-                    # run that talks to the usage endpoint at all — with
-                    # --ignore-usage `source` is None and nothing polls.
-                    statusline.push_quotas(app, source, policy)
-                    app.add_service(statusline.QuotaRefresher(
-                        app, source, policy, provider=provider))
-                threads.start_initial()
-                # Started for EVERY run, including one launched with
-                # `--git-push none`: the policy is a knob, so "there is nothing
-                # to push on" is a fact about this instant, not about the run.
-                # `maybe_git_push` is a no-op for NONE, so the cost of a pump
-                # nobody has switched on is one thread asleep between turns.
-                # The no-op `first` is what makes `idle` due at all (an owner
-                # never runs it before its window's first post).
-                pusher.start(first=lambda: None)
+    #
+    # The `try` around all of it is the pusher's: `close_run` closes it on every
+    # ending that reaches the epilogue, and an exception or a Ctrl+C that
+    # unwinds past the epilogue must not leave it pushing every minute for the
+    # rest of the process — beside the next run's pusher, under a batching
+    # wrapper. Set just before the epilogue takes the pusher over.
+    handed_over = False
+    try:
+        with route_through(_console, post_timeout=CONSOLE_CLOSE_TIMEOUT_S):
+            _console.start()
+            try:
+                with app:
+                    if source is not None:
+                        # Inside `with`, not before it: push_quotas is silent
+                        # until start() has marked the app enabled. The reading
+                        # is already paid for by the start-of-run snapshot
+                        # above, so this costs no round-trip. The refresher
+                        # only runs for a run that talks to the usage endpoint
+                        # at all — with --ignore-usage `source` is None and
+                        # nothing polls.
+                        statusline.push_quotas(app, source, policy)
+                        app.add_service(statusline.QuotaRefresher(
+                            app, source, policy, provider=provider))
+                    threads.start_initial()
+                    # Started for EVERY run, including one launched with
+                    # `--git-push none`: the policy is a knob, so "there is
+                    # nothing to push on" is a fact about this instant, not
+                    # about the run. `maybe_git_push` is a no-op for NONE, so
+                    # the cost of a pump nobody has switched on is one thread
+                    # asleep between turns. The no-op `first` is what makes
+                    # `idle` due at all (an owner never runs it before its
+                    # window's first post).
+                    pusher.start(first=lambda: None)
 
+                    try:
+                        join_workers(threads)
+                    except KeyboardInterrupt:
+                        # Signal first, talk second: nothing about the console
+                        # — a stalled one included — may stand between Ctrl+C
+                        # and the workers hearing it.
+                        interrupted.set()
+                        threads.close()
+                        shared.stop.set()
+                        # Queued, not printed, so the line lands after what the
+                        # workers had already said — and never waited for: a
+                        # queue that is full is a console that is not being
+                        # written, and this line is then deferred to the
+                        # closing report below rather than blocking the
+                        # interrupt behind it.
+                        if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
+                            announce_later = INTERRUPT_ANNOUNCEMENT
+                        # A second Ctrl+C gives up waiting for the workers; the
+                        # run's ending is this one either way.
+                        try:
+                            for t in threads:
+                                t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
+                        except KeyboardInterrupt:
+                            pass
+
+                    app.update(phase="idle")
+            finally:
+                # A Ctrl+C while a stuck console is waited for gives up that
+                # wait (CONSOLE_CLOSE_TIMEOUT_S) and ends the run as an
+                # interrupt; an exception already unwinding goes on unwinding.
                 try:
-                    join_workers(threads)
+                    _close_console()
                 except KeyboardInterrupt:
-                    # Signal first, talk second: nothing about the console — a
-                    # stalled one included — may stand between Ctrl+C and the
-                    # workers hearing it.
-                    interrupted = True
-                    threads.close()
-                    shared.stop.set()
-                    # Queued, not printed, so the line lands after what the
-                    # workers had already said — and never waited for: a queue
-                    # that is full is a console that is not being written, and
-                    # this line is then deferred to the closing report below
-                    # rather than blocking the interrupt behind it.
-                    if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
-                        announce_later = INTERRUPT_ANNOUNCEMENT
-                    for t in threads:
-                        t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
+                    interrupted.set()
 
-                app.update(phase="idle")
-        finally:
-            _close_console()
+        if announce_later is not None:
+            print(announce_later)
 
-    if announce_later is not None:
-        print(announce_later)
+        # This run's own closing report, before the shared epilogue: the run
+        # talks about its work first, and the housekeeping that closes it down
+        # follows. What the pusher prints is not ordered against it: a periodic
+        # push already under way when the workers ended may print its
+        # "git push: done." below this report. Accepted rather than waited for —
+        # waiting means sitting out a `git push` before a report that does not
+        # mention pushing, and the exit push, which the report does precede,
+        # comes after that push either way.
+        remaining = None
+        try:
+            remaining = driver.pending_total()
+            print(f"\nProcessed {shared.done} file(s) this run; "
+                  f"{remaining} still pending in {list_file_rel}.")
+            if shared.failed:
+                print(f"  ⚠ {len(shared.failed)} file(s) parked after "
+                      f"{MAX_ATTEMPTS} failed attempts:")
+                for line in sorted(shared.failed):
+                    print(f"      {os.path.basename(line.strip())}")
+        except KeyboardInterrupt:
+            interrupted.set()
 
-    # This run's own closing report, before the shared epilogue: the run talks
-    # about its work first, and the housekeeping that closes it down follows.
-    remaining = driver.pending_total()
-    print(f"\nProcessed {shared.done} file(s) this run; "
-          f"{remaining} still pending in {list_file_rel}.")
-    if shared.failed:
-        print(f"  ⚠ {len(shared.failed)} file(s) parked after "
-              f"{MAX_ATTEMPTS} failed attempts:")
-        for line in sorted(shared.failed):
-            print(f"      {os.path.basename(line.strip())}")
+        if interrupted.is_set():
+            # An interrupt is not a `RunStopReason` — nobody returns from here,
+            # so there is no `RunResult` to carry one — but it IS an ending, and
+            # it gets the same epilogue as any other. It used to get none at
+            # all: no reason recorded, no exit push, no closing snapshot, no
+            # report of the notes nobody delivered, so an operator who pressed
+            # Ctrl+C left the run's commits sitting local and its mailbox
+            # unread. The reason goes down first, so the record does not depend
+            # on the push surviving a second Ctrl+C.
+            #
+            # THE COST, NAMED because an operator feels it: this can take
+            # minutes. `close_run` hands the exit push to the pusher, and an
+            # interrupt that lands while the pusher is inside `git push` waits
+            # for a subprocess with a 300 s timeout (`gitpush.git_push`), on top
+            # of `jobs` × INTERRUPT_JOIN_TIMEOUT_S for the workers. Waited out
+            # rather than bounded, and that is the decision: the pusher is
+            # PUSHING, so the alternative to waiting is not a faster exit with
+            # the same result, it is racing a second `git` against the first
+            # one. The operator who will not wait presses Ctrl+C again: that
+            # abandons the exit push (`close_run` says how), keeps the rest of
+            # the epilogue, and still leaves with 130.
+            exitlog.set_reason("interrupted by the operator (Ctrl+C)",
+                               iterations=shared.claimed, completed=shared.done)
+            handed_over = True
+            try:
+                runlifecycle.close_run(
+                    ctx, usages=[usage], ending="interrupted",
+                    mailbox=mailboxes, pusher=pusher)
+            except KeyboardInterrupt:
+                pass
+            sys.exit(130)
 
-    if interrupted:
-        # An interrupt is not a `RunStopReason` — nobody returns from here, so
-        # there is no `RunResult` to carry one — but it IS an ending, and it gets
-        # the same epilogue as any other. It used to get none at all: no reason
-        # recorded, no exit push, no closing snapshot, no report of the notes
-        # nobody delivered, so an operator who pressed Ctrl+C left the run's
-        # commits sitting local and its mailbox unread. The reason goes down
-        # first, so the record does not depend on the push surviving a second
-        # Ctrl+C.
-        #
-        # THE COST, NAMED because an operator feels it: this can take minutes.
-        # `close_run` hands the exit push to the pusher, and an interrupt that
-        # lands while the pusher is inside `git push` waits for a subprocess
-        # with a 300 s timeout (`gitpush.git_push`), on top of `jobs` ×
-        # INTERRUPT_JOIN_TIMEOUT_S for the workers. Waited out rather than
-        # bounded, and that is the decision: the pusher is PUSHING, so the
-        # alternative to waiting is not a faster exit with the same result, it
-        # is racing a second `git` against the first one.
-        exitlog.set_reason("interrupted by the operator (Ctrl+C)",
-                           iterations=shared.claimed, completed=shared.done)
-        runlifecycle.close_run(
-            ctx, usages=[usage], ending="interrupted", mailbox=mailboxes,
-            pusher=pusher)
-        sys.exit(130)
+        # `stop_reason` unset means no worker ever reached a verdict about the run:
+        # every one of the endings — the cap, the drained queue, a latched stop —
+        # writes it before a worker can leave. So the threads did not run out of
+        # work, they died holding it (see Shared.abandon), and NO_WORK would tell
+        # the reader the opposite of what happened. A queue that ends with lines
+        # parked in `failed` is NOT this case: `_exhausted` latched NO_WORK there.
+        reason = shared.stop_reason
+        if reason is None:
+            reason = RunStopReason.WORKERS_DIED
+            print(f"  ⚠ every worker thread ended before the queue drained; "
+                  f"{remaining} file(s) left unclaimed.")
 
-    # `stop_reason` unset means no worker ever reached a verdict about the run:
-    # every one of the endings — the cap, the drained queue, a latched stop —
-    # writes it before a worker can leave. So the threads did not run out of
-    # work, they died holding it (see Shared.abandon), and NO_WORK would tell
-    # the reader the opposite of what happened. A queue that ends with lines
-    # parked in `failed` is NOT this case: `_exhausted` latched NO_WORK there.
-    reason = shared.stop_reason
-    if reason is None:
-        reason = RunStopReason.WORKERS_DIED
-        print(f"  ⚠ every worker thread ended before the queue drained; "
-              f"{remaining} file(s) left unclaimed.")
-
-    # `runlifecycle.end_run` is the epilogue both runners share; the exit push
-    # in it is made by this run's pusher, behind whatever push it has in flight
-    # (see `pusher` above, and `close_run`).
-    return runlifecycle.end_run(
-        ctx, RunResult(reason, shared.claimed, shared.done, remaining),
-        usages=[usage], mailbox=mailboxes, pusher=pusher)
+        # `runlifecycle.end_run` is the epilogue both runners share; the exit
+        # push in it is made by this run's pusher, behind whatever push it has
+        # in flight (see `pusher` above, and `close_run`).
+        handed_over = True
+        return runlifecycle.end_run(
+            ctx, RunResult(reason, shared.claimed, shared.done, remaining),
+            usages=[usage], mailbox=mailboxes, pusher=pusher)
+    finally:
+        if not handed_over:
+            _abandon_pusher(pusher)

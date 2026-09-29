@@ -112,7 +112,7 @@ def git_push(cwd: str) -> bool:
     return False
 
 
-def final_git_push(policy: GitPushPolicy, cwd: str) -> None:
+def final_git_push(policy: GitPushPolicy, cwd: str, *, abort=None) -> None:
     """Push whatever is still local on the way out of a run.
 
     Regardless of the EACH_HOUR cadence: the run is ending, so work must not be
@@ -127,10 +127,21 @@ def final_git_push(policy: GitPushPolicy, cwd: str) -> None:
     `runlifecycle.close_run`), and the sequential one has nothing to exclude. A
     function that pushes A REPOSITORY has no business knowing whether its caller
     is threaded (the same argument that made `cwd` a parameter; see the header).
+
+    `abort` (a `threading.Event`, or None) is asked before each git call: set,
+    the push starts no further git and returns quietly — the caller that set
+    it says why. A git call already running is not stopped from here: a Ctrl+C
+    typed at the terminal reaches the git child too (one console on Windows,
+    one foreground process group on POSIX), and anything else is bounded by
+    the call's own subprocess timeout.
     """
     if policy == GitPushPolicy.NONE:
         return
+    if abort is not None and abort.is_set():
+        return
     count = git_unpushed_count(cwd)
+    if abort is not None and abort.is_set():
+        return
     if count is None or count > 0:
         print("  · final git push on exit…")
         git_push(cwd)
