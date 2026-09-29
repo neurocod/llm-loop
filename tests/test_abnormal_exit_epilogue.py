@@ -63,6 +63,20 @@ class _StoppingDriver(Driver):
         raise LoopStop("state file says: error\nsecond line", exit_code=3)
 
 
+class _OneCommandDriver(Driver):
+    """One command, then the work is over: the run RETURNS, through `end_run`."""
+
+    def __init__(self):
+        self.limit_policy = StubPolicy()
+        self.served = False
+
+    def next_command(self):
+        if self.served:
+            return None
+        self.served = True
+        return ClaudeCommand("do the thing")
+
+
 def _seq_args(project_dir):
     # `git_push` stays the fixtures' "none", and that is not laziness.
     # `exit_pushes` replaces the EXIT push only; the sequential loop's per-pass
@@ -110,7 +124,10 @@ def loaded_mailbox(monkeypatch):
 
 
 def _assert_closed_down(pushes, policy, capsys, project_dir, *, snapshot, reason):
-    """The three steps of the epilogue, plus the ending's own record."""
+    """The three steps of the epilogue, plus the ending's own record.
+
+    Returns what the run printed up to the record's closing line.
+    """
     out = capsys.readouterr().out
     assert [where for _policy, where in pushes] == [project_dir], (
         f"the exit push did not run once against the run's own project: {pushes}")
@@ -125,6 +142,7 @@ def _assert_closed_down(pushes, policy, capsys, project_dir, *, snapshot, reason
     assert NOTE in out
     exitlog.finish()
     assert reason in capsys.readouterr().out
+    return out
 
 
 def test_five_provider_errors_in_a_row_still_close_the_run_down(
@@ -238,6 +256,94 @@ def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(
     _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
         snapshot="at end (parallel claude: interrupted)",
+        reason="interrupted by the operator (Ctrl+C)")
+
+
+@pytest.mark.parametrize("where", ["start", "stop", "join and stop"])
+def test_ctrl_c_in_the_status_region_s_own_waits_still_closes_the_run_down(
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox, where):
+    """The status region's start and teardown wait too, and Ctrl+C lands there.
+
+    `StatusApp.stop` waits for the services, the key reader and the painter's
+    last frame; an interrupt in it unwound `run_parallel` past both of its
+    epilogues — no exit push, no snapshot, no notes. `start` waits for the
+    first frame, before any worker exists. Either is the interrupt's one
+    ending: exit push once, snapshot, notes, 130 — and a Ctrl+C in the
+    teardown after one in the join is still that one ending, heard once.
+    """
+    method = "start" if where == "start" else "stop"
+    real = getattr(parallel.statusline.StatusApp, method)
+
+    def interrupted(app):
+        real(app)
+        # Typed here, where no worker is left to splice it (see above).
+        loaded_mailbox.submit(NOTE)
+        raise KeyboardInterrupt
+
+    def interrupt(threads):
+        for t in threads:
+            t.join()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(parallel.statusline.StatusApp, method, interrupted)
+    if where == "join and stop":
+        monkeypatch.setattr(parallel, "join_workers", interrupt)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: StubSource())
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None: (0, None, None))
+    driver = MemListDriver(["products/only.md"])
+
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            parallel.run_parallel(driver, _par_args(str(tmp_path)),
+                                  app_name="pytest-abnormal",
+                                  wait_on_start=False)
+    except KeyboardInterrupt:
+        pytest.fail("the Ctrl+C unwound the run past its epilogue")
+
+    assert exit_info.value.code == 130
+    out = _assert_closed_down(
+        exit_pushes, driver.limit_policy, capsys, str(tmp_path),
+        snapshot="at end (parallel claude: interrupted)",
+        reason="interrupted by the operator (Ctrl+C)")
+    assert out.count(parallel.INTERRUPT_ANNOUNCEMENT.strip()) == 1, (
+        f"the interrupt was not heard exactly once:\n{out}")
+
+
+def test_ctrl_c_during_a_normal_ending_s_exit_push_exits_130(
+        tmp_path, monkeypatch, capsys, loaded_mailbox):
+    """Ctrl+C in `end_run`'s exit push ends the run the way Ctrl+C does elsewhere.
+
+    `close_run` gives up the push, keeps the rest, and raises the interrupt on;
+    `end_run` used to let it out as a bare KeyboardInterrupt, the one door of
+    either runner that did not record the interrupt and exit 130.
+    """
+    pushes = []
+
+    def ctrl_c_in_the_push(policy, project_dir, abort=None):
+        pushes.append((policy, project_dir))
+        raise KeyboardInterrupt
+
+    def succeeds(*args, **kwargs):
+        loaded_mailbox.submit(NOTE)
+        return 0
+
+    monkeypatch.setattr(runlifecycle, "final_git_push", ctrl_c_in_the_push)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", succeeds)
+    driver = _OneCommandDriver()
+
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
+                               app_name="pytest-abnormal", wait_on_start=False)
+    except KeyboardInterrupt:
+        pytest.fail("the Ctrl+C left end_run as a bare KeyboardInterrupt")
+
+    assert exit_info.value.code == 130
+    _assert_closed_down(
+        pushes, driver.limit_policy, capsys, str(tmp_path),
+        snapshot="at end (claude)",
         reason="interrupted by the operator (Ctrl+C)")
 
 

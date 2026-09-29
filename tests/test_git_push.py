@@ -56,15 +56,24 @@ class _FakeGitModule:
     `pushed` fires on each `git push`. The parallel pin needs it: its pusher
     runs on a thread of its own, and the only way to know it has taken a turn
     without guessing at a sleep is to wait for the push itself.
+
+    `Popen` is the exit push's way in (a push with a `PushAbort` starts its
+    child under the abort's lock, see `gitpush._run_git`): the call is made,
+    and recorded, by `run` from the process's `communicate` — i.e. after the
+    start, outside the lock, where a real git call spends its time.
     """
 
     PIPE = subprocess.PIPE
     STDOUT = subprocess.STDOUT
     TimeoutExpired = subprocess.TimeoutExpired
+    CompletedProcess = subprocess.CompletedProcess
 
     def __init__(self):
         self.calls = []
         self.pushed = threading.Event()
+
+    def Popen(self, argv, **kwargs):
+        return _FakeProcess(self, argv, kwargs)
 
     def run(self, argv, **kwargs):
         self.calls.append((tuple(argv), kwargs.get("cwd")))
@@ -86,6 +95,30 @@ class _FakeGitModule:
         left every pin in this file green.
         """
         return [call for call in self.calls if call[0][:2] == ("git", "push")]
+
+
+class _FakeProcess:
+    """What `_FakeGitModule.Popen` starts: `communicate` makes the call."""
+
+    def __init__(self, git, argv, kwargs):
+        self._git = git
+        self._argv = argv
+        self._kwargs = kwargs
+        self.returncode = None
+
+    def communicate(self, timeout=None):
+        done = self._git.run(self._argv, timeout=timeout, **self._kwargs)
+        self.returncode = done.returncode
+        return done.stdout, None
+
+    def kill(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 # The runs below push under this policy: every branch of it that runs git at all
@@ -602,8 +635,88 @@ def test_ctrl_c_while_the_exit_push_is_waited_for_gives_up_the_push_only(
         f"Ctrl+C cost the closing usage snapshot: {policy.snapshots}")
     out = capsys.readouterr().out
     assert "the exit push is abandoned" in out
+    assert "final git push on exit" not in out, \
+        "the abandoned exit push still announced a push it was not going to make"
     assert "undelivered operator note" in out and NOTE in out, \
         "Ctrl+C cost the report of the notes nobody delivered"
+
+
+def test_ctrl_c_during_the_exit_push_announcement_starts_no_push(
+        tmp_path, monkeypatch):
+    """An abort heard while the push prints its announcement stops the push.
+
+    The announcement sits between the count and the push and can block on a
+    stalled console; the abort was asked before it, so a Ctrl+C heard during
+    it still let `git push` start. Staged: the print is held, the abort set,
+    the print let go.
+    """
+    fake = _FakeGitModule()
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    announcing = threading.Event()
+    let_print = threading.Event()
+
+    def held_print(*args, **kwargs):
+        if args and "final git push on exit" in str(args[0]):
+            announcing.set()
+            let_print.wait(timeout=HELD_PUSH_TIMEOUT_S)
+
+    monkeypatch.setattr(gitpush, "print", held_print, raising=False)
+    abort = gitpush.PushAbort()
+    root = root_not_cwd(tmp_path)
+    pusher = threading.Thread(
+        target=gitpush.final_git_push,
+        args=(gitpush.GitPushPolicy(PUSHING), root), kwargs={"abort": abort},
+        name="pusher", daemon=True)
+    pusher.start()
+    try:
+        assert announcing.wait(timeout=HELD_PUSH_TIMEOUT_S), \
+            "the exit push never announced itself — nothing staged"
+        abort.set()
+    finally:
+        let_print.set()
+    pusher.join(timeout=HELD_PUSH_TIMEOUT_S)
+
+    assert not pusher.is_alive(), "the exit push never returned"
+    assert [argv[:2] for argv, _ in fake.calls] == [("git", "rev-list")], (
+        f"git started after the push was abandoned: {fake.calls}")
+
+
+def test_an_abort_waits_out_a_git_start_in_progress():
+    """`PushAbort.set` returns only once no start can follow it.
+
+    "Is it set? then start" is two steps; a `set` between them would return
+    while a child was still about to start. The start is held in the middle
+    here, and `set` must not return until it is over.
+    """
+    abort = gitpush.PushAbort()
+    spawning = threading.Event()
+    let_spawn = threading.Event()
+    order = []
+
+    def spawn():
+        spawning.set()
+        let_spawn.wait(timeout=HELD_PUSH_TIMEOUT_S)
+        order.append("child started")
+        return "the child"
+
+    starter = threading.Thread(target=abort.start, args=(spawn,), daemon=True)
+    setter = threading.Thread(
+        target=lambda: (abort.set(), order.append("set returned")), daemon=True)
+    starter.start()
+    try:
+        assert spawning.wait(timeout=HELD_PUSH_TIMEOUT_S), "the start never ran"
+        setter.start()
+        # A `set` that does not wait returns inside this; one that does is
+        # still waiting at its end. Only the failing case depends on it.
+        setter.join(timeout=CTRL_C_SETTLE_S)
+    finally:
+        let_spawn.set()
+    starter.join(timeout=HELD_PUSH_TIMEOUT_S)
+    setter.join(timeout=HELD_PUSH_TIMEOUT_S)
+
+    assert order == ["child started", "set returned"], (
+        f"set returned while a git start was still in progress: {order}")
+    assert abort.start(lambda: pytest.fail("a start after set ran")) is None
 
 
 # How long the Ctrl+C pin below stretches the run's wind-down (the console's

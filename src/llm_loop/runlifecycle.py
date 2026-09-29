@@ -39,7 +39,6 @@ rather than to tidy it:
 
 import os
 import sys
-import threading
 import traceback
 from typing import Any, Iterable, NamedTuple, Optional, Tuple
 
@@ -49,6 +48,7 @@ from .gitpush import (
     GIT_PUSH_POLICY,
     GIT_PUSH_SETTING,
     GitPushPolicy,
+    PushAbort,
     final_git_push,
 )
 from .ownership import OwnerThread
@@ -402,7 +402,7 @@ def close_run(ctx: RunContext, *,
     or the runner body, `driver.final_summary` included — the parallel runner's
     `finally` closes only its console and its pusher.
     """
-    abort = threading.Event()
+    abort = PushAbort()
 
     def exit_push():
         final_git_push(ctx.settings.git_push, projectroot.project_dir(),
@@ -483,6 +483,12 @@ def _wait_for_exit_push(pusher: OwnerThread, push) -> None:
         pass
 
 
+# What the exit record says about a run the operator ended with Ctrl+C, from
+# either door of the epilogue (see `end_run`, and `parallel.run_parallel`'s
+# interrupt branch).
+INTERRUPTED_REASON = "interrupted by the operator (Ctrl+C)"
+
+
 def end_run(ctx: RunContext, result: RunResult, *,
             usages: Iterable[Optional[RunUsage]],
             mailbox=None,
@@ -495,15 +501,26 @@ def end_run(ctx: RunContext, result: RunResult, *,
     The reason is RECORDED rather than printed: a wrapper may call several
     runners, the `=== run ended: … ===` line belongs to the process, so the last
     reason set wins and exitlog prints it on the way out.
+
+    A Ctrl+C that abandoned the exit push (`close_run` raises it on once its
+    housekeeping is done) ends the run the way Ctrl+C ends it everywhere else
+    in both runners: INTERRUPTED_REASON recorded, `sys.exit(130)`. It used to
+    leave as a bare KeyboardInterrupt — a traceback, and an exit code of the
+    interpreter's choosing (0xC000013A on Windows) — from this one door only.
     """
     reason = result.reason
+    interrupted = False
     try:
         close_run(ctx, usages=usages, mailbox=mailbox, pusher=pusher)
+    except KeyboardInterrupt:
+        interrupted = True
     finally:
-        # Recorded whether or not the housekeeping got through: a Ctrl+C that
-        # abandoned the exit push is raised on from `close_run`, and the
-        # excepthook then records it over this — the last reason set wins.
+        # Recorded whether or not the housekeeping got through; an exception
+        # out of it is recorded over this by the excepthook.
         exitlog.set_reason(
-            stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
+            INTERRUPTED_REASON if interrupted
+            else stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
             iterations=result.attempted, completed=result.completed)
+    if interrupted:
+        sys.exit(130)
     return result
