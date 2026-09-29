@@ -66,7 +66,8 @@ def test_slow_paint_does_not_block_input_and_eventually_shows_the_latest_note():
             reader.join(timeout=budget)
 
         frame = terminal.wait_for_frame(
-            lambda frame: frame[-1].endswith("FINAL" + sl.MessagePromptRow.caret))
+            lambda frame: frame[-1].endswith("FINAL" + sl.MessagePromptRow.caret),
+            what="the prompt row ending in the note's last word")
         assert all(textwidth.cell_width(row) < terminal.columns for row in frame)
         # Every key read during the stall took effect once the terminal came back.
         assert app.mode.buffer == text
@@ -99,4 +100,5 @@ def test_restarting_the_same_app_restarts_input_repainting():
     with app:
         for char in "msecond run":
             source.handler(termio.Key(char))
-        terminal.wait_for_frame(lambda frame: frame[-1] == " ✉ second run|")
+        terminal.wait_for_frame(lambda frame: frame[-1] == " ✉ second run|",
+                                what="the second run's typed note")

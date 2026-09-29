@@ -1199,8 +1199,13 @@ def _hold_a_frame(app, terminal):
 
 
 def _shows(text):
-    """A `RecordingTerminal.wait_for_frame` predicate: `text` in any row."""
-    return lambda frame: any(text in row for row in frame)
+    """A `RecordingTerminal.wait_for_frame` predicate: `text` in any row. Its
+    `what` names the wait in the failure message."""
+    def shows(frame):
+        return any(text in row for row in frame)
+
+    shows.what = f"a row containing {text!r}"
+    return shows
 
 
 class _RecordingMode(sl.Mode):

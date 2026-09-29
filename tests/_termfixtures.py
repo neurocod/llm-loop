@@ -75,8 +75,8 @@ class RecordingTerminal(termio.Terminal):
     * `frames` — a queue of the frames painted, each a list of rows with the
       colour codes stripped: for a pin waiting on the painter thread. Only the
       frames the real `paint` accepted — one refused (no region reserved) never
-      reached a screen, so a pin must not read it as shown;
-      A pin waits on it through `wait_for_frame`;
+      reached a screen, so a pin must not read it as shown. A pin waits on it
+      through `wait_for_frame`;
     * `painted` — the same frames as a list, for a pin reading them after;
     * `writers` — the thread behind every reserve, release, title and paint
       call, refused or not, and `releases` the thread behind each release alone;
@@ -108,22 +108,35 @@ class RecordingTerminal(termio.Terminal):
     def arm_stall(self, limit):
         self._stall_limit = limit
 
-    def wait_for_frame(self, predicate, timeout=FRAME_WAIT_S):
+    def wait_for_frame(self, predicate, *, what=None, timeout=FRAME_WAIT_S):
         """Return the first accepted frame `predicate(frame)` holds for.
 
         Takes every frame before it off `frames`, so a second call waits for a
-        LATER frame. Past `timeout` the pin fails here, naming the wait.
+        LATER frame. Past `timeout` the pin fails here with an AssertionError
+        naming the wait — `what`, else the predicate's own `what` attribute
+        (`_shows` sets one) — and the last frame it saw.
+
+        The deadline is checked before every take, not only when the queue runs
+        dry: a painter that keeps repainting a wrong frame keeps the queue full,
+        and a take with items waiting never times out. Pinned by
+        `tests/test_termfixtures.py`.
         """
+        what = what or getattr(predicate, "what", None) or "the awaited frame"
         deadline = time.monotonic() + timeout
+        last = None
         while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
             try:
-                frame = self.frames.get(
-                    timeout=max(0, deadline - time.monotonic()))
+                frame = self.frames.get(timeout=left)
             except queue.Empty:
-                raise AssertionError(
-                    f"no painted frame matched within {timeout:g} s") from None
+                break
             if predicate(frame):
                 return frame
+            last = frame
+        raise AssertionError(f"no painted frame showed {what} within "
+                             f"{timeout:g} s; the last one seen: {last!r}")
 
     def reserve(self, rows):
         self.writers.append(threading.current_thread().name)

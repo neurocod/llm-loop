@@ -725,7 +725,7 @@ def test_a_batchs_cap_edit_reaches_the_claim_loop(tmp_path, monkeypatch):
     The invocation-cap assert guards that this runner uses the prologue's
     registry, not one of its own.
     """
-    _live_statusline(monkeypatch, {})
+    _live_statusline(monkeypatch, {})   # for the live terminal; `made` unread
     made = capture_run_context(monkeypatch)
     edited = threading.Event()
 
