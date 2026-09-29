@@ -1,7 +1,6 @@
 """Exercise the painted editor, including a terminal too slow for each key."""
 
 import threading
-import time
 
 import pytest
 
@@ -66,11 +65,8 @@ def test_slow_paint_does_not_block_input_and_eventually_shows_the_latest_note():
             terminal._lock.release()
             reader.join(timeout=budget)
 
-        deadline = time.monotonic() + budget
-        while True:
-            frame = terminal.frames.get(timeout=max(0, deadline - time.monotonic()))
-            if frame[-1].endswith("FINAL" + sl.MessagePromptRow.caret):
-                break
+        frame = terminal.wait_for_frame(
+            lambda frame: frame[-1].endswith("FINAL" + sl.MessagePromptRow.caret))
         assert all(textwidth.cell_width(row) < terminal.columns for row in frame)
         # Every key read during the stall took effect once the terminal came back.
         assert app.mode.buffer == text
@@ -103,9 +99,4 @@ def test_restarting_the_same_app_restarts_input_repainting():
     with app:
         for char in "msecond run":
             source.handler(termio.Key(char))
-        # 3.36 s measured for the entire focused suite on 2026-09-15.
-        deadline = time.monotonic() + 15.0
-        while True:
-            frame = terminal.frames.get(timeout=max(0, deadline - time.monotonic()))
-            if frame[-1] == " ✉ second run|":
-                break
+        terminal.wait_for_frame(lambda frame: frame[-1] == " ✉ second run|")

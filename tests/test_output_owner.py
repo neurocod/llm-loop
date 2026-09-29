@@ -29,7 +29,8 @@ from _runfixtures import (MemListDriver, isolated_run, par_args,
                           record_exit_pushes)
 from _termfixtures import KeysByHand, RecordingTerminal
 
-# Upper bound on every wait below, and on every painter stall a pin arms (so a
+# Upper bound on every wait below but the frame waits (those take
+# `_termfixtures.FRAME_WAIT_S`), and on every painter stall a pin arms (so a
 # pin that fails by hanging still ends). Each wait is a handshake a healthy run
 # completes at once, so only a broken owner ever gets near it. 0.49 s for this
 # whole file, measured 2026-09-25 — the bound is many times that.
@@ -1197,12 +1198,9 @@ def _hold_a_frame(app, terminal):
     assert terminal.stalled.wait(WAIT_S)
 
 
-def _wait_for_frame(terminal, text):
-    """Return once a painted frame shows `text` (raises queue.Empty past WAIT_S)."""
-    deadline = time.monotonic() + WAIT_S
-    while not any(text in row for row in terminal.frames.get(
-            timeout=max(0, deadline - time.monotonic()))):
-        pass
+def _shows(text):
+    """A `RecordingTerminal.wait_for_frame` predicate: `text` in any row."""
+    return lambda frame: any(text in row for row in frame)
 
 
 class _RecordingMode(sl.Mode):
@@ -1233,7 +1231,7 @@ def test_while_started_only_the_painter_writes_the_terminal():
         for thread in feeders:
             thread.join(WAIT_S)
         app.note("the LAST note")
-        _wait_for_frame(terminal, "the LAST note")
+        terminal.wait_for_frame(_shows("the LAST note"))
         writers = set(terminal.writers)
 
     assert writers == {sl.PAINTER_THREAD_NAME}
@@ -1315,7 +1313,7 @@ def test_the_painter_calls_the_apps_methods_as_they_are_now():
                        refresh=60)
     app.render = lambda width=None, now=None: ["patched render"]
     with app:
-        _wait_for_frame(terminal, "patched render")
+        terminal.wait_for_frame(_shows("patched render"))
 
 
 def test_stop_leaves_the_release_to_a_painter_stuck_in_its_frame(monkeypatch):
@@ -1376,7 +1374,7 @@ def test_a_restart_after_a_timed_out_stop_keeps_the_one_painter(monkeypatch):
         # Waited for, behind the old frame, the old release and the new region.
         app.handle_event(termio.Resize(terminal.columns, terminal.lines))
         app.update(iteration=2)
-        _wait_for_frame(terminal, "iter 2")
+        terminal.wait_for_frame(_shows("iter 2"))
         assert app.painter.thread is old, "the restart started a second painter"
         assert set(terminal.writers) == {sl.PAINTER_THREAD_NAME}
         # The old stop's release ran before the new region was pinned.
@@ -1564,7 +1562,7 @@ def test_a_burst_behind_a_stuck_frame_is_one_request_and_one_frame_of_its_end():
             queued = app.painter.backlog
         finally:
             terminal.unstall.set()
-        _wait_for_frame(terminal, "iter 999999")
+        terminal.wait_for_frame(_shows("iter 999999"))
         frames = len(terminal.painted) - before
         flag = app.painter.frame_requested
 
@@ -1584,7 +1582,7 @@ def test_a_frame_request_lost_before_the_queue_does_not_stop_the_frames():
         # As that poster left it: a state no public call leaves behind.
         app.painter._frame_posted = True
         app.update(iteration=7)
-        _wait_for_frame(terminal, "iter 7")
+        terminal.wait_for_frame(_shows("iter 7"))
 
 
 class _StartStopInput(termio.NullInputSource):

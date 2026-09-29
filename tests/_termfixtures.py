@@ -10,12 +10,21 @@ import io
 import queue
 import re
 import threading
+import time
 
 from llm_loop import termio
 from llm_loop.statusline import PAINTER_THREAD_NAME
 
 # A frame is recorded as the rows a reader sees, so a pin can compare text.
 _SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+# How long `RecordingTerminal.wait_for_frame` waits for the frame a pin expects.
+# A healthy painter shows it within a frame or two, so only a broken one gets
+# near this: the longest of the 21 waits over three runs of the eight painter
+# and runner test files was 0.047 s, measured 2026-09-29. Kept at the larger of
+# the two budgets it replaces (10 s and 15 s), since a red that means no
+# defect costs more than a slow one that does.
+FRAME_WAIT_S = 15.0
 
 
 class KeysByHand(termio.NullInputSource):
@@ -67,6 +76,7 @@ class RecordingTerminal(termio.Terminal):
       colour codes stripped: for a pin waiting on the painter thread. Only the
       frames the real `paint` accepted — one refused (no region reserved) never
       reached a screen, so a pin must not read it as shown;
+      A pin waits on it through `wait_for_frame`;
     * `painted` — the same frames as a list, for a pin reading them after;
     * `writers` — the thread behind every reserve, release, title and paint
       call, refused or not, and `releases` the thread behind each release alone;
@@ -97,6 +107,23 @@ class RecordingTerminal(termio.Terminal):
 
     def arm_stall(self, limit):
         self._stall_limit = limit
+
+    def wait_for_frame(self, predicate, timeout=FRAME_WAIT_S):
+        """Return the first accepted frame `predicate(frame)` holds for.
+
+        Takes every frame before it off `frames`, so a second call waits for a
+        LATER frame. Past `timeout` the pin fails here, naming the wait.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                frame = self.frames.get(
+                    timeout=max(0, deadline - time.monotonic()))
+            except queue.Empty:
+                raise AssertionError(
+                    f"no painted frame matched within {timeout:g} s") from None
+            if predicate(frame):
+                return frame
 
     def reserve(self, rows):
         self.writers.append(threading.current_thread().name)
