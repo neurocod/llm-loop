@@ -26,6 +26,7 @@ module has no business assuming which one.
 
 from enum import Enum
 import subprocess
+import sys
 import threading
 import time
 from typing import Callable, Optional
@@ -99,6 +100,34 @@ class PushAbort:
             return spawn()
 
 
+# Which of `subprocess.run`'s two reapings after a timeout applies (see
+# `_reap_killed`). A module constant so a test can take the other branch.
+_WINDOWS = sys.platform == "win32"
+
+
+def _reap_killed(proc: "subprocess.Popen") -> None:
+    """Collect a child `_run_git` has just killed on its timeout — without bound
+    only where that cannot outlive the child.
+
+    `subprocess.run`'s own split (CPython 3.9-3.14 alike): on POSIX a `wait()`,
+    never a second `communicate()`. The pipe's EOF is not the child's: a hook
+    or credential helper git started inherits its stdout and holds it open
+    after the kill, and an unbounded read for that EOF outlives the 30/300 s
+    timeout by as long as the descendant likes. POSIX `communicate` reads in
+    this thread, so nothing is left reading once it has raised.
+
+    On Windows the timed-out `communicate` leaves its reader threads blocked
+    in the pipe, and closing the pipe under them (`Popen.__exit__`) is not
+    safe; the second `communicate()` joins them, as `subprocess.run` does
+    there. A descendant holding the pipe then holds this too — the same bound
+    `subprocess.run`, and so the push without an abort, has on Windows.
+    """
+    if _WINDOWS:
+        proc.communicate()
+    else:
+        proc.wait()
+
+
 def _run_git(argv, cwd: str, timeout: float,
              abort: Optional[PushAbort] = None
              ) -> "Optional[subprocess.CompletedProcess]":
@@ -121,7 +150,7 @@ def _run_git(argv, cwd: str, timeout: float,
             out, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.communicate()
+            _reap_killed(proc)
             raise
         except BaseException:
             proc.kill()

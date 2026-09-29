@@ -16,7 +16,10 @@ directory git was actually handed, never merely that a push happened.
 """
 
 import _thread
+import os
+import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -717,6 +720,128 @@ def test_an_abort_waits_out_a_git_start_in_progress():
     assert order == ["child started", "set returned"], (
         f"set returned while a git start was still in progress: {order}")
     assert abort.start(lambda: pytest.fail("a start after set ran")) is None
+
+
+class _TimingOutProcess:
+    """A git child whose `communicate(timeout=...)` times out; records the rest."""
+
+    def __init__(self, argv):
+        self.argv = argv
+        self.returncode = None
+        self.steps = []
+
+    def communicate(self, timeout=None):
+        if timeout is not None:
+            self.steps.append("communicate(timeout)")
+            raise subprocess.TimeoutExpired(self.argv, timeout)
+        self.steps.append("communicate")
+        return "", None
+
+    def kill(self):
+        self.steps.append("kill")
+
+    def wait(self, timeout=None):
+        self.steps.append("wait")
+        return -9
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.parametrize("windows, reaped_by", [(False, "wait"),
+                                                (True, "communicate")],
+                         ids=["posix", "windows"])
+def test_a_timed_out_git_is_reaped_the_way_subprocess_run_does(
+        monkeypatch, windows, reaped_by):
+    """After the kill: POSIX waits for the child, Windows drains the pipe.
+
+    A second `communicate()` on POSIX waits for the pipe's EOF, and a hook or
+    credential helper that inherited git's stdout holds that open past the
+    kill — the 30/300 s timeout then bounds nothing. Both branches are pinned
+    on every host through a stand-in process; the real descendant is staged
+    below, where the platform allows it.
+    """
+    made = []
+
+    class _Git:
+        PIPE = subprocess.PIPE
+        STDOUT = subprocess.STDOUT
+        TimeoutExpired = subprocess.TimeoutExpired
+        CompletedProcess = subprocess.CompletedProcess
+
+        @staticmethod
+        def Popen(argv, **kwargs):
+            made.append(_TimingOutProcess(argv))
+            return made[-1]
+
+    monkeypatch.setattr(gitpush, "subprocess", _Git)
+    monkeypatch.setattr(gitpush, "_WINDOWS", windows)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        gitpush._run_git(["git", "push"], ".", 300, gitpush.PushAbort())
+
+    [proc] = made
+    assert proc.steps == ["communicate(timeout)", "kill", reaped_by], (
+        f"the killed git was not reaped as subprocess.run reaps it: {proc.steps}")
+
+
+# The descendant pin's timeout, and how long it lets `_run_git` take to come
+# back from it. NOT measured: no POSIX host among the project's machines
+# (2026-09-29), and on Windows the pin is skipped. Wide by construction
+# instead: the child needs one interpreter start to spawn its descendant
+# before GIT_TIMEOUT_S, and the healthy return after it is a kill and a
+# wait; only the failing case (the unbounded read) waits out RETURN_BOUND_S,
+# and DESCENDANT_SLEEP_S keeps that case hanging past it.
+GIT_TIMEOUT_S = 5.0
+RETURN_BOUND_S = 60.0
+DESCENDANT_SLEEP_S = 300
+
+_HOLDS_THE_PIPE = (
+    "import subprocess, sys, time\n"
+    "held = subprocess.Popen([sys.executable, '-c',\n"
+    "                         'import time; time.sleep(%d)'])\n"
+    "with open(sys.argv[1], 'w') as f:\n"
+    "    f.write(str(held.pid))\n"
+    "time.sleep(%d)\n" % (DESCENDANT_SLEEP_S, DESCENDANT_SLEEP_S))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason=(
+    "Windows drains the pipe after the kill, as subprocess.run does there: a "
+    "descendant holding it holds the reap too, and there is no bound to pin"))
+def test_a_timed_out_git_returns_although_a_descendant_holds_its_stdout(
+        tmp_path):
+    """The kill ends git, not the hook git started: its end must not be awaited."""
+    pid_file = tmp_path / "descendant.pid"
+    argv = [sys.executable, "-c", _HOLDS_THE_PIPE, str(pid_file)]
+    outcome = []
+
+    def run():
+        try:
+            gitpush._run_git(argv, str(tmp_path), GIT_TIMEOUT_S,
+                             gitpush.PushAbort())
+        except subprocess.TimeoutExpired:
+            outcome.append("timed out")
+
+    caller = threading.Thread(target=run, daemon=True)
+    caller.start()
+    try:
+        caller.join(timeout=GIT_TIMEOUT_S + RETURN_BOUND_S)
+        returned = not caller.is_alive()
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+
+    assert pid_file.exists(), (
+        "the descendant never started before the timeout — nothing staged")
+    assert returned, ("the timed-out git was reaped by waiting for a pipe its "
+                      "descendant still holds")
+    assert outcome == ["timed out"]
 
 
 # How long the Ctrl+C pin below stretches the run's wind-down (the console's
