@@ -437,6 +437,66 @@ def test_finish_does_not_wait_for_a_stalled_write_forever(tmp_path, monkeypatch)
         f"the closing line was lost or printed twice: {lines}")
 
 
+class _SignalInsideSet:
+    """Stands in for a record's `_done`: a signal's `finish` lands inside `set`.
+
+    `threading.Event.set` holds the Event's own lock, which is not reentrant,
+    while it notifies; a termination signal's handler runs `finish` on the
+    main thread right there. The lock here is a plain one too, taken with a
+    bound instead of for ever: `deadlocked` is whether a `set` found it held
+    by the thread already inside one — the real Event hangs there.
+    """
+
+    def __init__(self, record):
+        self._real = record._done       # the one the heartbeat waits on
+        self._lock = threading.Lock()
+        self._record = record
+        self.deadlocked = False
+
+    def set(self):
+        if not self._lock.acquire(timeout=REENTRY_BOUND_S):
+            self.deadlocked = True
+            return
+        try:
+            self._real.set()
+            record, self._record = self._record, None
+            if record is not None:
+                record.finish()         # the handler, mid-notification
+        finally:
+            self._lock.release()
+
+    def wait(self, timeout=None):
+        return self._real.wait(timeout)
+
+    def is_set(self):
+        return self._real.is_set()
+
+
+# How long `_SignalInsideSet` lets a reentrant `set` wait before calling it a
+# deadlock. Only the failing case waits it out: a healthy re-entry never asks.
+REENTRY_BOUND_S = 1.0
+
+
+def test_a_signal_s_finish_inside_the_heartbeat_s_wakeup_does_not_deadlock(
+        tmp_path, monkeypatch):
+    """A finish re-entered during `_done.set()` must not set it again."""
+    record = _record(tmp_path, monkeypatch)
+    lines = []
+    record._echo = lines.append
+    done = _SignalInsideSet(record)
+    record._done = done
+
+    record.finish()
+
+    assert not done.deadlocked, (
+        "the re-entered finish set the heartbeat's Event again from inside "
+        "its own set — on the real Event that waits for ever")
+    assert done.is_set(), "the heartbeat was never told the record ended"
+    assert len(lines) == 1 and "=== run ended" in lines[0], (
+        f"the closing line was lost or printed twice: {lines}")
+    assert not record.path.exists()
+
+
 def test_an_older_snapshot_never_overwrites_a_newer_one(tmp_path, monkeypatch):
     """The payload is built before the file lock is taken; the older one loses.
 

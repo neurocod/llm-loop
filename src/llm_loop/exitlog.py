@@ -279,6 +279,12 @@ class RunRecord:
         """
         locked = self._file_lock.acquire(timeout=FINISH_WAIT_S)
         try:
+            # Only the finish that ENDS the record wakes the heartbeat. A
+            # signal handler's `finish` can land on the main thread inside
+            # this very `_done.set()`, holding the Event's lock — which is not
+            # reentrant, so a second `set` there waits on itself for ever. The
+            # flag goes up before the `set`, so the handler finds it up.
+            first = not self._finished
             self._finished = True
             if reason:
                 self._reason = reason
@@ -288,7 +294,8 @@ class RunRecord:
         finally:
             if locked:
                 self._file_lock.release()
-        self._done.set()
+        if first:
+            self._done.set()
         if not announce:
             return
         reason = self._reason or "process exit (reason not recorded)"
