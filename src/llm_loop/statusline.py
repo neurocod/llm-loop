@@ -1897,8 +1897,9 @@ class WeeklyLimitAction(Action):
 
 
 class Setting:
-    """ONE editable knob: the single source of truth for the limit editor AND for
-    the reproducing command line.
+    """ONE editable knob: the single source of truth for the pinned row AND for
+    the reproducing command line. Edited through `set`/`nudge` — by the pins
+    today; no status-line key edits a knob yet.
 
     `flag` is the canonical CLI spelling `cmdline.FLAG_ALIASES` speaks, which is
     what lets `SettingsRegistry.overrides()` be handed straight to
@@ -2745,8 +2746,13 @@ class Painter:
 
 class StatusApp:
     """Owns the Layout, the input, the Mode stack, the Actions, the
-    SettingsRegistry, the LoopStatus and the `Painter` — which owns the
-    Terminal and the repaint thread.
+    LoopStatus and the `Painter` — which owns the Terminal and the repaint
+    thread.
+
+    It holds no knob registry: the run's knobs live on `RunContext.registry`
+    (`runlifecycle.knob_registry`), and the app only shows them, through
+    `update(script_limits=...)`. There is no key that edits them yet; an
+    editor for them would take the registry here again.
 
     Public surface the loops use: start()/stop() (or `with`), update(**fields),
     note(text), register_action(a), job(job_id). `painter` is exposed for the
@@ -2758,13 +2764,11 @@ class StatusApp:
                  terminal: Optional[termio.Terminal] = None,
                  input_source: Optional[termio.InputSource] = None,
                  layout: Optional[Layout] = None,
-                 registry: Optional[SettingsRegistry] = None,
                  messages=None,
                  enabled: bool = True, refresh: float = REFRESH_SECONDS,
                  stop_file: Optional[str] = None,
                  default_actions: bool = True):
         self.status = status or LoopStatus()
-        self.registry = registry or SettingsRegistry()
         # This run's operator.Mailbox/MailboxSet, or None when there is nobody to
         # address (a dry run). Registering the key on the same condition keeps
         # the legend from offering what it cannot do.

@@ -96,6 +96,26 @@ def _close_mirror_handlers():
             logger.removeHandler(handler)
 
 
+def capture_run_context(monkeypatch) -> dict:
+    """Hand the pin the run's own `RunContext` as `made["ctx"]`, once the
+    shared prologue (`runlifecycle.begin_run`) has built it.
+
+    The seam for a pin that edits a knob mid-run: `ctx.registry` is the one
+    registry whose setters write the run's `RunSettings`, so an edit through it
+    is an edit the runner has to see. Wrapped rather than replaced, so the run
+    goes through the real prologue.
+    """
+    made = {}
+    real_begin_run = runlifecycle.begin_run     # captured before the patch
+
+    def _begin_run(*args, **kwargs):
+        made["ctx"] = real_begin_run(*args, **kwargs)
+        return made["ctx"]
+
+    monkeypatch.setattr(runlifecycle, "begin_run", _begin_run)
+    return made
+
+
 def record_exit_pushes(monkeypatch) -> list:
     """Record every call to the EXIT push, and stop it reaching git.
 

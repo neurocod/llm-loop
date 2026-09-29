@@ -20,10 +20,10 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, gitpush, parallel, statusline
+from llm_loop import cyclecore, gitpush, parallel
 
-from _runfixtures import (MemListDriver, OneShotDriver, isolated_run, par_args,
-                          root_not_cwd, seq_args)
+from _runfixtures import (MemListDriver, OneShotDriver, capture_run_context,
+                          isolated_run, par_args, root_not_cwd, seq_args)
 
 
 @pytest.fixture(autouse=True)
@@ -211,26 +211,6 @@ def test_the_parallel_pusher_pushes_the_project_it_was_pointed_at(
         f"the parallel pusher pushed the wrong repository: {fake.calls}"
 
 
-def _capture_status_app(monkeypatch) -> dict:
-    """Hand the test the run's own StatusApp, and with it the knob registry.
-
-    Through the seam a run already has — `app.registry` is the registry the
-    status app is handed, i.e. `ctx.registry` — rather than by replacing
-    `runlifecycle.knob_registry`, so the pin edits the very registry whose
-    setters write the run's RunSettings. `test_parallel_statusline` reaches it
-    the same way.
-    """
-    made = {}
-    real_app_class = statusline.StatusApp        # captured before the patch
-
-    def _app(**kwargs):
-        made["app"] = real_app_class(**kwargs)
-        return made["app"]
-
-    monkeypatch.setattr(statusline, "StatusApp", _app)
-    return made
-
-
 def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
     """`--git-push` is an editable knob in BOTH runners, not only the sequential one.
 
@@ -246,14 +226,14 @@ def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
     a run that read the policy after the edit rather than before it.
     """
     fake = _FakeGitModule()
-    made = _capture_status_app(monkeypatch)
+    made = capture_run_context(monkeypatch)
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
     saw_push = []
 
     def edit_the_knob_then_wait(job_id, command, mailbox=None):
-        # The run's own knob registry (`ctx.registry`, handed to the app).
-        made["app"].registry.get(gitpush.GIT_PUSH_SETTING).set("after_new_commits")
+        # The run's own knob registry, whose setters write its RunSettings.
+        made["ctx"].registry.get(gitpush.GIT_PUSH_SETTING).set("after_new_commits")
         saw_push.append(fake.pushed.wait(timeout=PUMP_WAIT_S))
         return 0, None, None
 

@@ -418,7 +418,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     provider, spec = ctx.provider, ctx.spec
     progress = ctx.progress
     # The live knobs (see RunSettings): read where they are USED, never
-    # snapshotted into locals, so the status line's editor can move them mid-run.
+    # snapshotted into locals, so an edit through `ctx.registry` moves them mid-run.
     run_settings = ctx.settings
     # A finite cap at launch disables automatic quota waits and background
     # polling even if the live cap changes later. Provider quota support is

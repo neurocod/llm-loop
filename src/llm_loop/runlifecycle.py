@@ -254,7 +254,6 @@ def open_status(ctx: RunContext, driver, *, job_count: int,
         progress.note_remaining(total)
     app = statusline.StatusApp(
         status=statusline.LoopStatus(jobs=progress.jobs(job_count)),
-        registry=ctx.registry,
         messages=messages,
         enabled=ctx.status_enabled)
     app.update(

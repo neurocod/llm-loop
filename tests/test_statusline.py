@@ -27,7 +27,7 @@ from llm_loop import (console, cyclecore, ownership, projectroot,
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
-from _runfixtures import isolated_run, seq_args
+from _runfixtures import capture_run_context, isolated_run, seq_args
 from _termfixtures import LiveTerminal
 
 
@@ -1470,19 +1470,19 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
     comparing against a local it snapshotted at startup."""
     from llm_loop.agentwork import AgentCommand, Driver
 
+    made = capture_run_context(monkeypatch)
+
     class _RaisesItsOwnCap(Driver):
-        app = None
         calls = 0
 
         def next_command(self):
             self.calls += 1
             if self.calls == 1:
-                self.app.registry.get("max-runs").set(2)
+                made["ctx"].registry.get("max-runs").set(2)
             return AgentCommand("do the thing", "", f"item-{self.calls}")
 
     driver = _RaisesItsOwnCap()
-    app, _source = _run_with_status(monkeypatch, tmp_path, driver,
-                                    on_app=lambda a: setattr(driver, "app", a))
+    app, _source = _run_with_status(monkeypatch, tmp_path, driver)
 
     assert driver.calls == 2                          # the raised cap took effect
     # An edited cap shows up as the counter's denominator — the one place it is

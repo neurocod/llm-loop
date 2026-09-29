@@ -21,8 +21,8 @@ from llm_loop import cyclecore, parallel, runlifecycle, stopchannel
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
-from _runfixtures import (MemListDriver, NoWorkDriver, isolated_run, par_args,
-                          seq_args)
+from _runfixtures import (MemListDriver, NoWorkDriver, capture_run_context,
+                          isolated_run, par_args, seq_args)
 from _termfixtures import LiveTerminal
 
 
@@ -725,13 +725,14 @@ def test_a_batchs_cap_edit_reaches_the_claim_loop(tmp_path, monkeypatch):
     The invocation-cap assert guards that this runner uses the prologue's
     registry, not one of its own.
     """
-    made = _live_statusline(monkeypatch, {})
+    _live_statusline(monkeypatch, {})
+    made = capture_run_context(monkeypatch)
     edited = threading.Event()
 
     def raise_the_cap_from_the_first_file(job_id, command, mailbox=None):
         if not edited.is_set():
             edited.set()
-            made["app"].registry.get("max-runs").set(3)
+            made["ctx"].registry.get("max-runs").set(3)
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", raise_the_cap_from_the_first_file)
