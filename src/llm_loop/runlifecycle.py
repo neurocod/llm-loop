@@ -378,7 +378,7 @@ def close_run(ctx: RunContext, *,
     which has nothing to exclude) the push is made here, on the caller. The
     policy is read AT the push, off the live settings, either way. On the pusher
     a push that raises is reported with its traceback on stderr and the
-    housekeeping below still runs; made here it propagates, as it always has.
+    housekeeping below still runs; made here it propagates.
 
     Ctrl+C while the exit push is waited for — on the pusher or here — gives
     up the push, not the housekeeping: see the body for the order, and
@@ -504,9 +504,9 @@ def end_run(ctx: RunContext, result: RunResult, *,
 
     A Ctrl+C that abandoned the exit push (`close_run` raises it on once its
     housekeeping is done) ends the run the way Ctrl+C ends it everywhere else
-    in both runners: INTERRUPTED_REASON recorded, `sys.exit(130)`. It used to
-    leave as a bare KeyboardInterrupt — a traceback, and an exit code of the
-    interpreter's choosing (0xC000013A on Windows) — from this one door only.
+    in both runners: INTERRUPTED_REASON recorded, `sys.exit(130)`. Let out
+    bare, the KeyboardInterrupt would leave a traceback and an exit code of the
+    interpreter's choosing (0xC000013A on Windows) from this one door only.
     """
     reason = result.reason
     interrupted = False
