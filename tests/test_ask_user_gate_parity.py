@@ -297,40 +297,61 @@ def test_run_closes_stdin_of_what_it_starts():
     assert result.stdout.strip() == "''", result.stdout + result.stderr
 
 
-def test_port_options_are_the_reference_options():
-    """The port's kOptions is a hand copy of the reference's option strings.
+def _build_module():
+    """cpp/build.py, loaded by path; importing it builds nothing."""
+    spec = importlib.util.spec_from_file_location(
+        "ask_user_gate_build", os.path.join(PLUGIN, "cpp", "build.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    Read from the source, so it bites on every checkout: the behavioural pin
-    (parity_check's per-option ARGV_CASES rows) needs the binary, and an option
-    added to the script alone would otherwise stay unknown to the port -- a
-    usage error there, a verdict here -- until someone built it.
+
+def test_port_options_are_generated_from_the_reference():
+    """The committed kOptions.inc is what cpp/build.py writes, line for line
+    (text mode: a core.autocrlf checkout holds it with CRLF).
+
+    Bites on every checkout, no compiler needed: an option added to the script
+    alone would otherwise stay unknown to the port -- a usage error there, a
+    verdict here -- until someone built it (parity_check's per-option rows
+    need the binary). And the .cpp must still take its table from the file:
+    a hand-written kOptions beside a fresh, unused .inc would pass the rest.
     """
+    build = _build_module()
+    with open(build.OPTIONS_INC, encoding="utf-8") as handle:
+        committed = handle.read()
+    assert committed == build.options_inc(), (
+        "cpp/kOptions.inc is stale: run `python cpp/build.py` and commit it")
     with open(os.path.join(PLUGIN, "cpp", "ask_user_gate.cpp"),
               encoding="utf-8") as handle:
         source = handle.read()
-    block = re.search(r"constexpr CliOption kOptions\[\] = \{(.*?)\n\};", source,
-                      re.DOTALL)
-    assert block, "kOptions initializer not found in ask_user_gate.cpp"
-    # What the compiler reads: a commented-out entry is no entry.
-    body = re.sub(r"//[^\n]*|/\*.*?\*/", "", block.group(1), flags=re.DOTALL)
-    entry = r'\{\s*"([^"\\]+)"\s*,\s*Arity::(\w+)\s*\}'
-    # Every character is an entry, a comma or whitespace: an entry spelled
-    # some other way fails here instead of dropping out of the comparison.
-    leftover = re.sub(r"[\s,]+", " ", re.sub(entry, "", body)).strip()
-    assert not leftover, (f"kOptions holds something other than "
-                          f"{{\"name\", Arity::X}} entries: {leftover!r}")
-    entries = re.findall(entry, body)
-    names = [name for name, _ in entries]
-    # The port takes the FIRST match, and a second copy of a name makes every
-    # prefix of it ambiguous there -- a dict here would swallow it.
-    duplicates = sorted({name for name in names if names.count(name) > 1})
-    assert not duplicates, f"kOptions repeats {duplicates}"
-    arities = {arity for _, arity in entries}
-    assert arities <= {"None", "Value"}, (
-        f"kOptions uses arities {sorted(arities - {'None', 'Value'})} this "
-        f"test does not know; teach it what they take")
-    port = {name: arity == "Value" for name, arity in entries}
-    assert port == _PARITY.reference_options()
+    assert ('constexpr CliOption kOptions[] = {\n#include "kOptions.inc"\n};'
+            in source)
+
+
+def test_option_generator_refuses_what_the_port_cannot_spell():
+    """nargs other than a flag or one value, and a name a literal cannot hold,
+    stop the build instead of being written as something the port misreads."""
+    build = _build_module()
+    for kwargs in ({"nargs": "?"}, {"nargs": 2}, {"action": "append", "nargs": "*"}):
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--x", **kwargs)
+        with pytest.raises(ValueError, match="nargs="):
+            build.options_inc(parser)
+    parser = argparse.ArgumentParser(add_help=False, prefix_chars="-+")
+    parser.add_argument("+x", action="store_true")
+    with pytest.raises(ValueError, match="cannot be written"):
+        build.options_inc(parser)
+
+
+def test_the_generated_table_is_a_source_of_the_binary(tmp_path):
+    """parity_check refuses a binary older than kOptions.inc, as it does one
+    older than the .cpp: both are compiled in."""
+    old = tmp_path / "gate.exe"
+    old.write_bytes(b"")
+    os.utime(old, (0, 0))
+    stale = _PARITY.newer_sources(str(old))
+    assert _build_module().OPTIONS_INC in stale
+    assert os.path.join(PLUGIN, "cpp", "ask_user_gate.cpp") in stale
 
 
 def _gate_module():

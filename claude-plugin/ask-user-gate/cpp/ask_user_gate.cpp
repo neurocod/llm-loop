@@ -1481,17 +1481,15 @@ given. Exit 1 when a checked command is denied.
 // Pinned by parity_check's ARGV_CASES, per option by its _option_rows.
 
 // One entry per reference option string, with whether it takes a value.
-// tests/test_ask_user_gate_parity.py reads this initializer and compares it with
-// the reference's parser, so keep it one `{"name", Arity::...}` pair per entry.
+// Generated from the reference's build_parser() by cpp/build.py (OPTIONS_INC
+// there says why the file is committed); edit the script, not the .inc.
 enum class Arity { None, Value };
 struct CliOption {
 	std::string_view name;
 	Arity arity;
 };
 constexpr CliOption kOptions[] = {
-	{"-h", Arity::None}, {"--help", Arity::None}, {"--check", Arity::Value},
-	{"--check-file", Arity::Value}, {"--shell", Arity::Value}, {"--tool", Arity::Value},
-	{"--platform", Arity::Value}, {"--self-test", Arity::None},
+#include "kOptions.inc"
 };
 
 // What one argv token is to argparse before anything is done with it.

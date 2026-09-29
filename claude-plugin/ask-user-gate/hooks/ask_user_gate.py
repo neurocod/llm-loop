@@ -1106,8 +1106,9 @@ class _Parser(argparse.ArgumentParser):
 
 
 def build_parser() -> _Parser:
-    """The CLI. Its own function because parity_check reads its option strings:
-    the port's kOptions copies them, and ARGV_CASES gets a row per option."""
+    """The CLI. Its own function because other files read its option strings:
+    cpp/build.py generates the port's kOptions from them, and parity_check's
+    ARGV_CASES gets a row per option."""
     parser = _Parser(
         description="Refuse shell commands that would stop for a human "
                     "permission prompt. Reads a PreToolUse hook payload on "

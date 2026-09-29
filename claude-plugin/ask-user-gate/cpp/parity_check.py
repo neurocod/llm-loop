@@ -376,9 +376,9 @@ ARGV_CASES = [
 def reference_options() -> "dict[str, bool]":
     """Every option string of the reference's CLI -> whether it takes a value.
 
-    The port's kOptions is a hand copy of exactly this; the pytest suite
-    compares the two without a binary, and _option_rows below makes the
-    comparison behavioural where there is one.
+    The port's kOptions is generated from the same parser by cpp/build.py;
+    _option_rows below checks the BUILT binary against this, which catches one
+    compiled from a stale table.
     """
     return {option: action.nargs != 0
             for action in reference.build_parser()._actions
@@ -656,9 +656,13 @@ def newer_sources(exe: str) -> "list[str]":
     that changes the source touches it too, which is right, since the binary
     no longer matches what is checked out. CMakeLists.txt is left out on
     purpose: a change there need not relink, and would read as stale forever.
+    Every .cpp/.inc/.h/.hpp beside this script counts, not a list of names:
+    kOptions.inc is compiled in too, and a file included later must not be
+    forgotten here the way it would be in a list.
     """
     built = os.path.getmtime(exe)
-    sources = [os.path.join(HERE, "ask_user_gate.cpp")]
+    sources = [os.path.join(HERE, name) for name in sorted(os.listdir(HERE))
+               if os.path.splitext(name)[1] in (".cpp", ".inc", ".h", ".hpp")]
     for folder, _, names in os.walk(os.path.join(HERE, "third_party")):
         sources += [os.path.join(folder, name) for name in names]
     return [path for path in sources if os.path.getmtime(path) > built]
