@@ -47,13 +47,18 @@ HEARTBEAT_SECONDS = 30
 # without it. A healthy write (temp file + replace of a ~300-byte record) holds
 # the file lock for 0.4 ms median, 2.8 / 13.2 ms at worst (2000 writes each,
 # measured 2026-09-29 under the home dir); past this the filesystem is taken to
-# be stalled. The bound is what keeps a stalled disk from holding `atexit` and
-# a termination signal's handler (which runs `finish` on the main thread) for as
-# long as the disk likes. Given up on, the write is not lost track of: it
-# checks `_finished` again once it has written, and removes what it wrote (see
-# `_write`) — so the residual risk is only a process that ENDS before that
-# stalled write returns, whose record then stays behind and is reported as a
-# kill by the next launch.
+# be stalled. The guarantee is about the WHOLE of `finish`, not only its lock
+# wait: a `finish` that gives up returns at once and touches neither the
+# filesystem nor the stream — no closing line (it goes through the tee into the
+# mirror log, which lives in the record's own, stalled, directory) and no
+# removal of the record (the same directory). So a stalled disk holds `atexit`
+# and a termination signal's handler (which runs `finish` on the main thread)
+# for FINISH_WAIT_S, never longer. What is skipped is not lost track of: the
+# stalled write checks `_finished` once it has written and removes what it
+# wrote (see `_write`), and a later `finish` that gets the lock prints the
+# closing line then. The residual risk is a process that ENDS before that
+# write returns: no closing line, and its record stays behind and is reported
+# as a kill by the next launch.
 FINISH_WAIT_S = 2.0
 
 RECORD_SUFFIX = ".run.json"
@@ -198,6 +203,8 @@ class RunRecord:
         self._file_lock = threading.RLock()
         self._done = threading.Event()
         self._finished = False
+        # Whether a `finish` has claimed the closing line (see `finish`).
+        self._announced = False
         self._reason: Optional[str] = None
         # Every payload is numbered under `_lock` as it is built, and a write
         # whose number is not above the last one written is dropped under
@@ -266,21 +273,25 @@ class RunRecord:
 
         Waits out a write in flight — for FINISH_WAIT_S at most — and no write
         starts after it (see `_file_lock`). Past the bound it ends the record
-        without the lock, and the stalled write removes what it wrote once it
-        returns (see `_write`). Only then can two `finish` calls race to print
-        the closing line twice; a duplicate line is the cheaper failure than a
-        termination signal's handler held by a stalled disk.
+        without the lock and returns, leaving the line and the removal to
+        whoever comes after the stalled write (see FINISH_WAIT_S). The line is
+        printed once: only a `finish` holding the lock may claim it.
         """
         locked = self._file_lock.acquire(timeout=FINISH_WAIT_S)
         try:
-            if self._finished:
-                return
             self._finished = True
+            if reason:
+                self._reason = reason
+            announce = locked and not self._announced
+            if announce:
+                self._announced = True
         finally:
             if locked:
                 self._file_lock.release()
         self._done.set()
-        reason = reason or self._reason or "process exit (reason not recorded)"
+        if not announce:
+            return
+        reason = self._reason or "process exit (reason not recorded)"
         ended = time.time()
         started = self._fields.get("started") or ended
         parts = [f"=== run ended: {reason}"]

@@ -191,7 +191,7 @@ class _HeldReplaceOs:
     A replacement MODULE for one importer (patching `os.replace` itself would
     hold every thread in the process); everything else is forwarded.
     `replaced` names the thread of every replace, held or not, as it starts;
-    `completed` as it returns.
+    `completed` as it returns; `removed` the thread of every remove.
     """
 
     def __init__(self):
@@ -199,9 +199,14 @@ class _HeldReplaceOs:
         self.release = threading.Event()
         self.replaced = []
         self.completed = []
+        self.removed = []
 
     def __getattr__(self, name):
         return getattr(os, name)
+
+    def remove(self, path):
+        self.removed.append(threading.current_thread().name)
+        os.remove(path)
 
     def replace(self, src, dst):
         self.replaced.append(threading.current_thread().name)
@@ -372,13 +377,28 @@ def test_finish_in_the_middle_of_a_write_leaves_nothing_behind(
     assert not tmp.exists(), "the interrupted write left its temp file behind"
 
 
+# How long the stalled-write pin gives `finish` (FINISH_WAIT_S patched to 0.05
+# there) to return — the deadline under test, kept apart from HELD_S, after
+# which the held write lets itself go only so a broken staging cannot hang the
+# suite. A giving-up `finish` took 0.062 s median, 0.0628 / 0.0633 s at worst
+# (two runs of 20, measured 2026-09-29); thirty times that, because only the
+# failing case waits it out.
+FINISH_DEADLINE_S = 2.0
+
+
 def test_finish_does_not_wait_for_a_stalled_write_forever(tmp_path, monkeypatch):
     """A stalled disk must not hold the process's ending for as long as it likes.
 
     `finish` runs from `atexit` and from a termination signal's handler, and
-    the heartbeat holds the file lock across its write. Past FINISH_WAIT_S the
-    record is ended without the lock, and the write, once it returns, removes
-    what it wrote.
+    the heartbeat holds the file lock across its write. Past FINISH_WAIT_S
+    `finish` returns without touching the stalled directory — no closing line
+    (the tee writes it into the mirror log there), no removal of the record —
+    and the write, once it returns, removes what it wrote; the next `finish`
+    prints the line, once.
+
+    What is asked of the first `finish` is that it returned while the write was
+    STILL held: a `finish` that waits without bound returns too, the moment the
+    held write lets itself go.
     """
     monkeypatch.setattr(exitlog, "FINISH_WAIT_S", 0.05)
     held = _HeldReplaceOs()
@@ -386,23 +406,35 @@ def test_finish_does_not_wait_for_a_stalled_write_forever(tmp_path, monkeypatch)
     record = _record(tmp_path, monkeypatch, heartbeat=0.01)
     lines = []
     record._echo = lines.append
-    finisher = threading.Thread(target=record.finish, name="finisher",
-                                daemon=True)
+    at_return = []
+
+    def finish():
+        record.finish()
+        at_return.append((held.release.is_set(), list(held.removed), list(lines)))
+
+    finisher = threading.Thread(target=finish, name="finisher", daemon=True)
     try:
         assert held.in_replace.wait(timeout=HELD_S), "the heartbeat never wrote"
         finisher.start()
-        finisher.join(timeout=HELD_S)
-        stalled = finisher.is_alive()
+        finisher.join(timeout=FINISH_DEADLINE_S)
+        in_time = not finisher.is_alive()
     finally:
         held.release.set()
     finisher.join(timeout=HELD_S)
     record._beat.join(timeout=HELD_S)
 
-    assert not stalled, "finish waited for the stalled write past its bound"
-    assert len(lines) == 1 and "=== run ended" in lines[0]
+    assert in_time, "finish waited for the stalled write past its bound"
+    assert at_return == [(False, [], [])], (
+        "finish returned only after the stalled write was let go, or wrote to "
+        "the stalled directory on its way out — (write released, removed by, "
+        f"lines printed) at its return: {at_return}")
     assert not record._beat.is_alive(), "the heartbeat never stopped"
     assert not record.path.exists(), (
         "the stalled write put the record back after finish gave up on it")
+    record.finish()
+    record.finish()
+    assert len(lines) == 1 and "=== run ended" in lines[0], (
+        f"the closing line was lost or printed twice: {lines}")
 
 
 def test_an_older_snapshot_never_overwrites_a_newer_one(tmp_path, monkeypatch):
