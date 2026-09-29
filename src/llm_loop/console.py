@@ -507,8 +507,8 @@ def route_through(owner, *, post_timeout: float):
     it. Chosen over the two alternatives:
 
       * over an unbounded `post`: a poster must never wait for the owner
-        indefinitely. The gate holds `usage_lock` and the pusher `push_lock`
-        while they print, and the exit push waits for `push_lock`;
+        indefinitely. The gate holds `usage_lock` while it prints, and the
+        exit push waits for the pusher to finish the push it is printing about;
       * over `try_post` with a counted drop: these lines are the run's record —
         the mirror log is written by the same call — and a quota pause or a
         failed push missing from it is worse than one that is out of order. A

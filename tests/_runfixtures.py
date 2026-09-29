@@ -158,7 +158,7 @@ def record_exit_pushes(monkeypatch) -> list:
     """
     calls = []
     monkeypatch.setattr(runlifecycle, "final_git_push",
-                        lambda policy, project_dir: calls.append(
+                        lambda policy, project_dir, abort=None: calls.append(
                             (policy, project_dir)))
     return calls
 

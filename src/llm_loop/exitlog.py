@@ -43,6 +43,24 @@ from typing import Callable, List, Optional
 # anywhere inside that window. 30 s is one small file write per half-minute.
 HEARTBEAT_SECONDS = 30
 
+# How long `finish` waits for a write in flight before it ends the record
+# without it. A healthy write (temp file + replace of a ~300-byte record) holds
+# the file lock for 0.4 ms median, 2.8 / 13.2 ms at worst (2000 writes each,
+# measured 2026-09-29 under the home dir); past this the filesystem is taken to
+# be stalled. The guarantee is about the WHOLE of `finish`, not only its lock
+# wait: a `finish` that gives up returns at once and touches neither the
+# filesystem nor the stream — no closing line (it goes through the tee into the
+# mirror log, which lives in the record's own, stalled, directory) and no
+# removal of the record (the same directory). So a stalled disk holds `atexit`
+# and a termination signal's handler (which runs `finish` on the main thread)
+# for FINISH_WAIT_S, never longer. What is skipped is not lost track of: the
+# stalled write checks `_finished` once it has written and removes what it
+# wrote (see `_write`), and a later `finish` that gets the lock prints the
+# closing line then. The residual risk is a process that ENDS before that
+# write returns: no closing line, and its record stays behind and is reported
+# as a kill by the next launch.
+FINISH_WAIT_S = 2.0
+
 RECORD_SUFFIX = ".run.json"
 
 # Windows constants for the liveness probe (see pid_alive).
@@ -166,9 +184,35 @@ class RunRecord:
         self._fields = fields
         self._echo = echo
         self._lock = threading.Lock()
+        # The FILE's lock, apart from the fields': held across a whole write
+        # (the temp file and the replace) and across the step of `finish` that
+        # ends writing. Two races it closes: a write already under way when
+        # `finish` removed the record put it back after a clean exit — which
+        # the next launch then reports as a run killed from outside (pinned by
+        # `test_exit_reason.test_a_write_in_flight_does_not_outlive_finish`) —
+        # and two writers (the heartbeat, a worker's `note`) shared one temp
+        # file. Reentrant because `finish` is also called from a signal
+        # handler, which runs on the main thread, possibly in the middle of
+        # that thread's own write: a plain lock would deadlock there. That
+        # write then resumes after `finish` and cleans up behind itself (see
+        # `_write`).
+        #
+        # NEVER take `_lock` while holding this one: a signal handler's
+        # `finish` takes this lock on the main thread, which may be holding
+        # `_lock` at that moment, and `_lock` is not reentrant.
+        self._file_lock = threading.RLock()
         self._done = threading.Event()
         self._finished = False
+        # Whether a `finish` has claimed the closing line (see `finish`).
+        self._announced = False
         self._reason: Optional[str] = None
+        # Every payload is numbered under `_lock` as it is built, and a write
+        # whose number is not above the last one written is dropped under
+        # `_file_lock`. The payload is built before the file lock is taken, so
+        # without this a heartbeat's snapshot built a moment before a `note`
+        # could win the file lock second and put the older fields back.
+        self._built = 0
+        self._written = 0
         self._write()
         self._beat = threading.Thread(
             target=self._heartbeat, name="exitlog-heartbeat", daemon=True)
@@ -182,12 +226,31 @@ class RunRecord:
         with self._lock:
             self._fields["alive_at"] = time.time()
             payload = json.dumps(self._fields, ensure_ascii=False, indent=1)
+            self._built += 1
+            number = self._built
         tmp = self._path.with_name(self._path.name + ".tmp")
-        try:
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, self._path)
-        except OSError:
-            pass    # a diagnostic must never be a reason for the run to fail
+        with self._file_lock:
+            # A finished record is gone for good: written now, it would outlive
+            # the run and be reported as a kill (see `_file_lock`).
+            if self._finished or number <= self._written:
+                return
+            self._written = number
+            try:
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, self._path)
+            except OSError:
+                pass    # a diagnostic must never be a reason for the run to fail
+            finally:
+                # Asked again AFTER the write, because `finish` can have run in
+                # the middle of it: from a signal handler on this very thread
+                # (the lock is reentrant for it), or from a thread that gave up
+                # waiting for a stalled write (FINISH_WAIT_S). The replace has
+                # then put the record back, or a handler that raised
+                # (`SystemExit` from a previous handler) left the temp file:
+                # both are removed here, and the exception, if any, goes on.
+                if self._finished:
+                    _remove_quietly(self._path)
+                    _remove_quietly(tmp)
 
     def _heartbeat(self) -> None:
         while not self._done.wait(HEARTBEAT_SECONDS):
@@ -206,13 +269,36 @@ class RunRecord:
             self.note(**fields)
 
     def finish(self, reason: Optional[str] = None) -> None:
-        """Print the closing line and drop the record. Safe to call twice."""
-        with self._lock:
-            if self._finished:
-                return
+        """Print the closing line and drop the record. Safe to call twice.
+
+        Waits out a write in flight — for FINISH_WAIT_S at most — and no write
+        starts after it (see `_file_lock`). Past the bound it ends the record
+        without the lock and returns, leaving the line and the removal to
+        whoever comes after the stalled write (see FINISH_WAIT_S). The line is
+        printed once: only a `finish` holding the lock may claim it.
+        """
+        locked = self._file_lock.acquire(timeout=FINISH_WAIT_S)
+        try:
+            # Only the finish that ENDS the record wakes the heartbeat. A
+            # signal handler's `finish` can land on the main thread inside
+            # this very `_done.set()`, holding the Event's lock — which is not
+            # reentrant, so a second `set` there waits on itself for ever. The
+            # flag goes up before the `set`, so the handler finds it up.
+            first = not self._finished
             self._finished = True
-        self._done.set()
-        reason = reason or self._reason or "process exit (reason not recorded)"
+            if reason:
+                self._reason = reason
+            announce = locked and not self._announced
+            if announce:
+                self._announced = True
+        finally:
+            if locked:
+                self._file_lock.release()
+        if first:
+            self._done.set()
+        if not announce:
+            return
+        reason = self._reason or "process exit (reason not recorded)"
         ended = time.time()
         started = self._fields.get("started") or ended
         parts = [f"=== run ended: {reason}"]
@@ -226,10 +312,14 @@ class RunRecord:
             self._echo(" · ".join(parts) + " ===")
         except Exception:       # a closed/broken stream at exit is not our problem
             pass
-        try:
-            os.remove(self._path)
-        except OSError:
-            pass
+        _remove_quietly(self._path)
+
+
+def _remove_quietly(path: Path) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _stem(app_name: str, project: str) -> str:
