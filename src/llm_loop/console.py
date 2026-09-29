@@ -139,21 +139,43 @@ class _MirrorLogHandler(RotatingFileHandler):
 def setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
     """Configure the rotating file logger at log_file_path(app_name).
 
-    Idempotent per logger: a second call finds this module's own mirror and
-    adds none. The test is for OUR handler, not for any handler: a host may hang
-    its own on the logger (pytest 9.1 attaches capture handlers to every
-    non-propagating logger at the start of each phase), and "has handlers" then
-    silently left the run without a log file. Pinned by
-    `tests/test_mirror_log.py::test_a_foreign_handler_does_not_switch_the_mirror_off`.
+    Idempotent per destination: a second call that finds this module's own
+    mirror already writing `log_file_path(app_name)` adds none. Two tests, both
+    needed:
+
+      * OUR handler, not any handler: a host may hang its own on the logger
+        (pytest 9.1 attaches capture handlers to every non-propagating logger
+        at the start of each phase), and "has handlers" then silently left the
+        run without a log file. Foreign handlers are left alone;
+      * the file, not the class: the path is derived per call (the project
+        root and `LOG_DIR` can move between two runs of one process), and a
+        mirror kept for its class alone went on writing the FIRST project's
+        log while the second run printed "logging to" its own. A mirror of
+        ours aimed anywhere else is closed and replaced.
+
+    Pinned by `tests/test_mirror_log.py`:
+    `test_a_foreign_handler_does_not_switch_the_mirror_off` and
+    `test_a_second_project_in_one_process_gets_its_own_log`.
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(f"runCycle.{app_name}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    if not any(isinstance(handler, _MirrorLogHandler)
-               for handler in logger.handlers):
+    path = log_file_path(app_name)
+    # `FileHandler` stores its path absolute; normcase for Windows' spelling.
+    target = os.path.normcase(os.path.abspath(str(path)))
+    kept = False
+    for handler in list(logger.handlers):
+        if not isinstance(handler, _MirrorLogHandler):
+            continue
+        if not kept and os.path.normcase(handler.baseFilename) == target:
+            kept = True
+            continue
+        handler.close()
+        logger.removeHandler(handler)
+    if not kept:
         handler = _MirrorLogHandler(
-            log_file_path(app_name), maxBytes=LOG_MAX_BYTES,
+            path, maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
         )
         handler.setFormatter(

@@ -236,13 +236,80 @@ def test_a_foreign_handler_does_not_switch_the_mirror_off(log_dir):
         console.setup_file_logging(app_name).info("second line")
         mirrors = [handler for handler in logger.handlers
                    if isinstance(handler, console._MirrorLogHandler)]
+        kept_foreign = foreign in logger.handlers
     finally:
         logger.removeHandler(foreign)
 
+    assert kept_foreign, "setup_file_logging removed a handler it does not own"
     assert len(mirrors) == 1, f"expected one mirror, got {len(mirrors)}"
     mirrors[0].flush()
     written = console.log_file_path(app_name).read_text(encoding="utf-8")
     assert "first line" in written and "second line" in written
+
+
+def test_a_second_project_in_one_process_gets_its_own_log(tmp_path, log_dir):
+    """One app name, two project roots, one process: the second run's lines go
+    to the second project's log, the one its "logging to" line names.
+
+    The log's name is derived per call from the root, so a mirror kept because
+    it is OURS — without asking where it writes — went on filling the first
+    project's file. The first project's mirror is closed, not left open beside
+    the new one."""
+    app_name = "pytest-two-roots"
+    first, second = tmp_path / "project-a", tmp_path / "project-b"
+    first.mkdir()
+    second.mkdir()
+
+    projectroot.set_project_root(str(first))
+    first_log = console.log_file_path(app_name)
+    logger = console.setup_file_logging(app_name)
+    logger.info("line of A")
+    first_mirror, = [handler for handler in logger.handlers
+                     if isinstance(handler, console._MirrorLogHandler)]
+
+    projectroot.set_project_root(str(second))
+    second_log = console.log_file_path(app_name)
+    console.setup_file_logging(app_name).info("line of B")
+    mirrors = [handler for handler in logger.handlers
+               if isinstance(handler, console._MirrorLogHandler)]
+    for handler in mirrors:
+        handler.flush()
+
+    assert first_log != second_log
+    assert "line of B" in second_log.read_text(encoding="utf-8"), \
+        "the second project's run wrote nothing to its own log"
+    assert "line of B" not in first_log.read_text(encoding="utf-8"), \
+        "the second project's run went on writing the first project's log"
+    assert first_mirror not in mirrors and first_mirror.stream is None, \
+        "the first project's mirror was left attached or open"
+    assert len(mirrors) == 1, f"expected one mirror, got {len(mirrors)}"
+
+
+def test_an_isolated_run_hands_back_its_loggers_propagation(tmp_path):
+    """`setup_file_logging` turns propagation off, and pytest hangs a capture
+    handler on every non-propagating logger it finds at each phase — so a mirror
+    logger left that way is captured in every later test. `isolated_run` puts
+    back what it found: a logger created inside propagates again, one that
+    already did not propagate keeps that."""
+    created, existing = "runCycle.pytest-created", "runCycle.pytest-existing"
+    assert created not in logging.Logger.manager.loggerDict, \
+        "the created-inside half needs a logger no earlier test registered"
+    before = logging.getLogger(existing)
+    before.propagate = False
+    before.setLevel(logging.WARNING)
+    try:
+        with pytest.MonkeyPatch.context() as inner, \
+                isolated_run(inner, tmp_path / "inner"):
+            console.setup_file_logging("pytest-created")
+            console.setup_file_logging("pytest-existing")
+
+        assert logging.getLogger(created).propagate is True
+        assert logging.getLogger(created).level == logging.NOTSET
+        assert before.propagate is False
+        assert before.level == logging.WARNING
+    finally:
+        before.propagate = True
+        before.setLevel(logging.NOTSET)
 
 
 def test_a_projects_log_is_named_after_that_project(tmp_path, log_dir):

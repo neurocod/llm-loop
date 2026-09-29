@@ -42,11 +42,17 @@ def isolated_run(monkeypatch, tmp_path):
     logger and the live-message transport `begin_run` set are put back.
 
     Every mirror handler is closed on the way in AND out, whatever `app_name`
-    the run used, so a caller cannot name the wrong one:
-    `console.setup_file_logging` adds no mirror to a logger that already has
-    one, so one left open would carry the next run's output into an earlier
-    test's (deleted) file while this run's own path is merely printed — and on
-    Windows keep that directory from being removed.
+    the run used, so a caller cannot name the wrong one: a mirror left open
+    holds its file, which on Windows keeps the test's directory from being
+    removed.
+
+    The mirror loggers' `propagate` and level are put back too
+    (`_logger_settings`): `setup_file_logging` turns propagation off, and pytest
+    hangs its capture handler on every non-propagating logger it finds at the
+    start of each phase, so a logger left that way is captured in every later
+    test that never ran it. Handler lists are NOT restored wholesale: pytest's
+    handler of the phase the snapshot was taken in is gone by the teardown, and
+    putting it back would leave a stale capture handler behind.
 
     Called explicitly, from a thin autouse fixture in each file that stages runs;
     `conftest.py` fails any test that leaves a record open, the root moved or
@@ -59,6 +65,7 @@ def isolated_run(monkeypatch, tmp_path):
     monkeypatch.setattr(exitlog, "_record", None)
     root = projectroot.project_dir()
     streams = sys.stdout, sys.stderr
+    settings = _logger_settings()
     _close_mirror_handlers()
     try:
         yield logs
@@ -67,6 +74,7 @@ def isolated_run(monkeypatch, tmp_path):
         sys.stdout, sys.stderr = streams
         projectroot.set_project_root(root)
         _close_mirror_handlers()
+        _restore_logger_settings(settings)
 
 
 def finish_record(reason=None):
@@ -81,19 +89,43 @@ def finish_record(reason=None):
     return record
 
 
+def _registered_loggers():
+    """Every logger in the registry, read as it is: `logging.getLogger` on a
+    placeholder name would create one."""
+    return [logger for logger in list(logging.Logger.manager.loggerDict.values())
+            if isinstance(logger, logging.Logger)]
+
+
 def _close_mirror_handlers():
     """Close and detach every mirror handler (`console._MirrorLogHandler`), on
-    whichever logger holds it.
-
-    Loggers are read from the registry as they are: `logging.getLogger` on a
-    placeholder name would create one."""
-    for logger in list(logging.Logger.manager.loggerDict.values()):
-        if not isinstance(logger, logging.Logger):
-            continue
+    whichever logger holds it."""
+    for logger in _registered_loggers():
         for handler in [handler for handler in logger.handlers
                         if isinstance(handler, console._MirrorLogHandler)]:
             handler.close()
             logger.removeHandler(handler)
+
+
+# The loggers `console.setup_file_logging` configures: "runCycle.<app_name>".
+_MIRROR_LOGGER_PREFIX = "runCycle."
+
+
+def _logger_settings() -> dict:
+    """`propagate` and level of each mirror logger, by name (`isolated_run`)."""
+    return {logger.name: (logger.propagate, logger.level)
+            for logger in _registered_loggers()
+            if logger.name.startswith(_MIRROR_LOGGER_PREFIX)}
+
+
+def _restore_logger_settings(settings: dict) -> None:
+    """Put `_logger_settings`' snapshot back; a mirror logger created since gets
+    a new logger's own (propagating, NOTSET), since the registry cannot forget
+    it."""
+    for logger in _registered_loggers():
+        if logger.name.startswith(_MIRROR_LOGGER_PREFIX):
+            logger.propagate, level = settings.get(logger.name,
+                                                   (True, logging.NOTSET))
+            logger.setLevel(level)
 
 
 def capture_run_context(monkeypatch) -> dict:
