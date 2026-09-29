@@ -24,6 +24,8 @@ these runs are launched `--git-push none` so that stays true of them, which it
 was not at first (see `_seq_args`).
 """
 
+import threading
+
 import pytest
 
 from llm_loop import cyclecore, exitlog, operator, parallel, runlifecycle
@@ -308,6 +310,93 @@ def test_ctrl_c_in_the_status_region_s_own_waits_still_closes_the_run_down(
         reason="interrupted by the operator (Ctrl+C)")
     assert out.count(parallel.INTERRUPT_ANNOUNCEMENT.strip()) == 1, (
         f"the interrupt was not heard exactly once:\n{out}")
+
+
+# Upper bound on every wait of the second-Ctrl+C pin below; only a broken
+# staging comes near it.
+HELD_S = 10.0
+
+
+@pytest.mark.parametrize("cut_closes", [1, 2],
+                         ids=["second-ctrl-c", "second-and-third-ctrl-c"])
+def test_a_ctrl_c_in_the_pool_s_close_still_stops_the_workers(
+        tmp_path, monkeypatch, capsys, exit_pushes, cut_closes):
+    """A hearing cut short in `threads.close` must not leave the workers claiming.
+
+    `close` waits for the pool's lock, which a worker holds across its claim,
+    and that wait is where a second Ctrl+C lands. The hearing used to mark the
+    interrupt heard before it stopped the workers, so the boundary outside
+    skipped it, and the run did its housekeeping and left while its workers
+    went on claiming the queue. Staged: the first Ctrl+C lands in the join
+    while a worker is inside its turn, the next `cut_closes` in the pool's
+    close; the worker is let go only once the run has left. With a third
+    Ctrl+C the boundary's own close is cut short too, and only a stop set
+    BEFORE the close keeps the workers from claiming.
+    """
+    working = threading.Event()
+    release = threading.Event()
+    turns = []
+
+    def held_first_turn(job_id, command, mailbox=None):
+        turns.append(threading.current_thread())
+        if len(turns) == 1:
+            working.set()
+            release.wait(timeout=HELD_S)
+        return 0, None, None
+
+    def ctrl_c_once_a_worker_works(threads):
+        working.wait(timeout=HELD_S)
+        raise KeyboardInterrupt
+
+    pools = []
+    real_close = parallel.WorkerPool.close
+
+    def ctrl_c_in_the_first_closes(pool):
+        pools.append(pool)
+        if len(pools) <= cut_closes:
+            raise KeyboardInterrupt     # a further Ctrl+C, in the lock wait
+        real_close(pool)
+
+    housekeeping = []
+    real_close_run = runlifecycle.close_run
+
+    def counted_close_run(*args, **kwargs):
+        housekeeping.append(kwargs.get("ending"))
+        return real_close_run(*args, **kwargs)
+
+    monkeypatch.setattr(parallel, "run_job", held_first_turn)
+    monkeypatch.setattr(parallel, "join_workers", ctrl_c_once_a_worker_works)
+    monkeypatch.setattr(parallel.WorkerPool, "close", ctrl_c_in_the_first_closes)
+    monkeypatch.setattr(runlifecycle, "close_run", counted_close_run)
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
+                        lambda provider: StubSource())
+    driver = MemListDriver([f"products/item{i}.md" for i in range(5)])
+
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            parallel.run_parallel(driver, _par_args(str(tmp_path)),
+                                  app_name="pytest-abnormal",
+                                  wait_on_start=False)
+    finally:
+        release.set()
+    assert turns, "no worker ever started its turn — nothing staged"
+    turns[0].join(timeout=HELD_S)
+
+    assert not turns[0].is_alive(), "the held worker never finished"
+    assert len(turns) == 1, (
+        f"the workers went on claiming after the run left: {len(turns)} turns")
+    if cut_closes == 1:
+        assert pools and pools[0].grow() is None, (
+            "the pool still takes workers — the cut-short close was never "
+            "completed")
+    assert housekeeping == ["interrupted"], (
+        f"the interrupt's housekeeping did not run exactly once: {housekeeping}")
+    assert exit_info.value.code == 130
+    assert exit_pushes, "the interrupted run left without its exit push"
+    out = capsys.readouterr().out
+    assert out.count(parallel.INTERRUPT_ANNOUNCEMENT.strip()) == 1, (
+        f"the interrupt was not announced exactly once:\n{out}")
+    exitlog.finish()
 
 
 def test_ctrl_c_during_a_normal_ending_s_exit_push_exits_130(

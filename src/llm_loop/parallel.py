@@ -1474,22 +1474,41 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     interrupted = threading.Event()
     # The Ctrl+C line when the console's queue had no room for it (see there).
     announce_later: Optional[str] = None
+    # The two steps of `hear_interrupt` a second Ctrl+C can cut short, each
+    # recorded once DONE, so the region's boundary finishes what a cut-short
+    # hearing left: `interrupted` alone says only that one began.
+    pool_closed = False
+    announced = False
 
-    def hear_interrupt() -> None:
-        """What a Ctrl+C inside the status region does — once, wherever it lands."""
-        nonlocal announce_later
+    def hear_interrupt(wait_for_workers: bool = True) -> None:
+        """What a Ctrl+C inside the status region does — once, wherever it lands.
+
+        Every step is safe to repeat, and one that is done is not redone: a
+        second call completes a hearing a second Ctrl+C cut short.
+        """
+        nonlocal announce_later, pool_closed, announced
         # Signal first, talk second: nothing about the console — a stalled
         # one included — may stand between Ctrl+C and the workers hearing it.
-        interrupted.set()
-        threads.close()
+        # And the stop before the pool: `threads.close` waits for the pool's
+        # lock, which a worker holds across its claim, and a second Ctrl+C in
+        # that wait must not leave the workers claiming. Before `interrupted`
+        # too, so a run that reads `interrupted` finds the stop set.
         shared.stop.set()
+        interrupted.set()
         # Queued, not printed, so the line lands after what the workers had
         # already said — and never waited for: a queue that is full is a
         # console that is not being written, and this line is then deferred
         # to the closing report below rather than blocking the interrupt
-        # behind it.
-        if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
-            announce_later = INTERRUPT_ANNOUNCEMENT
+        # behind it. Never waiting, it goes before the close, which can wait.
+        if not announced:
+            announced = True
+            if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
+                announce_later = INTERRUPT_ANNOUNCEMENT
+        if not pool_closed:
+            threads.close()
+            pool_closed = True
+        if not wait_for_workers:
+            return
         # A second Ctrl+C gives up waiting for the workers; the run's ending
         # is this one either way. A worker the region never got to start has
         # nothing to wait for.
@@ -1530,7 +1549,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                 # last frame — and a Ctrl+C in one of those waits used to
                 # unwind past the epilogue (no exit push, no snapshot, no
                 # notes). Heard once: a Ctrl+C in the teardown after one in
-                # the join is the same ending.
+                # the join is the same ending — it completes that hearing if
+                # a second Ctrl+C cut it short, and waits for no worker again.
                 try:
                     with app:
                         if source is not None:
@@ -1563,8 +1583,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
                         app.update(phase="idle")
                 except KeyboardInterrupt:
-                    if not interrupted.is_set():
-                        hear_interrupt()
+                    try:
+                        hear_interrupt(
+                            wait_for_workers=not interrupted.is_set())
+                    except KeyboardInterrupt:
+                        pass    # the stop is set first; the ending is this one
             finally:
                 # A Ctrl+C while a stuck console is waited for gives up that
                 # wait (CONSOLE_CLOSE_TIMEOUT_S) and ends the run as an
