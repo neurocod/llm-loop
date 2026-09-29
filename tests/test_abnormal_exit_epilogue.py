@@ -32,8 +32,8 @@ from llm_loop import cyclecore, exitlog, operator, parallel, runlifecycle
 from llm_loop.agentwork import ClaudeCommand, Driver, LoopStop
 from llm_loop.drivers import StateFileDriver
 
-from _runfixtures import (MemListDriver, StubPolicy, StubSource, isolated_run,
-                          par_args, record_exit_pushes, seq_args)
+from _runfixtures import (MemListDriver, OneShotDriver, StubPolicy, StubSource,
+                          isolated_run, par_args, record_exit_pushes, seq_args)
 
 # What the operator typed and never got delivered. One string, asserted by
 # identity, so a run that printed SOME note would not satisfy a pin about THIS
@@ -63,20 +63,6 @@ class _StoppingDriver(Driver):
             self.commands -= 1
             return ClaudeCommand("do the thing")
         raise LoopStop("state file says: error\nsecond line", exit_code=3)
-
-
-class _OneCommandDriver(Driver):
-    """One command, then the work is over: the run RETURNS, through `end_run`."""
-
-    def __init__(self):
-        self.limit_policy = StubPolicy()
-        self.served = False
-
-    def next_command(self):
-        if self.served:
-            return None
-        self.served = True
-        return ClaudeCommand("do the thing")
 
 
 def _seq_args(project_dir):
@@ -420,7 +406,8 @@ def test_ctrl_c_during_a_normal_ending_s_exit_push_exits_130(
     monkeypatch.setattr(runlifecycle, "final_git_push", ctrl_c_in_the_push)
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
     monkeypatch.setattr(cyclecore, "run_claude_streaming", succeeds)
-    driver = _OneCommandDriver()
+    # One command, then the work is over: the run RETURNS, through `end_run`.
+    driver = OneShotDriver()
 
     try:
         with pytest.raises(SystemExit) as exit_info:
