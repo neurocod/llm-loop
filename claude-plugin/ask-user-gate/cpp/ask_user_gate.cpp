@@ -1473,12 +1473,10 @@ given. Exit 1 when a checked command is denied.
 //     one (argparse's "ignored explicit argument"): `--help=x`, `--self-test=`.
 //   * `--` ends the options, and since nothing here takes a positional, it and
 //     everything after it are unrecognised.
-//   * `-h` glued to more h's is that many -h, and glued to `-` or `=` after
-//     them it is refused by every version. Glued to anything else (`-hx`,
-//     `-h x`, `-hhx`) 3.9 and 3.10 refuse it and 3.11+ print the help; the
-//     reference does not pin that, so this takes the refusal and parity_check
-//     has no row for it. (`-h=` is the `=` rule above, where 3.9.25 raises an
-//     IndexError instead.) Measured on 3.9 to 3.14, 2026-09-28.
+//   * `-h` glued to more h's is that many -h, and glued to anything else
+//     (`-hx`, `-h x`, `-hhx`, `-h=`) it is refused where reached: the reading
+//     the reference's _Parser._parse_optional pins over argparse's, which
+//     moved between versions (the reason is there).
 //
 // Pinned by parity_check's ARGV_CASES, per option by its _option_rows.
 

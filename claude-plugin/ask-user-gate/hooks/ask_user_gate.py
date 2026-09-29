@@ -929,16 +929,19 @@ def self_test() -> int:
     return 1 if failures else 0
 
 
-class _AmbiguousOption(argparse.Action):
-    """What _Parser._get_option_tuples returns for an ambiguous abbreviation:
-    a flag (so never a value) that is refused only when parsing reaches it."""
+class _Refusal(argparse.Action):
+    """What _Parser hands argparse in place of a token it refuses: a flag (so
+    never a value) that raises only when parsing reaches it, so a --help before
+    it still prints and one after it never runs. `blamed` is the action the
+    message is about, None for a token that names no one option."""
 
-    def __init__(self, token, names):
+    def __init__(self, message, blamed=None):
         super().__init__(option_strings=[], dest=argparse.SUPPRESS, nargs=0)
-        self.message = f"ambiguous option: {token} could match {', '.join(names)}"
+        self.message = message
+        self.blamed = blamed
 
     def __call__(self, parser, namespace, values, option_string=None):
-        raise argparse.ArgumentError(None, self.message)
+        raise argparse.ArgumentError(self.blamed, self.message)
 
 
 def _option_tuple_fields() -> int:
@@ -977,6 +980,7 @@ class _Parser(argparse.ArgumentParser):
     Each rule, and what it overrides of argparse's private API:
       NEGATIVE_NUMBER      which dash-led tokens are values (3.14 widened it)
       _get_option_tuples   `-=`-led tokens, deferred ambiguity (3.9-3.11, early 3.12)
+      _parse_optional      `-h` glued to a non-flag (3.11+; `-h=` on 3.9)
       _get_values          a glued `=--` value (3.9, 3.10)
     The versions and measurements are at each member; _option_tuple_fields
     covers the tuple layout _get_option_tuples returns in each.
@@ -1035,9 +1039,49 @@ class _Parser(argparse.ArgumentParser):
             return matches
         names = ([match[1] for match in matches] if len(matches) > 1
                  else ["every option"])
+        message = f"ambiguous option: {option_string} could match {', '.join(names)}"
         # No separator and no explicit argument, whichever layout this is.
-        return [(_AmbiguousOption(option_string, names), option_string)
+        return [(_Refusal(message), option_string)
                 + (None,) * (_option_tuple_fields() - 2)]
+
+    def _parse_optional(self, arg_string):
+        # One more rule argparse moved: a short flag that takes no value, glued
+        # to anything but more such flags -- `-hx`, `-h x` (one token), `-hhx`,
+        # `-h=`. Every version reads the token as -h plus a tail, then parts:
+        # 3.9 and 3.10 refuse the tail before running anything, 3.11+ run the
+        # -h first and so print the help (exit 0), and 3.9.25 raises IndexError
+        # on the empty tail of `-h=` -- a traceback, exit 1, which is this
+        # CLI's "denied". Pinned to the refusal, which the port has always
+        # given (its parseCommandLine: a glued tail that is not all `h`), and
+        # which a caller who typed `-hx` more likely meant than the help.
+        # `-hh` stays two -h, and a tail led by `-` or `=` was refused by every
+        # version already. Measured on 3.9.25, 3.10.21, 3.11.16, 3.12.14,
+        # 3.13.7 and 3.14.7; parity_check's glued `-h` ARGV_CASES bite on
+        # 3.11+ (and `-h=` on 3.9).
+        #
+        # Here and not in _get_option_tuples: `-h=` never reaches that, since
+        # `-h` before the `=` is an option string of its own. The tuple is the
+        # one super() returned with the stand-in swapped in, so its width and
+        # whether it comes in a list (3.12.14+) are argparse's, not a guess.
+        found = super()._parse_optional(arg_string)
+        matches = found if isinstance(found, list) else [found]
+        if len(matches) != 1 or matches[0] is None:
+            return found
+        action, option = matches[0][0], matches[0][1]
+        tail = arg_string[len(option):]
+        if (action is None or action.nargs != 0 or len(option) != 2
+                or option[1] in self.prefix_chars
+                or not arg_string.startswith(option) or not tail):
+            return found
+        # This CLI has no short option that takes a value, so a tail is more
+        # flags or it is refused; nothing here reads a glued short VALUE.
+        flags = self._option_string_actions
+        if all(getattr(flags.get(option[0] + char), "nargs", None) == 0
+               for char in tail):
+            return found
+        refused = ((_Refusal(f"ignored explicit argument {tail!r}", action),
+                    arg_string) + (None,) * (len(matches[0]) - 2))
+        return [refused] if isinstance(found, list) else refused
 
     def _get_values(self, action, arg_strings):
         # One more rule argparse moved: 3.9 and 3.10 strip the first `--` from

@@ -317,11 +317,24 @@ ARGV_CASES = [
     (["--sh="], 2, None),                     # a value option: '' is no shell
     (["--tool=", "--check", "ls"], 0, ALLOWED),   # ... but it is a tool name
     # -h glued to more h's is that many -h; to `-` or `=` it is refused by every
-    # Python. (To a letter it depends on the version: no row, see the port.)
+    # Python.
     (["-hh"], 0, HELP),
     (["--zz", "-hhh"], 0, HELP),
     (["-h-", "--help"], 2, None),
     (["-hh=x"], 2, None),
+    # Glued to anything else it is refused too, where parsing reaches it -- the
+    # reading _Parser._parse_optional pins. argparse 3.11+ printed the help for
+    # these and 3.9.25 raised IndexError on `-h=` (exit 1, "denied"), so the
+    # rows bite there.
+    (["-hx"], 2, None),
+    (["-he"], 2, None),
+    (["-h x"], 2, None),                      # one token
+    (["-hhx"], 2, None),
+    (["-h="], 2, None),
+    (["-hx", "--help"], 2, None),
+    (["-h=", "--help"], 2, None),
+    (["--help", "-hx"], 0, HELP),             # the help is reached first
+    (["--help", "-h="], 0, HELP),
     # Unrecognised tokens are reported after the parse, so a --help anywhere
     # still prints; every other refusal stops where parsing reaches it.
     (["-x", "--help"], 0, HELP),
