@@ -285,6 +285,30 @@ class _CodexAppProcess:
         self.fail_pending("the turn is over")
 
 
+def _console_isolation() -> dict:
+    """Popen options that keep a provider CLI off the runner's console.
+
+    A Windows console's input buffer is ONE queue for every process attached to
+    it, and a child inherits the console even when all three of its stdio are
+    pipes. `claude.exe` then reads that queue itself: measured 2026-09-30, the
+    `m` editor took the first key of a note and every later one went to the
+    agent — the key reader alive in its poll, `kbhit()` False, and the console
+    shared by exactly the runner, its launcher, its parent shell and
+    `claude.exe` (`diaglog.console_snapshot`). CREATE_NO_WINDOW gives the child
+    a console of its own, never shown, which its descendants (the tool shells)
+    inherit in turn — so nothing it starts writes into our region or reads our
+    keys, and a console program among them still has a console to run in
+    (DETACHED_PROCESS would leave it none, and it would open a window).
+
+    What it costs: Ctrl+C here no longer reaches the child as a console event.
+    It never had to — the runner turns it into KeyboardInterrupt and ends the
+    whole tree through `reap_agent_process` (`taskkill /T`).
+    """
+    if os.name != "nt":
+        return {}
+    return {"creationflags": subprocess.CREATE_NO_WINDOW}
+
+
 def _start_codex_app_server(argv: list, prompt: str, project_dir: str):
     options = argv if isinstance(argv, _CodexArgv) else None
     app_argv = [argv[0], "app-server", "--stdio"]
@@ -298,6 +322,7 @@ def _start_codex_app_server(argv: list, prompt: str, project_dir: str):
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        **_console_isolation(),
     )
     buffered = []
     try:
@@ -413,6 +438,7 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
         "encoding": "utf-8",
         "errors": "replace",
         "bufsize": 1,
+        **_console_isolation(),
     }
     on_stdin = prompt_on_stdin(provider)
     keep_open = live_messages_enabled(provider)
