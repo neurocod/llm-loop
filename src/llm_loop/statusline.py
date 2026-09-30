@@ -103,6 +103,12 @@ __all__ = [
 # enough to be invisible next to the agent's own output.
 REFRESH_SECONDS = 0.5
 
+# With the key trace on, who shares the console is logged every this many
+# periodic ticks (10 at REFRESH_SECONDS = every 5 s): a descendant of the agent
+# attached to the console can take keys from its one input queue
+# (`diaglog.console_snapshot`), and the snapshot dates when it came and went.
+CONSOLE_SNAPSHOT_TICKS = 10
+
 # Coalesce a typing/paste burst into at most 30 frames per second. This is a UI
 # cadence, not a readiness timeout: terminal writes must not pace the key reader.
 INPUT_REFRESH_SECONDS = 1 / 30
@@ -1729,6 +1735,8 @@ class MessageAction(Action):
         # No note announcing the mode: the editor's own row carries the hint
         # while the line is empty, and the note row is where each delivery
         # reports itself a moment later.
+        if diaglog.log_path() is not None:
+            diaglog.record("note editor opened", diaglog.console_snapshot())
         target_ids = tuple(getattr(app.messages, "target_ids", ()))
         if len(target_ids) > 1:
             app.push_mode(MessageTargetMode(app))
@@ -2740,6 +2748,8 @@ class Painter:
                 diaglog.record("Painter resize on tick raised", exc=exc)
                 self._disable()
         self._report_dropped_keys()
+        if self._ticks % CONSOLE_SNAPSHOT_TICKS == 0 and diaglog.keytrace_enabled():
+            diaglog.trace("console", diaglog.console_snapshot())
         self._app_tick(self._ticks)
         # Re-assert the region on the periodic repaint: see
         # termio.Terminal.paint.

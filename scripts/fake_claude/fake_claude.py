@@ -18,6 +18,11 @@ Knobs, all environment variables so the runner's argv stays the real one:
   FAKE_CLAUDE_DELTA_MS  pause between two text deltas (default 40) — lower it
                         to press the terminal harder
   FAKE_CLAUDE_TOOL_EVERY  a tool call every N deltas (default 60)
+  FAKE_CLAUDE_TOOL_SECONDS  make the FIRST tool call a silent foreground
+                        child running this long (default 0: none) — the agent
+                        waiting on a script, with nothing on the stream
+  FAKE_CLAUDE_TOOL_CMD  that child: a preset (`sleep`, `conin`, `powershell`,
+                        `bash` — see TOOL_PRESETS) or a command line with `{s}`
 """
 
 import json
@@ -78,6 +83,38 @@ def read_notes(first_line: threading.Event, done: threading.Event) -> None:
     done.set()
 
 
+# Presets for FAKE_CLAUDE_TOOL_CMD; `{s}` is FAKE_CLAUDE_TOOL_SECONDS. `sleep`
+# only sits on the console; `conin` reads the console's input queue the way a
+# prompting program does, which is the key-stealing case to rule in or out.
+TOOL_PRESETS = {
+    "sleep": '"{py}" -c "import time; time.sleep({s})"',
+    # One line: the command goes through cmd.exe, which ends it at a newline.
+    "conin": ('"{py}" -c "import msvcrt, time; t = time.time() + {s}; '
+              '[print(repr(msvcrt.getwch()), flush=True) if msvcrt.kbhit() '
+              'else time.sleep(0.05) '
+              'for _ in iter(lambda: time.time() < t, False)]"'),
+    "powershell": 'powershell -NoProfile -NonInteractive -Command "Start-Sleep {s}"',
+    "bash": 'bash -c "sleep {s}"',
+}
+
+
+def tool_command(seconds: float) -> str:
+    raw = os.environ.get("FAKE_CLAUDE_TOOL_CMD", "sleep")
+    template = TOOL_PRESETS.get(raw, raw)
+    return template.format(py=sys.executable, s=seconds)
+
+
+def run_long_tool(command: str) -> str:
+    """Run it as a tool would: a child that inherits this process's console
+    (the runner's own), stdin closed, output captured — and nothing on the
+    event stream until it ends, like a foreground script the agent waits on."""
+    import subprocess
+
+    done = subprocess.run(command, shell=True, stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, errors="replace")
+    return (done.stdout + done.stderr).strip() or f"exit {done.returncode}"
+
+
 def main() -> int:
     # The real CLI speaks UTF-8 on its pipes and the runner decodes UTF-8; a
     # Windows pipe defaults to the ANSI code page, which cannot encode a
@@ -89,6 +126,7 @@ def main() -> int:
     seconds = float(os.environ.get("FAKE_CLAUDE_SECONDS", "300"))
     delta_s = float(os.environ.get("FAKE_CLAUDE_DELTA_MS", "40")) / 1000
     tool_every = int(os.environ.get("FAKE_CLAUDE_TOOL_EVERY", "60"))
+    tool_seconds = float(os.environ.get("FAKE_CLAUDE_TOOL_SECONDS", "0"))
 
     got_prompt, stdin_closed = threading.Event(), threading.Event()
     if live:
@@ -120,16 +158,20 @@ def main() -> int:
                 break
         emit(stream_event({"type": "content_block_stop", "index": 0}))
         tool_id = f"toolu_fake_{message_no}"
+        long_tool = message_no == 1 and tool_seconds > 0
+        command = (tool_command(tool_seconds) if long_tool
+                   else f"echo fake step {message_no}")
         emit({"type": "assistant", "session_id": SESSION, "message": {
             "model": MODEL, "usage": usage(), "content": [
                 {"type": "text", "text": "".join(text)},
                 {"type": "tool_use", "id": tool_id, "name": "Bash",
-                 "input": {"command": f"echo fake step {message_no}",
+                 "input": {"command": command,
                            "description": "Fake tool call"}}]}})
+        output = run_long_tool(command) if long_tool else f"fake step {message_no}"
         emit({"type": "user", "session_id": SESSION, "message": {
             "role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": tool_id,
-                 "content": f"fake step {message_no}"}]}})
+                 "content": output}]}})
 
     emit({"type": "result", "subtype": "success", "is_error": False,
           "session_id": SESSION, "duration_ms": int(seconds * 1000),

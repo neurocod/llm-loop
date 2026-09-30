@@ -111,7 +111,11 @@ def test_key_trace_is_off_by_default_and_names_each_stage_when_on(
     reader = termio.TerminalInput()
     reader._emit(lambda event: None, "m")
     app._apply_key(app._key_epoch, termio.Key("m"))
-    assert _text(diag) == ""
+    # Opening the editor is always named, with who shares the console; the
+    # per-stage key lines are not, with the trace off.
+    text = _text(diag)
+    assert "note editor opened" in text
+    assert "key " not in text
 
     monkeypatch.setenv(diaglog.KEYTRACE_ENV, "1")
     reader._emit(lambda event: None, "q")

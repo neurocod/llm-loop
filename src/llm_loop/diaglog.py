@@ -106,6 +106,56 @@ def trace(where: str, text: str = "") -> None:
         record(where, text)
 
 
+def console_snapshot() -> str:
+    """Who shares this console, and its input/output modes (Windows; "" else).
+
+    A Windows console's input buffer is ONE queue for every process attached to
+    it: the agent's descendants (a shell, the script it runs) inherit the
+    console even though the agent's own stdio are pipes. One of them reading
+    CONIN$, or switching the input mode, takes keys the status line never sees
+    — so the list and the modes are what tells that apart from a stuck reader.
+    """
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        pids = (wintypes.DWORD * 64)()
+        count = kernel32.GetConsoleProcessList(pids, 64)
+        names = []
+        for pid in list(pids)[:min(count, 64)]:
+            names.append(f"{pid}:{_process_name(kernel32, pid)}")
+        modes = []
+        for label, std in (("in", -10), ("out", -11)):
+            mode = wintypes.DWORD()
+            handle = kernel32.GetStdHandle(std)
+            ok = kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+            modes.append(f"{label}=0x{mode.value:04x}" if ok else f"{label}=?")
+        return f"{count} process(es) [{' '.join(names)}] {' '.join(modes)}"
+    except Exception as exc:
+        return f"console snapshot failed: {exc!r}"
+
+
+def _process_name(kernel32, pid: int) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return "?"
+    try:
+        buffer = ctypes.create_unicode_buffer(512)
+        size = wintypes.DWORD(512)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer,
+                                               ctypes.byref(size)):
+            return os.path.basename(buffer.value)
+        return "?"
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def flush(timeout: float = FLUSH_WAIT_S) -> bool:
     """Wait until every line put so far is written; False past `timeout`."""
     if _writer is None:
