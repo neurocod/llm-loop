@@ -22,6 +22,8 @@ import threading
 import time
 from typing import Callable, Optional
 
+from . import diaglog
+
 __all__ = ["OwnerThread", "DEFAULT_MAXSIZE", "IDLE_DELAY_MAX"]
 
 # How many posted calls may wait before `post` blocks. Not a throughput knob: it
@@ -401,6 +403,7 @@ class OwnerThread:
         if text == self._last_report:
             return
         self._last_report = text
+        diaglog.record(f"{self.name} posted call raised", exc=exc)
         print(text, file=sys.stderr)
 
 

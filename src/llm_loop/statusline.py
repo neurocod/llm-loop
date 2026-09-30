@@ -42,8 +42,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import (cmdline, console, gitpush, ownership, stopchannel, termio,
-               textwidth, wire)
+from . import (cmdline, console, diaglog, gitpush, ownership, stopchannel,
+               termio, textwidth, wire)
 
 __all__ = [
     "Action",
@@ -2461,6 +2461,11 @@ class Painter:
         """
         if not self._owner.try_post(call, *args):
             self._keys_dropped += 1
+            diaglog.record("key dropped, painter queue full",
+                           f"{self._keys_dropped} so far, backlog "
+                           f"{self._owner.backlog}")
+        else:
+            diaglog.trace("key posted", f"backlog {self._owner.backlog}")
 
     def run_and_wait(self, call: Callable, *args) -> None:
         """`call(*args)` on the thread that owns the terminal, waited for.
@@ -2570,6 +2575,9 @@ class Painter:
         self.request_frame()
 
     def _disable(self) -> None:
+        if not isinstance(self._terminal, termio.NullTerminal):
+            diaglog.record("Painter disabled the terminal for good, the status "
+                           "line stops repainting")
         self._region = _REGION_CLOSED   # nothing left for the idle hook to tick
         try:
             self._terminal.release()
@@ -2614,6 +2622,7 @@ class Painter:
         if not self.terminal.active:
             return
         try:
+            started = time.monotonic()
             columns, _lines = self.terminal.size()
             # The bottom-right cell can immediately scroll a Windows console.
             # Budget the margin BEFORE windowing the editor, or its caret is cut.
@@ -2622,10 +2631,18 @@ class Painter:
                 # A Mode added or dropped a row: resize the region rather than
                 # painting into lines the terminal is still scrolling.
                 if not self._reserve(len(rows)):
+                    diaglog.record("Painter frame skipped, region refused",
+                                   f"{len(rows)} rows, {columns} columns")
                     return
             self.terminal.paint([colorize(line) for line in rows],
                                 reassert=reassert)
-        except Exception:
+            if diaglog.keytrace_enabled():
+                diaglog.trace("frame painted",
+                              f"{(time.monotonic() - started) * 1000:.1f} ms, "
+                              f"{columns} columns, last row {rows[-1]!r}"
+                              if rows else "no rows")
+        except Exception as exc:
+            diaglog.record("Painter._draw raised", exc=exc)
             self._disable()
 
     # --- the painter's own calls -------------------------------------------
@@ -2649,7 +2666,8 @@ class Painter:
                 on_refused()
                 return
             self._draw()
-        except Exception:
+        except Exception as exc:
+            diaglog.record("Painter._open_region raised", exc=exc)
             self._disable()
 
     def _close_region(self) -> None:
@@ -2691,7 +2709,8 @@ class Painter:
                 self._tick()
             elif self._frame_due is not None and now >= self._frame_due:
                 self._draw()
-        except Exception:
+        except Exception as exc:
+            diaglog.record("Painter._on_idle raised", exc=exc)
             self._disable()
         due = self._next_tick
         if self._frame_due is not None:
@@ -2706,7 +2725,8 @@ class Painter:
             self._last_size = size
             try:
                 self._resize()
-            except Exception:
+            except Exception as exc:
+                diaglog.record("Painter resize on tick raised", exc=exc)
                 self._disable()
         self._report_dropped_keys()
         self._app_tick(self._ticks)
@@ -2738,6 +2758,7 @@ class Painter:
         if line == self._last_warning:
             return
         self._last_warning = line
+        diaglog.record("Painter warning", text)
         try:
             print(line, file=sys.stderr)
         except Exception:
@@ -3166,7 +3187,10 @@ class StatusApp:
                 if mode.handle(event):
                     break
             self.painter.request_frame()
-        except Exception:
+        except Exception as exc:
+            diaglog.record("StatusApp._handle_event raised",
+                           f"event {event!r}, mode {type(self.mode).__name__}",
+                           exc=exc)
             self.painter.disable()
 
     def _handle_input(self, event: termio.InputEvent) -> None:
@@ -3182,6 +3206,10 @@ class StatusApp:
         """A key the reader posted — unless a discard came between (`pop_mode`)."""
         if epoch == self._key_epoch:
             self._handle_event(event)
+            diaglog.trace("key applied",
+                          f"{event!r}, mode {type(self.mode).__name__}")
+        else:
+            diaglog.trace("key discarded, stale epoch", repr(event))
 
     # --- rendering ---------------------------------------------------------
 

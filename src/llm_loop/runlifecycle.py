@@ -42,8 +42,8 @@ import sys
 import traceback
 from typing import Any, Iterable, NamedTuple, Optional, Tuple
 
-from . import (console, exitlog, limits, operator, projectroot, statusline,
-               stopchannel)
+from . import (console, diaglog, exitlog, limits, operator, projectroot,
+               statusline, stopchannel)
 from .gitpush import (
     GIT_PUSH_POLICY,
     GIT_PUSH_SETTING,
@@ -220,6 +220,9 @@ def begin_run(driver, args, app_name: str, progress=None, *,
               f"{console.log_file_path(app_name)}")
     else:
         print(f"  · logging to {console.log_file_path(app_name)}")
+        if diaglog.log_path() is not None:
+            print(f"  · status line diagnostics: {diaglog.log_path()}"
+                  + (" (key trace on)" if diaglog.keytrace_enabled() else ""))
     print(f"  · provider: {spec.display_name}")
     print(f"  · git push policy: {settings.git_push.value}")
     console.warn_missing_dependencies()

@@ -27,7 +27,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from . import console
+from . import console, diaglog
 
 __all__ = [
     "CSI_KEYS",
@@ -509,8 +509,13 @@ class TerminalInput(InputSource):
     def _guard(self, target, handler):
         try:
             target(handler)
-        except Exception:
-            return  # a broken reader costs the keys, never the run
+        except Exception as exc:
+            # A broken reader costs the keys, never the run — but it is named.
+            diaglog.record("TerminalInput reader died, keys are no longer read",
+                           exc=exc)
+            return
+        if not self._stop.is_set():
+            diaglog.record("TerminalInput reader returned without a stop")
 
     def discard_pending(self) -> None:
         """Called by an input handler when Enter closes an editor.
@@ -535,6 +540,7 @@ class TerminalInput(InputSource):
 
             _thread.interrupt_main()
             return
+        diaglog.trace("key read", f"{char!r} discarding={self._discarding}")
         if self._discarding:
             return
         for event in self._decoder.feed(char):

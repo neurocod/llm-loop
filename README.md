@@ -661,6 +661,16 @@ Codex receives an app-server `turn/steer` request for the active turn. With
 instead. It is not a paste target — every newline in a paste sends what
 precedes it as its own note.
 
+### When the status line freezes
+
+Its quiet failure branches (a key reader that died, a frame that raised, keys
+dropped behind a stuck write) are written to `<app>-<project>.diag.log` beside
+the mirror log; the run's banner prints the path. `LLM_LOOP_KEYTRACE=1` adds a
+line per key per stage (read, posted, applied, painted). To reproduce without a
+paid turn, `python scripts/fake_claude/fake_cycle.py` runs a real sequential
+runner against a fake `claude`, and `py-spy dump --pid <pid> --native` shows
+where each thread is.
+
 ## Per-user settings
 
 Wrappers can opt into a completion sound through the per-user JSON settings
