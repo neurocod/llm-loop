@@ -125,8 +125,13 @@ class Terminal:
             self._stream.write(text)
             self._stream.flush()
             return True
-        except Exception:
-            # A closed/odd stream must not take the loop down with it.
+        except Exception as exc:
+            # A closed/odd stream must not take the loop down with it — but
+            # from here on `active` is False and every frame returns early,
+            # so the screen just stops changing: named, once.
+            if not self.failed:
+                diaglog.record("Terminal write failed, painting stops for good",
+                               exc=exc)
             self.failed = True
             return False
 

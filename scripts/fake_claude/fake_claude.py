@@ -32,9 +32,15 @@ WORDS = ("the painter owns the terminal while the reader posts keys and the "
          "agent streams text into the same console ").split()
 
 
+_emit_lock = threading.Lock()
+
+
 def emit(event: dict) -> None:
-    sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    """One event line. Two threads emit (the stream and the note replay), and a
+    line must never be cut by the other's."""
+    with _emit_lock:
+        sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
 
 
 def stream_event(inner: dict) -> dict:
@@ -60,13 +66,24 @@ def read_notes(first_line: threading.Event, done: threading.Event) -> None:
         except ValueError:
             emit({"type": "system", "subtype": "fake_bad_input", "line": line})
             continue
-        # --replay-user-messages: the note comes back on the event stream.
-        message.setdefault("session_id", SESSION)
-        emit(message)
+        # --replay-user-messages: the note comes back on the event stream, its
+        # content flattened to a bare string as the real CLI does
+        # (`wire.message_blocks` handles exactly that shape).
+        content = message.get("message", {}).get("content")
+        if isinstance(content, list):
+            content = "".join(block.get("text", "") for block in content
+                              if isinstance(block, dict))
+        emit({"type": "user", "session_id": SESSION,
+              "message": {"role": "user", "content": content}})
     done.set()
 
 
 def main() -> int:
+    # The real CLI speaks UTF-8 on its pipes and the runner decodes UTF-8; a
+    # Windows pipe defaults to the ANSI code page, which cannot encode a
+    # Cyrillic note replayed back (UnicodeEncodeError, seen 2026-09-30).
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdin.reconfigure(encoding="utf-8")
     argv = sys.argv[1:]
     live = "--input-format" in argv and "stream-json" in argv
     seconds = float(os.environ.get("FAKE_CLAUDE_SECONDS", "300"))

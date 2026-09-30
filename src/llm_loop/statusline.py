@@ -2355,7 +2355,10 @@ class Painter:
         # The last stderr line `_warn` wrote, so a stuck painter is named once
         # rather than once per caller that gave up on it.
         self._last_warning = ""
-        # Painter-only from here down. When the requested frame is due (a
+        # Painter-only from here down. The (rows, columns, lines) a refused
+        # region last skipped a frame at, so the diagnostics name it once.
+        self._skip_logged: Optional[Tuple[int, int, int]] = None
+        # When the requested frame is due (a
         # monotonic time, None: none requested) — INPUT_REFRESH_SECONDS after
         # the first request of a burst, so the burst is one frame.
         self._frame_due: Optional[float] = None
@@ -2631,12 +2634,20 @@ class Painter:
                 # A Mode added or dropped a row: resize the region rather than
                 # painting into lines the terminal is still scrolling.
                 if not self._reserve(len(rows)):
-                    diaglog.record("Painter frame skipped, region refused",
-                                   f"{len(rows)} rows, {columns} columns")
+                    # Every frame skips while the refusal lasts: named once
+                    # per shape, not once per tick.
+                    shape = (len(rows), columns, _lines)
+                    if shape != self._skip_logged:
+                        self._skip_logged = shape
+                        diaglog.record("Painter frames skipped, region refused",
+                                       f"{len(rows)} rows, {columns}x{_lines}")
                     return
-            self.terminal.paint([colorize(line) for line in rows],
-                                reassert=reassert)
-            if diaglog.keytrace_enabled():
+            self._skip_logged = None
+            painted = self.terminal.paint([colorize(line) for line in rows],
+                                          reassert=reassert)
+            if not painted:
+                diaglog.trace("frame NOT painted, the terminal refused it")
+            elif diaglog.keytrace_enabled():
                 diaglog.trace("frame painted",
                               f"{(time.monotonic() - started) * 1000:.1f} ms, "
                               f"{columns} columns, last row {rows[-1]!r}"

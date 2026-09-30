@@ -222,6 +222,11 @@ class RunRecord:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def finished(self) -> bool:
+        """True once `finish` has ended the record (the run has ended)."""
+        return self._finished
+
     def _write(self) -> None:
         with self._lock:
             self._fields["alive_at"] = time.time()
@@ -502,8 +507,10 @@ def _make_signal_handler(name: str, number: int, previous):
 
 
 def current() -> Optional[RunRecord]:
-    with _lock:
-        return _record
+    """This process's record. Unlocked on purpose: one attribute read is atomic,
+    and `_lock` is plain — a termination signal's handler (`set_reason` ->
+    here) landing on the main thread inside a locked read would wait on itself."""
+    return _record
 
 
 def note(**fields) -> None:
