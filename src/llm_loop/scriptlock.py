@@ -7,12 +7,41 @@ import os
 from pathlib import Path
 import sys
 import time
+from typing import NamedTuple
 
 
 # The operator requested a half-second polling cadence; this is not a timeout.
 POLL_SECONDS = 0.5
 LOCK_DIR = Path.home() / ".llm-loop" / "script-locks"
 _launches = {}
+_launch_decision = None
+
+
+class LaunchDecision(NamedTuple):
+    """The startup choice retained for the whole process and its run record."""
+
+    mode: str
+    path: str
+    conflict: str
+    wait_seconds: float
+
+    @property
+    def held_at_start(self) -> bool:
+        return self.mode != "independent"
+
+    def record(self) -> dict:
+        return {"mode": self.mode, "path": self.path,
+                "conflict": self.conflict,
+                "wait_seconds": round(self.wait_seconds, 1),
+                "held_at_start": self.held_at_start}
+
+    def summary(self) -> str:
+        detail = f"; initial conflict: {self.conflict}" if self.conflict else ""
+        waited = (f"; waited {self.wait_seconds:.1f} s"
+                  if self.mode == "waited" else "")
+        return (f"script lock: {self.mode} (held at startup="
+                f"{self.held_at_start}); pid {os.getpid()}; "
+                f"path: {self.path}{detail}{waited}")
 
 
 class ScriptLock:
@@ -62,7 +91,7 @@ class ScriptLock:
 
 
 def ensure_script_lock(*, app_name: str = None,
-                       project_dir: str = None) -> None:
+                       project_dir: str = None) -> LaunchDecision:
     """Ask once on contention, before logging, terminal input or work starts.
 
     The OS lock's identity comes from argv[0], never the driver class, app label,
@@ -79,8 +108,9 @@ def ensure_script_lock(*, app_name: str = None,
     """
     # One process has one invoking script. Check the retained decision BEFORE
     # resolving argv[0] again: a batching wrapper may have changed its cwd.
+    global _launch_decision
     if _launches:
-        return
+        return _launch_decision
     lock = ScriptLock(sys.argv[0])
     if project_dir is not None:
         project_dir = os.path.normcase(os.path.abspath(project_dir))
@@ -96,7 +126,10 @@ def ensure_script_lock(*, app_name: str = None,
 
     try:
         locked = lock.acquire()
-        peers = live_runs() if locked else []
+        peers = live_runs()
+        conflict = "; ".join(filter(None, (
+            "OS lock held" if not locked else "",
+            f"live run pid {', '.join(map(str, peers))}" if peers else "")))
         if not locked or peers:
             detail = (f" (live run pid {', '.join(map(str, peers))})"
                       if peers else "")
@@ -114,17 +147,28 @@ def ensure_script_lock(*, app_name: str = None,
                 if choice in ("i", "independent", "3"):
                     print("Starting independently without the script lock.", flush=True)
                     lock.close()
+                    decision = LaunchDecision(
+                        "independent", str(lock.path), conflict, 0.0)
                     _launches[lock.script] = None
-                    return
+                    _launch_decision = decision
+                    return decision
                 if choice in ("w", "wait", "2"):
                     print("Waiting for the script lock (checking every 0.5 s); "
                           "Ctrl+C cancels.", flush=True)
+                    started = time.monotonic()
                     while not lock.acquire() or live_runs():
                         time.sleep(POLL_SECONDS)
+                    decision = LaunchDecision(
+                        "waited", str(lock.path), conflict,
+                        time.monotonic() - started)
                     break
                 print("Choose e, w or i.", flush=True)
+        else:
+            decision = LaunchDecision("acquired", str(lock.path), "", 0.0)
         _launches[lock.script] = lock
+        _launch_decision = decision
         atexit.register(lock.close)
+        return decision
     except KeyboardInterrupt:
         lock.close()
         print("\nScript launch cancelled.", file=sys.stderr)

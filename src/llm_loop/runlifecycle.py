@@ -165,8 +165,9 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     for a caller that built its namespace by hand and left one out — the caller
     that gets an AttributeError instead.
     """
+    launch = None
     if not args.dry_run:
-        ensure_script_lock(
+        launch = ensure_script_lock(
             app_name=app_name,
             project_dir=os.path.abspath(
                 args.project_dir or projectroot.project_dir()))
@@ -215,14 +216,17 @@ def begin_run(driver, args, app_name: str, progress=None, *,
         # to land in the mirror log whose abrupt end it explains. Idempotent per
         # process: a batching wrapper calls a runner repeatedly and keeps one
         # record.
-        exitlog.begin(app_name, console.LOG_DIR,
-                      os.path.basename(projectroot.project_dir()))
+        record = exitlog.begin(app_name, console.LOG_DIR,
+                               os.path.basename(projectroot.project_dir()))
+        if record is not None:
+            record.note(script_lock=launch.record())
     print(f"  · project root: {projectroot.project_dir()}")
     if dry_run:
         print(f"  · dry run: nothing is mirrored to "
               f"{console.log_file_path(app_name)}")
     else:
         print(f"  · logging to {console.log_file_path(app_name)}")
+        print(f"  · {launch.summary()}")
         if diaglog.log_path() is not None:
             print(f"  · status line diagnostics: {diaglog.log_path()}"
                   + (" (key trace on)" if diaglog.keytrace_enabled() else ""))

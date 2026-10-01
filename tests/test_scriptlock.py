@@ -1,5 +1,6 @@
 """Exercise contention across real processes, including a forcibly killed owner."""
 
+import json
 import os
 from pathlib import Path
 import queue
@@ -70,6 +71,24 @@ console.LOG_DIR = lock_dir.parent
 project_dir = sys.argv[2] if len(sys.argv) > 2 else str(lock_dir.parent / 'project')
 scriptlock.ensure_script_lock(app_name='runCycle',
                               project_dir=project_dir)
+print('READY', flush=True)
+sys.stdin.readline()
+"""
+
+LOGGING_CHILD = """\
+from pathlib import Path
+import sys
+from llm_loop import StateFileDriver, console, cyclecore, runlifecycle, scriptlock
+
+lock_dir = Path(sys.argv[1])
+root = lock_dir.parent
+project = root / 'project'
+project.mkdir(exist_ok=True)
+scriptlock.LOCK_DIR = lock_dir
+console.LOG_DIR = root
+args = cyclecore.parse_args(['--project-dir', str(project),
+                             '--git-push', 'none', '--no-statusline'])
+runlifecycle.begin_run(StateFileDriver(), args, 'runCycle')
 print('READY', flush=True)
 sys.stdin.readline()
 """
@@ -220,6 +239,45 @@ def test_legacy_record_project_name_with_brackets_is_found(launch, tmp_path):
     other.until('Another instance')
     other.send('e')
     other.wait()
+
+
+@pytest.mark.parametrize('choice, mode, held', [
+    ('w', 'waited', True), ('i', 'independent', False),
+])
+def test_launch_decision_is_in_mirror_log_and_live_record(
+        launch, tmp_path, choice, mode, held):
+    legacy = launch('legacy.py', content=LEGACY_CHILD)
+    legacy.until('READY')
+    other = launch('runCycle.py', content=LOGGING_CHILD)
+    other.until('Another instance')
+    other.send(choice)
+    if choice == 'w':
+        other.until('checking every 0.5 s')
+        legacy.send('')
+        legacy.wait()
+    other.until('READY')
+    record_path = tmp_path / f'runCycle-project.{other.proc.pid}.run.json'
+    decision = json.loads(record_path.read_text(encoding='utf-8'))['script_lock']
+    assert decision['mode'] == mode
+    assert decision['held_at_start'] is held
+    assert decision['path'].endswith('.lock')
+    assert 'live run pid' in decision['conflict']
+    log = (tmp_path / 'runCycle-project.log').read_text(encoding='utf-8')
+    assert f'script lock: {mode} (held at startup={held})' in log
+    assert f'pid {other.proc.pid}' in log
+    assert decision['path'] in log
+
+
+def test_uncontended_launch_records_its_lock(launch, tmp_path):
+    run = launch('runCycle.py', content=LOGGING_CHILD)
+    run.until('READY')
+    record_path = tmp_path / f'runCycle-project.{run.proc.pid}.run.json'
+    decision = json.loads(record_path.read_text(encoding='utf-8'))['script_lock']
+    assert decision['mode'] == 'acquired'
+    assert decision['held_at_start'] is True
+    assert decision['conflict'] == ''
+    log = (tmp_path / 'runCycle-project.log').read_text(encoding='utf-8')
+    assert 'script lock: acquired (held at startup=True)' in log
 
 
 def test_independent_launch_does_not_release_the_owner(launch):
