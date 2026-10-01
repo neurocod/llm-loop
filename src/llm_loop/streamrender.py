@@ -1,7 +1,7 @@
 """One provider run, rendered live into the terminal — the sequential runner's half.
 
 Everything about turning ONE stream of provider events into what a person
-watching a run sees: start the CLI, read its JSONL, print each event in the
+watching a run sees: start the CLI, read its events, print each event in the
 style of interactive mode, and hand back the exit code. The words the stream is
 made of are `wire`, shared with the other renderer; the SHAPES of the printed
 lines are `compactline` and `console`, shared with it too. What is genuinely
@@ -256,7 +256,7 @@ def _render_codex_event(ev: dict, mailbox=None) -> None:
 def run_agent_streaming(cmd: list, provider: str, raw: bool,
                         partial: bool = True, prompt: str = "",
                         mailbox=None) -> int:
-    """Run one provider CLI, parse its JSONL and render progress live.
+    """Run one provider CLI, decode its events and render progress live.
 
     Claude's rate-limit verdict, if streamed, is left in
     ``last_rate_limit_event()``. Codex limits are queried separately through

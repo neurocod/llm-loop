@@ -424,6 +424,10 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
       * codex without them - ``exec --json`` reads the prompt from a stdin closed
         immediately after, preserving the old fallback transport.
 
+    The returned process's ``stdout`` yields ``str`` lines (JSONL or plain
+    diagnostics) for every shape, plus already-decoded ``dict`` events for the
+    codex app-server shape; a consumer must accept both item types.
+
     Everything after `Popen` runs with a child alive and is therefore inside a
     guard of its own, ending it if the function does not get to return. Both
     runners wrap their whole render loop in `try/finally: reap_agent_process`,
