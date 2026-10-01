@@ -30,8 +30,8 @@ rather than to tidy it:
     terminal nobody is reading any more. Pinned by
     `tests/test_exit_reason.py::test_the_report_of_a_vanished_run_lands_in_the_log`;
   * the exit push is the WHOLE of `final_git_push`, the `git_unpushed_count`
-    inside it included, made by the caller's pusher when it has one, because
-    the runner with threads may still have that pusher inside `git push`.
+    inside it included, made by the caller's pusher because it may still be
+    inside `git push`.
     Reading the count beside it is how "nothing to push" could be printed about
     a repository that was being pushed at that moment. Pinned by
     `tests/test_git_push.py`.

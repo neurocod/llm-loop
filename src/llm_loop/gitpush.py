@@ -68,8 +68,8 @@ GIT_PUSH_INTERVAL = 3600  # seconds — one hour
 class PushAbort:
     """A Ctrl+C's hold on a push: once `set` has returned, no git child of it starts.
 
-    A plain Event could not say that. The push is on another thread (the
-    parallel runner's pusher), so "is it set?" and "start git" are two steps,
+    A plain Event could not say that. The push is on a pusher thread, so
+    "is it set?" and "start git" are two steps,
     and a `set` landing between them — while the push printed its announcement,
     say — let a `git push` start after the operator had abandoned it. Here the
     check and the child's start are one step under `_lock`, and `set` takes the
