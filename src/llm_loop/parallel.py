@@ -532,18 +532,24 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # `providers.reap_agent_process`.
     try:
         with note_channel(proc, provider, mailbox) as channel:
-            for line in proc.stdout:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    # Printed indented under a head of its own if the job fails.
-                    diagnostics.append(compactline.short(line, out.budget("  ")))
-                    continue  # non-JSON CLI diagnostics — skip in compact mode
-                if not isinstance(ev, dict):
-                    continue  # valid JSON can still be a diagnostic, not an event
+            for item in proc.stdout:
+                if isinstance(item, dict):
+                    # An app-server event arrives decoded
+                    # (`providers._CodexEventStream`).
+                    ev = item
+                else:
+                    line = item.rstrip("\n")
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        # Printed indented under a head of its own if the job fails.
+                        diagnostics.append(
+                            compactline.short(line, out.budget("  ")))
+                        continue  # non-JSON CLI diagnostics — skip in compact mode
+                    if not isinstance(ev, dict):
+                        continue  # valid JSON can still be a diagnostic, not an event
                 et = wire.event_type(ev)
                 if provider != "codex":
                     # The row's resolved model and window (see `statusline.describing`).

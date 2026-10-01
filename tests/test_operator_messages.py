@@ -238,8 +238,7 @@ def test_a_codex_note_uses_turn_steer_and_its_replay_is_logged(capsys):
         sender = threading.Thread(
             target=lambda: delivered.append(mailbox.submit("check the hinges")))
         sender.start()
-        for line in proc.stdout:
-            event = json.loads(line)
+        for event in proc.stdout:
             if wire.event_type(event) == wire.TURN_COMPLETED:
                 channel.close()
             streamrender._render_codex_event(event, mailbox)

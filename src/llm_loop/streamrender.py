@@ -294,20 +294,25 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     codex_outcome = wire.CodexOutcome()
     try:
         with note_channel(proc, provider, mailbox) as channel:
-            for line in proc.stdout:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    # non-JSON line (e.g. CLI diagnostics) — print it as is
-                    print(line)
-                    continue
-                if not isinstance(ev, dict):
-                    # A JSON scalar/array is diagnostic output, not a JSONL event.
-                    print(line)
-                    continue
+            for item in proc.stdout:
+                if isinstance(item, dict):
+                    # An app-server event arrives decoded
+                    # (`providers._CodexEventStream`); `raw` re-encodes it.
+                    ev, line = item, None
+                else:
+                    line = item.rstrip("\n")
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        # non-JSON line (e.g. CLI diagnostics) — print it as is
+                        print(line)
+                        continue
+                    if not isinstance(ev, dict):
+                        # A JSON scalar/array is diagnostic output, not an event.
+                        print(line)
+                        continue
                 event_type = wire.event_type(ev)
                 if provider == "claude":
                     # Before `raw`, so a raw run's row learns the model too.
@@ -325,7 +330,8 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                     # turn that has already reported its ending.
                     channel.close()
                 if raw:
-                    print(line)
+                    print(line if line is not None
+                          else json.dumps(ev, ensure_ascii=True))
                     continue
                 if provider == "claude":
                     _render_claude_event(ev, partial, mailbox)

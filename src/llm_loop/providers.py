@@ -147,7 +147,13 @@ class _CodexSteerStream:
 
 
 class _CodexEventStream:
-    """Turn app-server JSON-RPC notifications into ``exec --json`` events."""
+    """Turn app-server JSON-RPC notifications into ``exec --json`` events.
+
+    An event is yielded as the decoded ``dict``, not re-serialized: both
+    renderers would only parse the line straight back. A line that is not a
+    JSON object stays the ``str`` it arrived as, so diagnostics keep the
+    renderers' string path. Consumers therefore take ``dict | str`` items.
+    """
 
     def __init__(self, owner, buffered: list):
         self._owner = owner
@@ -185,7 +191,7 @@ class _CodexEventStream:
                 self._latest_usage = usage
             event = wire.codex_app_event(message, self._latest_usage)
             if event is not None:
-                return json.dumps(event, ensure_ascii=True) + "\n"
+                return event
 
     def close(self) -> None:
         try:

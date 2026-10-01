@@ -316,9 +316,9 @@ def test_codex_process_ignores_nested_agent_events():
     proc = providers._CodexAppProcess(
         raw, [], thread_id="root-thread", turn_id="root-turn")
 
-    context = json.loads(next(proc.stdout))
-    item = json.loads(next(proc.stdout))
-    completed = json.loads(next(proc.stdout))
+    context = next(proc.stdout)
+    item = next(proc.stdout)
+    completed = next(proc.stdout)
 
     assert context["type"] == "thread.token_usage.updated"
     assert context["tokenUsage"]["last"]["inputTokens"] == 9
@@ -329,6 +329,63 @@ def test_codex_process_ignores_nested_agent_events():
         "usage": {"input_tokens": 9, "cached_input_tokens": 8,
                   "output_tokens": 7},
     }
+
+
+def _app_server_stream(*items):
+    """App-server stdout: dicts become JSON lines, strings stay as written."""
+    return "".join(item if isinstance(item, str) else json.dumps(item) + "\n"
+                   for item in items)
+
+
+_ROOT_MESSAGE = {"method": "item/completed", "params": {
+    "threadId": "root", "turnId": "turn", "completedAtMs": 1,
+    "item": {"id": "m", "type": "agentMessage", "text": "корень готов"}}}
+
+
+def test_codex_app_events_arrive_as_objects_and_diagnostics_as_lines():
+    """No dumps/loads round trip between the provider and its renderers."""
+    raw = _FakeAgentProcess(stdout=_app_server_stream(
+        "npm warn deprecated\n", "[1]\n", _ROOT_MESSAGE))
+    proc = providers._CodexAppProcess(raw, [], "root", "turn")
+
+    assert next(proc.stdout) == "npm warn deprecated\n"
+    assert next(proc.stdout) == "[1]\n"
+    event = next(proc.stdout)
+    assert isinstance(event, dict)
+    assert event["type"] == "item.completed"
+    assert event["item"]["text"] == "корень готов"
+
+
+@pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
+def test_both_renderers_take_codex_app_events_as_objects(
+        monkeypatch, capsys, runner):
+    """The object path keeps diagnostics, raw JSONL and the outcome alike."""
+    raw = _FakeAgentProcess(returncode=1, stdout=_app_server_stream(
+        "provider said: boom\n", _ROOT_MESSAGE))
+    proc = providers._CodexAppProcess(raw, [], "root", "turn")
+    monkeypatch.setattr(streamrender, "start_agent_process", lambda *a: proc)
+    monkeypatch.setattr(parallel, "start_agent_process", lambda *a: proc)
+
+    if runner == "parallel":
+        rc, _, _ = parallel.run_job(
+            1, AgentCommand("p", "gpt-test", "j", "codex"))
+    else:
+        rc = streamrender.run_agent_streaming(
+            ["codex"], "codex", raw=runner == "raw")
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    # Printed live by the sequential renderer, kept as the failure tail by the
+    # parallel one — either way the diagnostic reaches the screen.
+    assert "provider said: boom" in out
+    if runner == "raw":
+        # Normalized, ASCII-escaped JSONL — what the old string tract printed.
+        events = [json.loads(ln) for ln in out.splitlines()
+                  if ln.startswith("{")]
+        assert [ev["item"]["text"] for ev in events] == ["корень готов"]
+        assert "корень" not in out
+    else:
+        assert "корень готов" in out
 
 
 def test_codex_no_live_process_closes_stdin_after_the_prompt(
