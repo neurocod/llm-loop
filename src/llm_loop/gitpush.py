@@ -104,6 +104,10 @@ class PushAbort:
 # `_reap_killed`). A module constant so a test can take the other branch.
 _WINDOWS = sys.platform == "win32"
 
+# A run abandoned with a git child in flight can be followed by another run
+# in the same process. Their pusher threads must not start git beside each other.
+_GIT_CALL_LOCK = threading.Lock()
+
 
 def _reap_killed(proc: "subprocess.Popen") -> None:
     """Collect a child `_run_git` has just killed on its timeout — without bound
@@ -131,13 +135,20 @@ def _reap_killed(proc: "subprocess.Popen") -> None:
 def _run_git(argv, cwd: str, timeout: float,
              abort: Optional[PushAbort] = None
              ) -> "Optional[subprocess.CompletedProcess]":
-    """`subprocess.run` of one git call, or None when `abort` refused its start.
+    """One serialized git call, or None when `abort` refused its start.
 
     Without `abort` it IS `subprocess.run`. With one the child is started under
     the abort's lock (`PushAbort.start`) and then waited for outside it, the
     way `subprocess.run` does: killed on its timeout (TimeoutExpired raised
     on) and on any exception out of the wait.
     """
+    with _GIT_CALL_LOCK:
+        return _run_git_exclusive(argv, cwd, timeout, abort)
+
+
+def _run_git_exclusive(argv, cwd: str, timeout: float,
+                       abort: Optional[PushAbort]
+                       ) -> "Optional[subprocess.CompletedProcess]":
     options = dict(cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                    text=True, encoding="utf-8", errors="replace")
     if abort is None:
@@ -241,21 +252,27 @@ def final_git_push(policy: GitPushPolicy, cwd: str, *,
         print("  · final git push: nothing to push.")
 
 
-def maybe_git_push(policy: GitPushPolicy, last_push: float, cwd: str) -> float:
+def maybe_git_push(policy: GitPushPolicy, last_push: float, cwd: str, *,
+                   abort: Optional[PushAbort] = None) -> float:
     """Apply the GitPushPolicy at the start of an iteration.
 
     `last_push` is the epoch time of the previous push attempt (0.0 if never).
     Returns the updated `last_push` so the caller can carry it to the next
     iteration. A no-op for NONE; pushes when commits are pending for
     AFTER_NEW_COMMITS; for EACH_HOUR pushes pending commits at most once an hour.
+    `abort` stops queued work from starting git after its run has unwound.
     """
     if policy == GitPushPolicy.NONE:
         return last_push
+    if abort is not None and abort.is_set():
+        return last_push
 
     if policy == GitPushPolicy.AFTER_NEW_COMMITS:
-        count = git_unpushed_count(cwd)
+        count = git_unpushed_count(cwd, abort=abort)
+        if abort is not None and abort.is_set():
+            return last_push
         if count is None or count > 0:
-            if git_push(cwd):
+            if git_push(cwd, abort=abort):
                 return time.time()
         return last_push
 
@@ -265,9 +282,11 @@ def maybe_git_push(policy: GitPushPolicy, last_push: float, cwd: str) -> float:
             return last_push
         # An hour has passed — push if there is anything to push, and reset the
         # timer either way so we re-check at most once per hour.
-        count = git_unpushed_count(cwd)
+        count = git_unpushed_count(cwd, abort=abort)
+        if abort is not None and abort.is_set():
+            return last_push
         if count is None or count > 0:
-            git_push(cwd)
+            git_push(cwd, abort=abort)
         return now
 
     return last_push

@@ -131,7 +131,7 @@ from .streamrender import (
 # call is named here now — the exit push, the policy enum and its status label
 # are the shared prologue/epilogue's (`runlifecycle`), which is the one place
 # both runners open and close a run through.
-from .gitpush import maybe_git_push
+from .gitpush import PushAbort, maybe_git_push
 from .ownership import OwnerThread
 # What is known about a quota lives in `usage`, so the limit rules (and the
 # parallel runner) can use it without importing this one. Only the length of the
@@ -388,19 +388,21 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     call is the invocation and owns its own figures.
     """
     pusher = OwnerThread("pusher", maxsize=1)
+    push_abort = PushAbort()
     try:
         return _run_loop(driver, args, app_name, setup_logging=setup_logging,
                          wait_on_start=wait_on_start, progress=progress,
-                         pusher=pusher)
+                         pusher=pusher, push_abort=push_abort)
     finally:
-        # An exceptional exit may bypass close_run. Stop accepting periodic
-        # work without waiting for a git call that is already in flight.
+        # An exceptional exit may bypass close_run. Queued work still drains
+        # on close, so forbid any further git child before releasing the owner.
+        push_abort.set()
         pusher.close(timeout=0)
 
 
 def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
               setup_logging: bool, wait_on_start: bool, progress,
-              pusher: OwnerThread) -> stopchannel.RunResult:
+              pusher: OwnerThread, push_abort: PushAbort) -> stopchannel.RunResult:
     # --cost: report per-run spend from the mirror log and exit, without touching
     # the loop, the tee, git, or the usage gate. BEFORE the prologue, whose first
     # act is to raise the tee and open an exit record: a report is not a run, and
@@ -482,7 +484,7 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
     def push_turn() -> None:
         nonlocal last_git_push
         last_git_push = maybe_git_push(run_settings.git_push, last_git_push,
-                                       projectroot.project_dir())
+                                       projectroot.project_dir(), abort=push_abort)
 
     if not dry_run:
         pusher.start()

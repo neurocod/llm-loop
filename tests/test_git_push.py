@@ -227,6 +227,62 @@ def test_a_sequential_agent_starts_while_git_push_is_running(tmp_path, monkeypat
         f"git ran on the agent's thread: {fake.threads}"
 
 
+def test_abandoned_sequential_run_starts_no_queued_git(tmp_path, monkeypatch):
+    # The test body took 0.02 s measured 2026-10-02; 10 s bounds a broken
+    # handshake without making a loaded CI worker fail on normal scheduling.
+    class HeldPushGit(_FakeGitModule):
+        def __init__(self):
+            super().__init__()
+            self.release = threading.Event()
+
+        def run(self, argv, **kwargs):
+            result = super().run(argv, **kwargs)
+            if tuple(argv)[:2] == ("git", "push"):
+                self.release.wait(timeout=HELD_PUSH_TIMEOUT_S)
+            return result
+
+    class TwoShotDriver(OneShotDriver):
+        def next_command(self):
+            if self.served == 2:
+                return None
+            self.served += 1
+            return ClaudeCommand("do the thing", "", f"thing-{self.served}")
+
+    fake = HeldPushGit()
+    made = []
+    real_owner = ownership.OwnerThread
+
+    def owner(*args, **kwargs):
+        pusher = real_owner(*args, **kwargs)
+        made.append(pusher)
+        return pusher
+
+    calls = []
+
+    def agent(*args, **kwargs):
+        calls.append("agent")
+        if len(calls) == 1:
+            assert fake.pushed.wait(timeout=HELD_PUSH_TIMEOUT_S)
+            return 0
+        assert made[0].backlog == 2, "the second push check was not queued"
+        raise RuntimeError("agent failed")
+
+    monkeypatch.setattr(cyclecore, "OwnerThread", owner)
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", agent)
+    try:
+        with pytest.raises(RuntimeError, match="agent failed"):
+            cyclecore.run_loop(TwoShotDriver(),
+                               seq_args(root_not_cwd(tmp_path), git_push=PUSHING),
+                               app_name="pytest-gitpush")
+    finally:
+        fake.release.set()
+
+    assert made[0].close(timeout=HELD_PUSH_TIMEOUT_S)
+    assert len(fake.pushes) == 1, \
+        f"a queued push started after the run was abandoned: {fake.calls}"
+
+
 def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(
         tmp_path, monkeypatch):
     """The same handover from the other runner, on its exit push.
@@ -604,6 +660,29 @@ class _HeldCountGit(_FakeGitModule):
             self.counting.set()
             self.release.wait(timeout=HELD_PUSH_TIMEOUT_S)
         return super().run(argv, **kwargs)
+
+
+def test_aborting_a_periodic_count_starts_no_push(tmp_path, monkeypatch):
+    # Under 0.005 s measured 2026-10-02; the existing 10 s bound leaves room
+    # for CI scheduling while still failing a lost release.
+    fake = _HeldCountGit()
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    abort = gitpush.PushAbort()
+    pusher = threading.Thread(
+        target=gitpush.maybe_git_push,
+        args=(gitpush.GitPushPolicy.AFTER_NEW_COMMITS, 0.0,
+              root_not_cwd(tmp_path)), kwargs={"abort": abort}, daemon=True)
+    pusher.start()
+    try:
+        assert fake.counting.wait(timeout=HELD_PUSH_TIMEOUT_S)
+        abort.set()
+    finally:
+        fake.release.set()
+    pusher.join(timeout=HELD_PUSH_TIMEOUT_S)
+
+    assert not pusher.is_alive()
+    assert fake.pushes == [], \
+        f"a push started after the periodic check was abandoned: {fake.calls}"
 
 
 def test_ctrl_c_while_the_exit_push_is_waited_for_gives_up_the_push_only(
