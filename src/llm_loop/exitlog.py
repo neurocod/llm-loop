@@ -27,6 +27,7 @@ failing to write one must not cost an iteration.
 from __future__ import annotations
 
 import atexit
+import glob
 import json
 import os
 import sys
@@ -35,6 +36,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, List, Optional
+
+from . import projectroot
 
 # How often the watchdog thread refreshes `alive_at`. The record's job is to
 # answer "when did the process stop existing?", and only a clock the run keeps
@@ -338,7 +341,8 @@ def record_path(log_dir: Path, app_name: str, project: str, pid: int) -> Path:
     return Path(log_dir) / f"{_stem(app_name, project)}.{pid}{RECORD_SUFFIX}"
 
 
-def live_run_pids(app_name: str, log_dir: Path, project: str) -> List[int]:
+def live_run_pids(app_name: str, log_dir: Path, project: str, *,
+                  script: str, project_dir: str) -> List[int]:
     """Live owners of this app/project's run records, excluding this process.
 
     The script lock is authoritative for current launches, but an older running
@@ -346,19 +350,29 @@ def live_run_pids(app_name: str, log_dir: Path, project: str) -> List[int]:
     signal. Check process creation time too, so a reused PID cannot strand a
     launch waiting for a process unrelated to the record.
     """
+    stem = _stem(app_name, project)
     try:
         candidates = Path(log_dir).glob(
-            f"{_stem(app_name, project)}.*{RECORD_SUFFIX}")
+            f"{glob.escape(stem)}.*{RECORD_SUFFIX}")
         records = list(candidates)
     except OSError:
         return []
     live = []
     for path in records:
+        record_pid = path.name[len(stem) + 1:-len(RECORD_SUFFIX)]
+        if not record_pid.isdecimal():
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             pid = int(data.get("pid") or 0)
             started = data.get("started")
         except (OSError, ValueError, AttributeError):
+            continue
+        # Older records lack these fields. Treat those conservatively as a
+        # possible peer; new records can reject another script or checkout.
+        if data.get("script") and data["script"] != script:
+            continue
+        if data.get("project_dir") and data["project_dir"] != project_dir:
             continue
         if (pid != os.getpid() and isinstance(started, (int, float))
                 and pid_alive(pid, started)):
@@ -439,6 +453,8 @@ def begin(app_name: str, log_dir: Path, project: str, argv=None,
         "pid": os.getpid(),
         "app": app_name,
         "project": project,
+        "script": os.path.normcase(os.path.realpath(sys.argv[0])),
+        "project_dir": os.path.normcase(os.path.abspath(projectroot.project_dir())),
         "argv": argv,
         "started": _own_start_time(),
     }

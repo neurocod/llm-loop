@@ -28,11 +28,32 @@ sys.stdin.readline()
 """
 
 LEGACY_CHILD = """\
+import json
+import os
 from pathlib import Path
 import sys
 from llm_loop import exitlog
 
 root = Path(sys.argv[1]).parent
+project = sys.argv[2] if len(sys.argv) > 2 else 'project'
+record = exitlog.record_path(root, 'runCycle', project, os.getpid())
+record.write_text(json.dumps({'pid': os.getpid(),
+                              'started': exitlog._own_start_time()}),
+                  encoding='utf-8')
+print('READY', flush=True)
+sys.stdin.readline()
+record.unlink()
+"""
+
+MODERN_CHILD = """\
+from pathlib import Path
+import sys
+from llm_loop import exitlog, projectroot
+
+root = Path(sys.argv[1]).parent
+project = root / 'project'
+project.mkdir(exist_ok=True)
+projectroot.set_project_root(str(project))
 exitlog.begin('runCycle', root, 'project')
 print('READY', flush=True)
 sys.stdin.readline()
@@ -46,19 +67,21 @@ from llm_loop import console, scriptlock
 lock_dir = Path(sys.argv[1])
 scriptlock.LOCK_DIR = lock_dir
 console.LOG_DIR = lock_dir.parent
+project_dir = sys.argv[2] if len(sys.argv) > 2 else str(lock_dir.parent / 'project')
 scriptlock.ensure_script_lock(app_name='runCycle',
-                              project_dir=str(lock_dir.parent / 'project'))
+                              project_dir=project_dir)
 print('READY', flush=True)
 sys.stdin.readline()
 """
 
 
 class Child:
-    def __init__(self, path, lock_dir, cwd):
+    def __init__(self, path, lock_dir, cwd, extra_args):
         env = dict(os.environ, PYTHONPATH=str(
             Path(scriptlock.__file__).resolve().parents[1]))
         self.proc = subprocess.Popen(
-            [sys.executable, '-u', str(path), str(lock_dir)], cwd=cwd, env=env,
+            [sys.executable, '-u', str(path), str(lock_dir), *extra_args],
+            cwd=cwd, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding='utf-8')
         self.lines = queue.Queue()
@@ -103,11 +126,13 @@ def launch(tmp_path, monkeypatch):
     monkeypatch.setattr(scriptlock, 'LOCK_DIR', tmp_path / 'locks')
     children = []
 
-    def start(name='runCycle.py', *, cwd=None, path=None, content=CHILD):
+    def start(name='runCycle.py', *, cwd=None, path=None, content=CHILD,
+              extra_args=()):
         script = tmp_path / name
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text(content, encoding='utf-8')
-        child = Child(path or script, scriptlock.LOCK_DIR, cwd or tmp_path)
+        child = Child(path or script, scriptlock.LOCK_DIR, cwd or tmp_path,
+                      extra_args)
         children.append(child)
         return child
 
@@ -151,10 +176,16 @@ def test_wait_acquires_after_normal_or_forced_exit(launch, kill_owner):
 
 
 @pytest.mark.parametrize('kill_owner', [False, True])
-def test_live_record_catches_owner_without_script_lock(launch, kill_owner):
+@pytest.mark.parametrize('relative_project', [False, True])
+def test_live_record_catches_owner_without_script_lock(
+        launch, kill_owner, relative_project, tmp_path):
     legacy = launch('legacy.py', content=LEGACY_CHILD)
     legacy.until('READY')
-    waiter = launch('runCycle.py', content=RECORD_CHILD)
+    project = tmp_path / 'project'
+    project.mkdir(exist_ok=True)
+    waiter = launch('runCycle.py', content=RECORD_CHILD,
+                    cwd=project if relative_project else None,
+                    extra_args=('.',) if relative_project else ())
     waiter.until('Another instance')
     waiter.send('w')
     waiter.until('checking every 0.5 s')
@@ -171,6 +202,24 @@ def test_live_record_catches_owner_without_script_lock(launch, kill_owner):
     third.until('Another instance')
     third.send('e')
     third.wait()
+
+
+def test_new_record_from_another_script_is_not_a_peer(launch):
+    owner = launch('other.py', content=MODERN_CHILD)
+    owner.until('READY')
+    other = launch('runCycle.py', content=RECORD_CHILD)
+    assert 'Another instance' not in other.until('READY')
+
+
+def test_legacy_record_project_name_with_brackets_is_found(launch, tmp_path):
+    legacy = launch('legacy.py', content=LEGACY_CHILD,
+                    extra_args=('[demo]',))
+    legacy.until('READY')
+    other = launch('runCycle.py', content=RECORD_CHILD,
+                   extra_args=(str(tmp_path / '[demo]'),))
+    other.until('Another instance')
+    other.send('e')
+    other.wait()
 
 
 def test_independent_launch_does_not_release_the_owner(launch):

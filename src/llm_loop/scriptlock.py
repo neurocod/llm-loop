@@ -82,13 +82,17 @@ def ensure_script_lock(*, app_name: str = None,
     if _launches:
         return
     lock = ScriptLock(sys.argv[0])
+    if project_dir is not None:
+        project_dir = os.path.normcase(os.path.abspath(project_dir))
 
     def live_runs() -> list[int]:
         if app_name is None or project_dir is None:
             return []
         from . import console, exitlog
         project = os.path.basename(os.path.normpath(project_dir))
-        return exitlog.live_run_pids(app_name, console.LOG_DIR, project)
+        return exitlog.live_run_pids(
+            app_name, console.LOG_DIR, project, script=lock.script,
+            project_dir=project_dir)
 
     try:
         locked = lock.acquire()
