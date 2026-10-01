@@ -166,7 +166,9 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     that gets an AttributeError instead.
     """
     if not args.dry_run:
-        ensure_script_lock()
+        ensure_script_lock(
+            app_name=app_name,
+            project_dir=args.project_dir or projectroot.project_dir())
 
     provider = args.provider or driver.provider
     spec = provider_spec(provider)

@@ -27,6 +27,31 @@ print('READY', flush=True)
 sys.stdin.readline()
 """
 
+LEGACY_CHILD = """\
+from pathlib import Path
+import sys
+from llm_loop import exitlog
+
+root = Path(sys.argv[1]).parent
+exitlog.begin('runCycle', root, 'project')
+print('READY', flush=True)
+sys.stdin.readline()
+"""
+
+RECORD_CHILD = """\
+from pathlib import Path
+import sys
+from llm_loop import console, scriptlock
+
+lock_dir = Path(sys.argv[1])
+scriptlock.LOCK_DIR = lock_dir
+console.LOG_DIR = lock_dir.parent
+scriptlock.ensure_script_lock(app_name='runCycle',
+                              project_dir=str(lock_dir.parent / 'project'))
+print('READY', flush=True)
+sys.stdin.readline()
+"""
+
 
 class Child:
     def __init__(self, path, lock_dir, cwd):
@@ -78,10 +103,10 @@ def launch(tmp_path, monkeypatch):
     monkeypatch.setattr(scriptlock, 'LOCK_DIR', tmp_path / 'locks')
     children = []
 
-    def start(name='runCycle.py', *, cwd=None, path=None):
+    def start(name='runCycle.py', *, cwd=None, path=None, content=CHILD):
         script = tmp_path / name
         script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text(CHILD, encoding='utf-8')
+        script.write_text(content, encoding='utf-8')
         child = Child(path or script, scriptlock.LOCK_DIR, cwd or tmp_path)
         children.append(child)
         return child
@@ -120,6 +145,29 @@ def test_wait_acquires_after_normal_or_forced_exit(launch, kill_owner):
     waiter.until('READY')
     # The waiter owns the lock, rather than merely observing its release.
     third = launch()
+    third.until('Another instance')
+    third.send('e')
+    third.wait()
+
+
+@pytest.mark.parametrize('kill_owner', [False, True])
+def test_live_record_catches_owner_without_script_lock(launch, kill_owner):
+    legacy = launch('legacy.py', content=LEGACY_CHILD)
+    legacy.until('READY')
+    waiter = launch('runCycle.py', content=RECORD_CHILD)
+    waiter.until('Another instance')
+    waiter.send('w')
+    waiter.until('checking every 0.5 s')
+    assert waiter.proc.poll() is None
+    if kill_owner:
+        legacy.proc.kill()
+        legacy.proc.wait(timeout=PROCESS_TIMEOUT)
+    else:
+        legacy.send('')
+        legacy.wait()
+    waiter.until('READY')
+    # The waiter holds the OS lock once the older run's record disappears.
+    third = launch('runCycle.py', content=RECORD_CHILD)
     third.until('Another instance')
     third.send('e')
     third.wait()
@@ -227,7 +275,7 @@ def test_both_runners_lock_before_any_startup_side_effect(runner, monkeypatch):
     class ReachedGuard(Exception):
         pass
 
-    def guard():
+    def guard(**kwargs):
         raise ReachedGuard
 
     def unexpected(*args, **kwargs):
@@ -238,7 +286,7 @@ def test_both_runners_lock_before_any_startup_side_effect(runner, monkeypatch):
     monkeypatch.setattr(runlifecycle.exitlog, 'begin', unexpected)
     # Incomplete inputs deliberately fail if anything reads them before locking.
     with pytest.raises(ReachedGuard):
-        runner(object(), SimpleNamespace(dry_run=False))
+        runner(object(), SimpleNamespace(dry_run=False, project_dir=None))
 
 
 def test_dry_run_skips_the_guard(monkeypatch):

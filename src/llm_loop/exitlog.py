@@ -338,6 +338,34 @@ def record_path(log_dir: Path, app_name: str, project: str, pid: int) -> Path:
     return Path(log_dir) / f"{_stem(app_name, project)}.{pid}{RECORD_SUFFIX}"
 
 
+def live_run_pids(app_name: str, log_dir: Path, project: str) -> List[int]:
+    """Live owners of this app/project's run records, excluding this process.
+
+    The script lock is authoritative for current launches, but an older running
+    copy can lack that lock after an engine update. Its run record is a second
+    signal. Check process creation time too, so a reused PID cannot strand a
+    launch waiting for a process unrelated to the record.
+    """
+    try:
+        candidates = Path(log_dir).glob(
+            f"{_stem(app_name, project)}.*{RECORD_SUFFIX}")
+        records = list(candidates)
+    except OSError:
+        return []
+    live = []
+    for path in records:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(data.get("pid") or 0)
+            started = data.get("started")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if (pid != os.getpid() and isinstance(started, (int, float))
+                and pid_alive(pid, started)):
+            live.append(pid)
+    return live
+
+
 def report_orphans(app_name: str, log_dir: Path, project: str,
                    echo: Callable[[str], None] = print) -> List[dict]:
     """Print (and clear) the records of runs that never wrote an ending.

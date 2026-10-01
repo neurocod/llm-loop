@@ -61,14 +61,17 @@ class ScriptLock:
             self._file = None
 
 
-def ensure_script_lock() -> None:
+def ensure_script_lock(*, app_name: str = None,
+                       project_dir: str = None) -> None:
     """Ask once on contention, before logging, terminal input or work starts.
 
-    Identity comes from argv[0], never the driver class, app label, project root
-    or library location. Resolve it before a runner can change its cwd. A
-    batching wrapper calls several runners; retain its choice and lock until
-    PROCESS exit, including the gaps between those calls. Dry-run callers skip
-    this function because they only preview work; --help exits before it.
+    The OS lock's identity comes from argv[0], never the driver class, app label,
+    project root or library location. Resolve it before a runner can change its
+    cwd. A live run record for this app/project also counts as contention: a
+    process started with older engine code may not hold this OS lock. A batching
+    wrapper calls several runners; retain its choice and lock until PROCESS
+    exit, including the gaps between those calls. Dry-run callers skip this
+    function because they only preview work; --help exits before it.
 
     Independent means bypassing the mutex for this invocation: it neither
     releases the owner's lock nor becomes an owner after that process exits.
@@ -79,10 +82,22 @@ def ensure_script_lock() -> None:
     if _launches:
         return
     lock = ScriptLock(sys.argv[0])
+
+    def live_runs() -> list[int]:
+        if app_name is None or project_dir is None:
+            return []
+        from . import console, exitlog
+        project = os.path.basename(os.path.normpath(project_dir))
+        return exitlog.live_run_pids(app_name, console.LOG_DIR, project)
+
     try:
-        if not lock.acquire():
-            print(f"Another instance of this script is running: {lock.script}",
-                  flush=True)
+        locked = lock.acquire()
+        peers = live_runs() if locked else []
+        if not locked or peers:
+            detail = (f" (live run pid {', '.join(map(str, peers))})"
+                      if peers else "")
+            print(f"Another instance of this script is running: "
+                  f"{lock.script}{detail}", flush=True)
             while True:
                 try:
                     choice = input(
@@ -94,12 +109,13 @@ def ensure_script_lock() -> None:
                     raise SystemExit(0)
                 if choice in ("i", "independent", "3"):
                     print("Starting independently without the script lock.", flush=True)
+                    lock.close()
                     _launches[lock.script] = None
                     return
                 if choice in ("w", "wait", "2"):
                     print("Waiting for the script lock (checking every 0.5 s); "
                           "Ctrl+C cancels.", flush=True)
-                    while not lock.acquire():
+                    while not lock.acquire() or live_runs():
                         time.sleep(POLL_SECONDS)
                     break
                 print("Choose e, w or i.", flush=True)
