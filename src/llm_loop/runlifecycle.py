@@ -370,17 +370,18 @@ def close_run(ctx: RunContext, *,
     the least behind, and an operator's commits sat local until some later run
     happened to push them. Each of those now calls this and then exits.
 
-    `pusher` is the thread that owns the caller's git (`parallel.run_parallel`
-    has one), and the exit push is handed to it as its `final` — queued behind
+    `pusher` is the thread that owns the caller's git, and the exit push is
+    handed to it as its `final` — queued behind
     a push it has in flight, and waited for, however long that push takes: the
     exit push is the WHOLE of `final_git_push`, `git_unpushed_count` included,
     so no git call of it can run beside that push. The pusher is closed here on
     every ending that reaches this function, a dry run's included (the runner
-    closes it on the ones that do not). Without one (the sequential runner,
-    which has nothing to exclude) the push is made here, on the caller. The
+    closes it on the ones that do not). Without one the push is made here, on
+    the caller. The
     policy is read AT the push, off the live settings, either way. On the pusher
     a push that raises is reported with its traceback on stderr and the
-    housekeeping below still runs; made here it propagates.
+    housekeeping below still runs; made here it propagates. A KeyboardInterrupt
+    from the pusher is returned to this thread for the normal interrupt ending.
 
     Ctrl+C while the exit push is waited for — on the pusher or here — gives
     up the push, not the housekeeping: see the body for the order, and
@@ -406,6 +407,7 @@ def close_run(ctx: RunContext, *,
     """
     usages = list(usages)           # walked twice: snapshots, then sources
     abort = PushAbort()
+    exit_interrupt = []
 
     def exit_push():
         final_git_push(ctx.settings.git_push, projectroot.project_dir(),
@@ -418,6 +420,8 @@ def close_run(ctx: RunContext, *,
         # silence the exit push's. stderr is teed to the mirror log.
         try:
             exit_push()
+        except KeyboardInterrupt as caught:
+            exit_interrupt.append(caught)
         except Exception:
             print("  ⚠ the exit push failed; what is still local stays local:",
                   file=sys.stderr)
@@ -435,6 +439,8 @@ def close_run(ctx: RunContext, *,
                 pusher.close()
         elif pusher is not None:
             _wait_for_exit_push(pusher, exit_push_on_pusher)
+            if exit_interrupt:
+                raise exit_interrupt[0]
         else:
             exit_push()
     except KeyboardInterrupt as caught:

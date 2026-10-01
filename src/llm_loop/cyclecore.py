@@ -132,6 +132,7 @@ from .streamrender import (
 # are the shared prologue/epilogue's (`runlifecycle`), which is the one place
 # both runners open and close a run through.
 from .gitpush import maybe_git_push
+from .ownership import OwnerThread
 # What is known about a quota lives in `usage`, so the limit rules (and the
 # parallel runner) can use it without importing this one. Only the length of the
 # window a token-limited run waits out is named here — the verdict's vocabulary
@@ -386,6 +387,20 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     makes several runner calls in one process (see run_parallel); left None, this
     call is the invocation and owns its own figures.
     """
+    pusher = OwnerThread("pusher", maxsize=1)
+    try:
+        return _run_loop(driver, args, app_name, setup_logging=setup_logging,
+                         wait_on_start=wait_on_start, progress=progress,
+                         pusher=pusher)
+    finally:
+        # An exceptional exit may bypass close_run. Stop accepting periodic
+        # work without waiting for a git call that is already in flight.
+        pusher.close(timeout=0)
+
+
+def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
+              setup_logging: bool, wait_on_start: bool, progress,
+              pusher: OwnerThread) -> stopchannel.RunResult:
     # --cost: report per-run spend from the mirror log and exit, without touching
     # the loop, the tee, git, or the usage gate. BEFORE the prologue, whose first
     # act is to raise the tee and open an exit record: a report is not a run, and
@@ -462,7 +477,15 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
     provider_refusals = {}
     quota_refresher = None
-    last_git_push = 0.0           # epoch time of the last `git push` (0 = never)
+    last_git_push = 0.0           # owned by the pusher thread
+
+    def push_turn() -> None:
+        nonlocal last_git_push
+        last_git_push = maybe_git_push(run_settings.git_push, last_git_push,
+                                       projectroot.project_dir())
+
+    if not dry_run:
+        pusher.start()
     if ignore_usage_limits:
         print(f"  · usage limit policy: disabled (bounded run, "
               f"--max {run_settings.max_runs})")
@@ -559,10 +582,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 app.update(phase="stopping")
                 break
 
-            # Git push policy: evaluated at the start of every iteration.
+            # Git push policy: requested at the start of every iteration. A
+            # slow push cannot hold the next agent; one pending check suffices
+            # while the owner is busy, and the exit push checks again.
             if not dry_run:
-                last_git_push = maybe_git_push(run_settings.git_push,
-                                               last_git_push, projectroot.project_dir())
+                pusher.try_post(push_turn)
 
             max_runs = run_settings.max_runs
             if max_runs is not None and iteration >= max_runs:
@@ -646,7 +670,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     runlifecycle.close_run(
                         ctx, usages=opened_usages(),
                         ending="driver stopped the run",
-                        mailbox=mailbox)
+                        mailbox=mailbox, pusher=pusher)
                     sys.exit(stop.exit_code)
                 stop_reason = stopchannel.RunStopReason.DRIVER_STOP
                 break
@@ -905,7 +929,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 runlifecycle.close_run(
                     ctx, usages=opened_usages(),
                     ending="provider errors in a row",
-                    mailbox=mailbox)
+                    mailbox=mailbox, pusher=pusher)
                 sys.exit(returncode)
 
     # This run's own closing line, if the driver has one (e.g. "Final state: …").
@@ -914,10 +938,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     summary = driver.final_summary()
     if summary:
         print(f"\n{summary}")
-    # `runlifecycle.end_run` is the epilogue both runners share. No `pusher`,
-    # because this runner has one thread and nothing to exclude — see
-    # `gitpush.final_git_push` for why the exclusion belongs to the caller that
-    # has threads rather than to the call.
+    # The exit push follows every check queued while agents were running.
     return runlifecycle.end_run(
         ctx, stopchannel.RunResult(stop_reason, iteration, completed),
-        usages=opened_usages(), mailbox=mailbox)
+        usages=opened_usages(), mailbox=mailbox, pusher=pusher)

@@ -32,6 +32,7 @@ from llm_loop.stopchannel import RunStopReason
 from _runfixtures import (MemListDriver, OneShotDriver, StubPolicy, StubSource,
                           capture_run_context, isolated_run, par_args,
                           record_exit_pushes, root_not_cwd, seq_args)
+from llm_loop.agentwork import ClaudeCommand
 
 
 @pytest.fixture(autouse=True)
@@ -157,8 +158,11 @@ def test_the_sequential_runner_pushes_the_project_it_was_pointed_at(
     """
     fake = _FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
-    monkeypatch.setattr(cyclecore, "run_claude_streaming",
-                        lambda *args, **kwargs: 0)
+    def agent(*args, **kwargs):
+        assert fake.pushed.wait(timeout=PUMP_WAIT_S)
+        return 0
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", agent)
     root = root_not_cwd(tmp_path)
 
     cyclecore.run_loop(OneShotDriver(), seq_args(root, git_push=PUSHING),
@@ -168,6 +172,59 @@ def test_the_sequential_runner_pushes_the_project_it_was_pointed_at(
         f"expected two per-pass pushes and the exit push: {fake.calls}"
     assert fake.dirs == {root}, \
         f"the sequential runner pushed the wrong repository: {fake.calls}"
+
+
+def test_a_sequential_agent_starts_while_git_push_is_running(tmp_path, monkeypatch):
+    # The test body took 0.02 s measured 2026-10-02; the existing 10 s
+    # HELD_PUSH_TIMEOUT_S leaves room for slower CI while bounding a regression.
+    class HeldPushGit(_FakeGitModule):
+        def __init__(self):
+            super().__init__()
+            self.push_started = threading.Event()
+            self.release = threading.Event()
+            self.push_finished = threading.Event()
+            self.threads = set()
+
+        def run(self, argv, **kwargs):
+            self.threads.add(threading.current_thread().name)
+            if tuple(argv)[:2] == ("git", "push") and not self.push_started.is_set():
+                self.push_started.set()
+                self.release.wait(timeout=HELD_PUSH_TIMEOUT_S)
+                self.push_finished.set()
+            return super().run(argv, **kwargs)
+
+    class TwoShotDriver(OneShotDriver):
+        def next_command(self):
+            if self.served == 2:
+                return None
+            self.served += 1
+            return ClaudeCommand("do the thing", "", f"thing-{self.served}")
+
+    fake = HeldPushGit()
+    observed = []
+
+    def agent(*args, **kwargs):
+        if not observed:
+            observed.append(fake.push_started.wait(timeout=HELD_PUSH_TIMEOUT_S))
+        else:
+            observed.append(not fake.push_finished.is_set())
+            fake.release.set()
+        return 0
+
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", agent)
+    try:
+        cyclecore.run_loop(TwoShotDriver(),
+                           seq_args(root_not_cwd(tmp_path), git_push=PUSHING),
+                           app_name="pytest-gitpush")
+    finally:
+        fake.release.set()
+
+    assert observed == [True, True], (
+        "the next agent waited for the previous turn's git push to finish: "
+        f"{observed}")
+    assert fake.threads == {"pusher"}, \
+        f"git ran on the agent's thread: {fake.threads}"
 
 
 def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(

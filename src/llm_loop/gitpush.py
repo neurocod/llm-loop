@@ -214,9 +214,8 @@ def final_git_push(policy: GitPushPolicy, cwd: str, *,
 
     THIS FUNCTION DOES NOT EXCLUDE ANYTHING, and that is the answer to "who owns
     the mutual exclusion of the exit push": the caller does. Both runners end
-    with this call and only one of them has threads: the parallel one has it
-    made by the same thread that makes its periodic pushes (see
-    `runlifecycle.close_run`), and the sequential one has nothing to exclude. A
+    with this call and both have pusher threads: each makes it on the same
+    thread as its periodic pushes (see `runlifecycle.close_run`). A
     function that pushes A REPOSITORY has no business knowing whether its caller
     is threaded (the same argument that made `cwd` a parameter; see the header).
 
