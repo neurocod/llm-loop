@@ -73,11 +73,15 @@ def test_unchanged_text_is_not_parsed_again(monkeypatch, parses, logged):
     stream = console.MarkdownStream()
     stream.start()
     stream.feed("hello")
-    first = stream._frame()
-    assert stream._frame() is first
-    before = len(parses)
-    stream._frame()
-    assert len(parses) == before
+    # Hold Live's refresh lock, as Rich does around every frame: a refresh
+    # tick racing this thread's first `_frame` would parse twice and swap
+    # `_parsed` without any defect in the code under test.
+    with stream._live._lock:
+        first = stream._frame()
+        assert stream._frame() is first
+        before = len(parses)
+        stream._frame()
+        assert len(parses) == before
     stream.stop()
     assert logged == ["hello"]
 
