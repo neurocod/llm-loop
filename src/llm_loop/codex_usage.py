@@ -10,20 +10,44 @@ turn is started and no prompt tokens are consumed.  Query failures degrade to
 an empty snapshot so a temporary CLI/auth problem does not make the loop crash.
 """
 
+import atexit
 import json
+import queue
 import shutil
 import subprocess
 import threading
 import time
-from typing import Optional
+import weakref
+from typing import Callable, List, Optional
 
 from . import wire
 from .console import print_line
 from .usage import EMPTY_READING, EMPTY_USAGE, Usage, UsageReading, summary_line
 
+# The bound on one request — the handshake of a fresh server included. A wait
+# that runs out kills the server; the next query starts another.
 APP_SERVER_TIMEOUT = 15.0
 USAGE_CACHE_TTL = 30.0
 LONG_WINDOW_MINUTES = 24 * 60
+# A quota server older than this is replaced at its next query, so a process
+# that has drifted (a refreshed login, a CLI upgraded underneath the run) is
+# not consulted for the whole of a multi-day run. A restart costs one
+# handshake: on Codex CLI 0.159.2 a one-shot query took 0.610–1.463 s (median
+# 0.696 s) against 0.419–0.589 s (median 0.486 s) for a read through a live
+# server (5 + 5 runs, measured 2026-10-01), so an hourly restart is noise.
+APP_SERVER_MAX_AGE = 60 * 60.0
+
+# Why not the official `codex app-server daemon` + `codex app-server proxy`
+# (checked on codex-cli 0.160.0, 2026-10-02): the daemon is ONE per user
+# (`~/.codex/app-server-control/app-server-control.sock`), started by `daemon
+# start` and outliving whoever started it. The loop would either share it with
+# the user's IDE and other loops — and could then neither restart it on a hang
+# nor stop it on exit without breaking them (`daemon update`/`restart` "may
+# interrupt running work") — or leave it running after the run, which is the
+# orphan this source must not leave. And `proxy` is itself a `codex` process
+# per connection, so reaching the daemon through it still pays a CLI start per
+# query unless the proxy is kept alive — which is the private process below
+# with an extra hop. Hence a private `codex app-server` owned by the source.
 
 
 def _reading(entry, *, reached: bool = False) -> UsageReading:
@@ -99,102 +123,242 @@ def parse_rate_limits(data: dict) -> Usage:
     return Usage(session, week, EMPTY_READING, summary)
 
 
-class CodexUsageSource:
-    """Query and cache Codex rate limits without starting a model turn."""
+class _ServerClosed(RuntimeError):
+    """The quota server's stdout ended (EOF) before the awaited reply."""
 
-    def __init__(self, cache_ttl: float = USAGE_CACHE_TTL,
-                 timeout: float = APP_SERVER_TIMEOUT):
-        self.cache_ttl = cache_ttl
-        self.timeout = timeout
-        self._cached: Optional[Usage] = None
-        self._cached_ts = 0.0
 
-    @staticmethod
-    def _write(proc, message: dict) -> None:
-        proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-        proc.stdin.flush()
+_EOF = object()
 
-    @staticmethod
-    def _read_response(proc, request_id: int, timed_out: threading.Event) -> dict:
-        for line in proc.stdout:
+
+class _QuotaServer:
+    """One live `codex app-server` and the thread pumping its stdout.
+
+    The pump turns the blocking `readline` into a queue the caller can wait on
+    with a deadline — the only way to bound a read from a pipe that is
+    portable to Windows. stderr is merged into stdout; lines that are not JSON
+    are skipped.
+    """
+
+    def __init__(self, argv: List[str]):
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+            errors="replace", bufsize=1,
+        )
+        self.started = time.monotonic()
+        self._lines: "queue.Queue[object]" = queue.Queue()
+        self._pump = threading.Thread(target=self._read_stdout,
+                                      name="codex-quota-stdout", daemon=True)
+        self._pump.start()
+
+    def _read_stdout(self) -> None:
+        try:
+            for line in self.proc.stdout:
+                self._lines.put(line)
+        except (OSError, ValueError):
+            pass                    # stdout closed under us by `stop`
+        finally:
+            self._lines.put(_EOF)
+
+    def write(self, message: dict) -> None:
+        self.proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+
+    def read_response(self, request_id: int, deadline: float) -> dict:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("codex app-server request timed out")
+            try:
+                line = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                raise TimeoutError("codex app-server request timed out") from None
+            if line is _EOF:
+                self._lines.put(_EOF)   # every later read sees it too
+                raise _ServerClosed("codex app-server closed before replying")
             try:
                 message = json.loads(line)
             except (TypeError, ValueError):
                 continue
-            if message.get("id") != request_id:
+            if not isinstance(message, dict) or message.get("id") != request_id:
                 continue
             if "error" in message:
                 error = message.get("error") or {}
                 detail = error.get("message") if isinstance(error, dict) else error
                 raise RuntimeError(str(detail or "unknown app-server error"))
             return message.get("result") or {}
-        if timed_out.is_set():
-            raise TimeoutError("codex app-server request timed out")
-        raise RuntimeError("codex app-server closed before replying")
 
-    def query_rate_limits_json(self) -> Optional[dict]:
-        executable = shutil.which("codex") or "codex"
+    def stop(self) -> None:
+        """Close stdin and reap; escalate to terminate, then kill."""
+        proc = self.proc
         try:
-            proc = subprocess.Popen(
-                [executable, "app-server"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                errors="replace", bufsize=1,
-            )
-        except (FileNotFoundError, OSError) as exc:
-            print_line(f"  · no Codex usage figures: could not start 'codex app-server' ({exc})")
-            return None
-
-        timed_out = threading.Event()
-
-        def kill_on_timeout():
-            timed_out.set()
-            try:
-                proc.kill()
-            except OSError:
-                pass
-
-        timer = threading.Timer(self.timeout, kill_on_timeout)
-        timer.daemon = True
-        timer.start()
+            proc.stdin.close()
+        except OSError:
+            pass
         try:
-            self._write(proc, wire.codex_app_initialize(0))
-            self._read_response(proc, 0, timed_out)
-            self._write(proc, wire.codex_app_initialized())
-            self._write(proc, wire.codex_app_rate_limits_read(1))
-            return self._read_response(proc, 1, timed_out)
-        except (BrokenPipeError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
-            print_line(f"  · no Codex usage figures: {exc}")
-            return None
-        finally:
-            timer.cancel()
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             try:
-                proc.stdin.close()
+                proc.terminate()
                 proc.wait(timeout=2)
-            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+            except (OSError, subprocess.TimeoutExpired):
                 try:
-                    if proc.poll() is None:
-                        proc.terminate()
+                    proc.kill()
                     proc.wait(timeout=2)
                 except (OSError, subprocess.TimeoutExpired):
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+                    pass
+        self._pump.join(timeout=2)
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+
+
+# Every source that may own a live server, so the endings that never reach
+# `runlifecycle.close_run` (see its docstring) still reap them at interpreter
+# exit. Weak: a source the run dropped is not kept alive by this registry.
+_open_sources: "weakref.WeakSet[CodexUsageSource]" = weakref.WeakSet()
+
+
+@atexit.register
+def _close_open_sources() -> None:
+    for source in list(_open_sources):
+        source.close()
+
+
+def _default_argv() -> List[str]:
+    return [shutil.which("codex") or "codex", "app-server"]
+
+
+class CodexUsageSource:
+    """Query and cache Codex rate limits without starting a model turn.
+
+    Keeps one private quota server (`_QuotaServer`) for its lifetime rather
+    than starting one per cache miss. It is never the turn's app-server: that
+    process's stdout belongs to the renderer, while the quota gate and the
+    status line's `QuotaRefresher` read from other threads at any time.
+
+    Queries are serialized by one lock, cache check included, so a gate that
+    waited behind the refresher's read takes the figures that read produced.
+    Request ids grow monotonically for the source's whole life, across server
+    restarts, so a late reply to an abandoned request can never answer a newer
+    one. A timeout kills the server; EOF or a broken pipe on a reused server is
+    retried once on a fresh one (the server died while idle); a server older
+    than `max_age` is replaced. `close` stops the server for good — a query
+    after it reads nothing rather than starting a process nobody will reap.
+    """
+
+    def __init__(self, cache_ttl: float = USAGE_CACHE_TTL,
+                 timeout: float = APP_SERVER_TIMEOUT,
+                 max_age: float = APP_SERVER_MAX_AGE,
+                 argv: Optional[Callable[[], List[str]]] = None):
+        self.cache_ttl = cache_ttl
+        self.timeout = timeout
+        self.max_age = max_age
+        self._argv = argv or _default_argv
+        self._cached: Optional[Usage] = None
+        self._cached_ts = 0.0
+        self._lock = threading.Lock()
+        self._server: Optional[_QuotaServer] = None
+        self._next_id = 0
+        self._closed = False
+        _open_sources.add(self)
+
+    def _request_id(self) -> int:
+        request_id = self._next_id
+        self._next_id += 1
+        return request_id
+
+    def _drop_server(self) -> None:
+        server, self._server = self._server, None
+        if server is not None:
+            server.stop()
+
+    def _live_server(self, deadline: float) -> _QuotaServer:
+        """The current server, after a max-age replacement or a first start."""
+        server = self._server
+        if server is not None and (server.proc.poll() is not None or
+                                   time.monotonic() - server.started >= self.max_age):
+            self._drop_server()
+            server = None
+        if server is None:
+            server = _QuotaServer(self._argv())
+            self._server = server
+            try:
+                request_id = self._request_id()
+                server.write(wire.codex_app_initialize(request_id))
+                server.read_response(request_id, deadline)
+                server.write(wire.codex_app_initialized())
+            except BaseException:
+                self._drop_server()
+                raise
+        return server
+
+    def _query_locked(self) -> Optional[dict]:
+        deadline = time.monotonic() + self.timeout
+        for attempt in (1, 2):
+            fresh = self._server is None
+            try:
+                server = self._live_server(deadline)
+            except (FileNotFoundError, PermissionError) as exc:
+                print_line(f"  · no Codex usage figures: could not start "
+                           f"'codex app-server' ({exc})")
+                return None
+            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                print_line(f"  · no Codex usage figures: {exc}")
+                return None
+            try:
+                request_id = self._request_id()
+                server.write(wire.codex_app_rate_limits_read(request_id))
+                return server.read_response(request_id, deadline)
+            except (BrokenPipeError, _ServerClosed) as exc:
+                self._drop_server()
+                if fresh or attempt == 2:
+                    print_line(f"  · no Codex usage figures: {exc}")
+                    return None
+                # A reused server that died while idle: one fresh retry.
+            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                if not isinstance(exc, RuntimeError):
+                    self._drop_server()   # timeout or pipe trouble: restart
+                print_line(f"  · no Codex usage figures: {exc}")
+                return None
+        return None
+
+    def query_rate_limits_json(self) -> Optional[dict]:
+        with self._lock:
+            if self._closed:
+                return None
+            return self._query_locked()
 
     def get_usage(self, cache_value: bool = True) -> Usage:
-        now = time.time()
-        if (cache_value and self._cached is not None
-                and now - self._cached_ts < self.cache_ttl):
-            return self._cached
-        data = self.query_rate_limits_json()
-        if data is None:
-            return EMPTY_USAGE
-        snapshot = parse_rate_limits(data)
-        self._cached = snapshot
-        self._cached_ts = now
-        return snapshot
+        with self._lock:
+            now = time.time()
+            if (cache_value and self._cached is not None
+                    and now - self._cached_ts < self.cache_ttl):
+                return self._cached
+            if self._closed:
+                # A status-line poll racing the epilogue keeps the last figures.
+                return self._cached or EMPTY_USAGE
+            data = self._query_locked()
+            if data is None:
+                return EMPTY_USAGE
+            snapshot = parse_rate_limits(data)
+            self._cached = snapshot
+            self._cached_ts = now
+            return snapshot
 
     def invalidate(self) -> None:
-        self._cached = None
-        self._cached_ts = 0.0
+        with self._lock:
+            self._cached = None
+            self._cached_ts = 0.0
+
+    def close(self) -> None:
+        """Stop the quota server; later queries read nothing. Idempotent.
+
+        Waits for a query in flight (bounded by `timeout`) rather than
+        killing the process under it.
+        """
+        with self._lock:
+            self._closed = True
+            self._drop_server()
+        _open_sources.discard(self)

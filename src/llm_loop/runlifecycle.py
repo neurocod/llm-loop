@@ -404,6 +404,7 @@ def close_run(ctx: RunContext, *,
     or the runner body, `driver.final_summary` included — the parallel runner's
     `finally` closes only its console and its pusher.
     """
+    usages = list(usages)           # walked twice: snapshots, then sources
     abort = PushAbort()
 
     def exit_push():
@@ -455,6 +456,21 @@ def close_run(ctx: RunContext, *,
                 except Exception as error:
                     print(f"  ⚠ usage at end ({usage.name}) could not be read: "
                           f"{type(error).__name__}: {error}")
+        except KeyboardInterrupt as caught:
+            interrupt = interrupt or caught
+
+    # Stop what a source keeps running between reads (Codex's quota server),
+    # dry runs included: the gate and the status line read the source there
+    # too. Endings that never get here leave it to the source's atexit hook.
+    for usage in usages:
+        close_source = getattr(usage and usage.source, "close", None)
+        if close_source is None:
+            continue
+        try:
+            close_source()
+        except Exception as error:
+            print(f"  ⚠ usage source ({usage.name}) did not close: "
+                  f"{type(error).__name__}: {error}")
         except KeyboardInterrupt as caught:
             interrupt = interrupt or caught
 
