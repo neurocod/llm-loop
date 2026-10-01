@@ -27,6 +27,7 @@ Escape hatch: put `allowAskUser` anywhere in the command (a trailing
 `# allowAskUser` is a comment in both shells) and the gate passes it straight
 through. The prompt will then be asked -- that is the point of the marker: it
 says "I know, and I want this command anyway".
+Delegated reviews run without permission prompts and ignore this marker.
 
 It ships as a Claude Code PLUGIN rather than as a file inside one repository,
 because what it encodes -- one product's permission analyser -- is the same on
@@ -593,9 +594,9 @@ def scan_task_follow(command: str) -> list[Finding]:
 
 
 def scan(command: str, shell: str, windows: "bool | None" = None,
-         tool: str = "Bash") -> list[Finding]:
+         tool: str = "Bash", *, allow_marker: bool = True) -> list[Finding]:
     """All reasons this command would stop for a human, or an empty list."""
-    if MARKER in command.translate(ASCII_LOWER):
+    if allow_marker and MARKER in command.translate(ASCII_LOWER):
         return []
     if windows is None:
         windows = is_windows()
@@ -1195,7 +1196,8 @@ def main() -> int:
         command = payload.get("tool_input", {}).get("command", "")
         if not isinstance(command, str):
             return 0
-        findings = scan(command, shell, tool=tool_name)
+        review = os.environ.get("CLAUDE_AGENT_REVIEW_GATE") == "1"
+        findings = scan(command, shell, tool=tool_name, allow_marker=not review)
     except Exception:
         return 0
 
@@ -1205,7 +1207,7 @@ def main() -> int:
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
         "permissionDecisionReason": render(
-            findings, include_escape_hatch=os.environ.get("CLAUDE_AGENT_REVIEW_GATE") != "1"),
+            findings, include_escape_hatch=not review),
     }}, sys.stdout)
     return 0
 

@@ -762,8 +762,9 @@ std::vector<Finding> scanTaskFollow(const std::string& command) {
 
 // All reasons this command would stop for a human, or an empty list.
 std::vector<Finding> scan(const std::string& command, std::string_view shell,
-		std::optional<bool> windows = std::nullopt, std::string_view tool = "Bash") {
-	if (toLowerAscii(command).find(kMarker) != std::string::npos)
+		std::optional<bool> windows = std::nullopt, std::string_view tool = "Bash",
+		bool allowMarker = true) {
+	if (allowMarker && toLowerAscii(command).find(kMarker) != std::string::npos)
 		return {};
 	const bool onWindows = windows ? *windows : isWindowsHost();
 	const std::string_view sleepFix = contains(kMonitorTools, tool) ? kMonitorSleepFix : kSleepFix;
@@ -1737,11 +1738,6 @@ int run(int argc, char** argv) {
 	const Json* commandValue = toolInput->member("command");
 	if (!commandValue || commandValue->type != Json::Type::String)
 		return 0;
-	const std::vector<Finding> findings = scan(commandValue->text, *payloadShell, std::nullopt,
-		toolName);
-	if (findings.empty())
-		return 0;
-
 	bool includeEscapeHatch = true;
 #ifdef _WIN32
 	char reviewGate[2] = {};
@@ -1752,6 +1748,11 @@ int run(int argc, char** argv) {
 	const char* reviewGate = std::getenv("CLAUDE_AGENT_REVIEW_GATE");
 	includeEscapeHatch = !reviewGate || std::strcmp(reviewGate, "1") != 0;
 #endif
+	const std::vector<Finding> findings = scan(commandValue->text, *payloadShell, std::nullopt,
+		toolName, includeEscapeHatch);
+	if (findings.empty())
+		return 0;
+
 	writeStdout("{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", "
 		"\"permissionDecision\": \"deny\", \"permissionDecisionReason\": \""
 		+ jsonEscape(render(findings, includeEscapeHatch)) + "\"}}");
