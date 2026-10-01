@@ -787,7 +787,7 @@ std::vector<Finding> scan(const std::string& command, std::string_view shell,
 }
 
 // The refusal the agent reads, in place of the dialog the user would.
-std::string render(const std::vector<Finding>& findings) {
+std::string render(const std::vector<Finding>& findings, bool includeEscapeHatch = true) {
 	// Resolved, not hardcoded: the same gate is a plugin on one machine and a
 	// loose hook on another, and a reader who has never seen this plugin needs
 	// to know where the thing refusing their command lives.
@@ -807,12 +807,16 @@ std::string render(const std::vector<Finding>& findings) {
 			out += "    -> " + finding.fix + "\n";
 		}
 	}
-	out += hangOnly
-		? "\nIf you want this exact command anyway, add the marker `allowAskUser` to it (e.g. "
-			"append ` # allowAskUser`) and it will be passed through unchanged."
-		: "\nIf you want this exact command anyway and accept that the user will be asked, add "
-			"the marker `allowAskUser` to it (e.g. append ` # allowAskUser`) and it will be passed "
-			"through unchanged.";
+	if (includeEscapeHatch) {
+		out += hangOnly
+			? "\nIf you want this exact command anyway, add the marker `allowAskUser` to it (e.g. "
+				"append ` # allowAskUser`) and it will be passed through unchanged."
+			: "\nIf you want this exact command anyway and accept that the user will be asked, add "
+				"the marker `allowAskUser` to it (e.g. append ` # allowAskUser`) and it will be passed "
+				"through unchanged.";
+	} else if (!out.empty() && out.back() == '\n') {
+		out.pop_back();
+	}
 	return out;
 }
 
@@ -1738,9 +1742,19 @@ int run(int argc, char** argv) {
 	if (findings.empty())
 		return 0;
 
+	bool includeEscapeHatch = true;
+#ifdef _WIN32
+	char reviewGate[2] = {};
+	const DWORD length = GetEnvironmentVariableA("CLAUDE_AGENT_REVIEW_GATE", reviewGate,
+		sizeof(reviewGate));
+	includeEscapeHatch = length != 1 || reviewGate[0] != '1';
+#else
+	const char* reviewGate = std::getenv("CLAUDE_AGENT_REVIEW_GATE");
+	includeEscapeHatch = !reviewGate || std::strcmp(reviewGate, "1") != 0;
+#endif
 	writeStdout("{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", "
 		"\"permissionDecision\": \"deny\", \"permissionDecisionReason\": \""
-		+ jsonEscape(render(findings)) + "\"}}");
+		+ jsonEscape(render(findings, includeEscapeHatch)) + "\"}}");
 	return 0;
 }
 
