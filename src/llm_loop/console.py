@@ -323,29 +323,65 @@ def _log_plain(text: str) -> None:
         logger.info(line)
 
 
+# Repaints per second of a streaming Markdown block, and so also the ceiling on
+# how often its text is PARSED: Rich's Markdown parses in its constructor, and
+# `MarkdownStream` builds one only when `Live` asks for a frame. Building one per
+# delta instead made the work quadratic in the block (synthetic 600 deltas,
+# 9.2 KiB: 5.9 s of parsing in the reader thread vs 0.016 s for one final parse,
+# measured 2026-10-01). With parsing tied to this rate the block parses once
+# per frame that saw new text — see the measurement beside
+# `MarkdownStream._frame`. Raising it buys smoother
+# typing for proportionally more parses of a long block.
+LIVE_REFRESH_PER_SECOND = 12
+
+
 class MarkdownStream:
     """Render one assistant text block as live-updating Markdown.
 
-    The model streams Markdown token by token; we accumulate it and let Rich
-    re-render the whole block inside a `Live` region on each delta, so formatting
-    appears in realtime. When Rich is unavailable we degrade to the original
-    behaviour: print a `💬` header and stream the raw tokens inline.
+    The model streams Markdown token by token; `feed` only accumulates it, and
+    Rich's `Live` asks `_frame` for the block on each repaint, so formatting
+    appears in realtime at `LIVE_REFRESH_PER_SECOND` without a parse per delta.
+    When Rich is unavailable we degrade to the original behaviour: print a `💬`
+    header and stream the raw tokens inline.
     """
 
     def __init__(self):
         self._buf = ""
         self._live = None
         self._console = None
+        # The buffer object the cached Markdown was parsed from, and that
+        # Markdown. Compared by identity: every feed of new text makes a new
+        # string, and an unchanged one must not be parsed again on the next
+        # repaint.
+        self._parsed_from = None
+        self._parsed = None
+
+    def _frame(self):
+        """The block as Markdown, parsed only if text arrived since the last frame.
+
+        Called by `Live` — from its refresh thread under the Live lock, and from
+        `start`/`stop` — never by `feed`. Measured 2026-10-01 (two runs) with
+        the same synthetic ~600 deltas / 9.2 KiB: back to back, 2 parses and
+        <0.001 s across all feeds; paced over 3 s, 37 parses taking 0.31-0.32 s,
+        all off the reader thread, and 0.005 s across all feeds.
+        """
+        buf = self._buf
+        if buf is not self._parsed_from:
+            self._parsed = _RichMarkdown(buf)
+            self._parsed_from = buf
+        return self._parsed
 
     def start(self) -> None:
         self._buf = ""
+        self._parsed_from = None
+        self._parsed = None
         if RICH_AVAILABLE:
             self._console = _RichConsole(file=real_stream())
             self._console.print("\n[dim]💬[/dim]")
             self._live = _RichLive(
-                _RichMarkdown(""),
+                get_renderable=self._frame,
                 console=self._console,
-                refresh_per_second=12,
+                refresh_per_second=LIVE_REFRESH_PER_SECOND,
                 vertical_overflow="visible",
                 # Nothing else prints during a text block, so we don't need Rich
                 # to hijack stdout/stderr (which would fight with TeeToLog).
@@ -358,14 +394,13 @@ class MarkdownStream:
 
     def feed(self, text: str) -> None:
         self._buf += text
-        if self._live is not None:
-            self._live.update(_RichMarkdown(self._buf))
-        else:
+        if self._live is None:
             print(text, end="", flush=True)
 
     def stop(self) -> None:
         if self._live is not None:
-            self._live.update(_RichMarkdown(self._buf))
+            # `Live.stop` repaints once more through `_frame`, so the final
+            # frame is the whole block even if no refresh saw the last delta.
             self._live.stop()
             self._live = None
             self._console = None
@@ -377,6 +412,8 @@ class MarkdownStream:
         else:
             print(flush=True)  # finish the inline line in fallback mode
         self._buf = ""
+        self._parsed_from = None
+        self._parsed = None
 
 
 def render_markdown_block(text: str) -> None:
