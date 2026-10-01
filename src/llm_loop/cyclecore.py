@@ -899,7 +899,7 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                 app.update(phase="waiting")
                 paused, session_start = limit_policy.check_and_wait(
                     usage_source, session_start, note=" (checked after error)",
-                    should_stop=stop_pending)
+                    should_stop=stop_pending, report_status=False)
                 statusline.push_quotas(app, usage_source, limit_policy)
                 app.update(phase="idle")
                 if paused:
