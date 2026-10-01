@@ -17,7 +17,6 @@ import shutil
 import subprocess
 import threading
 import time
-import weakref
 from typing import Callable, List, Optional
 
 from . import wire
@@ -189,35 +188,52 @@ class _QuotaServer:
             return message.get("result") or {}
 
     def stop(self) -> None:
-        """Close stdin and reap; escalate to terminate, then kill."""
+        """Close stdin and reap; escalate to ending the tree, then kill.
+
+        On Windows `proc` is usually the npm shim's `cmd.exe` and the CLI a
+        grandchild, so the escalation goes through the turn process's
+        tree-aware `ask_agent_process_to_end` (`taskkill /T`), not the
+        shim-only `terminate`. A grandchild that survives anyway keeps the
+        stdout write end: the pump then stays in `readline`, and closing
+        stdout would block on the lock that read holds (19.0 s measured
+        2026-10-02 against a 20 s grandchild) — so the stream is left to the
+        daemon pump instead.
+        """
+        # Imported here: `providers` imports this module.
+        from .providers import REAP_GRACE_S, ask_agent_process_to_end
         proc = self.proc
         try:
             proc.stdin.close()
         except OSError:
             pass
         try:
-            proc.wait(timeout=2)
+            proc.wait(timeout=REAP_GRACE_S)
         except subprocess.TimeoutExpired:
+            ask_agent_process_to_end(proc)
             try:
-                proc.terminate()
-                proc.wait(timeout=2)
+                proc.wait(timeout=REAP_GRACE_S)
             except (OSError, subprocess.TimeoutExpired):
                 try:
                     proc.kill()
-                    proc.wait(timeout=2)
+                    proc.wait(timeout=REAP_GRACE_S)
                 except (OSError, subprocess.TimeoutExpired):
                     pass
-        self._pump.join(timeout=2)
-        try:
-            proc.stdout.close()
         except OSError:
             pass
+        self._pump.join(timeout=REAP_GRACE_S)
+        if not self._pump.is_alive():
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
 
 
 # Every source that may own a live server, so the endings that never reach
 # `runlifecycle.close_run` (see its docstring) still reap them at interpreter
-# exit. Weak: a source the run dropped is not kept alive by this registry.
-_open_sources: "weakref.WeakSet[CodexUsageSource]" = weakref.WeakSet()
+# exit. Strong, not weak: a source an unwinding exception dropped without
+# `close` leaves its server and pump running, and a weak entry would vanish
+# before the hook that exists to reap exactly that server. `close` removes it.
+_open_sources: "set[CodexUsageSource]" = set()
 
 
 @atexit.register
@@ -297,9 +313,12 @@ class CodexUsageSource:
     def _query_locked(self) -> Optional[dict]:
         deadline = time.monotonic() + self.timeout
         for attempt in (1, 2):
-            fresh = self._server is None
+            previous = self._server
             try:
                 server = self._live_server(deadline)
+                # A server started by this very call (first, dead or over-age)
+                # gets no retry: only one that died while idle does.
+                fresh = server is not previous
             except (FileNotFoundError, PermissionError) as exc:
                 print_line(f"  · no Codex usage figures: could not start "
                            f"'codex app-server' ({exc})")

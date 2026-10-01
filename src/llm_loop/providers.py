@@ -12,7 +12,7 @@ and the second is the larger half:
     is not a preference: the copies had already drifted, in a way that left
     workers unable to end the CLIs they had started (see `note_channel`), and
     the sequential runner aimed its ending at the wrong process on Windows (see
-    `_ask_agent_process_to_end`).
+    `ask_agent_process_to_end`).
 """
 
 from contextlib import contextmanager
@@ -522,7 +522,7 @@ def note_channel(proc, provider: str, mailbox: Optional[object] = None):
 REAP_GRACE_S = 2.0
 
 
-def _ask_agent_process_to_end(proc) -> None:
+def ask_agent_process_to_end(proc) -> None:
     """Aim the ending at the provider CLI, not at the shim standing in front of it.
 
     On Windows the handle we hold is usually `cmd.exe`: `runtime_argv` resolves
@@ -576,7 +576,7 @@ def reap_agent_process(proc) -> None:
     started the process, and that is `start_agent_process` above: the sequential
     runner used to spell its half as a bare `proc.terminate()` under
     `except KeyboardInterrupt`, which on Windows aims at the shim and leaves
-    exactly the child being complained about (see `_ask_agent_process_to_end`).
+    exactly the child being complained about (see `ask_agent_process_to_end`).
 
     Safe on a child that has already exited (only the pipe is closed) and
     bounded on every other path: told to end, then killed if it will not be.
@@ -622,7 +622,7 @@ def _reap(proc) -> None:
             return
     except OSError:
         return  # the handle is gone; there is nothing left to end
-    _ask_agent_process_to_end(proc)
+    ask_agent_process_to_end(proc)
     try:
         proc.wait(timeout=REAP_GRACE_S)
     except OSError:

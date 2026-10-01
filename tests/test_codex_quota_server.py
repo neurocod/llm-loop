@@ -1,5 +1,6 @@
 """`CodexUsageSource` keeps one private quota server and never orphans it."""
 
+import gc
 import json
 import os
 import sys
@@ -101,17 +102,73 @@ def test_eof_on_an_idle_server_restarts_it_once(pid_log, capsys):
         source.close()
 
 
+def _alive(pid: int) -> bool:
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
+    if not handle:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def test_timeout_is_bounded_and_kills_the_server(pid_log, capsys):
-    source = _source(pid_log, mode="hang", timeout=1.0)
+    # The fake outlives stdin EOF, so the kill escalation in `stop` is what
+    # ends it.
+    source = _source(pid_log, mode="hang-ignore-eof", timeout=1.0)
     try:
         started = time.monotonic()
         assert source.get_usage(cache_value=False).week_all.percent is None
-        # 1.0 s timeout + up to 2 s reaping a server that ignores stdin EOF
+        # 1.0 s timeout + 2 s grace on stdin EOF + the kill; the fake would
+        # otherwise live 60 s.
         assert time.monotonic() - started < 10
         assert "timed out" in capsys.readouterr().out
         assert source._server is None
+        assert not _alive(int(pid_log.read_text().split()[0]))
         source.get_usage(cache_value=False)
         assert _starts(pid_log) == 2           # restarted, not reused
+    finally:
+        source.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="npm .cmd shims are Windows-only")
+def test_timeout_behind_an_npm_shim_ends_the_grandchild(pid_log, tmp_path):
+    # Real `codex` resolves to npm's `codex.cmd`: the handle is cmd.exe and
+    # the CLI a grandchild holding stdout. Killing only the shim would leave
+    # it running and block `stop` on the stdout close for its whole life.
+    shim = tmp_path / "codex.cmd"
+    shim.write_text(f'@"{sys.executable}" "{FAKE}" %*\r\n', encoding="utf-8")
+    source = codex_usage.CodexUsageSource(
+        argv=lambda: [str(shim), "hang-ignore-eof", str(pid_log)], timeout=1.0)
+    try:
+        started = time.monotonic()
+        assert source.get_usage(cache_value=False).week_all.percent is None
+        assert time.monotonic() - started < 15
+        assert not _alive(int(pid_log.read_text().split()[0]))
+    finally:
+        source.close()
+
+
+def test_eof_on_a_server_started_by_this_query_is_not_retried(pid_log, capsys):
+    modes = iter(["ok", "exit-on-read", "exit-on-read"])
+    source = codex_usage.CodexUsageSource(
+        argv=lambda: [sys.executable, FAKE, next(modes), str(pid_log)],
+        max_age=0.0)
+    try:
+        assert _percent(source) == 1
+        # The over-age server is replaced inside this query; the replacement
+        # dying is not "a reused server that died while idle".
+        assert source.get_usage(cache_value=False).week_all.percent is None
+        assert "no Codex usage figures" in capsys.readouterr().out
+        assert _starts(pid_log) == 2
     finally:
         source.close()
 
@@ -147,6 +204,16 @@ def test_atexit_hook_reaps_a_source_nobody_closed(pid_log):
     codex_usage._close_open_sources()
     assert proc.poll() is not None
     assert source not in codex_usage._open_sources
+
+
+def test_atexit_hook_reaps_a_source_dropped_without_close(pid_log):
+    source = _source(pid_log)
+    _percent(source)
+    proc = source._server.proc
+    del source                       # an exception unwound the frame holding it
+    gc.collect()
+    codex_usage._close_open_sources()
+    assert proc.poll() is not None
 
 
 def test_close_run_closes_every_source_dry_run_included(pid_log):

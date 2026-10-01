@@ -6,12 +6,16 @@ the number of reads THIS process has answered, so a test can tell a reused
 server (1, 2, ...) from a restarted one (1 again).
 
 Modes: `ok` answers everything; `exit-after-read` exits right after its first
-read reply (the next read on it sees EOF); `hang` never answers a read.
+read reply (the next read on it sees EOF); `exit-on-read` exits on its first
+read without replying; `hang` never answers a read;
+`hang-ignore-eof` never answers a read and outlives stdin EOF by a minute, so
+only a kill ends it.
 """
 
 import json
 import os
 import sys
+import time
 
 
 def main() -> None:
@@ -25,8 +29,10 @@ def main() -> None:
         if method == "initialize":
             reply = {"id": request_id, "result": {"userAgent": "fake"}}
         elif method == "account/rateLimits/read":
-            if mode == "hang":
+            if mode.startswith("hang"):
                 continue
+            if mode == "exit-on-read":
+                return
             reads += 1
             reply = {"id": request_id, "result": {"rateLimits": {
                 "primary": {"usedPercent": reads, "windowDurationMins": 10080},
@@ -37,6 +43,8 @@ def main() -> None:
         print(json.dumps(reply), flush=True)
         if mode == "exit-after-read" and method == "account/rateLimits/read":
             return
+    if mode == "hang-ignore-eof":
+        time.sleep(60)
 
 
 if __name__ == "__main__":
