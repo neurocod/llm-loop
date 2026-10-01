@@ -26,21 +26,21 @@ class LaunchDecision(NamedTuple):
     wait_seconds: float
 
     @property
-    def held_at_start(self) -> bool:
+    def held_at_run_start(self) -> bool:
         return self.mode != "independent"
 
     def record(self) -> dict:
         return {"mode": self.mode, "path": self.path,
                 "conflict": self.conflict,
                 "wait_seconds": round(self.wait_seconds, 1),
-                "held_at_start": self.held_at_start}
+                "held_at_run_start": self.held_at_run_start}
 
     def summary(self) -> str:
         detail = f"; initial conflict: {self.conflict}" if self.conflict else ""
         waited = (f"; waited {self.wait_seconds:.1f} s"
                   if self.mode == "waited" else "")
-        return (f"script lock: {self.mode} (held at startup="
-                f"{self.held_at_start}); pid {os.getpid()}; "
+        return (f"script lock: {self.mode} (held when run began="
+                f"{self.held_at_run_start}); pid {os.getpid()}; "
                 f"path: {self.path}{detail}{waited}")
 
 

@@ -259,11 +259,11 @@ def test_launch_decision_is_in_mirror_log_and_live_record(
     record_path = tmp_path / f'runCycle-project.{other.proc.pid}.run.json'
     decision = json.loads(record_path.read_text(encoding='utf-8'))['script_lock']
     assert decision['mode'] == mode
-    assert decision['held_at_start'] is held
+    assert decision['held_at_run_start'] is held
     assert decision['path'].endswith('.lock')
     assert 'live run pid' in decision['conflict']
     log = (tmp_path / 'runCycle-project.log').read_text(encoding='utf-8')
-    assert f'script lock: {mode} (held at startup={held})' in log
+    assert f'script lock: {mode} (held when run began={held})' in log
     assert f'pid {other.proc.pid}' in log
     assert decision['path'] in log
 
@@ -274,10 +274,10 @@ def test_uncontended_launch_records_its_lock(launch, tmp_path):
     record_path = tmp_path / f'runCycle-project.{run.proc.pid}.run.json'
     decision = json.loads(record_path.read_text(encoding='utf-8'))['script_lock']
     assert decision['mode'] == 'acquired'
-    assert decision['held_at_start'] is True
+    assert decision['held_at_run_start'] is True
     assert decision['conflict'] == ''
     log = (tmp_path / 'runCycle-project.log').read_text(encoding='utf-8')
-    assert 'script lock: acquired (held at startup=True)' in log
+    assert 'script lock: acquired (held when run began=True)' in log
 
 
 def test_independent_launch_does_not_release_the_owner(launch):

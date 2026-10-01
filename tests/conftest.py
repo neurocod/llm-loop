@@ -115,6 +115,7 @@ def isolate_launch_decision(tmp_path, monkeypatch):
     launches = {}
     monkeypatch.setattr(scriptlock, 'LOCK_DIR', tmp_path / 'script-locks')
     monkeypatch.setattr(scriptlock, '_launches', launches)
+    monkeypatch.setattr(scriptlock, '_launch_decision', None)
     yield
     for lock in launches.values():
         if lock is not None:
