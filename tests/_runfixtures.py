@@ -246,7 +246,7 @@ class StubPolicy:
         self.logged.append((source, label, cache_value))
 
     def check_and_wait(self, source, session_start, note="",
-                       cache_value=True, should_stop=None):
+                       cache_value=True, should_stop=None, *, report_status=True):
         return False, session_start
 
 

@@ -1624,7 +1624,7 @@ def test_a_pause_pressed_at_the_usage_gate_holds_the_next_iteration(monkeypatch,
             return None
 
         def check_and_wait(self, source, session_start, note="",
-                           cache_value=True, should_stop=None):
+                           cache_value=True, should_stop=None, *, report_status=True):
             self.reached = True
             key["up"] = True
             return False, session_start

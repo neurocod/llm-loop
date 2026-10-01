@@ -276,7 +276,8 @@ class LimitPolicy:
     # --- the public entry point ------------------------------------------------
 
     def check_and_wait(self, source, session_start: float, note: str = "",
-                       cache_value: bool = True, should_stop=None) -> tuple:
+                       cache_value: bool = True, should_stop=None, *,
+                       report_status: bool = True) -> tuple:
         """Read the usage figures; if any rule is at/over its ceiling, pause until
         they all clear (a window reset, or — for DayNightLimit — the ceiling rising
         above the usage as the reset nears).
@@ -284,6 +285,9 @@ class LimitPolicy:
         Returns (paused, session_start). `session_start` is refreshed to now only
         when the *session* window actually reset, so callers can reset their
         per-session bookkeeping; otherwise it is returned unchanged.
+
+        `report_status=False` suppresses the routine usage snapshot; quota
+        checks and messages explaining an actual wait remain active.
 
         `should_stop` is the caller's stop channels (see stopchannel.sleep_unless).
         The pause here is the longest hold in the engine — hours, with every
@@ -294,18 +298,19 @@ class LimitPolicy:
         now = time.time()
         status = self._status(usage, now)
 
-        for r, rd, c in status:
-            if rd.percent is None:
-                print_line(f"  · {r.label}: no figure in the usage report{note}")
-            else:
-                # How long the window still has to run: the other half of what a
-                # percentage means (10% with four hours left is a different
-                # situation from 10% with ten minutes left), and the quantity a
-                # DayNightLimit ceiling is itself computed from.
-                left = (f", {fmt_left(rd.reset_ts - now)} left"
-                        if rd.reset_ts is not None else " now")
-                print_percents(f"  · {r.label} usage: {rd.percent:.0f}% "
-                               f"(ceiling {_format_ceiling(c)}{left}){note}")
+        if report_status:
+            for r, rd, c in status:
+                if rd.percent is None:
+                    print_line(f"  · {r.label}: no figure in the usage report{note}")
+                else:
+                    # How long the window still has to run: the other half of what a
+                    # percentage means (10% with four hours left is a different
+                    # situation from 10% with ten minutes left), and the quantity a
+                    # DayNightLimit ceiling is itself computed from.
+                    left = (f", {fmt_left(rd.reset_ts - now)} left"
+                            if rd.reset_ts is not None else " now")
+                    print_percents(f"  · {r.label} usage: {rd.percent:.0f}% "
+                                   f"(ceiling {_format_ceiling(c)}{left}){note}")
 
         if not self._violations(status):
             return False, session_start

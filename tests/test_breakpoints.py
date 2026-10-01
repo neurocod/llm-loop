@@ -188,7 +188,8 @@ def test_breakpoint_releases_a_quota_wait_without_launching(runner, monkeypatch)
         def log_snapshot(self, *a, **kw):
             pass
 
-        def check_and_wait(self, source, session_start, *, should_stop):
+        def check_and_wait(self, source, session_start, *, should_stop,
+                           report_status=True):
             assert not should_stop()
             press(apps[0], "b", *"implementation", "\r")
             waits.append(should_stop())

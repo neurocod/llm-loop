@@ -709,8 +709,9 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                 app.update(provider=provider, quotas=[])
                 statusline.push_quotas(app, usage_source, limit_policy)
                 if not ignore_usage_limits:
-                    print_percents(f"  · {provider} usage limit policy: "
-                                   f"{limit_policy.describe()}")
+                    if iteration == 0:
+                        print_percents(f"  · {provider} usage limit policy: "
+                                       f"{limit_policy.describe()}")
                     if not dry_run and quota_refresher is None:
                         quota_refresher = app.add_service(statusline.QuotaRefresher(
                             app, usage_source, limit_policy, provider=provider))
@@ -741,7 +742,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
             if not dry_run and not ignore_usage_limits:
                 app.update(phase="waiting")
                 paused, session_start = limit_policy.check_and_wait(
-                    usage_source, session_start, should_stop=stop_pending)
+                    usage_source, session_start, should_stop=stop_pending,
+                    report_status=iteration == 0)
                 statusline.push_quotas(app, usage_source, limit_policy)
                 app.update(phase="idle")
                 if paused:
