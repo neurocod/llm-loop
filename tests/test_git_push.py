@@ -685,6 +685,91 @@ def test_aborting_a_periodic_count_starts_no_push(tmp_path, monkeypatch):
         f"a push started after the periodic check was abandoned: {fake.calls}"
 
 
+def test_aborted_git_wait_does_not_wait_for_another_runs_push():
+    # 0.26 s measured 2026-10-02, including one 0.25 s lock poll; the
+    # existing 10 s timeout leaves ample room for slower CI scheduling.
+    abort = gitpush.PushAbort()
+    waiting = threading.Event()
+    result = []
+
+    def call_git():
+        waiting.set()
+        result.append(gitpush._run_git(["git", "rev-list"], ".", 30, abort))
+
+    lock = gitpush._GIT_CALL_LOCK
+    lock.acquire()
+    worker = threading.Thread(target=call_git, daemon=True)
+    try:
+        worker.start()
+        assert waiting.wait(timeout=HELD_PUSH_TIMEOUT_S)
+        abort.set()
+        worker.join(timeout=HELD_PUSH_TIMEOUT_S)
+        assert not worker.is_alive(), "aborted git kept waiting for another run"
+    finally:
+        lock.release()
+        worker.join(timeout=HELD_PUSH_TIMEOUT_S)
+
+    assert result == [None]
+
+
+def test_exit_interrupt_cancels_queued_periodic_push(tmp_path, monkeypatch):
+    # Under 0.005 s measured 2026-10-02; the 10 s handshake bound fails a
+    # stuck pusher without requiring a particular scheduler interleaving.
+    class HeldPushGit(_FakeGitModule):
+        def __init__(self):
+            super().__init__()
+            self.release = threading.Event()
+
+        def run(self, argv, **kwargs):
+            result = super().run(argv, **kwargs)
+            if tuple(argv)[:2] == ("git", "push") and len(self.pushes) == 1:
+                self.release.wait(timeout=HELD_PUSH_TIMEOUT_S)
+            return result
+
+    fake = HeldPushGit()
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    projectroot.set_project_root(root_not_cwd(tmp_path))
+    abort = gitpush.PushAbort()
+    pusher = ownership.OwnerThread("pusher", maxsize=1).start()
+    policy = gitpush.GitPushPolicy.AFTER_NEW_COMMITS
+    pusher.post(gitpush.maybe_git_push, policy, 0.0,
+                projectroot.project_dir(), timeout=0)
+    assert fake.pushed.wait(timeout=HELD_PUSH_TIMEOUT_S)
+    assert pusher.try_post(lambda: gitpush.maybe_git_push(
+        policy, 0.0, projectroot.project_dir(), abort=abort))
+
+    def interrupted_wait(owner, final):
+        owner.close(timeout=0, final=final)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runlifecycle, "_wait_for_exit_push", interrupted_wait)
+    closed = []
+
+    class ClosingUsage:
+        source = StubSource()
+        name = "claude"
+
+        def close(self, ending):
+            fake.release.set()
+            closed.append(pusher.close(timeout=HELD_PUSH_TIMEOUT_S))
+
+    ctx = runlifecycle.RunContext(
+        provider="claude", spec=None, dry_run=False, progress=None,
+        settings=runlifecycle.RunSettings(git_push=policy),
+        registry=None, status_enabled=False)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            runlifecycle.close_run(ctx, usages=[ClosingUsage()], pusher=pusher,
+                                   push_abort=abort)
+    finally:
+        fake.release.set()
+        pusher.close(timeout=HELD_PUSH_TIMEOUT_S)
+
+    assert closed == [True]
+    assert len(fake.pushes) == 1, \
+        f"a periodic push started after Ctrl+C abandoned it: {fake.calls}"
+
+
 def test_ctrl_c_while_the_exit_push_is_waited_for_gives_up_the_push_only(
         tmp_path, monkeypatch, capsys):
     """Ctrl+C during the exit push abandons the push, not the run's ending.

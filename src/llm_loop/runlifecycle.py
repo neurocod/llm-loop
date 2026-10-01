@@ -353,7 +353,8 @@ def close_run(ctx: RunContext, *,
               usages: Iterable[Optional[RunUsage]],
               ending: Optional[str] = None,
               mailbox=None,
-              pusher: Optional[OwnerThread] = None) -> None:
+              pusher: Optional[OwnerThread] = None,
+              push_abort: Optional[PushAbort] = None) -> None:
     """The housekeeping half of the epilogue, for every ending a run can have.
 
     Push what is still local, record where the quotas finished, report the notes
@@ -386,6 +387,8 @@ def close_run(ctx: RunContext, *,
     Ctrl+C while the exit push is waited for — on the pusher or here — gives
     up the push, not the housekeeping: see the body for the order, and
     `gitpush.final_git_push` for what happens to a git call already running.
+    The sequential runner shares `push_abort` with its periodic checks so
+    an interrupt also cancels checks queued behind the current push.
 
     `usages` is EVERY usage the run opened, not the one it ended on: a
     mixed-provider sequential run opens one per account it selects, and each is
@@ -406,7 +409,7 @@ def close_run(ctx: RunContext, *,
     `finally` closes only its console and its pusher.
     """
     usages = list(usages)           # walked twice: snapshots, then sources
-    abort = PushAbort()
+    abort = push_abort or PushAbort()
     exit_interrupt = []
 
     def exit_push():
@@ -518,7 +521,8 @@ INTERRUPTED_REASON = "interrupted by the operator (Ctrl+C)"
 def end_run(ctx: RunContext, result: RunResult, *,
             usages: Iterable[Optional[RunUsage]],
             mailbox=None,
-            pusher: Optional[OwnerThread] = None) -> RunResult:
+            pusher: Optional[OwnerThread] = None,
+            push_abort: Optional[PushAbort] = None) -> RunResult:
     """Everything both runners do when the work is over and they RETURN.
 
     The housekeeping is `close_run`; this adds what only a normal ending has — a
@@ -537,7 +541,8 @@ def end_run(ctx: RunContext, result: RunResult, *,
     reason = result.reason
     interrupted = False
     try:
-        close_run(ctx, usages=usages, mailbox=mailbox, pusher=pusher)
+        close_run(ctx, usages=usages, mailbox=mailbox, pusher=pusher,
+                  push_abort=push_abort)
     except KeyboardInterrupt:
         interrupted = True
     finally:

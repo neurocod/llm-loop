@@ -397,7 +397,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # An exceptional exit may bypass close_run. Queued work still drains
         # on close, so forbid any further git child before releasing the owner.
         push_abort.set()
-        pusher.close(timeout=0)
+        # Idle owner close: 0.98 ms worst of 600 measured 2026-09-29 in
+        # parallel._abandon_pusher; 0.5 s lets close acquire its short lock.
+        pusher.close(timeout=0.5)
 
 
 def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
@@ -586,7 +588,10 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
 
             # Git push policy: requested at the start of every iteration. A
             # slow push cannot hold the next agent; one pending check suffices
-            # while the owner is busy, and the exit push checks again.
+            # while the owner is busy, and the exit push checks again. The
+            # agent may change HEAD while a push runs; a later check sends its
+            # commits, while a history rewrite can make that push fail as
+            # non-fast-forward (reported by git_push).
             if not dry_run:
                 pusher.try_post(push_turn)
 
@@ -672,7 +677,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                     runlifecycle.close_run(
                         ctx, usages=opened_usages(),
                         ending="driver stopped the run",
-                        mailbox=mailbox, pusher=pusher)
+                        mailbox=mailbox, pusher=pusher,
+                        push_abort=push_abort)
                     sys.exit(stop.exit_code)
                 stop_reason = stopchannel.RunStopReason.DRIVER_STOP
                 break
@@ -931,7 +937,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                 runlifecycle.close_run(
                     ctx, usages=opened_usages(),
                     ending="provider errors in a row",
-                    mailbox=mailbox, pusher=pusher)
+                    mailbox=mailbox, pusher=pusher,
+                    push_abort=push_abort)
                 sys.exit(returncode)
 
     # This run's own closing line, if the driver has one (e.g. "Final state: …").
@@ -943,4 +950,5 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
     # The exit push follows every check queued while agents were running.
     return runlifecycle.end_run(
         ctx, stopchannel.RunResult(stop_reason, iteration, completed),
-        usages=opened_usages(), mailbox=mailbox, pusher=pusher)
+        usages=opened_usages(), mailbox=mailbox, pusher=pusher,
+        push_abort=push_abort)

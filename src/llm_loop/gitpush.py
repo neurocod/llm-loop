@@ -107,6 +107,7 @@ _WINDOWS = sys.platform == "win32"
 # A run abandoned with a git child in flight can be followed by another run
 # in the same process. Their pusher threads must not start git beside each other.
 _GIT_CALL_LOCK = threading.Lock()
+_GIT_LOCK_POLL_S = 0.25
 
 
 def _reap_killed(proc: "subprocess.Popen") -> None:
@@ -142,8 +143,20 @@ def _run_git(argv, cwd: str, timeout: float,
     way `subprocess.run` does: killed on its timeout (TimeoutExpired raised
     on) and on any exception out of the wait.
     """
-    with _GIT_CALL_LOCK:
+    if abort is None:
+        _GIT_CALL_LOCK.acquire()
+    else:
+        # Another run may still own git after this one was abandoned. Stop
+        # waiting promptly if our own run is abandoned too.
+        while not abort.is_set():
+            if _GIT_CALL_LOCK.acquire(timeout=_GIT_LOCK_POLL_S):
+                break
+        else:
+            return None
+    try:
         return _run_git_exclusive(argv, cwd, timeout, abort)
+    finally:
+        _GIT_CALL_LOCK.release()
 
 
 def _run_git_exclusive(argv, cwd: str, timeout: float,
