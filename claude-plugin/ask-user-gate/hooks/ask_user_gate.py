@@ -628,8 +628,12 @@ def scan(command: str, shell: str, windows: "bool | None" = None,
     return findings
 
 
-def render(findings: list[Finding]) -> str:
-    """The refusal the agent reads, in place of the dialog the user would."""
+def render(findings: list[Finding], *, include_escape_hatch: bool = True) -> str:
+    """The refusal the agent reads, in place of the dialog the user would.
+
+    A delegated review runs with no permission prompts, so its hook call omits
+    the escape-hatch paragraph; interactive callers retain the original text.
+    """
     # Resolved, not hardcoded: the same script is a plugin on one machine and a
     # loose hook on another, so a literal path lies on half of them -- and the
     # bare basename, while greppable, does not tell a reader who has never seen
@@ -649,16 +653,17 @@ def render(findings: list[Finding]) -> str:
         if finding.fix not in said:
             said.add(finding.fix)
             lines.append(f"    -> {finding.fix}")
-    lines.append("")
-    if hang_only:
-        lines.append("If you want this exact command anyway, add the marker "
-                     "`allowAskUser` to it (e.g. append ` # allowAskUser`) and "
-                     "it will be passed through unchanged.")
-    else:
-        lines.append("If you want this exact command anyway and accept that "
-                     "the user will be asked, add the marker `allowAskUser` to "
-                     "it (e.g. append ` # allowAskUser`) and it will be passed "
-                     "through unchanged.")
+    if include_escape_hatch:
+        lines.append("")
+        if hang_only:
+            lines.append("If you want this exact command anyway, add the marker "
+                         "`allowAskUser` to it (e.g. append ` # allowAskUser`) and "
+                         "it will be passed through unchanged.")
+        else:
+            lines.append("If you want this exact command anyway and accept that "
+                         "the user will be asked, add the marker `allowAskUser` to "
+                         "it (e.g. append ` # allowAskUser`) and it will be passed "
+                         "through unchanged.")
     return "\n".join(lines)
 
 
@@ -1199,7 +1204,8 @@ def main() -> int:
     json.dump({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": render(findings),
+        "permissionDecisionReason": render(
+            findings, include_escape_hatch=os.environ.get("CLAUDE_AGENT_REVIEW_GATE") != "1"),
     }}, sys.stdout)
     return 0
 
