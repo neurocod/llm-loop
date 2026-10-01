@@ -1,7 +1,6 @@
 """`CodexUsageSource` keeps one private quota server and never orphans it."""
 
 import gc
-import json
 import os
 import sys
 import threading
@@ -20,10 +19,23 @@ def pid_log(tmp_path):
     return tmp_path / "pids.txt"
 
 
+@pytest.fixture
+def sent(monkeypatch):
+    """Every message written to any quota server, in order."""
+    messages = []
+    real_write = codex_usage._QuotaServer.write
+
+    def recording_write(self, message):
+        messages.append(message)
+        real_write(self, message)
+
+    monkeypatch.setattr(codex_usage._QuotaServer, "write", recording_write)
+    return messages
+
+
 def _source(pid_log, mode="ok", **kwargs):
-    source = codex_usage.CodexUsageSource(
+    return codex_usage.CodexUsageSource(
         argv=lambda: [sys.executable, FAKE, mode, str(pid_log)], **kwargs)
-    return source
 
 
 def _starts(pid_log) -> int:
@@ -56,17 +68,8 @@ def test_cached_read_does_not_touch_the_server(pid_log):
         source.close()
 
 
-def test_gate_and_refresher_reads_are_serialized(pid_log, monkeypatch):
+def test_gate_and_refresher_reads_are_serialized(pid_log, sent):
     source = _source(pid_log)
-    sent = []
-    real_write = codex_usage._QuotaServer.write
-
-    def recording_write(self, message):
-        if "id" in message:
-            sent.append(message["id"])
-        real_write(self, message)
-
-    monkeypatch.setattr(codex_usage._QuotaServer, "write", recording_write)
     results = []
     barrier = threading.Barrier(8)
 
@@ -83,7 +86,8 @@ def test_gate_and_refresher_reads_are_serialized(pid_log, monkeypatch):
         # Every reader got its own reply, none another's: one server, eight
         # distinct answers, ids issued strictly in order.
         assert sorted(results) == list(range(1, 9))
-        assert sent == sorted(sent) and len(set(sent)) == len(sent)
+        ids = [m["id"] for m in sent if "id" in m]
+        assert ids == sorted(ids) and len(set(ids)) == len(ids)
         assert _starts(pid_log) == 1
     finally:
         source.close()
@@ -192,7 +196,6 @@ def test_close_reaps_the_server_and_refuses_to_start_another(pid_log):
     # A status-line poll racing the epilogue keeps the last figures and
     # starts nothing.
     assert source.get_usage(cache_value=False).week_all.percent == 1
-    assert source.query_rate_limits_json() is None
     assert _starts(pid_log) == 1
     source.close()                              # idempotent
 
@@ -239,13 +242,8 @@ def test_start_failure_degrades_to_no_figures(capsys):
         source.close()
 
 
-def test_wire_messages_of_one_query(pid_log, monkeypatch):
+def test_wire_messages_of_one_query(pid_log, sent):
     source = _source(pid_log)
-    sent = []
-    real_write = codex_usage._QuotaServer.write
-    monkeypatch.setattr(codex_usage._QuotaServer, "write",
-                        lambda self, m: (sent.append(json.loads(json.dumps(m))),
-                                         real_write(self, m))[1])
     try:
         _percent(source)
     finally:

@@ -463,7 +463,9 @@ def close_run(ctx: RunContext, *,
     # dry runs included: the gate and the status line read the source there
     # too. Endings that never get here leave it to the source's atexit hook.
     for usage in usages:
-        close_source = getattr(usage and usage.source, "close", None)
+        if usage is None:
+            continue
+        close_source = getattr(usage.source, "close", None)
         if close_source is None:
             continue
         try:

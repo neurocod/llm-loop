@@ -126,6 +126,10 @@ class _ServerClosed(RuntimeError):
     """The quota server's stdout ended (EOF) before the awaited reply."""
 
 
+class _ServerError(RuntimeError):
+    """The quota server answered with an error: it is alive and kept."""
+
+
 _EOF = object()
 
 
@@ -184,7 +188,7 @@ class _QuotaServer:
             if "error" in message:
                 error = message.get("error") or {}
                 detail = error.get("message") if isinstance(error, dict) else error
-                raise RuntimeError(str(detail or "unknown app-server error"))
+                raise _ServerError(str(detail or "unknown app-server error"))
             return message.get("result") or {}
 
     def stop(self) -> None:
@@ -240,6 +244,10 @@ _open_sources: "set[CodexUsageSource]" = set()
 def _close_open_sources() -> None:
     for source in list(_open_sources):
         source.close()
+
+
+def _no_figures(reason) -> None:
+    print_line(f"  · no Codex usage figures: {reason}")
 
 
 def _default_argv() -> List[str]:
@@ -320,12 +328,9 @@ class CodexUsageSource:
                 # gets no retry: only one that died while idle does.
                 fresh = server is not previous
             except (FileNotFoundError, PermissionError) as exc:
-                print_line(f"  · no Codex usage figures: could not start "
-                           f"'codex app-server' ({exc})")
-                return None
-            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
-                print_line(f"  · no Codex usage figures: {exc}")
-                return None
+                return _no_figures(f"could not start 'codex app-server' ({exc})")
+            except (OSError, RuntimeError, ValueError) as exc:
+                return _no_figures(exc)
             try:
                 request_id = self._request_id()
                 server.write(wire.codex_app_rate_limits_read(request_id))
@@ -333,21 +338,14 @@ class CodexUsageSource:
             except (BrokenPipeError, _ServerClosed) as exc:
                 self._drop_server()
                 if fresh or attempt == 2:
-                    print_line(f"  · no Codex usage figures: {exc}")
-                    return None
+                    return _no_figures(exc)
                 # A reused server that died while idle: one fresh retry.
-            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
-                if not isinstance(exc, RuntimeError):
-                    self._drop_server()   # timeout or pipe trouble: restart
-                print_line(f"  · no Codex usage figures: {exc}")
-                return None
+            except _ServerError as exc:
+                return _no_figures(exc)
+            except (OSError, ValueError) as exc:
+                self._drop_server()   # timeout or pipe trouble: restart
+                return _no_figures(exc)
         return None
-
-    def query_rate_limits_json(self) -> Optional[dict]:
-        with self._lock:
-            if self._closed:
-                return None
-            return self._query_locked()
 
     def get_usage(self, cache_value: bool = True) -> Usage:
         with self._lock:
