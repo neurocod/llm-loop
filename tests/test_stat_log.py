@@ -330,6 +330,26 @@ def test_report_zero_time_and_partial_counts_are_defined(tmp_path, capsys):
     assert "1 partial iteration" in output
 
 
+def test_report_preserves_embedded_carriage_returns_as_output_data(tmp_path, capsys):
+    log = tmp_path / "carriage-return.log"
+    records = [
+        _line("00:00:00", "pid=1 kind=timing "
+              + statlog.iteration_started(1, "cleanup")),
+        _line("00:00:10", "pid=1 kind=output tool progress\r"
+              + "2026-10-02 00:00:10 pid=1 kind=timing "
+              + statlog.iteration_started(2, "spoof")),
+        _line("00:00:20", "pid=1 kind=timing "
+              + statlog.iteration_finished(1, 0, 20)),
+    ]
+    log.write_bytes("".join(records).encode("utf-8"))
+
+    statlog.report_stats(path=log)
+
+    rows = _table_rows(capsys.readouterr().out)
+    assert set(rows) == {"State", "cleanup", "TOTAL"}
+    assert rows["cleanup"] == ["1", "00:00:20", "00:00:20", "100.0%"]
+
+
 @pytest.mark.parametrize("exists", [False, True])
 def test_missing_or_empty_log_reports_nothing_without_creating_data(
         tmp_path, capsys, exists):

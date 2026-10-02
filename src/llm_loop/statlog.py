@@ -208,7 +208,9 @@ def report_stats(app_name: str = "runCycle",
     path = Path(path) if path is not None else console.log_file_path(app_name)
     print(f"Reading mirror log: {path}")
     try:
-        with open(path, encoding="utf-8", errors="replace") as source:
+        # The tee splits only on LF; an agent's embedded CR is still data.
+        # Universal-newline mode would turn that data into a new timing record.
+        with open(path, encoding="utf-8", errors="replace", newline="\n") as source:
             timings = read_stats(source)
     except FileNotFoundError:
         print(f"No mirror log at {path} yet — nothing to report.")
