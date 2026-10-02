@@ -66,7 +66,13 @@ Usage:
   python try_patch.py --recover    # undo what a KILLED run left (see
                                    # JOURNAL_DIR_NAME in try_patch_journal.py)
 
-Exit codes of its own: 2 bad edit, 3 restore failed, 4 refused by the journal.
+  # a gate with its own "could not judge" code: name it, or a typo'd suite
+  # reads as the mutation caught
+  python try_patch.py --file a.h --old X --new Y --expect-fail \\
+      --reject-exit 5 -- python selftest_run.py ped-delta
+
+Exit codes of its own: 2 bad edit, 3 restore failed, 4 refused by the journal,
+6 the command refused for a reason named by --reject-exit.
 """
 
 import argparse
@@ -98,6 +104,14 @@ from try_patch_journal import (  # noqa: E402
 # -- no `finally`. "1" on a one-file run is "after mutating".
 SELFTEST_DIE_ENV = "TRY_PATCH_SELFTEST_DIE_AFTER_MUTATION"
 SELFTEST_DIE_CODE = 86
+
+# --expect-fail met an exit named by --reject-exit: the gate refused for its own
+# reason (selftest_run.py's 5 for an unknown suite name), so the run proved
+# nothing about the pin. Not 1: 1 is "the pin pins nothing", a verdict about the
+# TEST that sends the caller to rewrite it; this one is about the RUN and sends
+# them to fix the command. Not the gate's own code passed through either: a
+# rejected 2 would then read as this script's "bad edit". Free among 2/3/4/127.
+EXIT_GATE_REFUSED = 6
 
 
 class Triple(argparse.Action):
@@ -242,6 +256,11 @@ def main() -> int:
                         help="run the command here (instead of `cd DIR &&`)")
     parser.add_argument("--expect-fail", action="store_true",
                         help="succeed only if the command FAILS (pin check)")
+    parser.add_argument("--reject-exit", type=int, action="append", default=[],
+                        metavar="N",
+                        help="with --expect-fail: exit N is the command "
+                             "refusing for its own reason, not the pin firing "
+                             f"-- end with {EXIT_GATE_REFUSED} (repeatable)")
     parser.add_argument("--keep", action="store_true",
                         help="leave the edits in place (debugging this script)")
     parser.add_argument("--selftest", action="store_true",
@@ -263,6 +282,14 @@ def main() -> int:
         command = command[1:]
     if not command:
         parser.error("no command given; put it after a bare --")
+    # Without --expect-fail the command's code is passed through untouched, so
+    # the flag would do nothing -- refused rather than silently ignored. A 0 is
+    # a pass, which --expect-fail already refuses.
+    if options.reject_exit and not options.expect_fail:
+        parser.error("--reject-exit needs --expect-fail")
+    if 0 in options.reject_exit:
+        parser.error("--reject-exit 0 makes no sense: a passing command "
+                     "already fails --expect-fail")
 
     try:
         edits = collect_edits(options)
@@ -406,6 +433,12 @@ def main() -> int:
             print("try_patch: the command PASSED without the fix -- the pin "
                   "does not pin anything", file=sys.stderr)
             return 1
+        if status in options.reject_exit:
+            print(f"try_patch: the command refused for its own reason (exit "
+                  f"{status}, named by --reject-exit), so it proves nothing "
+                  "about the pin -- fix the command and rerun",
+                  file=sys.stderr)
+            return EXIT_GATE_REFUSED
         print(f"try_patch: the command failed as expected (exit {status})")
         return 0
     return status
@@ -705,6 +738,53 @@ def _case_expect_fail_rejects_a_passing_command(work: Path) -> None:
                   *CMD_OK)
     _expect(result.returncode == 1,
             f"a pin that pins nothing must fail: exit {result.returncode}")
+    _expect_bytes(victim, GUARDS, result)
+
+
+def _case_reject_exit_voids_the_proof(work: Path) -> None:
+    """A gate's own refusal code (a typo'd suite name, a missing exe) must not
+    read as the mutation caught: --reject-exit names it, and the run ends
+    EXIT_GATE_REFUSED with the reason, not "failed as expected".
+    """
+    victim = _victim(work)
+    result = _run(work, "--expect-fail", "--reject-exit", "5",
+                  "--reject-exit", "7", *_flip("guardA"), *CMD_FAIL)
+    shown = f"exit {result.returncode}\n{result.stdout}{result.stderr}"
+    _expect(result.returncode == EXIT_GATE_REFUSED, f"not refused -- {shown}")
+    _expect("failed as expected" not in result.stdout, f"counted -- {shown}")
+    _expect("refused for its own reason (exit 7," in result.stderr,
+            f"the reason is not named -- {shown}")
+    _expect_bytes(victim, GUARDS, result)
+
+
+def _case_reject_exit_leaves_other_failures_counted(work: Path) -> None:
+    """...while an exit outside the set is still the pin firing; and the flag
+    is refused without --expect-fail, where it would silently do nothing."""
+    victim = _victim(work)
+    result = _run(work, "--expect-fail", "--reject-exit", "5",
+                  *_flip("guardA"), *CMD_FAIL)
+    _expect(result.returncode == 0,
+            f"exit {result.returncode}\n{result.stdout}{result.stderr}")
+    _expect_bytes(victim, GUARDS, result)
+    _expect_refused_unrun_plain(work, victim,
+                                ["--reject-exit", "5", *_flip("guardA")],
+                                "--reject-exit needs --expect-fail")
+    _expect_refused_unrun_plain(work, victim,
+                                ["--expect-fail", "--reject-exit", "0",
+                                 *_flip("guardA")],
+                                "--reject-exit 0")
+
+
+def _expect_refused_unrun_plain(work: Path, victim: Path, args: "list[str]",
+                                names: str) -> None:
+    """`args` refused by argparse (exit 2) before anything is written or run."""
+    result = _run(work, *args, *CMD_FAIL)
+    shown = f"{args}: exit {result.returncode}\n{result.stdout}{result.stderr}"
+    _expect(result.returncode == 2, f"not refused -- {shown}")
+    _expect("try_patch: running" not in result.stdout,
+            f"the command ran -- {shown}")
+    _expect(names in result.stderr, f"the refusal does not say {names!r} -- "
+                                    f"{shown}")
     _expect_bytes(victim, GUARDS, result)
 
 
@@ -1039,6 +1119,8 @@ SELFTEST_CASES = (
     _case_expect_fail_accepts_a_failing_command,
     _case_expect_fail_rejects_a_passing_command,
     _case_expect_fail_rejects_an_unrunnable_command,
+    _case_reject_exit_voids_the_proof,
+    _case_reject_exit_leaves_other_failures_counted,
     _case_pathext_shim_runs_by_its_bare_name,
     _case_command_rewriting_the_file_is_reported,
     _case_missing_pattern_rolls_the_earlier_edits_back,
