@@ -433,8 +433,6 @@ def _interpreter_under_a_space(tmp_path):
 @pytest.mark.parametrize("argv, overrides, spaced_interpreter", [
     (["-m", "5"], {"--project-dir": ""}, False),
     (["-C", "", "-m", "5"], {"--max-runs": 2}, False),
-    # No `-p`: it selects the parallel parser, which has no --start-in, and the
-    # meaning check below parses with the sequential one.
     (["--finish", "products/configs/x"],
      {"--start-in": "", "--project-dir": r"C:\my project"}, False),
     (["-m", "5"], {"--project-dir": _METACHARACTERS}, False),

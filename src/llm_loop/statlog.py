@@ -1,4 +1,4 @@
-"""State timings reconstructed from the sequential runner's mirror log."""
+"""State timings reconstructed from sequential and pool mirror records."""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,6 +28,20 @@ def iteration_finished(iteration: int, returncode: int,
     elapsed = (f", elapsed {elapsed_seconds:.3f} s"
                if elapsed_seconds is not None else "")
     return f"=== Iteration {iteration} finished (exit {returncode}{elapsed}) ==="
+
+
+def pool_iteration_started(session: str, worker: int, state: str) -> str:
+    """Pool workers share a pid; each run/worker needs its own timing cursor."""
+    return json.dumps({"event": "pool_iteration_start", "session": session,
+                       "worker": worker, "state": state or "(no label)"},
+                      ensure_ascii=False)
+
+
+def pool_iteration_finished(session: str, worker: int,
+                            elapsed_seconds: float) -> str:
+    """Provider wall time, excluding usage gates and per-item driver hooks."""
+    return json.dumps({"event": "pool_iteration_finish", "session": session,
+                       "worker": worker, "elapsed_seconds": elapsed_seconds})
 
 
 _RECORD = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$")
@@ -129,16 +143,19 @@ class _ActiveIteration:
 
 
 def read_stats(lines: Iterable[str]) -> Dict[str, StateTiming]:
-    """Read tagged timing events per pid, with best-effort legacy fallback.
+    """Read tagged timing events per pid/worker, with legacy fallback.
 
     New mirror records distinguish machine timings from ordinary stdout, so
     agent prose cannot end an iteration. Each process has its own cursor; a
     killed process contributes observed time only, without charging downtime
-    before another launch. Old untagged logs cannot disambiguate concurrent
+    before another launch. Pool cursors observe machine result records only;
+    ordinary stdout has no authoritative worker identity. Old untagged logs
+    cannot disambiguate concurrent
     writers or exact copies of runner messages in agent output.
     """
     timings: Dict[str, StateTiming] = {}
-    active: Dict[str, _ActiveIteration] = {}
+    active = {}
+    pool_workers = {}
 
     def flush(pid, seconds=None):
         item = active.pop(pid, None)
@@ -177,6 +194,25 @@ def read_stats(lines: Iterable[str]) -> Dict[str, StateTiming]:
                 active[pid] = _ActiveIteration(event["iteration"], event["state"],
                                                 stamp, stamp)
                 continue
+            if isinstance(event, dict):
+                session, worker = event.get("session"), event.get("worker")
+                kind = event.get("event")
+                if isinstance(session, str) and isinstance(worker, int):
+                    key = (pid, session, worker)
+                    if (kind == "pool_iteration_start"
+                            and isinstance(event.get("state"), str)):
+                        previous = pool_workers.get((pid, worker))
+                        if previous is not None:
+                            flush(previous)
+                        pool_workers[pid, worker] = key
+                        active[key] = _ActiveIteration(0, event["state"], stamp, stamp)
+                    elif (kind == "pool_iteration_finish"
+                          and isinstance(event.get("elapsed_seconds"), (int, float))):
+                        flush(key, event["elapsed_seconds"])
+                elif kind == "pool_cost" and isinstance(worker, int):
+                    key = pool_workers.get((pid, worker))
+                    if key in active:
+                        active[key].last = stamp
             finished = _FINISHED.fullmatch(message)
             if (finished is not None and pid in active
                     and int(finished[1]) == active[pid].number):

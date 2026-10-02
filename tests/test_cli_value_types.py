@@ -72,7 +72,7 @@ def test_set_project_root_keeps_the_root_on_none():
     assert projectroot.set_project_root(None) == before
 
 
-# --- -s / --start-in (sequential only: the parallel parser has no delay) --------
+# --- -s / --start-in ----------------------------------------------------------
 
 _START_IN_REFUSAL = "argument -s/--start-in/--startIn: "
 
@@ -90,20 +90,22 @@ _START_IN_REFUSAL = "argument -s/--start-in/--startIn: "
     (["-s", "1.5"], "cannot parse duration: '1.5'"),
 ], ids=["short", "equals", "deprecated-alias", "equals-empty", "blank",
         "unit-less-tail", "leading-junk", "bare-fraction"])
-def test_a_malformed_start_in_is_a_usage_error(argv, why, capsys):
+@pytest.mark.parametrize("parse", [cyclecore.parse_args, parallel.parse_args])
+def test_a_malformed_start_in_is_a_usage_error(argv, why, capsys, parse):
     # At parse time, not when the wait begins: a runner reads the value only
     # after its prologue, and a host wrapper after its own startup steps.
-    err = _refusal(cyclecore.parse_args, argv, capsys)
+    err = _refusal(parse, argv, capsys)
 
     assert _START_IN_REFUSAL + why in err
 
 
 @pytest.mark.parametrize("spelling", ["1h30m", "29", "90s", "0", " 29m ",
                                       "1h 30m"])
-def test_a_well_formed_start_in_is_kept_as_typed(spelling):
+@pytest.mark.parametrize("parse", [cyclecore.parse_args, parallel.parse_args])
+def test_a_well_formed_start_in_is_kept_as_typed(spelling, parse):
     # As typed, not in seconds: the wait announces the spelling it was given.
-    assert cyclecore.parse_args(["-s", spelling]).start_in == spelling
-    assert cyclecore.parse_args([]).start_in is None
+    assert parse(["-s", spelling]).start_in == spelling
+    assert parse([]).start_in is None
 
 
 @pytest.mark.parametrize("text, seconds", [

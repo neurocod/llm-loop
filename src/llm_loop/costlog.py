@@ -1,10 +1,8 @@
 """costlog.py - what a run cost, read back out of the mirror log.
 
-`--cost` reconstructs per-run spend from two PRINTED lines with no bookkeeping
-of its own: every run's first iteration prints an "=== Iteration 1 ===" header
-(`run_loop`), and every successful Claude turn prints a "· done (… c, $…)" line
-(`streamrender._render_claude_event`). Summing the dollar figures between
-headers is the whole report.
+Sequential runs delimit sessions with iteration_header and print successful
+Claude costs through done_line. Pool runs write pool_started/pool_result machine
+records, since concurrent workers cannot share a sequential session cursor.
 
 Those two lines are therefore a CONTRACT between three modules — the two that
 print them and the one that parses them — and this module is where it lives:
@@ -22,6 +20,7 @@ in it mean; this one is handed `console.log_file_path` / `LOG_MAX_BYTES` and
 reads, the same shape as `exitlog` writing its own file beside the mirror.
 """
 
+import json
 import os
 import re
 from pathlib import Path
@@ -75,6 +74,23 @@ _SESSION_RE = re.compile(re.escape(iteration_header(1)))
 # Hand-written, because it has to capture the dollar figure out of a formatted
 # number; the round trip through `done_line` is pinned by tests instead.
 _COST_RE = re.compile(r"done \(\s*[\d.]+ c,\s*\$([\d.]+)\)")
+_MACHINE_RE = re.compile(r"^\S+ \S+ pid=(\d+) kind=timing (.*)$")
+
+
+def pool_started(session: str) -> str:
+    """A distinct pool invocation, independent of sequential promotion headers."""
+    return json.dumps({"event": "pool_start", "session": session})
+
+
+def pool_result(worker: int, duration_ms: Optional[float],
+                cost: Optional[float]) -> str:
+    """A successful turn's delta, with the same two-figure rule as done_line.
+
+    Worker identity is scoped to its pid and most recent pool iteration start.
+    Human worker summaries are never counted, including failed/retried jobs.
+    """
+    return json.dumps({"event": "pool_cost", "worker": worker,
+                       "duration_ms": duration_ms, "cost": cost})
 
 
 def named_log(path: Union[str, "os.PathLike[str]"]) -> Path:
@@ -98,8 +114,9 @@ def report_costs(app_name: str = "runCycle",
     """Print per-session (per-run) cost totals parsed from the mirror log, then
     exit — the standalone counterpart reached via the --cost flag.
 
-    A "session" is one run of the loop, delimited by its "=== Iteration 1 ==="
-    header; within it every "done (… c, $…)" line contributes its dollar cost. We
+    A sequential session starts at its "=== Iteration 1 ===" header; a pool
+    session starts at pool_started and scopes its workers by pid/run ID. Each
+    successful turn with both duration and cost contributes its dollar cost. We
     print a line per session, a grand total, and how full the log is against the
     rotation limit (LOG_MAX_BYTES). With no `path`, the log is resolved via
     log_file_path(app_name), so --cost reports on the very log this entry point
@@ -119,32 +136,54 @@ def report_costs(app_name: str = "runCycle",
     # Always name the log we are reading, so an empty report is unambiguous
     # (right file, no data) rather than looking like a silent failure.
     print(f"Reading mirror log: {path}")
-    sessions = []  # list of (header, total_cost, count)
-    header = None
-    total = 0.0
-    count = 0
-
-    def flush():
-        if header is not None:
-            sessions.append((header, total, count))
+    sessions = []  # mutable rows: [header, total_cost, count]
+    sequential = None
+    pools = {}
+    workers = {}
 
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace", newline="\n") as f:
             for line in f:
+                machine = _MACHINE_RE.fullmatch(line.rstrip("\r\n"))
+                if machine is not None:
+                    try:
+                        event = json.loads(machine[2])
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    pid = machine[1]
+                    session = event.get("session")
+                    worker = event.get("worker")
+                    kind = event.get("event")
+                    if kind == "pool_start" and isinstance(session, str):
+                        row = [line.strip(), 0.0, 0]
+                        pools[pid, session] = row
+                        sessions.append(row)
+                    elif (kind == "pool_iteration_start"
+                          and isinstance(session, str) and isinstance(worker, int)):
+                        workers[pid, worker] = pools.get((pid, session))
+                    elif kind == "pool_cost" and isinstance(worker, int):
+                        row = workers.get((pid, worker))
+                        cost = event.get("cost")
+                        duration = event.get("duration_ms")
+                        if (row is not None and isinstance(cost, (int, float))
+                                and isinstance(duration, (int, float))):
+                            # Match sequential done_line's four-decimal rounding.
+                            row[1] += float(f"{cost:.4f}")
+                            row[2] += 1
+                    continue
                 if _SESSION_RE.search(line):
-                    flush()
-                    header = line.strip()
-                    total = 0.0
-                    count = 0
+                    sequential = [line.strip(), 0.0, 0]
+                    sessions.append(sequential)
                 else:
                     m = _COST_RE.search(line)
-                    if m and header is not None:
-                        total += float(m.group(1))
-                        count += 1
+                    if m and sequential is not None:
+                        sequential[1] += float(m.group(1))
+                        sequential[2] += 1
     except FileNotFoundError:
         print(f"No mirror log at {path} yet — nothing to report.")
         return
-    flush()
 
     grand = 0.0
     grand_count = 0

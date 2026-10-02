@@ -42,9 +42,12 @@ import sys
 import threading
 import time
 from typing import Callable, Optional
+from uuid import uuid4
 
 from . import clispec
 from . import compactline
+from . import console
+from . import costlog
 from . import exitlog
 from . import operator
 from . import ownership
@@ -52,6 +55,7 @@ from . import projectroot
 from . import providers
 from . import runlifecycle
 from . import statusline
+from . import statlog
 from . import stopchannel
 from . import textwidth
 # BY NAME, not through the module, and that is the repair of a real defect: this
@@ -634,10 +638,16 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                     # `total_cost_usd` is the session's running total (so the last
                     # one is the job's cost), `duration_ms` is that turn's alone (so
                     # they add up).
+                    previous_cost = cost_usd or 0.0
+                    result_cost = wire.result_cost(ev)
                     cost_usd = wire.result_cost(ev, cost_usd)
                     dur = wire.result_duration_ms(ev)
                     if dur is not None:
                         duration_s = (duration_s or 0.0) + dur / 1000
+                    if not wire.result_failed(ev):
+                        console.record_timing(costlog.pool_result(
+                            job_id, dur, (result_cost - previous_cost
+                                          if result_cost is not None else None)))
         # Outside the `with`, so the pipe is closed before we wait on the process:
         # a worker waiting on a CLI whose stdin is still open never returns, and a
         # run whose final join() never finishes is the whole fleet.
@@ -681,6 +691,7 @@ class Shared:
 
     def __init__(self, driver: ListFileDriver, settings):
         self.driver = driver
+        self.log_session = uuid4().hex
         # The run's live knobs (runlifecycle.RunSettings), not a copy of the cap
         # taken here: `--max-runs` is editable from the status line, and the
         # claim loop below is the one place that enforces it — so it has to read
@@ -1273,8 +1284,16 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # spliced in, the row already announced.
             note_driver_handback(job_id, shared,
                                  shared.driver.item_started(command))
+            console.record_timing(statlog.pool_iteration_started(
+                shared.log_session, job_id, command.label))
+            provider_started = time.monotonic()
             with statusline.describing(job):
-                rc, cost_usd, dur = run_job(job_id, command, mailbox)
+                try:
+                    rc, cost_usd, dur = run_job(job_id, command, mailbox)
+                finally:
+                    console.record_timing(statlog.pool_iteration_finished(
+                        shared.log_session, job_id,
+                        time.monotonic() - provider_started))
         except BaseException:
             # Hand the claim back (see `Shared.abandon` for which way and why),
             # then let the exception go on ending the thread it was always going
@@ -1419,6 +1438,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     if wait_on_start:
         stopchannel.wait_for_stop_file_clear()
 
+    if args.start_in:
+        # Local import keeps the shared startup UI out of the module import cycle.
+        from .cyclecore import wait_before_start
+        wait_before_start(args.start_in, interactive=ctx.status_enabled)
+
     # Usage gate: one account's RunUsage (see runlifecycle.open_usage), shared by
     # every worker. One is the whole set this run closes:
     # `ListFileDriver.command_for` stamps every command with `driver.provider`,
@@ -1441,6 +1465,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # Copying the push policy into a local is what once made that knob do
     # nothing in this mode.
     shared = Shared(driver, run_settings)
+    console.record_timing(costlog.pool_started(shared.log_session))
 
     # Each worker owns a mailbox for both live delivery and notes queued between
     # its turns. This is a growable set even at one worker: MessageAction opens

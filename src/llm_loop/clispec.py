@@ -387,6 +387,7 @@ OPTION_ORDER: Dict[str, Tuple[str, ...]] = {
         "--max-runs",
         "--codex",
         "--dry-run",
+        "--start-in",
         "--git-push",
         "--project-dir",
         "--ignore-usage",
