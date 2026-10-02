@@ -3010,16 +3010,33 @@ class StatusApp:
         if not self._started:
             return
         self._started = False
-        self._remove_emergency_restore()
-        for service in self._services:
+        # Every step runs whatever the one before it raised: each wait here is
+        # bounded, and a Ctrl+C in one of them (a service's join, the key
+        # reader, the painter's last frame) used to skip the rest — the painter
+        # left open and the region pinned through the report, with the
+        # emergency restore already gone and a second stop() a no-op. The first
+        # exception is raised once all of them have run.
+        def stop_service(service) -> None:
             try:
                 service.stop()
             except Exception:
                 pass
-        # Keys first: a key read after the painter hands back would be handled
-        # — and painted — on the key reader's own thread.
-        self._stop_input()
-        self.painter.close(PAINTER_JOIN_SECONDS)
+
+        # Keys before the painter: a key read after the painter hands back
+        # would be handled — and painted — on the key reader's own thread.
+        steps = [self._remove_emergency_restore,
+                 *(functools.partial(stop_service, s) for s in self._services),
+                 self._stop_input,
+                 lambda: self.painter.close(PAINTER_JOIN_SECONDS)]
+        first: Optional[BaseException] = None
+        for step in steps:
+            try:
+                step()
+            except BaseException as exc:
+                if first is None:
+                    first = exc
+        if first is not None:
+            raise first
 
     def _stop_input(self) -> None:
         with self._input_lock:

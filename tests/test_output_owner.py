@@ -1549,6 +1549,53 @@ def test_ctrl_c_while_start_waits_for_its_first_frame_puts_the_terminal_back():
     assert not app._atexit_registered
 
 
+def test_ctrl_c_in_a_service_stop_still_stops_the_rest_and_releases_the_region():
+    """Every step of stop() runs past an interrupted one, then it re-raises.
+
+    A Ctrl+C in a service's join used to skip the later services, the key
+    reader and the painter's close: the region stayed pinned with the emergency
+    restore already removed, and a second stop() did nothing.
+    """
+    class Interrupted:
+        def start(self):
+            pass
+
+        def stop(self):
+            raise KeyboardInterrupt
+
+    class Recorded:
+        stopped = False
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped = True
+
+    class Keys(termio.NullInputSource):
+        stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    terminal = _paint_log()
+    keys = Keys()
+    app = sl.StatusApp(terminal=terminal, input_source=keys, refresh=60)
+    app.add_service(Interrupted())
+    later = app.add_service(Recorded())
+    app.start()
+    painter = app.painter.thread
+    with pytest.raises(KeyboardInterrupt):
+        app.stop()
+    painter.join(WAIT_S)
+    assert later.stopped, "a service after the interrupted one was never stopped"
+    assert keys.stopped, "the key reader was never stopped"
+    assert terminal.releases == [sl.PAINTER_THREAD_NAME], "the region was never released"
+    assert not terminal.active
+    assert not painter.is_alive(), "the painter was never closed"
+    assert not app._atexit_registered
+
+
 def test_a_burst_behind_a_stuck_frame_is_one_request_and_one_frame_of_its_end():
     """Every paint request asks for "the state as it is now", so one in flight
     is the whole queue, and the frame after the stall shows the burst's end."""
