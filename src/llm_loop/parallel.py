@@ -305,7 +305,12 @@ def job_lines(job_id: int) -> compactline.LineWriter:
     runners, and the tag counts against the width of each of them.
     """
     tag_plain, tag_markup = _job_tag(job_id)
-    return compactline.LineWriter(_emit_markup, f"{tag_plain} ",
+
+    def emit(plain: str, markup: str) -> None:
+        console.record_timing(statlog.pool_worker_activity(job_id))
+        _emit_markup(plain, markup)
+
+    return compactline.LineWriter(emit, f"{tag_plain} ",
                                   f"{tag_markup} ")
 
 
@@ -1438,7 +1443,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     if wait_on_start:
         stopchannel.wait_for_stop_file_clear()
 
-    if args.start_in:
+    if getattr(args, "start_in", None):
         # Local import keeps the shared startup UI out of the module import cycle.
         from .cyclecore import wait_before_start
         wait_before_start(args.start_in, interactive=ctx.status_enabled)

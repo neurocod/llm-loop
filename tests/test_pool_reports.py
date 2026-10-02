@@ -2,6 +2,7 @@
 
 import io
 import json
+import logging
 import sys
 import threading
 from types import SimpleNamespace
@@ -96,6 +97,8 @@ def test_real_pool_promotion_pool_log_keeps_sessions_and_timings_distinct(
     _wall_clock(monkeypatch)
     monkeypatch.setattr(parallel, "start_agent_process",
                         lambda *args: _Process([_result(.2), _result(.25)]))
+    # The real provider renderer resets this at every process launch.
+    monkeypatch.setattr(streamrender, "_turn_cost_base", 0.0)
 
     def promotion(*args, **kwargs):
         streamrender._render_claude_event(_result(.1), True)
@@ -143,3 +146,26 @@ def test_interleaved_pool_workers_do_not_replace_same_pid_promotion_cursor():
         "promotion": 5, "a": 30, "b": 20}
     assert all(row.iterations == 1 and row.partial_iterations == 0
                for row in stats.values())
+
+
+def test_real_worker_tool_line_advances_partial_time_without_result_or_finish(
+        tmp_path, monkeypatch):
+    stamp = ["2026-10-02 00:00:00"]
+    monkeypatch.setattr(logging.Formatter, "formatTime", lambda *args: stamp[0])
+    with isolated_run(monkeypatch, tmp_path):
+        app = "pytest-pool-partial"
+        console.setup_file_logging(app)
+        console.record_timing(statlog.pool_iteration_started("run", 1, "a"))
+        console.record_timing(statlog.pool_iteration_started("run", 2, "b"))
+        stamp[0] = "2026-10-02 00:00:25"
+        parallel.job_lines(1).tool("Read", "source.py")
+        # A line from a worker with no active turn must not extend either cursor.
+        stamp[0] = "2026-10-02 01:00:00"
+        parallel.job_lines(3).tool("Read", "orphan.py")
+        with console.log_file_path(app).open(encoding="utf-8", newline="\n") as source:
+            stats = statlog.read_stats(source)
+    assert stats["a"].iterations == 1
+    assert stats["a"].partial_iterations == 1
+    assert stats["a"].total_seconds == 25
+    assert stats["b"].total_seconds == 0
+    assert stats["b"].partial_iterations == 1

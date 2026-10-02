@@ -90,7 +90,7 @@ def pool_result(worker: int, duration_ms: Optional[float],
     Human worker summaries are never counted, including failed/retried jobs.
     """
     return json.dumps({"event": "pool_cost", "worker": worker,
-                       "duration_ms": duration_ms, "cost": cost})
+                       "elapsed_ms": duration_ms, "cost": cost})
 
 
 def named_log(path: Union[str, "os.PathLike[str]"]) -> Path:
@@ -166,7 +166,7 @@ def report_costs(app_name: str = "runCycle",
                     elif kind == "pool_cost" and isinstance(worker, int):
                         row = workers.get((pid, worker))
                         cost = event.get("cost")
-                        duration = event.get("duration_ms")
+                        duration = event.get("elapsed_ms")
                         if (row is not None and isinstance(cost, (int, float))
                                 and isinstance(duration, (int, float))):
                             # Match sequential done_line's four-decimal rounding.

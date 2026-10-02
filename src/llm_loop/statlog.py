@@ -44,6 +44,11 @@ def pool_iteration_finished(session: str, worker: int,
                        "worker": worker, "elapsed_seconds": elapsed_seconds})
 
 
+def pool_worker_activity(worker: int) -> str:
+    """Observe a compact worker line without treating its prose as timing data."""
+    return json.dumps({"event": "pool_activity", "worker": worker})
+
+
 _RECORD = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$")
 _HEADER = re.compile(r"^=== Iteration (\d+) === \[(.*)\]$")
 _FINISHED = re.compile(
@@ -148,10 +153,9 @@ def read_stats(lines: Iterable[str]) -> Dict[str, StateTiming]:
     New mirror records distinguish machine timings from ordinary stdout, so
     agent prose cannot end an iteration. Each process has its own cursor; a
     killed process contributes observed time only, without charging downtime
-    before another launch. Pool cursors observe machine result records only;
+    before another launch. Pool cursors observe machine result/activity records;
     ordinary stdout has no authoritative worker identity. Old untagged logs
-    cannot disambiguate concurrent
-    writers or exact copies of runner messages in agent output.
+    cannot disambiguate concurrent writers or copies of runner messages in prose.
     """
     timings: Dict[str, StateTiming] = {}
     active = {}
@@ -209,7 +213,7 @@ def read_stats(lines: Iterable[str]) -> Dict[str, StateTiming]:
                     elif (kind == "pool_iteration_finish"
                           and isinstance(event.get("elapsed_seconds"), (int, float))):
                         flush(key, event["elapsed_seconds"])
-                elif kind == "pool_cost" and isinstance(worker, int):
+                elif kind in ("pool_cost", "pool_activity") and isinstance(worker, int):
                     key = pool_workers.get((pid, worker))
                     if key in active:
                         active[key].last = stamp
