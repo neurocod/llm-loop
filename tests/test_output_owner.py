@@ -911,10 +911,16 @@ class _OnePushGit:
     PIPE = subprocess.PIPE
     STDOUT = subprocess.STDOUT
     TimeoutExpired = subprocess.TimeoutExpired
+    CompletedProcess = subprocess.CompletedProcess
 
     def __init__(self):
         self.let_push = threading.Event()
         self.pushed = False
+
+    def Popen(self, argv, **kwargs):
+        # The pump's checks carry the run's `PushAbort`, and a git call with
+        # one is started through `Popen` (see `gitpush._run_git`).
+        return _OnePushProcess(self, argv)
 
     def run(self, argv, **kwargs):
         if tuple(argv)[:2] == ("git", "push"):
@@ -923,6 +929,29 @@ class _OnePushGit:
             return subprocess.CompletedProcess(argv, 0, stdout="")
         return subprocess.CompletedProcess(argv, 0,
                                            stdout="0" if self.pushed else "1")
+
+
+class _OnePushProcess:
+    """What `_OnePushGit.Popen` starts: `communicate` makes the call."""
+
+    def __init__(self, git, argv):
+        self._git = git
+        self._argv = argv
+        self.returncode = None
+
+    def communicate(self, timeout=None):
+        done = self._git.run(self._argv)
+        self.returncode = done.returncode
+        return done.stdout, None
+
+    def kill(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class _OverTheCeiling:

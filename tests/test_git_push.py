@@ -1123,6 +1123,97 @@ def test_no_periodic_push_starts_once_the_operator_pressed_ctrl_c(
         f"{len(fake.pushes)} in all")
 
 
+class _HeldGitLock:
+    """Stands in for `gitpush._GIT_CALL_LOCK`, held by "an earlier run".
+
+    `hold` takes it the way a git call an abandoned run left running holds
+    it; `contended` fires once the pusher asks for it while it is held.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.holding = False
+        self.contended = threading.Event()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if self.holding and threading.current_thread().name == "pusher":
+            self.contended.set()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self):
+        self._lock.release()
+
+    def hold(self):
+        self._lock.acquire()
+        self.holding = True
+
+    def let_go(self):
+        if self.holding:
+            self.holding = False
+            self._lock.release()
+
+
+def test_a_periodic_check_behind_another_run_s_git_starts_none_after_the_run(
+        tmp_path, monkeypatch):
+    """An abandoned exit push cancels the periodic check waiting ahead of it.
+
+    The pump's checks ran without the run's `PushAbort`, so one waiting for
+    the process-wide git lock — held by a git call an earlier, abandoned run
+    left running — waited unbounded, and once that call let go it started
+    `rev-list` and `git push` after this run had passed its exit push's
+    deadline and left. Staged: the lock is held while the pump waits for it,
+    the region raises, the run leaves past its (shortened) deadline, and only
+    then is the lock let go; no git may start after that.
+    """
+    fake = _FakeGitModule()
+    lock = _HeldGitLock()
+    owners = []
+    real_owner = ownership.OwnerThread
+
+    def recording_owner(name, **kwargs):
+        owner = real_owner(name, **kwargs)
+        if name == "pusher":
+            owners.append(owner)
+        return owner
+
+    calls_at_hold = []
+
+    def fail_while_the_pump_waits(threads):
+        for t in threads:
+            t.join()
+        lock.hold()
+        calls_at_hold.append(len(fake.calls))
+        assert lock.contended.wait(timeout=PUMP_WAIT_S), \
+            "the pump never asked for git — nothing staged"
+        raise RuntimeError("staged: the join broke")
+
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    monkeypatch.setattr(gitpush, "_GIT_CALL_LOCK", lock)
+    monkeypatch.setattr(ownership, "OwnerThread", recording_owner)
+    monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
+    monkeypatch.setattr(runlifecycle, "UNWIND_PUSH_DEADLINE_S", 0.5)
+    monkeypatch.setattr(parallel, "join_workers", fail_while_the_pump_waits)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None: (0, None, None))
+
+    try:
+        with pytest.raises(RuntimeError, match="staged"):
+            parallel.run_parallel(MemListDriver(["products/only.md"]),
+                                  par_args(root_not_cwd(tmp_path), jobs=1,
+                                           git_push=PUSHING, no_statusline=True),
+                                  app_name="pytest-gitpush")
+    finally:
+        lock.let_go()
+
+    [pusher] = owners
+    assert pusher.close(timeout=HELD_PUSH_TIMEOUT_S), \
+        "the pusher never finished once the git lock was let go"
+    [before] = calls_at_hold
+    assert fake.calls[before:] == [], (
+        f"git started after the run had abandoned its push: "
+        f"{fake.calls[before:]}")
+
+
 def test_a_run_that_unwinds_past_its_epilogue_closes_its_pusher(
         tmp_path, monkeypatch):
     """An exception after the fleet must not leave the run's pusher pushing.

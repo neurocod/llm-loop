@@ -81,7 +81,7 @@ from .console import print_markup, route_through
 # the shared epilogue, `runlifecycle.end_run`, which is where both runners close
 # a run down and therefore the one place that decides how the exit push is
 # guarded.
-from .gitpush import maybe_git_push
+from .gitpush import PushAbort, maybe_git_push
 from .stopchannel import RunResult, RunStopReason
 from .providers import (note_channel, provider_spec, reap_agent_process,
                         start_agent_process)
@@ -196,10 +196,10 @@ class _Interrupt:
         """
         # Signal first, talk second: nothing about the console — a stalled
         # one included — may stand between Ctrl+C and the workers hearing it.
-        # And the stop before the pool: `threads.close` waits for the pool's
-        # lock, which a worker holds across its claim, and a second Ctrl+C in
-        # that wait must not leave the workers claiming. Before `set` too, so a
-        # run that reads `is_set` finds the stop set.
+        # And the stop before the pool: a second Ctrl+C in the pool's close
+        # must not leave the workers claiming, and a worker that a `+` holding
+        # the pool's lock starts anyway leaves on it (`WorkerPool.close`).
+        # Before `set` too, so a run that reads `is_set` finds the stop set.
         self._shared.stop.set()
         self.set()
         # Queued, not printed, so the line lands after what the workers had
@@ -442,8 +442,19 @@ class WorkerPool:
         return True
 
     def close(self) -> None:
-        with self._lock:
-            self._accepting = False
+        """No further worker from `+`, and no `-` either — and no wait.
+
+        Written without the pool's lock on purpose: a worker holds that lock
+        across its whole claim (`claim` → `Shared.claim` → the driver reading
+        the list file), so a claim stuck in the driver's I/O held every
+        ending that closed the pool — an exception's included, before its
+        exit push's deadline had even begun. A bool store is atomic under the
+        GIL, and `grow`/`shrink` read it under the lock, so every one that
+        takes the lock after this sees it. One that already holds it may
+        still start its worker; every caller sets `shared.stop` first
+        (`_Interrupt.stop_workers`), and that worker leaves at its first look.
+        """
+        self._accepting = False
 
     def join_all(self) -> None:
         index = 0
@@ -1453,10 +1464,19 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # before it is taken) and the preparation before the region included.
     opened = []
     shared = interrupted = None
+    # The run's one hold on its git, shared by the pump's periodic checks and
+    # the exit push (`close_run`): an exit push abandoned — by Ctrl+C or past
+    # an exception's deadline — must cancel a periodic check still waiting
+    # behind it too. Without it such a check waited for `gitpush`'s
+    # process-wide git lock unbounded and, once a git call an earlier
+    # abandoned run left running had let go of it, started `rev-list` and
+    # `git push` after this run had left.
+    push_abort = PushAbort()
     boundary = runlifecycle.RunBoundary(
         ctx, usages=lambda: opened,
         counts=lambda: ((shared.claimed, shared.done) if shared is not None
-                        else (0, 0)))
+                        else (0, 0)),
+        push_abort=push_abort)
     try:
         usage = (None if args.ignore_usage
                  else runlifecycle.open_usage(driver, provider,
@@ -1520,7 +1540,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                 # captured in this closure. A run launched `--git-push none` whose
                 # operator later turns pushing on must start pushing.
                 last_push = maybe_git_push(run_settings.git_push, last_push,
-                                           projectroot.project_dir())
+                                           projectroot.project_dir(),
+                                           abort=push_abort)
             pump_armed = True
             return PUSH_PUMP_INTERVAL_S
 
@@ -1688,10 +1709,10 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             # the same result, it is racing a second `git` against the first
             # one. The operator who will not wait presses Ctrl+C again: that
             # abandons the exit push (`close_run` says how), keeps the rest of
-            # the epilogue, and still leaves with 130.
-            exitlog.set_reason(runlifecycle.INTERRUPTED_REASON,
-                               iterations=shared.claimed, completed=shared.done)
-            boundary.exit(130, ending="interrupted")
+            # the epilogue, and still leaves with 130 — a second Ctrl+C in
+            # the reason's record included (`RunBoundary.exit`'s `reason`).
+            boundary.exit(130, ending="interrupted",
+                          reason=runlifecycle.INTERRUPTED_REASON)
 
         # `stop_reason` unset means no worker ever reached a verdict about the run:
         # every one of the endings — the cap, the drained queue, a latched stop —

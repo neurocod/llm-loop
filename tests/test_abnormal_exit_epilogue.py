@@ -317,8 +317,10 @@ def test_a_ctrl_c_in_the_pool_s_close_still_stops_the_workers(
         tmp_path, monkeypatch, capsys, exit_pushes, cut_closes):
     """A hearing cut short in `threads.close` must not leave the workers claiming.
 
-    `close` waits for the pool's lock, which a worker holds across its claim,
-    and that wait is where a second Ctrl+C lands. The hearing used to mark the
+    `close` used to wait for the pool's lock, which a worker holds across its
+    claim, and that wait was where a second Ctrl+C landed (it waits no more —
+    see the stuck-claim pin below — but a Ctrl+C can still land in any step
+    of it). The hearing used to mark the
     interrupt heard before it stopped the workers, so the boundary outside
     skipped it, and the run did its housekeeping and left while its workers
     went on claiming the queue. Staged: the first Ctrl+C lands in the join
@@ -776,7 +778,8 @@ def _seq_run_raising(driver, project_dir):
                                       wait_on_start=False)
 
 
-@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+@pytest.mark.parametrize("runner", ["sequential", "parallel",
+                                    "parallel preparation"])
 def test_an_exception_does_not_wait_out_a_stuck_exit_push(
         tmp_path, monkeypatch, capsys, loaded_mailbox, runner):
     """An exception's ending waits for its exit push a bounded time, then leaves.
@@ -787,6 +790,11 @@ def test_an_exception_does_not_wait_out_a_stuck_exit_push(
     run must still raise its own exception within the (shortened) deadline,
     say why it paused, abandon the push so no further git starts, and keep
     the snapshot and the notes.
+
+    "parallel preparation" fails where the worker pool is built: the run has
+    made its pusher and not started it, and an owner that never started runs
+    its `final` inline — the stuck push on the main thread, where no deadline
+    was being kept.
     """
     monkeypatch.setattr(runlifecycle, "UNWIND_PUSH_DEADLINE_S", 0.5)
     stuck = threading.Event()
@@ -806,6 +814,17 @@ def test_an_exception_does_not_wait_out_a_stuck_exit_push(
         driver = _SecondCommandDriver(on_second=staged)
         run = _seq_run_raising(driver, str(tmp_path))
         snapshot = "at end (claude: unhandled RuntimeError)"
+    elif runner == "parallel preparation":
+        def pool_fails(*args, **kwargs):
+            raise staged
+
+        monkeypatch.setattr(parallel, "WorkerPool", pool_fails)
+        driver = MemListDriver(["products/only.md"])
+        args = _par_args(str(tmp_path))
+        run = lambda: parallel.run_parallel(driver, args,  # noqa: E731
+                                            app_name="pytest-abnormal",
+                                            wait_on_start=False)
+        snapshot = "at end (parallel claude: unhandled RuntimeError)"
     else:
         def broken_join(threads):
             for t in threads:
@@ -888,6 +907,64 @@ def test_an_exception_out_of_the_parallel_region_stops_the_workers(
     assert not turns[0].is_alive(), "the held worker never finished"
     assert len(turns) == 1, (
         f"the workers went on claiming after the run left: {len(turns)} turns")
+    assert exit_pushes, "the run left without its exit push"
+
+
+def test_a_claim_stuck_in_the_pool_s_lock_does_not_hold_an_exception_s_ending(
+        tmp_path, monkeypatch, capsys, exit_pushes):
+    """Stopping the fleet must not wait for the pool's lock.
+
+    A worker holds that lock across its whole claim, the driver's read of the
+    list file included, and the pool's close used to take it: a claim stuck
+    in that I/O held an exception's ending in `stop_workers`, before the exit
+    push's deadline had even begun. Staged: the lock is held, on another
+    thread, as long as STUCK_PUSH_S at most, and the region then raises.
+    """
+    pools = []
+    real_pool = parallel.WorkerPool
+
+    def recording_pool(*args, **kwargs):
+        pools.append(real_pool(*args, **kwargs))
+        return pools[-1]
+
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_the_pool_lock():
+        with pools[0]._lock:
+            held.set()
+            release.wait(timeout=STUCK_PUSH_S)
+
+    def join_then_fail_under_a_held_claim(threads):
+        for t in threads:
+            t.join()
+        threading.Thread(target=hold_the_pool_lock, daemon=True).start()
+        assert held.wait(timeout=HELD_S)
+        raise RuntimeError("staged: the join broke")
+
+    monkeypatch.setattr(parallel, "WorkerPool", recording_pool)
+    monkeypatch.setattr(parallel, "join_workers",
+                        join_then_fail_under_a_held_claim)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None: (0, None, None))
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
+                        lambda provider: StubSource())
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="staged"):
+            parallel.run_parallel(MemListDriver(["products/only.md"]),
+                                  _par_args(str(tmp_path)),
+                                  app_name="pytest-abnormal",
+                                  wait_on_start=False)
+    finally:
+        elapsed = time.monotonic() - started
+        release.set()
+
+    assert held.is_set(), "the pool's lock was never held — nothing staged"
+    assert elapsed < STUCK_PUSH_S / 2, (
+        f"the ending waited for the pool's lock: {elapsed:.1f} s")
+    assert pools[0].grow() is None, "the pool still takes workers"
     assert exit_pushes, "the run left without its exit push"
 
 
@@ -991,17 +1068,32 @@ def test_a_failing_step_of_an_exiting_door_keeps_its_exit_code(
         "the failing step went unreported")
 
 
-def test_a_second_ctrl_c_while_the_reason_is_recorded_still_exits_130(
-        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox):
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_a_second_ctrl_c_while_the_reason_is_recorded_abandons_the_push(
+        tmp_path, monkeypatch, capsys, loaded_mailbox, runner):
     """The interrupt's reason is written as the run leaves — where Ctrl+C comes.
 
     A second Ctrl+C inside `exitlog.set_reason` (a lock and a file write) left
-    the boundary as a bare KeyboardInterrupt: no housekeeping, no 130.
+    the boundary as a bare KeyboardInterrupt: no housekeeping, no 130. Then it
+    was swallowed, and the ending went on to wait for its exit push without
+    limit — over a stuck push the operator had to press Ctrl+C a third time.
+    The second Ctrl+C is the operator abandoning that push: none is waited
+    for (none is started), the snapshot and the notes still happen, 130.
+
+    Staged with an exit push that never comes back on its own, so a run that
+    waits for it is told apart by its time alone.
     """
     endings = _count_close_runs(monkeypatch)
+    stuck = threading.Event()
+    pushes = []
+
+    def stuck_push(policy, project_dir, abort=None):
+        pushes.append(abort)
+        stuck.wait(timeout=STUCK_PUSH_S)
+
+    monkeypatch.setattr(runlifecycle, "final_git_push", stuck_push)
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
-    monkeypatch.setattr(cyclecore, "run_claude_streaming",
-                        _noting_turn(loaded_mailbox))
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
     real_set_reason = exitlog.set_reason
     cut = []
 
@@ -1012,21 +1104,87 @@ def test_a_second_ctrl_c_while_the_reason_is_recorded_still_exits_130(
             raise KeyboardInterrupt
 
     monkeypatch.setattr(exitlog, "set_reason", ctrl_c_in_the_write)
-    driver = _SecondCommandDriver(on_second=KeyboardInterrupt())
+    if runner == "sequential":
+        monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                            _noting_turn(loaded_mailbox))
+        driver = _SecondCommandDriver(on_second=KeyboardInterrupt())
+        run = _seq_run_raising(driver, str(tmp_path))
+        snapshot = "at end (claude: interrupted)"
+    else:
+        def interrupt(threads):
+            for t in threads:
+                t.join()
+            loaded_mailbox.submit(NOTE)     # no worker left to splice it
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(parallel, "join_workers", interrupt)
+        monkeypatch.setattr(parallel, "run_job",
+                            lambda job_id, command, mailbox=None: (0, None, None))
+        driver = MemListDriver(["products/only.md"])
+        args = _par_args(str(tmp_path))
+        run = lambda: parallel.run_parallel(driver, args,  # noqa: E731
+                                            app_name="pytest-abnormal",
+                                            wait_on_start=False)
+        snapshot = "at end (parallel claude: interrupted)"
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            run()
+    except KeyboardInterrupt:
+        pytest.fail("the second Ctrl+C left the run as a bare KeyboardInterrupt")
+    finally:
+        elapsed = time.monotonic() - started
+        stuck.set()
+
+    assert cut, "the reason was never recorded — nothing staged"
+    assert elapsed < STUCK_PUSH_S / 2, (
+        f"the second Ctrl+C still waited for the exit push: {elapsed:.1f} s")
+    assert pushes == [], "the push the operator abandoned was started anyway"
+    assert exit_info.value.code == 130
+    assert endings == ["interrupted"], f"not closed down exactly once: {endings}"
+    assert driver.limit_policy.snapshots[-1] == snapshot
+    out = capsys.readouterr().out
+    assert "the exit push is abandoned" in out
+    assert NOTE in out and "undelivered operator note" in out
+    exitlog.finish()
+    assert runlifecycle.INTERRUPTED_REASON in capsys.readouterr().out
+
+
+def test_a_ctrl_c_while_a_normal_ending_s_reason_is_recorded_exits_130(
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox):
+    """The first Ctrl+C, landing in `end_run`'s record, still ends with 130.
+
+    `end_run` records its reason after the housekeeping, and swallowing a
+    Ctrl+C there let the run RETURN its result as if nobody had pressed it.
+    """
+    real_set_reason = exitlog.set_reason
+    cut = []
+
+    def ctrl_c_in_the_write(reason, **fields):
+        real_set_reason(reason, **fields)
+        if reason != runlifecycle.INTERRUPTED_REASON and not cut:
+            cut.append(reason)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(exitlog, "set_reason", ctrl_c_in_the_write)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        _noting_turn(loaded_mailbox))
+    driver = OneShotDriver()
 
     try:
         with pytest.raises(SystemExit) as exit_info:
             cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
                                app_name="pytest-abnormal", wait_on_start=False)
     except KeyboardInterrupt:
-        pytest.fail("the second Ctrl+C left the run as a bare KeyboardInterrupt")
+        pytest.fail("the Ctrl+C left end_run as a bare KeyboardInterrupt")
 
-    assert cut, "the reason was never recorded — nothing staged"
-    assert exit_info.value.code == 130
-    assert endings == ["interrupted"], f"not closed down exactly once: {endings}"
+    assert cut, "the normal ending's reason was never recorded — nothing staged"
+    assert exit_info.value.code == 130, "the Ctrl+C was lost"
     _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
-        snapshot="at end (claude: interrupted)",
+        snapshot="at end (claude)",
         reason=runlifecycle.INTERRUPTED_REASON)
 
 
