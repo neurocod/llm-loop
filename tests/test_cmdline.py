@@ -343,17 +343,22 @@ def _msys_bash():
     launcher, which runs a different machine that has no such path. Git's
     `Git/bin/bash.exe` is a launcher for `Git/usr/bin/bash.exe`, the one with
     `msys-2.0.dll` beside it, so it is resolved to that before the check.
+    Search every PATH entry: a Windows app alias or WSL launcher may appear
+    before the usable Git Bash executable.
     """
-    bash = shutil.which("bash")
-    if not bash or os.name != "nt":
-        return bash
-    beside_usr = os.path.join(os.path.dirname(os.path.dirname(bash)),
-                              "usr", "bin", os.path.basename(bash))
-    for candidate in (bash, beside_usr):
-        if os.path.isfile(os.path.join(os.path.dirname(candidate),
-                                       "msys-2.0.dll")) \
-                and os.path.isfile(candidate):
-            return candidate
+    if os.name != "nt":
+        return shutil.which("bash")
+    for directory in os.get_exec_path():
+        bash = shutil.which("bash", path=directory)
+        if not bash:
+            continue
+        beside_usr = os.path.join(os.path.dirname(os.path.dirname(bash)),
+                                  "usr", "bin", os.path.basename(bash))
+        for candidate in (bash, beside_usr):
+            if os.path.isfile(os.path.join(os.path.dirname(candidate),
+                                           "msys-2.0.dll")) \
+                    and os.path.isfile(candidate):
+                return candidate
     return None
 
 
@@ -365,13 +370,37 @@ def test_git_s_bash_launcher_counts_as_git_bash_and_wsl_s_does_not(
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_bytes(b"")
     found = {}
-    monkeypatch.setattr(shutil, "which", lambda name: found["bash"])
+    monkeypatch.setattr(shutil, "which", lambda name, **kwargs: found["bash"])
     found["bash"] = str(tmp_path / "Git" / "bin" / "bash.exe")
     assert _msys_bash() == str(tmp_path / "Git" / "usr" / "bin" / "bash.exe")
     found["bash"] = str(tmp_path / "Git" / "usr" / "bin" / "bash.exe")
     assert _msys_bash() == found["bash"]
     found["bash"] = str(tmp_path / "System32" / "bash.exe")
     assert _msys_bash() is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the MSYS check is Windows-only")
+@pytest.mark.parametrize("git_directory", ["Git/bin", "Git/usr/bin", None])
+def test_git_bash_is_found_after_an_unusable_path_match(
+        tmp_path, monkeypatch, git_directory):
+    for name in ("WindowsApps/bash.exe", "Git/bin/bash.exe",
+                 "Git/usr/bin/bash.exe", "Git/usr/bin/msys-2.0.dll"):
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"")
+    directories = [str(tmp_path / "WindowsApps")]
+    if git_directory is not None:
+        directories.append(str(tmp_path / git_directory))
+    monkeypatch.setenv("PATH", os.pathsep.join(directories))
+
+    expected = (str(tmp_path / "Git/usr/bin/bash.exe")
+                if git_directory is not None else None)
+    actual = _msys_bash()
+    if expected is None:
+        assert actual is None
+    else:
+        assert actual is not None
+        assert os.path.normcase(actual) == os.path.normcase(expected)
 
 
 BASH = _msys_bash()
