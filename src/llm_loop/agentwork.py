@@ -71,8 +71,8 @@ class LoopStop(Exception):
     """Raised by a Driver to abort the whole run (not a normal completion).
 
     `exit_code` is the process exit status: non-zero for an error stop that needs
-    a human (the loop sys.exit()s immediately, skipping the final push), 0 for a
-    clean stop. `message` is printed before exiting.
+    a human (the loop closes the run down and exits with it), 0 for a clean
+    stop. `message` is printed before exiting.
     """
 
     def __init__(self, message: str, exit_code: int = 0):

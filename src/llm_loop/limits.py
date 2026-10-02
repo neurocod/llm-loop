@@ -35,7 +35,6 @@ statusline.quota_rows), and a rule only adds its half — its ceiling — next t
 window it watches.
 """
 
-import sys
 import time
 from datetime import datetime
 from typing import Optional
@@ -380,8 +379,10 @@ class LimitPolicy:
                                f"to next reset (now {fmt_clock(now)})")
                 sleep_unless(min(next_reset - now, 60), should_stop)
         except KeyboardInterrupt:
+            # Raised on: the runner's boundary (`runlifecycle.RunBoundary`)
+            # closes the run down and exits 130.
             print_line("\nWait interrupted by user (Ctrl+C).")
-            sys.exit(130)
+            raise
 
     def log_snapshot(self, source, label: str = "",
                      cache_value: bool = True) -> None:

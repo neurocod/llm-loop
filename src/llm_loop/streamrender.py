@@ -274,10 +274,12 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     console write behind each rendered line, `note_channel`'s close and a
     decoder error on the child's own stream all raise past it. Hence the
     `finally` — `reap_agent_process` is what ends the CLI, and it is the whole
-    ending: the `except KeyboardInterrupt` below deliberately no longer calls
-    `proc.terminate()` itself, because on Windows that aims at the npm `.cmd`
-    shim and leaves the CLI — a GRANDCHILD — running with the terminal's stdout
-    in hand.
+    ending: nothing here calls `proc.terminate()` itself, because on Windows
+    that aims at the npm `.cmd` shim and leaves the CLI — a GRANDCHILD —
+    running with the terminal's stdout in hand.
+
+    Ctrl+C is said here and raised on to the runner's boundary
+    (`runlifecycle.RunBoundary`), which closes the run down and exits 130.
     """
     global _last_rate_limit_event, _turn_cost_base
     _last_rate_limit_event = None
@@ -349,7 +351,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
         return 1 if returncode == 0 and provider_failed else returncode
     except KeyboardInterrupt:
         print("\nInterrupted by user (Ctrl+C).")
-        sys.exit(130)
+        raise
     finally:
         reap_agent_process(proc)
 

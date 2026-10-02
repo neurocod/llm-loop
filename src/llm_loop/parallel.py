@@ -158,29 +158,6 @@ def _close_console() -> None:
           file=sys.stderr)
 
 
-# How long an unwinding run gives its pusher to hand back. Long enough for an
-# idle one — between turns it closes in 0.1 ms median, 0.98 / 0.43 ms at worst
-# (300 closes each, measured 2026-09-29) — and far too short to sit out a
-# `git push`, which is the point: see `_abandon_pusher`.
-PUSHER_ABANDON_TIMEOUT_S = 0.5
-
-
-def _abandon_pusher(pusher: ownership.OwnerThread) -> None:
-    """Close a run's pusher that the epilogue never took over — no exit push.
-
-    Reached only when an exception or a Ctrl+C unwinds `run_parallel` past its
-    epilogue, so it does not wait for a push: the owner starts no further
-    periodic push once it has seen `close`, and a push it is already inside
-    finishes on its own, as a daemon, within its subprocess timeout — said on
-    stderr, because until then it is a git writer the next run in this process
-    can meet.
-    """
-    if pusher.close(timeout=PUSHER_ABANDON_TIMEOUT_S):
-        return
-    print(f"  ⚠ {pusher.name}: a git push was still running when the run "
-          f"unwound; it finishes on its own.", file=sys.stderr)
-
-
 class _Interrupt:
     """The operator's Ctrl+C in one `run_parallel` — heard once, wherever it lands.
 
@@ -1460,138 +1437,141 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
              else runlifecycle.open_usage(driver, provider,
                                           name=f"parallel {provider}",
                                           dry_run=dry_run))
-    source, policy = runlifecycle.usage_halves(usage)
-    usage_lock = threading.Lock()
-    session_start_box = [time.time()]  # shared, refreshed when a window resets
-
-    # The live knobs reach the workers through the object, never a local:
-    # --max-runs reaches the claim loop through `Shared.max_items`, and
-    # --git-push the pusher and the exit push through `run_settings.git_push`.
-    # Copying the push policy into a local is what once made that knob do
-    # nothing in this mode.
-    shared = Shared(driver, run_settings)
-    console.record_timing(costlog.pool_started(shared.log_session))
-
-    # Each worker owns a mailbox for both live delivery and notes queued between
-    # its turns. This is a growable set even at one worker: MessageAction opens
-    # that sole address directly, while a later `+` can add another address
-    # without replacing (and losing the contents of) worker 1's mailbox.
-    mailboxes = operator.MailboxSet(range(1, jobs + 1))
-    app = runlifecycle.open_status(ctx, driver, job_count=jobs,
-                                   messages=mailboxes)
-    app.register_action(statusline.WeeklyLimitAction(
-        lambda: policy))
-
-    # The run's git has ONE owner, and every git call of the run is made on it:
-    # the periodic pushes as its `idle` work, and the exit push as its `final`,
-    # which `runlifecycle.close_run` hands it. The workers never push. git is
-    # not safe to call concurrently, and one thread cannot run two pushes at
-    # once — so the exit push queues behind a push in flight (`git push` has a
-    # 300 s subprocess timeout) by construction, not by a lock whose holder a
-    # bounded join could have given up on. Pinned by
-    # `test_git_push.test_every_git_call_of_a_parallel_run_is_made_by_the_pusher`.
-    #
-    # Its life is the run's, not the fleet's: it keeps its cadence while the
-    # workers wind down after a latched stop, and there is no wait for it
-    # between the workers' end and `close_run` for a Ctrl+C to land in outside
-    # the interrupt's boundary.
-    #
-    # The first push is one interval in, not up front: the owner asks `idle`
-    # right after the window's first post (see `pusher.start` below), and that
-    # turn only sets the clock — so a run shorter than the interval pushes only
-    # on the way out.
-    #
-    # And none once the operator has pressed Ctrl+C (`interrupted`, below): the
-    # run is leaving, the exit push is still to come, and a periodic push begun
-    # in the wind-down is one more `git push` for the exit push to queue behind
-    # while the operator waits.
-    last_push = 0.0
-    pump_armed = False
-
-    def push_turn() -> Optional[float]:
-        nonlocal last_push, pump_armed
-        if interrupted.is_set():
-            return None
-        if pump_armed:
-            # The policy is read HERE, at the push, off the live knobs — never
-            # captured in this closure. A run launched `--git-push none` whose
-            # operator later turns pushing on must start pushing.
-            last_push = maybe_git_push(run_settings.git_push, last_push,
-                                       projectroot.project_dir())
-        pump_armed = True
-        return PUSH_PUMP_INTERVAL_S
-
-    pusher = ownership.OwnerThread("pusher", idle=push_turn)
-
-    def retirement_requested(j):
-        return threads.retirement_requested(j)
-
-    def claim_work(j, worker_shared):
-        return threads.claim(j, worker_shared)
-
-    def make_worker(j):
-        return threading.Thread(
-            target=worker, name=f"job{j}",
-            args=(j, shared, source, policy, session_start_box, usage_lock, app,
-                  progress, mailboxes.mailbox(j), retirement_requested,
-                  claim_work),
-            daemon=True)
-
-    def prepare_worker(j):
-        if j not in mailboxes.target_ids:
-            try:
-                mailboxes.activate(j)
-            except KeyError:
-                mailboxes.add(j)
-        progress.set_worker_count(j)
-        # Use the invocation's Job object, not LoopStatus.job's fallback, so a
-        # later batch resumes the added row's iteration count.
-        app.update(jobs=progress.jobs(j))
-
-    def remove_worker(j, count):
-        mailboxes.deactivate(j)
-        progress.set_worker_count(count)
-
-    def finish_removal(count):
-        app.update(jobs=progress.jobs(count))
-
-    threads = WorkerPool(
-        [make_worker(j) for j in range(1, jobs + 1)],
-        make_worker, prepare_worker, remove_worker, finish_removal)
-    app.register_action(ResizeWorkerPoolAction(threads))
-    # Heard by the Ctrl+C branches below and read after the status region has
-    # been released. The interrupt does NOT exit from inside the `with app:`: the
-    # closing report and the exit push would then be written over a pinned status
-    # area, and the run would leave without either.
-    #
-    # A fact about THIS runner, not a rule — the sequential loop's two `sys.exit`
-    # endings do close down inside its region, and correctly: it prints inside
-    # the area on every iteration and pushes there on every pass, so a few more
-    # lines are what that area is already carrying. Here the workers' output is
-    # the area, and this is the one moment it stops being written to.
-    interrupted = _Interrupt(shared, threads)
-
-    # The region lives exactly as long as the workers do (run_loop releases it
-    # the same way, before its final push): a batching wrapper alternates runs of
-    # this runner with sequential ones, and two status areas pinned at
-    # once would fight over the same rows. The console's owner lives as long as
-    # the region, and its `close` in the `finally` is what puts every line the
-    # workers posted on screen BEFORE the closing report below (within
-    # CONSOLE_CLOSE_TIMEOUT_S — see there for a console that never comes back).
-    #
-    # The route is opened before the owner starts and closed after it has been
-    # closed, so no write is routed to an owner that has not got, or no longer
-    # has, the lines before it (see `console.route_through`). A poster waits for
-    # room as long as the close waits for the whole backlog: both are "this
-    # console is stuck", from the same measurement.
-    #
-    # The `try` around all of it is the pusher's: `close_run` closes it on every
-    # ending that reaches the epilogue, and an exception or a Ctrl+C that
-    # unwinds past the epilogue must not leave it pushing every minute for the
-    # rest of the process — beside the next run's pusher, under a batching
-    # wrapper. Set just before the epilogue takes the pusher over.
-    handed_over = False
+    # The run's one epilogue boundary, from the usage just opened to
+    # `close_run` (see `runlifecycle.RunBoundary`): every ending from here on
+    # closes the run down once — the two doors below, and through the
+    # `except` at the bottom whatever else unwinds it, the preparation
+    # before the region included.
+    shared = interrupted = None
+    boundary = runlifecycle.RunBoundary(
+        ctx, usages=lambda: [usage],
+        counts=lambda: ((shared.claimed, shared.done) if shared is not None
+                        else (0, 0)))
     try:
+        source, policy = runlifecycle.usage_halves(usage)
+        usage_lock = threading.Lock()
+        session_start_box = [time.time()]  # shared, refreshed when a window resets
+
+        # The live knobs reach the workers through the object, never a local:
+        # --max-runs reaches the claim loop through `Shared.max_items`, and
+        # --git-push the pusher and the exit push through `run_settings.git_push`.
+        # Copying the push policy into a local is what once made that knob do
+        # nothing in this mode.
+        shared = Shared(driver, run_settings)
+        console.record_timing(costlog.pool_started(shared.log_session))
+
+        # Each worker owns a mailbox for both live delivery and notes queued between
+        # its turns. This is a growable set even at one worker: MessageAction opens
+        # that sole address directly, while a later `+` can add another address
+        # without replacing (and losing the contents of) worker 1's mailbox.
+        mailboxes = boundary.mailbox = operator.MailboxSet(range(1, jobs + 1))
+        app = runlifecycle.open_status(ctx, driver, job_count=jobs,
+                                       messages=mailboxes)
+        app.register_action(statusline.WeeklyLimitAction(
+            lambda: policy))
+
+        # The run's git has ONE owner, and every git call of the run is made on it:
+        # the periodic pushes as its `idle` work, and the exit push as its `final`,
+        # which `runlifecycle.close_run` hands it. The workers never push. git is
+        # not safe to call concurrently, and one thread cannot run two pushes at
+        # once — so the exit push queues behind a push in flight (`git push` has a
+        # 300 s subprocess timeout) by construction, not by a lock whose holder a
+        # bounded join could have given up on. Pinned by
+        # `test_git_push.test_every_git_call_of_a_parallel_run_is_made_by_the_pusher`.
+        #
+        # Its life is the run's, not the fleet's: it keeps its cadence while the
+        # workers wind down after a latched stop, and there is no wait for it
+        # between the workers' end and `close_run` for a Ctrl+C to land in outside
+        # the interrupt's boundary.
+        #
+        # The first push is one interval in, not up front: the owner asks `idle`
+        # right after the window's first post (see `pusher.start` below), and that
+        # turn only sets the clock — so a run shorter than the interval pushes only
+        # on the way out.
+        #
+        # And none once the operator has pressed Ctrl+C (`interrupted`, below): the
+        # run is leaving, the exit push is still to come, and a periodic push begun
+        # in the wind-down is one more `git push` for the exit push to queue behind
+        # while the operator waits.
+        last_push = 0.0
+        pump_armed = False
+
+        def push_turn() -> Optional[float]:
+            nonlocal last_push, pump_armed
+            if interrupted.is_set():
+                return None
+            if pump_armed:
+                # The policy is read HERE, at the push, off the live knobs — never
+                # captured in this closure. A run launched `--git-push none` whose
+                # operator later turns pushing on must start pushing.
+                last_push = maybe_git_push(run_settings.git_push, last_push,
+                                           projectroot.project_dir())
+            pump_armed = True
+            return PUSH_PUMP_INTERVAL_S
+
+        pusher = boundary.pusher = ownership.OwnerThread("pusher", idle=push_turn)
+
+        def retirement_requested(j):
+            return threads.retirement_requested(j)
+
+        def claim_work(j, worker_shared):
+            return threads.claim(j, worker_shared)
+
+        def make_worker(j):
+            return threading.Thread(
+                target=worker, name=f"job{j}",
+                args=(j, shared, source, policy, session_start_box, usage_lock, app,
+                      progress, mailboxes.mailbox(j), retirement_requested,
+                      claim_work),
+                daemon=True)
+
+        def prepare_worker(j):
+            if j not in mailboxes.target_ids:
+                try:
+                    mailboxes.activate(j)
+                except KeyError:
+                    mailboxes.add(j)
+            progress.set_worker_count(j)
+            # Use the invocation's Job object, not LoopStatus.job's fallback, so a
+            # later batch resumes the added row's iteration count.
+            app.update(jobs=progress.jobs(j))
+
+        def remove_worker(j, count):
+            mailboxes.deactivate(j)
+            progress.set_worker_count(count)
+
+        def finish_removal(count):
+            app.update(jobs=progress.jobs(count))
+
+        threads = WorkerPool(
+            [make_worker(j) for j in range(1, jobs + 1)],
+            make_worker, prepare_worker, remove_worker, finish_removal)
+        app.register_action(ResizeWorkerPoolAction(threads))
+        # Heard by the Ctrl+C branches below and read after the status region has
+        # been released. The interrupt does NOT exit from inside the `with app:`: the
+        # closing report and the exit push would then be written over a pinned status
+        # area, and the run would leave without either.
+        #
+        # A fact about THIS runner, not a rule — the sequential loop's two `sys.exit`
+        # endings do close down inside its region, and correctly: it prints inside
+        # the area on every iteration and pushes there on every pass, so a few more
+        # lines are what that area is already carrying. Here the workers' output is
+        # the area, and this is the one moment it stops being written to.
+        interrupted = _Interrupt(shared, threads)
+
+        # The region lives exactly as long as the workers do (run_loop releases it
+        # the same way, before its final push): a batching wrapper alternates runs of
+        # this runner with sequential ones, and two status areas pinned at
+        # once would fight over the same rows. The console's owner lives as long as
+        # the region, and its `close` in the `finally` is what puts every line the
+        # workers posted on screen BEFORE the closing report below (within
+        # CONSOLE_CLOSE_TIMEOUT_S — see there for a console that never comes back).
+        #
+        # The route is opened before the owner starts and closed after it has been
+        # closed, so no write is routed to an owner that has not got, or no longer
+        # has, the lines before it (see `console.route_through`). A poster waits for
+        # room as long as the close waits for the whole backlog: both are "this
+        # console is stuck", from the same measurement.
         with route_through(_console, post_timeout=CONSOLE_CLOSE_TIMEOUT_S):
             _console.start()
             try:
@@ -1696,14 +1676,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             # the epilogue, and still leaves with 130.
             exitlog.set_reason(runlifecycle.INTERRUPTED_REASON,
                                iterations=shared.claimed, completed=shared.done)
-            handed_over = True
-            try:
-                runlifecycle.close_run(
-                    ctx, usages=[usage], ending="interrupted",
-                    mailbox=mailboxes, pusher=pusher)
-            except KeyboardInterrupt:
-                pass
-            sys.exit(130)
+            boundary.exit(130, ending="interrupted")
 
         # `stop_reason` unset means no worker ever reached a verdict about the run:
         # every one of the endings — the cap, the drained queue, a latched stop —
@@ -1720,10 +1693,17 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # `runlifecycle.end_run` is the epilogue both runners share; the exit
         # push in it is made by this run's pusher, behind whatever push it has
         # in flight (see `pusher` above, and `close_run`).
-        handed_over = True
-        return runlifecycle.end_run(
-            ctx, RunResult(reason, shared.claimed, shared.done, remaining),
-            usages=[usage], mailbox=mailboxes, pusher=pusher)
-    finally:
-        if not handed_over:
-            _abandon_pusher(pusher)
+        return boundary.end(
+            RunResult(reason, shared.claimed, shared.done, remaining))
+    except BaseException as error:
+        # Whatever unwound the run past both doors: the preparation above,
+        # `_console.start()`, `route_through`'s entry or exit, the report. A
+        # Ctrl+C here comes after the region's own hearing, or before there
+        # was a fleet to stop; set, it keeps the pump from starting a
+        # periodic push for the exit push to queue behind. `close_run` closes
+        # the pusher, so none is left pushing every minute for the rest of the
+        # process — beside the next run's pusher, under a batching wrapper.
+        if isinstance(error, KeyboardInterrupt) and interrupted is not None:
+            interrupted.set()
+        boundary.unwind(error)
+        raise

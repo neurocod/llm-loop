@@ -210,6 +210,27 @@ def test_a_mixed_run_that_exits_closes_every_account_it_opened(
                                  "at end (claude: driver stopped the run)"]
 
 
+def test_a_mixed_run_interrupted_mid_turn_closes_every_account_it_opened(
+        monkeypatch, runtime):
+    """Ctrl+C in claude's turn answers codex's `at start` too, not only its own.
+
+    It used to leave two `at start` lines in the log and no `at end` at all.
+    """
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cyclecore, "run_agent_streaming", lambda *a, **k: 0)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", interrupted)
+
+    with pytest.raises(SystemExit) as stopped:
+        run(_two_account_queue(None), runtime)
+
+    assert stopped.value.code == 130
+    assert runtime.snapshots == ["at start (codex)", "at start (claude)",
+                                 "at end (codex: interrupted)",
+                                 "at end (claude: interrupted)"]
+
+
 def test_dry_run_uses_step_provider_without_querying_quota(monkeypatch, runtime, capsys):
     class Queue(Driver):
         def next_command(self):

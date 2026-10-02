@@ -227,7 +227,16 @@ def test_a_sequential_agent_starts_while_git_push_is_running(tmp_path, monkeypat
         f"git ran on the agent's thread: {fake.threads}"
 
 
-def test_abandoned_sequential_run_starts_no_queued_git(tmp_path, monkeypatch):
+def test_a_sequential_run_an_exception_ends_runs_its_git_before_it_leaves(
+        tmp_path, monkeypatch):
+    """An exception out of the loop closes the run down; no git outlives it.
+
+    The run's boundary (`runlifecycle.RunBoundary`) gives the exception the
+    epilogue every ending gets: the check queued behind the push in flight
+    runs, then the exit push — all before `run_loop` lets the exception go on.
+    None may be left for the owner to start once the run has left, beside
+    whatever this process runs next.
+    """
     # The test body took 0.02 s measured 2026-10-02; 10 s bounds a broken
     # handshake without making a loaded CI worker fail on normal scheduling.
     class HeldPushGit(_FakeGitModule):
@@ -265,6 +274,8 @@ def test_abandoned_sequential_run_starts_no_queued_git(tmp_path, monkeypatch):
             assert fake.pushed.wait(timeout=HELD_PUSH_TIMEOUT_S)
             return 0
         assert made[0].backlog == 2, "the second push check was not queued"
+        # Let the held push finish, or the epilogue sits it out to its timeout.
+        fake.release.set()
         raise RuntimeError("agent failed")
 
     monkeypatch.setattr(cyclecore, "OwnerThread", owner)
@@ -277,10 +288,14 @@ def test_abandoned_sequential_run_starts_no_queued_git(tmp_path, monkeypatch):
                                app_name="pytest-gitpush")
     finally:
         fake.release.set()
+    calls_at_exit = list(fake.calls)
 
     assert made[0].close(timeout=HELD_PUSH_TIMEOUT_S)
-    assert len(fake.pushes) == 1, \
-        f"a queued push started after the run was abandoned: {fake.calls}"
+    assert fake.calls == calls_at_exit, \
+        f"git started after the run had left: {fake.calls[len(calls_at_exit):]}"
+    # The held push, the check queued behind it, the exit push.
+    assert len(fake.pushes) == 3, \
+        f"the exception's epilogue did not push what was queued: {fake.calls}"
 
 
 def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(
@@ -1102,10 +1117,11 @@ def test_a_run_that_unwinds_past_its_epilogue_closes_its_pusher(
         tmp_path, monkeypatch):
     """An exception after the fleet must not leave the run's pusher pushing.
 
-    `close_run` closes the pusher on every ending that reaches it; one that
-    does not — here the closing report's `pending_total` raising — used to
-    leave it open, pushing every minute for the rest of the process, beside
-    the next run's pusher under a batching wrapper.
+    `close_run` closes the pusher, and the run's boundary
+    (`runlifecycle.RunBoundary`) brings this ending — the closing report's
+    `pending_total` raising — there too. It used to leave the pusher open,
+    pushing every minute for the rest of the process, beside the next run's
+    pusher under a batching wrapper.
     """
     owners = []
     real_owner = ownership.OwnerThread

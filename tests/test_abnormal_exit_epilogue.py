@@ -1,13 +1,16 @@
-"""The three endings that `sys.exit` still get the epilogue every ending gets.
+"""The endings that do not return still get the epilogue every ending gets.
 
-A run has four ways to end and only one of them RETURNS. The other three —
-the driver stopping the run with an exit code, five provider errors in a row, and
-Ctrl+C in the parallel runner — used to write `exitlog.set_reason` and leave, so
-the endings with the most to explain were the ones that left the least behind:
-no exit push (an operator's commits sat local until some later run happened to
-push them), no closing usage snapshot, and no report of the notes nobody
-delivered — which are, on a run that died of provider errors, the likeliest
-explanation of what went wrong.
+Only one way to end a run RETURNS. The others — the driver stopping the run
+with an exit code, five provider errors in a row, Ctrl+C wherever it lands, an
+exit or an exception nobody wrote an ending for — used to write
+`exitlog.set_reason` and leave, or not even that, so the endings with the most
+to explain were the ones that left the least behind: no exit push (an
+operator's commits sat local until some later run happened to push them), no
+closing usage snapshot, and no report of the notes nobody delivered — which
+are, on a run that died of provider errors, the likeliest explanation of what
+went wrong. Each runner now holds one boundary (`runlifecycle.RunBoundary`)
+from its first `open_usage` to `close_run`, and every pin below stages an
+ending inside it.
 
 Each pin asserts all three steps at once, because the failure they guard is "one
 of them was dropped", not "the exit stopped working": a run that exits 130 with
@@ -25,12 +28,16 @@ was not at first (see `_seq_args`).
 """
 
 import threading
+import time
 
 import pytest
 
-from llm_loop import cyclecore, exitlog, operator, parallel, runlifecycle
+from llm_loop import (cyclecore, exitlog, limits, operator, parallel,
+                      runlifecycle, stopchannel, streamrender, usage)
 from llm_loop.agentwork import ClaudeCommand, Driver, LoopStop
 from llm_loop.drivers import StateFileDriver
+from llm_loop.limits import LimitPolicy, SessionLimit
+from llm_loop.usage import RateLimitEvent
 
 from _runfixtures import (MemListDriver, OneShotDriver, StubPolicy, StubSource,
                           isolated_run, par_args, record_exit_pushes, seq_args)
@@ -434,10 +441,310 @@ def test_the_two_doors_of_the_epilogue_run_the_same_housekeeping():
     import ast
     import inspect
 
-    tree = ast.parse(inspect.getsource(runlifecycle.end_run))
-    called = {node.func.id for node in ast.walk(tree)
-              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    for door in (runlifecycle.end_run, runlifecycle.exit_run):
+        tree = ast.parse(inspect.getsource(door))
+        called = {node.func.id for node in ast.walk(tree)
+                  if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name)}
 
-    assert "close_run" in called, (
-        "end_run stopped delegating to close_run — the normal ending and the "
-        "three sys.exit endings are doing different housekeeping again")
+        assert "close_run" in called, (
+            f"{door.__name__} stopped delegating to close_run — the normal "
+            f"ending and the sys.exit endings are doing different housekeeping "
+            f"again")
+
+
+# --- the run's one boundary: endings no door of the runner wrote -------------
+
+
+def _count_close_runs(monkeypatch) -> list:
+    """The `ending` of every `close_run` call, so a pin can say "exactly once"."""
+    endings = []
+    real_close_run = runlifecycle.close_run
+
+    def counted_close_run(*args, **kwargs):
+        endings.append(kwargs.get("ending"))
+        return real_close_run(*args, **kwargs)
+
+    monkeypatch.setattr(runlifecycle, "close_run", counted_close_run)
+    return endings
+
+
+class _InterruptedStream:
+    """A provider process whose stream is cut by Ctrl+C mid-turn.
+
+    Handed to the REAL `streamrender.run_agent_streaming`, so the pin covers
+    what that function does with the interrupt, not what a stub does. The note
+    is typed while the turn runs (see the five-errors pin for why then).
+    """
+
+    stdin = None
+
+    def __init__(self, mailbox):
+        self._mailbox = mailbox
+
+    @property
+    def stdout(self):
+        self._mailbox.submit(NOTE)
+        raise KeyboardInterrupt
+        yield  # pragma: no cover — makes this a generator, as a pipe iterates
+
+    def wait(self):  # pragma: no cover — the stream never ends
+        return 0
+
+
+class _OverTheCeiling:
+    """A usage source whose session is over any ceiling the pin sets."""
+
+    def get_usage(self, cache_value=True):
+        return usage.parse_usage({"five_hour": {"utilization": 90.0}})
+
+    def invalidate(self):
+        pass
+
+
+class _HoldingPolicy(LimitPolicy):
+    """The real quota hold, its snapshots recorded the way StubPolicy's are."""
+
+    def __init__(self):
+        super().__init__([SessionLimit(5)])
+        self.snapshots = []
+
+    def log_snapshot(self, source, label="", cache_value=True):
+        self.snapshots.append(label)
+
+
+class _SecondCommandDriver(Driver):
+    """One command, then `on_second` — raised, or returned when not an
+    exception — from the second `next_command`; `on_summary` likewise from
+    `final_summary`."""
+
+    def __init__(self, on_second=None, on_summary=None, policy=None):
+        self.limit_policy = policy or StubPolicy()
+        self.served = 0
+        self.on_second = on_second
+        self.on_summary = on_summary
+
+    def next_command(self):
+        self.served += 1
+        if self.served == 1:
+            return ClaudeCommand("do the thing", "", "the-thing")
+        if isinstance(self.on_second, BaseException):
+            raise self.on_second
+        return None
+
+    def final_summary(self):
+        if isinstance(self.on_summary, BaseException):
+            raise self.on_summary
+        return None
+
+
+@pytest.mark.parametrize("where", ["turn", "quota hold", "refusal wait",
+                                   "driver"])
+def test_ctrl_c_anywhere_in_a_sequential_run_still_closes_it_down(
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox, where):
+    """Ctrl+C is the commonest way a sequential run ends, and it left nothing.
+
+    The turn, the quota hold and the wait after a refusal each answered it
+    with a `sys.exit(130)` of their own, straight past `close_run`: no exit
+    push, no `at end` line, no report of the notes. Each is staged at the real
+    site, so a site that exits on its own again is read here as an "exit 130"
+    ending, not as the interrupt's.
+    """
+    endings = _count_close_runs(monkeypatch)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+
+    def succeeds(*args, **kwargs):
+        loaded_mailbox.submit(NOTE)
+        return 0
+
+    driver = _SecondCommandDriver()
+    if where == "turn":
+        monkeypatch.setattr(streamrender, "start_agent_process",
+                            lambda *a: _InterruptedStream(loaded_mailbox))
+        monkeypatch.setattr(streamrender, "reap_agent_process", lambda proc: None)
+    elif where == "quota hold":
+        # Before the first turn, so the note staged by the fixture is still
+        # queued: the hold comes before the prompt takes the notes.
+        driver = _SecondCommandDriver(policy=_HoldingPolicy())
+        monkeypatch.setattr(runlifecycle, "usage_source_for",
+                            lambda p: _OverTheCeiling())
+
+        def ctrl_c(seconds, should_stop=None):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(limits, "sleep_unless", ctrl_c)
+    elif where == "refusal wait":
+        driver = _AlwaysWorkDriver()
+        monkeypatch.setattr(cyclecore, "run_claude_streaming", succeeds)
+        monkeypatch.setattr(
+            cyclecore, "last_rate_limit_event",
+            lambda: RateLimitEvent("rejected", "five_hour", time.time() + 3600))
+
+        def ctrl_c(seconds, should_stop=None):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(stopchannel, "sleep_unless", ctrl_c)
+    else:
+        driver = _SecondCommandDriver(on_second=KeyboardInterrupt())
+        monkeypatch.setattr(cyclecore, "run_claude_streaming", succeeds)
+
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
+                               app_name="pytest-abnormal", wait_on_start=False)
+    except KeyboardInterrupt:
+        pytest.fail("the Ctrl+C left the run as a bare KeyboardInterrupt")
+
+    assert exit_info.value.code == 130
+    assert endings == ["interrupted"], (
+        f"the run was not closed down exactly once, as interrupted: {endings}")
+    _assert_closed_down(
+        exit_pushes, driver.limit_policy, capsys, str(tmp_path),
+        snapshot="at end (claude: interrupted)",
+        reason=runlifecycle.INTERRUPTED_REASON)
+
+
+@pytest.mark.parametrize("where", ["driver", "final summary"])
+def test_an_exception_out_of_a_sequential_run_still_closes_it_down(
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox, where):
+    """An exception is an ending too: closed down once, then raised on as is."""
+    endings = _count_close_runs(monkeypatch)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+
+    def succeeds(*args, **kwargs):
+        loaded_mailbox.submit(NOTE)
+        return 0
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", succeeds)
+    staged = RuntimeError("staged: the state file vanished")
+    driver = (_SecondCommandDriver(on_second=staged) if where == "driver"
+              else _SecondCommandDriver(on_summary=staged))
+
+    with pytest.raises(RuntimeError) as raised:
+        cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
+                           app_name="pytest-abnormal", wait_on_start=False)
+
+    assert raised.value is staged, "the exception was not the one let go on"
+    assert endings == ["unhandled RuntimeError"], (
+        f"the run was not closed down exactly once: {endings}")
+    out = capsys.readouterr().out
+    assert [where for _policy, where in exit_pushes] == [str(tmp_path)]
+    assert driver.limit_policy.snapshots[-1] == \
+        "at end (claude: unhandled RuntimeError)"
+    assert NOTE in out and "undelivered operator note" in out
+
+
+def test_a_provider_that_is_not_installed_still_closes_the_run_down(
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox):
+    """`streamrender`'s exit 2 keeps its code and gets the epilogue."""
+    endings = _count_close_runs(monkeypatch)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+
+    def not_installed(*args):
+        loaded_mailbox.submit(NOTE)
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(streamrender, "start_agent_process", not_installed)
+    driver = _SecondCommandDriver()
+
+    with pytest.raises(SystemExit) as exit_info:
+        cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
+                           app_name="pytest-abnormal", wait_on_start=False)
+
+    assert exit_info.value.code == 2
+    assert endings == ["exit 2"], f"not closed down exactly once: {endings}"
+    _assert_closed_down(
+        exit_pushes, driver.limit_policy, capsys, str(tmp_path),
+        snapshot="at end (claude: exit 2)", reason="sys.exit(2)")
+
+
+@pytest.mark.parametrize("door", ["driver stop", "provider errors"])
+def test_ctrl_c_in_an_exiting_door_s_push_exits_130(
+        tmp_path, monkeypatch, capsys, loaded_mailbox, door):
+    """The two `sys.exit` doors end a Ctrl+C in their push the way Ctrl+C ends.
+
+    `close_run` gives up the push and raises the interrupt on; the doors used
+    to let it out bare — neither 130 nor the driver's code, and no record of
+    the interrupt.
+    """
+    pushes = []
+
+    def ctrl_c_in_the_push(policy, project_dir, abort=None):
+        pushes.append((policy, project_dir))
+        raise KeyboardInterrupt
+
+    def turn(*args, **kwargs):
+        loaded_mailbox.submit(NOTE)
+        return 0 if door == "driver stop" else 7
+
+    monkeypatch.setattr(runlifecycle, "final_git_push", ctrl_c_in_the_push)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", turn)
+    if door == "driver stop":
+        driver = _StoppingDriver(commands=1)
+        ending = "driver stopped the run"
+    else:
+        driver = _AlwaysWorkDriver()
+        ending = "provider errors in a row"
+
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
+                               app_name="pytest-abnormal", wait_on_start=False)
+    except KeyboardInterrupt:
+        pytest.fail("the Ctrl+C left the door as a bare KeyboardInterrupt")
+
+    assert exit_info.value.code == 130
+    _assert_closed_down(
+        pushes, driver.limit_policy, capsys, str(tmp_path),
+        snapshot=f"at end (claude: {ending})",
+        reason=runlifecycle.INTERRUPTED_REASON)
+
+
+@pytest.mark.parametrize("staged", [KeyboardInterrupt, RuntimeError],
+                         ids=["ctrl-c", "exception"])
+def test_an_ending_in_the_parallel_preparation_still_closes_the_run_down(
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox, staged):
+    """Between `open_usage` and the status region the fleet had no boundary.
+
+    Staged where the worker pool is built: the usage is open, the mailboxes
+    exist, the pusher has not started.
+    """
+    endings = _count_close_runs(monkeypatch)
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
+                        lambda provider: StubSource())
+
+    def pool_fails(*args, **kwargs):
+        raise staged("staged: the pool could not be built")
+
+    monkeypatch.setattr(parallel, "WorkerPool", pool_fails)
+    driver = MemListDriver(["products/only.md"])
+    args = _par_args(str(tmp_path))
+
+    if staged is KeyboardInterrupt:
+        try:
+            with pytest.raises(SystemExit) as exit_info:
+                parallel.run_parallel(driver, args, app_name="pytest-abnormal",
+                                      wait_on_start=False)
+        except KeyboardInterrupt:
+            pytest.fail("the Ctrl+C unwound the run past its epilogue")
+        assert exit_info.value.code == 130
+        assert endings == ["interrupted"], f"not closed once: {endings}"
+        _assert_closed_down(
+            exit_pushes, driver.limit_policy, capsys, str(tmp_path),
+            snapshot="at end (parallel claude: interrupted)",
+            reason=runlifecycle.INTERRUPTED_REASON)
+        return
+
+    with pytest.raises(RuntimeError, match="staged"):
+        parallel.run_parallel(driver, args, app_name="pytest-abnormal",
+                              wait_on_start=False)
+    assert endings == ["unhandled RuntimeError"], f"not closed once: {endings}"
+    out = capsys.readouterr().out
+    assert [where for _policy, where in exit_pushes] == [str(tmp_path)]
+    assert driver.limit_policy.snapshots[-1] == \
+        "at end (parallel claude: unhandled RuntimeError)"
+    assert NOTE in out and "undelivered operator note" in out

@@ -213,8 +213,9 @@ def _count_down_to(target_ts: float, should_stop=None) -> bool:
 
     The body every timed wait shares; they differ only in the lines they print
     around it, which is why this holds none of them. Returns True when it left
-    early because `should_stop()` asked it to. Ctrl+C ends the process from
-    here, as it always did.
+    early because `should_stop()` asked it to. Ctrl+C is said here and raised
+    on to `run_loop`'s boundary (`runlifecycle.RunBoundary`), which closes the
+    run down and exits 130.
     """
     try:
         while True:
@@ -228,7 +229,7 @@ def _count_down_to(target_ts: float, should_stop=None) -> bool:
                 return True
     except KeyboardInterrupt:
         print("\nWait interrupted by user (Ctrl+C).")
-        sys.exit(130)
+        raise
 
 
 def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
@@ -395,11 +396,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                          wait_on_start=wait_on_start, progress=progress,
                          pusher=pusher, push_abort=push_abort)
     finally:
-        # An exceptional exit may bypass close_run. Queued work still drains
-        # on close, so forbid any further git child before releasing the owner.
+        # An exit before `_run_loop`'s boundary bypasses close_run. Queued
+        # work still drains on close, so forbid any further git child before
+        # releasing the owner.
         push_abort.set()
-        # Idle owner close: 0.98 ms worst of 600 measured 2026-09-29 in
-        # parallel._abandon_pusher; 0.5 s lets close acquire its short lock.
+        # Idle owner close: 0.1 ms median, 0.98 ms worst of 600 closes
+        # measured 2026-09-29; 0.5 s lets close acquire its short lock.
         pusher.close(timeout=0.5)
 
 
@@ -473,12 +475,11 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
     def opened_usages() -> list:
         """Every account's usage this run opened, for the closing snapshots.
 
-        All of them, not the selected one, so an ending that reaches
-        `runlifecycle.close_run` answers every `at start (…)` — see there for
-        the endings that do not. The selected `usage` is always the object
-        stored here — it is only ever assigned FROM `usage_states` — so nothing
-        has to be written back first; only the session clock beside it moves,
-        and closing ignores it.
+        All of them, not the selected one, so every ending answers every
+        `at start (…)` (see `boundary` below). The selected `usage` is always
+        the object stored here — it is only ever assigned FROM
+        `usage_states` — so nothing has to be written back first; only the
+        session clock beside it moves, and closing ignores it.
         """
         return [opened for opened, _session_start in usage_states.values()]
 
@@ -537,7 +538,15 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
         return (stopchannel.pending_stop(app) is not None
                 or (breakpoints is not None and breakpoints.reached() is not None))
 
-    with app:
+    # The run's one epilogue boundary: usages open lazily inside the loop, and
+    # every ending from here on — the doors below, Ctrl+C wherever it lands,
+    # an exception out of the driver — closes all of them, once. Outer to the
+    # region, so the region is released before the housekeeping prints; the
+    # doors inside the loop close down within it, as they always did.
+    boundary = runlifecycle.RunBoundary(
+        ctx, usages=opened_usages, counts=lambda: (iteration, completed),
+        mailbox=mailbox, pusher=pusher, push_abort=push_abort)
+    with boundary, app:
         while True:
             # The caps are read LIVE (see RunSettings) and republished here, so an
             # edit made while the run is going is what the pinned row shows at
@@ -677,12 +686,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                         f"the driver stopped the run (exit {stop.exit_code}): "
                         f"{stop.message.splitlines()[0]}",
                         iterations=iteration, completed=completed)
-                    runlifecycle.close_run(
-                        ctx, usages=opened_usages(),
-                        ending="driver stopped the run",
-                        mailbox=mailbox, pusher=pusher,
-                        push_abort=push_abort)
-                    sys.exit(stop.exit_code)
+                    boundary.exit(stop.exit_code,
+                                  ending="driver stopped the run")
                 stop_reason = stopchannel.RunStopReason.DRIVER_STOP
                 break
             if command is None:
@@ -946,21 +951,15 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                     f"{consecutive_errors} provider errors in a row "
                     f"(last exit code {returncode})",
                     iterations=iteration, completed=completed)
-                runlifecycle.close_run(
-                    ctx, usages=opened_usages(),
-                    ending="provider errors in a row",
-                    mailbox=mailbox, pusher=pusher,
-                    push_abort=push_abort)
-                sys.exit(returncode)
+                boundary.exit(returncode, ending="provider errors in a row")
 
-    # This run's own closing line, if the driver has one (e.g. "Final state: …").
-    # Before the shared epilogue, which is housekeeping: the run reports on its
-    # work first, then the run is closed down.
-    summary = driver.final_summary()
-    if summary:
-        print(f"\n{summary}")
-    # The exit push follows every check queued while agents were running.
-    return runlifecycle.end_run(
-        ctx, stopchannel.RunResult(stop_reason, iteration, completed),
-        usages=opened_usages(), mailbox=mailbox, pusher=pusher,
-        push_abort=push_abort)
+    with boundary:
+        # This run's own closing line, if the driver has one (e.g. "Final
+        # state: …"). Before the shared epilogue, which is housekeeping: the
+        # run reports on its work first, then the run is closed down.
+        summary = driver.final_summary()
+        if summary:
+            print(f"\n{summary}")
+        # The exit push follows every check queued while agents were running.
+        return boundary.end(
+            stopchannel.RunResult(stop_reason, iteration, completed))
