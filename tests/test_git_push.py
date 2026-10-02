@@ -232,8 +232,9 @@ def test_a_sequential_run_an_exception_ends_runs_its_git_before_it_leaves(
     """An exception out of the loop closes the run down; no git outlives it.
 
     The run's boundary (`runlifecycle.RunBoundary`) gives the exception the
-    epilogue every ending gets: the check queued behind the push in flight
-    runs, then the exit push — all before `run_loop` lets the exception go on.
+    epilogue every ending gets: the push in flight finishes, the check queued
+    behind it stands down for the exit push (`push_turn` reads the boundary),
+    and the exit push runs — all before `run_loop` lets the exception go on.
     None may be left for the owner to start once the run has left, beside
     whatever this process runs next.
     """
@@ -274,10 +275,18 @@ def test_a_sequential_run_an_exception_ends_runs_its_git_before_it_leaves(
             assert fake.pushed.wait(timeout=HELD_PUSH_TIMEOUT_S)
             return 0
         assert made[0].backlog == 2, "the second push check was not queued"
-        # Let the held push finish, or the epilogue sits it out to its timeout.
-        fake.release.set()
         raise RuntimeError("agent failed")
 
+    real_close_run = runlifecycle.close_run
+
+    def close_run_releasing_the_push(*args, **kwargs):
+        # The held push is let go only once the ending has begun, so the
+        # check queued behind it runs after that — let go from the agent, it
+        # could run before the exception reached the boundary.
+        fake.release.set()
+        return real_close_run(*args, **kwargs)
+
+    monkeypatch.setattr(runlifecycle, "close_run", close_run_releasing_the_push)
     monkeypatch.setattr(cyclecore, "OwnerThread", owner)
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(cyclecore, "run_claude_streaming", agent)
@@ -293,9 +302,10 @@ def test_a_sequential_run_an_exception_ends_runs_its_git_before_it_leaves(
     assert made[0].close(timeout=HELD_PUSH_TIMEOUT_S)
     assert fake.calls == calls_at_exit, \
         f"git started after the run had left: {fake.calls[len(calls_at_exit):]}"
-    # The held push, the check queued behind it, the exit push.
-    assert len(fake.pushes) == 3, \
-        f"the exception's epilogue did not push what was queued: {fake.calls}"
+    # The held push and the exit push; the check queued between them is the
+    # exit push's to make, and run it would be one more `git push` waited for.
+    assert len(fake.pushes) == 2, \
+        f"the exception's epilogue did not push exactly once more: {fake.calls}"
 
 
 def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(
@@ -753,7 +763,7 @@ def test_exit_interrupt_cancels_queued_periodic_push(tmp_path, monkeypatch):
     assert pusher.try_post(lambda: gitpush.maybe_git_push(
         policy, 0.0, projectroot.project_dir(), abort=abort))
 
-    def interrupted_wait(owner, final):
+    def interrupted_wait(owner, final, deadline_s=None):
         owner.close(timeout=0, final=final)
         raise KeyboardInterrupt
 

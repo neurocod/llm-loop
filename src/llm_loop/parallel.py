@@ -211,9 +211,7 @@ class _Interrupt:
             self._announced = True
             if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
                 self.announce_later = INTERRUPT_ANNOUNCEMENT
-        if not self._pool_closed:
-            self._threads.close()
-            self._pool_closed = True
+        self.stop_workers()
         if not wait_for_workers:
             return
         # A second Ctrl+C gives up waiting for the workers; the run's ending
@@ -225,6 +223,20 @@ class _Interrupt:
                     t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
         except KeyboardInterrupt:
             pass
+
+    def stop_workers(self) -> None:
+        """No further claim and no further worker — and no wait for either.
+
+        What every ending that unwinds the run past the region asks of the
+        fleet, an exception's included: its workers must not go on starting
+        agents while the run closes down, and the process exits under them
+        once it has. Neither announced nor joined, unlike `hear`: an
+        exception says its own line, and nobody asked to wait for a turn.
+        """
+        self._shared.stop.set()
+        if not self._pool_closed:
+            self._threads.close()
+            self._pool_closed = True
 
 
 def parse_args(argv=None, *, prog: str = "parallel",
@@ -1433,21 +1445,24 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # `at end (…)` line says whose figures it holds the way a sequential run's
     # does. --ignore-usage leaves it unopened, so there is no source to gate on
     # and no policy to gate with.
-    usage = (None if args.ignore_usage
-             else runlifecycle.open_usage(driver, provider,
-                                          name=f"parallel {provider}",
-                                          dry_run=dry_run))
-    # The run's one epilogue boundary, from the usage just opened to
-    # `close_run` (see `runlifecycle.RunBoundary`): every ending from here on
-    # closes the run down once — the two doors below, and through the
-    # `except` at the bottom whatever else unwinds it, the preparation
-    # before the region included.
+    #
+    # The run's one epilogue boundary, from that usage to `close_run` (see
+    # `runlifecycle.RunBoundary`): every ending from here on closes the run
+    # down once — the two doors below, and through the `except` at the bottom
+    # whatever else unwinds it: the opening snapshot (the pair is registered
+    # before it is taken) and the preparation before the region included.
+    opened = []
     shared = interrupted = None
     boundary = runlifecycle.RunBoundary(
-        ctx, usages=lambda: [usage],
+        ctx, usages=lambda: opened,
         counts=lambda: ((shared.claimed, shared.done) if shared is not None
                         else (0, 0)))
     try:
+        usage = (None if args.ignore_usage
+                 else runlifecycle.open_usage(driver, provider,
+                                              name=f"parallel {provider}",
+                                              dry_run=dry_run,
+                                              register=opened.append))
         source, policy = runlifecycle.usage_halves(usage)
         usage_lock = threading.Lock()
         session_start_box = [time.time()]  # shared, refreshed when a window resets
@@ -1696,14 +1711,21 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         return boundary.end(
             RunResult(reason, shared.claimed, shared.done, remaining))
     except BaseException as error:
-        # Whatever unwound the run past both doors: the preparation above,
-        # `_console.start()`, `route_through`'s entry or exit, the report. A
-        # Ctrl+C here comes after the region's own hearing, or before there
-        # was a fleet to stop; set, it keeps the pump from starting a
-        # periodic push for the exit push to queue behind. `close_run` closes
-        # the pusher, so none is left pushing every minute for the rest of the
-        # process — beside the next run's pusher, under a batching wrapper.
-        if isinstance(error, KeyboardInterrupt) and interrupted is not None:
-            interrupted.set()
+        # Whatever unwound the run past both doors: the opening snapshot, the
+        # preparation above, `_console.start()`, `route_through`'s entry or
+        # exit, an exception out of the region, the report. The fleet is
+        # stopped first (`stop_workers`): an exception out of the region used
+        # to leave the workers claiming the queue and starting agents through
+        # the exit push. The pump needs nothing of its own here: `close_run`'s
+        # close is what keeps it from starting a periodic push (an owner starts
+        # no idle pass once closed), and the moments before that close are the
+        # ones every ending has. `close_run` closes the pusher, so none is left
+        # pushing every minute for the rest of the process — beside the next
+        # run's pusher, under a batching wrapper.
+        if interrupted is not None:
+            try:
+                interrupted.stop_workers()
+            except KeyboardInterrupt:
+                pass    # the stop is set first; the ending is `error`'s
         boundary.unwind(error)
         raise

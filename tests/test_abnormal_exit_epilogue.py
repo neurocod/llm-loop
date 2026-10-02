@@ -33,7 +33,8 @@ import time
 import pytest
 
 from llm_loop import (cyclecore, exitlog, limits, operator, parallel,
-                      runlifecycle, stopchannel, streamrender, usage)
+                      runlifecycle, statusline, stopchannel, streamrender,
+                      usage)
 from llm_loop.agentwork import ClaudeCommand, Driver, LoopStop
 from llm_loop.drivers import StateFileDriver
 from llm_loop.limits import LimitPolicy, SessionLimit
@@ -747,4 +748,353 @@ def test_an_ending_in_the_parallel_preparation_still_closes_the_run_down(
     assert [where for _policy, where in exit_pushes] == [str(tmp_path)]
     assert driver.limit_policy.snapshots[-1] == \
         "at end (parallel claude: unhandled RuntimeError)"
+    assert NOTE in out and "undelivered operator note" in out
+
+
+# --- second failures inside the ending ----------------------------------------
+
+# How long the stuck exit push below would hold the run if nothing bounded the
+# wait: far past the shortened deadline and the whole bounded run (1.01 and
+# 1.03 s sequential — `run_loop`'s 0.5 s owner close included — 0.51 s
+# parallel, measured 2026-10-03), so a run that waited it out is told apart by
+# its time alone.
+STUCK_PUSH_S = 30.0
+
+
+def _noting_turn(mailbox):
+    """A turn that succeeds with a note typed while it runs (see the
+    five-errors pin for why then)."""
+    def turn(*args, **kwargs):
+        mailbox.submit(NOTE)
+        return 0
+    return turn
+
+
+def _seq_run_raising(driver, project_dir):
+    return lambda: cyclecore.run_loop(driver, _seq_args(project_dir),
+                                      app_name="pytest-abnormal",
+                                      wait_on_start=False)
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_an_exception_does_not_wait_out_a_stuck_exit_push(
+        tmp_path, monkeypatch, capsys, loaded_mailbox, runner):
+    """An exception's ending waits for its exit push a bounded time, then leaves.
+
+    Nobody may be there to press Ctrl+C: a batch run unwinding an exception
+    sat out the push in flight and the whole exit push, silently, before its
+    traceback. Staged with an exit push that never comes back on its own; the
+    run must still raise its own exception within the (shortened) deadline,
+    say why it paused, abandon the push so no further git starts, and keep
+    the snapshot and the notes.
+    """
+    monkeypatch.setattr(runlifecycle, "UNWIND_PUSH_DEADLINE_S", 0.5)
+    stuck = threading.Event()
+    aborts = []
+
+    def stuck_push(policy, project_dir, abort=None):
+        aborts.append(abort)
+        stuck.wait(timeout=STUCK_PUSH_S)
+
+    monkeypatch.setattr(runlifecycle, "final_git_push", stuck_push)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+    staged = RuntimeError("staged: the driver broke")
+    if runner == "sequential":
+        monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                            _noting_turn(loaded_mailbox))
+        driver = _SecondCommandDriver(on_second=staged)
+        run = _seq_run_raising(driver, str(tmp_path))
+        snapshot = "at end (claude: unhandled RuntimeError)"
+    else:
+        def broken_join(threads):
+            for t in threads:
+                t.join()
+            loaded_mailbox.submit(NOTE)     # no worker left to splice it
+            raise staged
+
+        monkeypatch.setattr(parallel, "join_workers", broken_join)
+        monkeypatch.setattr(parallel, "run_job",
+                            lambda job_id, command, mailbox=None: (0, None, None))
+        driver = MemListDriver(["products/only.md"])
+        args = _par_args(str(tmp_path))
+        run = lambda: parallel.run_parallel(driver, args,  # noqa: E731
+                                            app_name="pytest-abnormal",
+                                            wait_on_start=False)
+        snapshot = "at end (parallel claude: unhandled RuntimeError)"
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            run()
+    finally:
+        elapsed = time.monotonic() - started
+        stuck.set()
+
+    assert raised.value is staged, "the exception was not the one let go on"
+    assert elapsed < STUCK_PUSH_S / 2, (
+        f"the ending waited out the stuck exit push: {elapsed:.1f} s")
+    assert aborts and aborts[0] is not None and aborts[0].is_set(), (
+        "the abandoned exit push may still start git")
+    assert driver.limit_policy.snapshots[-1] == snapshot
+    captured = capsys.readouterr()
+    assert "waiting at most 0.5 s for the exit push" in captured.out, (
+        "the run went quiet without saying why")
+    assert "did not finish within 0.5 s" in captured.err
+    assert NOTE in captured.out and "undelivered operator note" in captured.out
+
+
+def test_an_exception_out_of_the_parallel_region_stops_the_workers(
+        tmp_path, monkeypatch, capsys, exit_pushes):
+    """An exception out of the region must not leave the fleet claiming.
+
+    Only Ctrl+C used to stop the workers: an exception out of the region went
+    to the boundary with `shared.stop` unset and the pool open, so the workers
+    went on claiming the queue and starting agents through the exit push, and
+    died with the process mid-turn. Staged: the join fails while a worker is
+    inside its turn, and the worker is let go only once the run has left.
+    """
+    working = threading.Event()
+    release = threading.Event()
+    turns = []
+
+    def held_first_turn(job_id, command, mailbox=None):
+        turns.append(threading.current_thread())
+        if len(turns) == 1:
+            working.set()
+            release.wait(timeout=HELD_S)
+        return 0, None, None
+
+    def join_fails_once_a_worker_works(threads):
+        working.wait(timeout=HELD_S)
+        raise RuntimeError("staged: the join broke")
+
+    monkeypatch.setattr(parallel, "run_job", held_first_turn)
+    monkeypatch.setattr(parallel, "join_workers", join_fails_once_a_worker_works)
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
+                        lambda provider: StubSource())
+    driver = MemListDriver([f"products/item{i}.md" for i in range(5)])
+
+    try:
+        with pytest.raises(RuntimeError, match="staged"):
+            parallel.run_parallel(driver, _par_args(str(tmp_path)),
+                                  app_name="pytest-abnormal",
+                                  wait_on_start=False)
+    finally:
+        release.set()
+    assert turns, "no worker ever started its turn — nothing staged"
+    turns[0].join(timeout=HELD_S)
+
+    assert not turns[0].is_alive(), "the held worker never finished"
+    assert len(turns) == 1, (
+        f"the workers went on claiming after the run left: {len(turns)} turns")
+    assert exit_pushes, "the run left without its exit push"
+
+
+class _ClosingSource(StubSource):
+    """A source that keeps something running between reads, and says if closed."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FailingOpenPolicy(StubPolicy):
+    """The opening snapshot raises `staged`; every other one is recorded."""
+
+    def __init__(self, staged):
+        super().__init__()
+        self.staged = staged
+
+    def log_snapshot(self, source, label="", cache_value=True):
+        super().log_snapshot(source, label, cache_value)
+        if label.startswith("at start"):
+            raise self.staged
+
+
+@pytest.mark.parametrize("staged", [RuntimeError, KeyboardInterrupt],
+                         ids=["exception", "ctrl-c"])
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_an_ending_in_the_opening_snapshot_still_closes_the_usage(
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox, runner,
+        staged):
+    """A usage whose opening snapshot failed is still the run's to close.
+
+    The snapshot is a usage query, and the source may have started what it
+    keeps running (Codex's quota server) before the query raised or was cut
+    by Ctrl+C. The sequential runner stored the pair only once `open_usage`
+    returned, so the ending closed nothing; the parallel runner opened it
+    outside its boundary, so the ending had no epilogue at all.
+    """
+    endings = _count_close_runs(monkeypatch)
+    source = _ClosingSource()
+    policy = _FailingOpenPolicy(staged("staged: the usage endpoint broke"))
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: source)
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+    if runner == "sequential":
+        driver = _SecondCommandDriver(policy=policy)
+        run = _seq_run_raising(driver, str(tmp_path))
+        name = "claude"
+    else:
+        driver = MemListDriver(["products/only.md"])
+        driver.limit_policy = policy
+        args = _par_args(str(tmp_path))
+        run = lambda: parallel.run_parallel(driver, args,  # noqa: E731
+                                            app_name="pytest-abnormal",
+                                            wait_on_start=False)
+        name = "parallel claude"
+
+    if staged is KeyboardInterrupt:
+        with pytest.raises(SystemExit) as exit_info:
+            run()
+        assert exit_info.value.code == 130
+        ending = "interrupted"
+    else:
+        with pytest.raises(RuntimeError, match="staged"):
+            run()
+        ending = "unhandled RuntimeError"
+
+    assert endings == [ending], f"not closed down exactly once: {endings}"
+    assert source.closed, "the source the opening query started was left running"
+    assert policy.snapshots[-1] == f"at end ({name}: {ending})"
+    if runner == "sequential":
+        # The fleet makes its mailboxes after the usage: none can hold a note.
+        out = capsys.readouterr().out
+        assert NOTE in out and "undelivered operator note" in out
+
+
+def test_a_failing_step_of_an_exiting_door_keeps_its_exit_code(
+        tmp_path, monkeypatch, capsys, exit_pushes):
+    """The driver's exit 3 survives a housekeeping step that raises.
+
+    The ending is already decided and recorded when `exit_run` closes the run
+    down; an exception out of that (here the report of undelivered notes)
+    used to replace `SystemExit(3)` with a traceback and exit 1.
+    """
+    def report_fails(mailbox):
+        raise RuntimeError("staged: the console is gone")
+
+    monkeypatch.setattr(operator, "report_undelivered_notes", report_fails)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **k: 0)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cyclecore.run_loop(_StoppingDriver(commands=1), _seq_args(str(tmp_path)),
+                           app_name="pytest-abnormal", wait_on_start=False)
+
+    assert exit_info.value.code == 3, "the housekeeping's failure took the exit"
+    err = capsys.readouterr().err
+    assert "closing the run down failed" in err and "staged" in err, (
+        "the failing step went unreported")
+
+
+def test_a_second_ctrl_c_while_the_reason_is_recorded_still_exits_130(
+        tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox):
+    """The interrupt's reason is written as the run leaves — where Ctrl+C comes.
+
+    A second Ctrl+C inside `exitlog.set_reason` (a lock and a file write) left
+    the boundary as a bare KeyboardInterrupt: no housekeeping, no 130.
+    """
+    endings = _count_close_runs(monkeypatch)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        _noting_turn(loaded_mailbox))
+    real_set_reason = exitlog.set_reason
+    cut = []
+
+    def ctrl_c_in_the_write(reason, **fields):
+        real_set_reason(reason, **fields)
+        if reason == runlifecycle.INTERRUPTED_REASON and not cut:
+            cut.append(reason)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(exitlog, "set_reason", ctrl_c_in_the_write)
+    driver = _SecondCommandDriver(on_second=KeyboardInterrupt())
+
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
+                               app_name="pytest-abnormal", wait_on_start=False)
+    except KeyboardInterrupt:
+        pytest.fail("the second Ctrl+C left the run as a bare KeyboardInterrupt")
+
+    assert cut, "the reason was never recorded — nothing staged"
+    assert exit_info.value.code == 130
+    assert endings == ["interrupted"], f"not closed down exactly once: {endings}"
+    _assert_closed_down(
+        exit_pushes, driver.limit_policy, capsys, str(tmp_path),
+        snapshot="at end (claude: interrupted)",
+        reason=runlifecycle.INTERRUPTED_REASON)
+
+
+def test_a_ctrl_c_in_the_region_s_teardown_keeps_the_door_s_exit(
+        tmp_path, monkeypatch, capsys, exit_pushes):
+    """A door inside the sequential region exits; Ctrl+C in the teardown after.
+
+    `StatusApp.stop` raises the first exception it meets, so a Ctrl+C there
+    replaced the driver's `SystemExit(3)` with a bare KeyboardInterrupt, and
+    the boundary — already closed by the door — let it go.
+    """
+    real_stop = statusline.StatusApp.stop
+
+    def ctrl_c_in_the_teardown(app):
+        real_stop(app)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(statusline.StatusApp, "stop", ctrl_c_in_the_teardown)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **k: 0)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            cyclecore.run_loop(_StoppingDriver(commands=1),
+                               _seq_args(str(tmp_path)),
+                               app_name="pytest-abnormal", wait_on_start=False)
+    except KeyboardInterrupt:
+        pytest.fail("the Ctrl+C in the teardown replaced the door's exit")
+
+    assert exit_info.value.code == 3
+    assert len(exit_pushes) == 1, f"not closed down once: {exit_pushes}"
+
+
+def test_a_ctrl_c_in_an_exception_s_exit_push_keeps_the_exception(
+        tmp_path, monkeypatch, capsys, loaded_mailbox):
+    """Ctrl+C while an exception's exit push runs gives up the push only.
+
+    The exception stays the ending: the snapshot and the notes still happen,
+    and what leaves `run_loop` is the exception, not the interrupt.
+    """
+    endings = _count_close_runs(monkeypatch)
+    pushes = []
+
+    def ctrl_c_in_the_push(policy, project_dir, abort=None):
+        pushes.append((policy, project_dir))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runlifecycle, "final_git_push", ctrl_c_in_the_push)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        _noting_turn(loaded_mailbox))
+    staged = RuntimeError("staged: the state file vanished")
+    driver = _SecondCommandDriver(on_second=staged)
+
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
+                               app_name="pytest-abnormal", wait_on_start=False)
+    except (KeyboardInterrupt, SystemExit) as replaced:
+        pytest.fail(f"the Ctrl+C replaced the exception: {replaced!r}")
+
+    assert raised.value is staged
+    assert endings == ["unhandled RuntimeError"], f"not closed once: {endings}"
+    assert pushes, "the exit push never ran — nothing staged"
+    assert driver.limit_policy.snapshots[-1] == \
+        "at end (claude: unhandled RuntimeError)"
+    out = capsys.readouterr().out
+    assert "the exit push is abandoned" in out
     assert NOTE in out and "undelivered operator note" in out

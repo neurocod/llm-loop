@@ -238,7 +238,9 @@ def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
     Used after a probable token-limit error, or once the LimitPolicy decides the
     account's real usage figures leave no room: we idle until the 5-hour session
     window should have refreshed. `reason` overrides the default opening line.
-    Ctrl+C interrupts the wait and stops the script.
+    Ctrl+C interrupts the wait and is raised on as KeyboardInterrupt — no
+    longer `SystemExit(130)`: inside a runner its boundary closes the run down
+    and exits 130, and a caller outside one handles the interrupt itself.
 
     `should_stop` is the run's stop channels (see `stopchannel.sleep_unless`):
     a hold that can last hours must end the moment a human asks it to, and
@@ -396,12 +398,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                          wait_on_start=wait_on_start, progress=progress,
                          pusher=pusher, push_abort=push_abort)
     finally:
-        # An exit before `_run_loop`'s boundary bypasses close_run. Queued
-        # work still drains on close, so forbid any further git child before
-        # releasing the owner.
-        push_abort.set()
-        # Idle owner close: 0.1 ms median, 0.98 ms worst of 600 closes
-        # measured 2026-09-29; 0.5 s lets close acquire its short lock.
+        # An exit before `_run_loop`'s boundary bypasses close_run and leaves
+        # the owner started with nothing posted to it — the first push check is
+        # posted inside the boundary, which hands every later ending to
+        # close_run — so this only ends the thread. Idle owner close: 0.1 ms
+        # median, 0.98 ms worst of 600 closes measured 2026-09-29; 0.5 s lets
+        # close acquire its short lock.
         pusher.close(timeout=0.5)
 
 
@@ -489,6 +491,11 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
 
     def push_turn() -> None:
         nonlocal last_git_push
+        # A check still queued once the run's ending has begun is the exit
+        # push's job, made right behind it: run, it is one more `git push`
+        # the ending waits for (the parallel pump stops the same way).
+        if boundary.closed:
+            return
         last_git_push = maybe_git_push(run_settings.git_push, last_git_push,
                                        projectroot.project_dir(), abort=push_abort)
 
@@ -703,10 +710,13 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                 provider = selected_provider
                 spec = providers.provider_spec(provider)
                 if provider not in usage_states:
-                    usage_states[provider] = (
-                        runlifecycle.open_usage(driver, provider,
-                                                dry_run=dry_run),
-                        time.time())
+                    def keep(opened, name=provider):
+                        # Before its opening snapshot, so an ending inside
+                        # that query still closes the pair (`open_usage`).
+                        usage_states[name] = (opened, time.time())
+
+                    runlifecycle.open_usage(driver, provider, dry_run=dry_run,
+                                            register=keep)
                 usage, session_start = usage_states[provider]
                 usage_source, limit_policy = runlifecycle.usage_halves(usage)
                 ignore_usage_limits = (args.max is not None or usage_source is None

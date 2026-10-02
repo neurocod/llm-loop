@@ -278,8 +278,10 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     that aims at the npm `.cmd` shim and leaves the CLI — a GRANDCHILD —
     running with the terminal's stdout in hand.
 
-    Ctrl+C is said here and raised on to the runner's boundary
-    (`runlifecycle.RunBoundary`), which closes the run down and exits 130.
+    Ctrl+C is said here and raised on as KeyboardInterrupt — no longer
+    `SystemExit(130)` — to the runner's boundary (`runlifecycle.RunBoundary`),
+    which closes the run down and exits 130; a caller outside a runner
+    handles the interrupt itself.
     """
     global _last_rate_limit_event, _turn_cost_base
     _last_rate_limit_event = None

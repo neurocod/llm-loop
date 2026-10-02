@@ -292,6 +292,11 @@ class LimitPolicy:
         The pause here is the longest hold in the engine — hours, with every
         worker parked in it — so it must be abandonable: the caller re-reads its
         own stop state after this returns and decides what to do about it.
+
+        Ctrl+C in the hold is raised on as KeyboardInterrupt — no longer
+        `SystemExit(130)`: inside a runner its boundary
+        (`runlifecycle.RunBoundary`) closes the run down and exits 130, and a
+        caller outside one handles the interrupt itself.
         """
         usage = source.get_usage(cache_value)
         now = time.time()
