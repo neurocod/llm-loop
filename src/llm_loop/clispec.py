@@ -275,7 +275,7 @@ OPTIONS: Dict[str, Option] = {
         kwargs=dict(dest="cost_log", metavar="LOG", type=log_file),
         help="report on this log file instead of this entry point's "
              "own — a rotated backup (<app>-<project>.log.1) or a "
-             "copy; implies --cost",
+             "copy; implies --cost unless --stat is selected",
     ),
     # --- store_true / store_const options ---------------------------------------
     "--codex": Option(
@@ -313,6 +313,13 @@ OPTIONS: Dict[str, Option] = {
         kwargs=dict(action="store_true"),
         help="print per-session cost totals from the mirror log and "
              "exit (no loop is run)",
+    ),
+    "--stat": Option(
+        aliases=("--stat",),
+        takes_value=False,
+        kwargs=dict(action="store_true"),
+        help="print a table of total time, average per iteration and percentage "
+             "by state from the mirror log and exit (no loop is run)",
     ),
     "--ignore-usage": Option(
         aliases=("--ignore-usage",),
@@ -366,6 +373,7 @@ OPTION_ORDER: Dict[str, Tuple[str, ...]] = {
         "--dry-run",
         "--log",
         "--cost",
+        "--stat",
         "--cost-log",
         "--raw",
         "--start-in",

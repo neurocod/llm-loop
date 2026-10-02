@@ -27,7 +27,7 @@ _SAMPLE_VALUES = {
 
 # What the rule says today. Pinned as a control: agreement alone would also hold
 # for a predicate and a runner that both forgot the same flag.
-_REPORT_OPTIONS = {"--log", "--cost", "--cost-log"}
+_REPORT_OPTIONS = {"--log", "--cost", "--stat", "--cost-log"}
 
 
 class _RunStarted(Exception):

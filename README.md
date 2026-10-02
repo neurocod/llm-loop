@@ -500,6 +500,7 @@ subsets of it (`clispec.OPTION_ORDER`), so ask the entry point you run:
 ```
 python runFileList.py --help           # .main(): the sequential runner
 python runFileListParallel.py --help   # .main_parallel(): the parallel one
+python runCycle.py --stat              # time spent per state in the mirror log
 ```
 
 ## Why the run ended

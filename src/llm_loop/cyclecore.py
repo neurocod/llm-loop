@@ -65,7 +65,7 @@ from typing import Callable, Optional
 # `sys.modules` before this line is reached. The cycle the local import really
 # was for is gone too — it does not import this module any more.
 from . import (clispec, console, costlog, exitlog, operator,
-               projectroot, providers, runlifecycle, statusline, stopchannel,
+               projectroot, providers, runlifecycle, statlog, statusline, stopchannel,
                termio, textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
 # Driver protocol that produces them — is `agentwork`, for the same reason as the
@@ -190,7 +190,7 @@ def parse_args(argv=None, *, prog: str = "runCycle.py",
 def is_report(args: argparse.Namespace) -> bool:
     """Does this command line ask for a report instead of a run?
 
-    `--log`, `--cost` and `--cost-log` each answer from the mirror log and exit
+    `--log`, `--cost`, `--stat` and `--cost-log` answer from the mirror log and exit
     before the prologue (see `run_loop`, the one reader that acts on it). A host
     asks the same question before it does anything a run needs and a report must
     not do — take the script lock, wait out a pending stop file, thaw a frozen
@@ -200,10 +200,11 @@ def is_report(args: argparse.Namespace) -> bool:
 
     `--cost-log` counts by its PRESENCE, never its truthiness: an empty path read
     as "absent" started the loop. Read with getattr because the parallel parser
-    declares none of the three (a namespace from it is never a report).
+    declares none of these flags (a namespace from it is never a report).
     """
     return bool(getattr(args, "log", False)
                 or getattr(args, "cost", False)
+                or getattr(args, "stat", False)
                 or getattr(args, "cost_log", None) is not None)
 
 
@@ -405,7 +406,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
               setup_logging: bool, wait_on_start: bool, progress,
               pusher: OwnerThread, push_abort: PushAbort) -> stopchannel.RunResult:
-    # --cost: report per-run spend from the mirror log and exit, without touching
+    # --cost/--stat: read the mirror log and exit, without touching
     # the loop, the tee, git, or the usage gate. BEFORE the prologue, whose first
     # act is to raise the tee and open an exit record: a report is not a run, and
     # it must neither be mirrored into the shared log nor leave a record behind.
@@ -427,6 +428,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
         # A path query must not open the log or start any part of the loop.
         if getattr(args, "log", False):
             print(console.log_file_path(app_name))
+        elif getattr(args, "stat", False):
+            statlog.report_stats(app_name, cost_log)
         else:
             costlog.report_costs(app_name, cost_log)
         return stopchannel.RunResult(stopchannel.RunStopReason.NO_WORK)
@@ -776,6 +779,7 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
             # the Job clock times THIS iteration, the run clock (latched once)
             # times the whole run.
             started_at = time.time()
+            iteration_clock = time.monotonic()
             app.mark_run_started(started_at)
             # The Job bumps its own counter (no `iteration=`): the local counter
             # restarts with every runner call, and pinning the row to it is what
@@ -846,6 +850,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                         cmd, provider, raw, partial=False, prompt=command.prompt,
                         mailbox=mailbox)
             app.job(1).finish()
+            print(statlog.iteration_finished(
+                iteration, returncode, time.monotonic() - iteration_clock))
             app.update(phase="idle")
 
             if returncode == 0:
