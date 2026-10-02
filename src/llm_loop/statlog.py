@@ -2,11 +2,19 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import re
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Union
 
 from . import console
+
+
+def iteration_started(iteration: int, state: str) -> str:
+    """Machine-only start record; JSON preserves arbitrary state labels."""
+    return json.dumps({"event": "iteration_start", "iteration": iteration,
+                       "state": _STATE_PREFIX.sub("", state).strip()
+                       or "(no label)"}, ensure_ascii=False)
 
 
 def iteration_finished(iteration: int, returncode: int,
@@ -32,6 +40,7 @@ _FAILED = re.compile(
     r"^(?:Claude Code|Codex CLI) exited with code -?\d+ "
     r"\(error #\d+ in a row\)\.$")
 _STATE_PREFIX = re.compile(r"^current state:\s*", re.IGNORECASE)
+_TAGGED = re.compile(r"^pid=(\d+) kind=(output|timing) (.*)$")
 
 
 @dataclass
@@ -41,7 +50,7 @@ class StateTiming:
     partial_iterations: int = 0
 
 
-def read_stats(lines: Iterable[str]) -> Dict[str, StateTiming]:
+def _read_legacy_stats(lines: Iterable[str]) -> Dict[str, StateTiming]:
     """Sum observed iteration wall time, grouped by the labels in the log.
 
     A finished marker's monotonic duration is authoritative; timestamp-only
@@ -97,7 +106,9 @@ def read_stats(lines: Iterable[str]) -> Dict[str, StateTiming]:
         # Only top-level runner messages count. A tool's numbered source dump,
         # quote or command containing these words must not split an iteration.
         if (message.startswith(("  · project root:", "Final state:",
-                                "=== run ended:", "  ⏸ "))
+                                "=== run ended:", "  ⏸ ",
+                                "  ⚠ the previous run left no exit record",
+                                "  · another "))
                 or message.startswith("  ⏳ ")):
             flush()
             continue
@@ -106,6 +117,81 @@ def read_stats(lines: Iterable[str]) -> Dict[str, StateTiming]:
             if _DONE.fullmatch(message):
                 ended = stamp
     flush()
+    return timings
+
+
+@dataclass
+class _ActiveIteration:
+    number: int
+    state: str
+    started: datetime
+    last: datetime
+
+
+def read_stats(lines: Iterable[str]) -> Dict[str, StateTiming]:
+    """Read tagged timing events per pid, with best-effort legacy fallback.
+
+    New mirror records distinguish machine timings from ordinary stdout, so
+    agent prose cannot end an iteration. Each process has its own cursor; a
+    killed process contributes observed time only, without charging downtime
+    before another launch. Old untagged logs cannot disambiguate concurrent
+    writers or exact copies of runner messages in agent output.
+    """
+    timings: Dict[str, StateTiming] = {}
+    active: Dict[str, _ActiveIteration] = {}
+
+    def flush(pid, seconds=None):
+        item = active.pop(pid, None)
+        if item is None:
+            return
+        row = timings.setdefault(item.state, StateTiming())
+        row.iterations += 1
+        row.total_seconds += (seconds if seconds is not None else
+                              max(0.0, (item.last - item.started).total_seconds()))
+        row.partial_iterations += int(seconds is None)
+
+    def legacy_lines():
+        for line in lines:
+            record = _RECORD.fullmatch(line.rstrip("\r\n"))
+            tagged = _TAGGED.fullmatch(record[2]) if record else None
+            if tagged is None:
+                yield line
+                continue
+            try:
+                stamp = datetime.strptime(record[1], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            pid, kind, message = tagged.groups()
+            if kind == "output":
+                if pid in active:
+                    active[pid].last = stamp
+                continue
+            try:
+                event = json.loads(message)
+            except ValueError:
+                event = None
+            if (isinstance(event, dict) and event.get("event") == "iteration_start"
+                    and isinstance(event.get("iteration"), int)
+                    and isinstance(event.get("state"), str)):
+                flush(pid)
+                active[pid] = _ActiveIteration(event["iteration"], event["state"],
+                                                stamp, stamp)
+                continue
+            finished = _FINISHED.fullmatch(message)
+            if (finished is not None and pid in active
+                    and int(finished[1]) == active[pid].number):
+                seconds = (float(finished[2]) if finished[2] is not None else
+                           max(0.0, (stamp - active[pid].started).total_seconds()))
+                flush(pid, seconds)
+
+    legacy = _read_legacy_stats(legacy_lines())
+    for pid in list(active):
+        flush(pid)
+    for state, row in legacy.items():
+        merged = timings.setdefault(state, StateTiming())
+        merged.iterations += row.iterations
+        merged.total_seconds += row.total_seconds
+        merged.partial_iterations += row.partial_iterations
     return timings
 
 

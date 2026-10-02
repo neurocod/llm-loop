@@ -808,6 +808,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                 f"[dim]{separator}[/]\n[bold cyan]{header}[/] "
                 f"[dim]\\[{state_label} · {model_label}][/]",
             )
+            if not dry_run:
+                console.record_timing(statlog.iteration_started(iteration, state_label))
 
             cmd = build_agent_argv(command, provider)
             if dry_run:
@@ -850,8 +852,10 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                         cmd, provider, raw, partial=False, prompt=command.prompt,
                         mailbox=mailbox)
             app.job(1).finish()
-            print(statlog.iteration_finished(
-                iteration, returncode, time.monotonic() - iteration_clock))
+            timing = statlog.iteration_finished(
+                iteration, returncode, time.monotonic() - iteration_clock)
+            console.record_timing(timing)
+            print(timing)
             app.update(phase="idle")
 
             if returncode == 0:

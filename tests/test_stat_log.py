@@ -15,6 +15,10 @@ def _line(clock, message):
     return f"2026-10-02 {clock} {message}\n"
 
 
+def _tagged_line(clock, pid, kind, message):
+    return _line(clock, f"pid={pid} kind={kind} {message}")
+
+
 def _header(iteration, state, model="claude/opus"):
     label = f"{state} · {model}" if model else state
     return f"{costlog.iteration_header(iteration)} [{label}]"
@@ -132,6 +136,116 @@ def test_a_new_header_closes_a_partial_iteration_without_charging_the_gap():
     _assert_timing(stats, "cleanup", 1, 0, partial=1)
 
 
+@pytest.mark.parametrize("warning", [
+    "  ⚠ the previous run left no exit record; its process may have stopped",
+    "  · another run is active; waiting for the script lock",
+])
+def test_legacy_orphan_warning_closes_before_the_relaunch_gap(warning):
+    stats = statlog.read_stats([
+        _line("00:00:00", _header(1, "implementation")),
+        _line("00:00:15", "  · last observed activity"),
+        _line("02:00:00", warning),
+        _line("03:00:00", "  · startup work before project root is printed"),
+        _line("04:00:00", "  · project root: C:\\project"),
+        _line("05:00:00", _header(1, "cleanup")),
+        _line("05:00:20", "  · done (20.0 c, $0.1000)"),
+    ])
+
+    _assert_timing(stats, "implementation", 1, 15, partial=1)
+    _assert_timing(stats, "cleanup", 1, 20)
+
+
+def test_tagged_concurrent_pids_keep_identical_iteration_numbers_independent():
+    stats = statlog.read_stats([
+        _tagged_line("00:00:00", 101, "timing",
+                     statlog.iteration_started(1, "implementation")),
+        _tagged_line("00:00:05", 202, "timing",
+                     statlog.iteration_started(1, "codex-review")),
+        _tagged_line("00:00:10", 101, "output", "editing"),
+        _tagged_line("00:00:25", 202, "timing",
+                     statlog.iteration_finished(1, 0)),
+        _tagged_line("00:00:40", 101, "timing",
+                     statlog.iteration_finished(1, 0)),
+    ])
+
+    assert set(stats) == {"implementation", "codex-review"}
+    _assert_timing(stats, "implementation", 1, 40)
+    _assert_timing(stats, "codex-review", 1, 20)
+
+
+@pytest.mark.parametrize("fake", [
+    _header(999, "spoof"),
+    statlog.iteration_started(999, "spoof"),
+    statlog.iteration_finished(1, 0, 999),
+    "Final state: done",
+    "  · done (999.0 c, $0.1000)",
+    "Claude Code exited with code 1 (error #1 in a row).",
+])
+def test_tagged_output_cannot_start_or_finish_an_iteration(fake):
+    stats = statlog.read_stats([
+        _tagged_line("00:00:00", 303, "output", fake),
+        _tagged_line("00:00:05", 101, "timing",
+                     statlog.iteration_started(1, "codex-review")),
+        _tagged_line("00:00:15", 101, "output", fake),
+        _tagged_line("00:00:35", 101, "timing",
+                     statlog.iteration_finished(1, 0)),
+    ])
+
+    assert set(stats) == {"codex-review"}
+    _assert_timing(stats, "codex-review", 1, 30)
+
+
+def test_tagged_killed_pid_is_bounded_by_its_own_last_activity():
+    stats = statlog.read_stats([
+        _tagged_line("00:00:00", 101, "timing",
+                     statlog.iteration_started(1, "implementation")),
+        _tagged_line("00:00:12", 101, "output", "editing a file"),
+        _tagged_line("03:00:00", 202, "output",
+                     "  ⚠ the previous run left no exit record"),
+        _tagged_line("04:00:00", 202, "output", "startup still running"),
+        _tagged_line("05:00:00", 202, "timing",
+                     statlog.iteration_started(1, "cleanup")),
+        _tagged_line("05:00:25", 202, "timing",
+                     statlog.iteration_finished(1, 0)),
+    ])
+
+    _assert_timing(stats, "implementation", 1, 12, partial=1)
+    _assert_timing(stats, "cleanup", 1, 25)
+
+
+def test_tagged_and_legacy_logs_merge_totals_for_the_same_state():
+    stats = statlog.read_stats([
+        _line("00:00:00", _header(1, "implementation")),
+        _tagged_line("00:00:05", 101, "timing",
+                     statlog.iteration_started(1, "implementation")),
+        _line("00:00:20", statlog.iteration_finished(1, 0)),
+        _tagged_line("00:00:35", 101, "timing",
+                     statlog.iteration_finished(1, 0, 30)),
+        _line("00:01:00", _header(2, "cleanup")),
+        _line("00:01:10", "  · done"),
+    ])
+
+    assert set(stats) == {"implementation", "cleanup"}
+    _assert_timing(stats, "implementation", 2, 50)
+    _assert_timing(stats, "cleanup", 1, 10)
+
+
+@pytest.mark.parametrize("state", [
+    "custom ] · delimiter | [claude/opus]",
+    'custom "quoted" \\ path\nsecond line',
+])
+def test_tagged_start_json_preserves_arbitrary_state_labels(state):
+    stats = statlog.read_stats([
+        _tagged_line("00:00:00", 101, "timing",
+                     statlog.iteration_started(1, state)),
+        _tagged_line("00:00:20", 101, "timing",
+                     statlog.iteration_finished(1, 0)),
+    ])
+
+    assert set(stats) == {state}
+    _assert_timing(stats, state, 1, 20)
+
+
 @pytest.mark.parametrize("fake", [
     '  > === Iteration 999 === [spoof · codex/gpt-6]',
     '42: === Iteration 999 === [spoof · codex/gpt-6]',
@@ -238,6 +352,17 @@ def test_real_runner_mirror_log_roundtrips_elapsed_and_state(
         sleep=cyclecore.time.sleep))
 
     def agent(*args, **kwargs):
+        streamrender._render_claude_event({
+            "type": "assistant", "message": {"content": [{
+                "type": "text", "text": "\n".join([
+                    "These diagnostics are quoted from a previous run:",
+                    "Final state: done",
+                    statlog.iteration_finished(1, 0, 999),
+                    _header(999, "spoof"),
+                    statlog.iteration_started(999, "spoof"),
+                ]),
+            }]},
+        }, False)
         streamrender._render_claude_event(
             {"type": "result", "subtype": "success", "duration_ms": 1000}, True)
         return 0
@@ -257,7 +382,11 @@ def test_real_runner_mirror_log_roundtrips_elapsed_and_state(
         contents = log.read_text(encoding="utf-8")
         stats = statlog.read_stats(contents.splitlines())
 
-    assert statlog.iteration_finished(1, 0, 12.345) in contents
+    assert ("kind=timing " + statlog.iteration_started(1, "the-thing")) in contents
+    assert ("kind=timing " + statlog.iteration_finished(1, 0, 12.345)) in contents
+    assert "kind=output Final state: done" in contents
+    assert ("kind=output " + statlog.iteration_finished(1, 0, 999)) in contents
+    assert ("kind=output " + _header(999, "spoof")) in contents
     assert set(stats) == {"the-thing"}
     assert stats["the-thing"].iterations == 1
     assert stats["the-thing"].partial_iterations == 0

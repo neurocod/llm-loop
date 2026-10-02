@@ -136,6 +136,20 @@ class _MirrorLogHandler(RotatingFileHandler):
         the tee — see the class docstring for why that cannot be allowed."""
 
 
+class _MirrorLogFormatter(logging.Formatter):
+    def format(self, record):
+        # Timing records are written directly, never inferred from agent output.
+        # The pid separates concurrent runs that share the app/project log.
+        record.loop_record = getattr(record, "loop_record", "output")
+        return super().format(record)
+
+
+def record_timing(message: str) -> None:
+    """Write a machine timing record without passing through the output tee."""
+    if _FILE_LOGGER is not None:
+        _FILE_LOGGER.info(message, extra={"loop_record": "timing"})
+
+
 def setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
     """Configure the rotating file logger at log_file_path(app_name).
 
@@ -179,7 +193,9 @@ def setup_file_logging(app_name: str = "runCycle") -> logging.Logger:
             backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
         )
         handler.setFormatter(
-            logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+            _MirrorLogFormatter(
+                "%(asctime)s pid=%(process)d kind=%(loop_record)s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S")
         )
         logger.addHandler(handler)
     global _FILE_LOGGER
