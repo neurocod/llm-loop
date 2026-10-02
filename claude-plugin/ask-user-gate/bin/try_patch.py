@@ -110,7 +110,11 @@ SELFTEST_DIE_CODE = 86
 # nothing about the pin. Not 1: 1 is "the pin pins nothing", a verdict about the
 # TEST that sends the caller to rewrite it; this one is about the RUN and sends
 # them to fix the command. Not the gate's own code passed through either: a
-# rejected 2 would then read as this script's "bad edit". Free among 2/3/4/127.
+# rejected 2 would then read as this script's "bad edit". The other exits this
+# script ends with: 0, 1 (pin pins nothing), 2 (bad command line or edit), 3
+# (command rewrote the file), 4 (journal refused), 127 (command not found),
+# SELFTEST_DIE_CODE (selftest only); without --expect-fail, the command's own
+# code, 130 if interrupted.
 EXIT_GATE_REFUSED = 6
 
 
@@ -273,6 +277,16 @@ def main() -> int:
     parser.set_defaults(_order={})
     options = parser.parse_args()
 
+    # Without --expect-fail the command's code is passed through untouched, so
+    # the flag would do nothing -- refused rather than silently ignored. A 0 is
+    # a pass, which --expect-fail already refuses. Checked before --recover,
+    # which would otherwise act on a command line it calls wrong.
+    if options.reject_exit and not options.expect_fail:
+        parser.error("--reject-exit needs --expect-fail")
+    if 0 in options.reject_exit:
+        parser.error("--reject-exit 0 makes no sense: a passing command "
+                     "already fails --expect-fail")
+
     if options.recover:
         folder = journal_dir(Path.cwd() / "_")
         return 0 if preflight(folder, set()) else 4
@@ -282,14 +296,6 @@ def main() -> int:
         command = command[1:]
     if not command:
         parser.error("no command given; put it after a bare --")
-    # Without --expect-fail the command's code is passed through untouched, so
-    # the flag would do nothing -- refused rather than silently ignored. A 0 is
-    # a pass, which --expect-fail already refuses.
-    if options.reject_exit and not options.expect_fail:
-        parser.error("--reject-exit needs --expect-fail")
-    if 0 in options.reject_exit:
-        parser.error("--reject-exit 0 makes no sense: a passing command "
-                     "already fails --expect-fail")
 
     try:
         edits = collect_edits(options)
@@ -769,15 +775,14 @@ def _case_reject_exit_leaves_other_failures_counted(work: Path) -> None:
     _expect_refused_unrun_plain(work, victim,
                                 ["--reject-exit", "5", *_flip("guardA")],
                                 "--reject-exit needs --expect-fail")
-    _expect_refused_unrun_plain(work, victim,
-                                ["--expect-fail", "--reject-exit", "0",
-                                 *_flip("guardA")],
-                                "--reject-exit 0")
+    _expect_refused_unrun(work, victim, ["--reject-exit", "0", *_flip("guardA")],
+                          "--reject-exit 0")
 
 
 def _expect_refused_unrun_plain(work: Path, victim: Path, args: "list[str]",
                                 names: str) -> None:
-    """`args` refused by argparse (exit 2) before anything is written or run."""
+    """`args` refused by argparse (exit 2) before anything is written or run --
+    without the --expect-fail that _expect_refused_unrun adds."""
     result = _run(work, *args, *CMD_FAIL)
     shown = f"{args}: exit {result.returncode}\n{result.stdout}{result.stderr}"
     _expect(result.returncode == 2, f"not refused -- {shown}")
@@ -975,6 +980,22 @@ def _case_recover_flag_undoes_a_killed_run(work: Path) -> None:
     _expect_no_journal(work)
 
 
+def _case_recover_refuses_a_misplaced_reject_exit(work: Path) -> None:
+    """`--recover --reject-exit 5` is a wrong command line: refused before the
+    journal is touched, as it would be without --recover."""
+    victim = _victim(work)
+    _kill_mid_run(work, *_flip("guardA"))
+    mutated = victim.read_bytes()
+    result = _run(work, "--recover", "--reject-exit", "5")
+    shown = f"exit {result.returncode}\n{result.stdout}{result.stderr}"
+    _expect(result.returncode == 2, f"not refused -- {shown}")
+    _expect("--reject-exit needs --expect-fail" in result.stderr,
+            f"the refusal does not name the flag -- {shown}")
+    _expect_bytes(victim, mutated, result)
+    _expect(any((work / JOURNAL_DIR_NAME).glob("*.jsonl")),
+            "the journal was consumed by a refused command line")
+
+
 def _case_live_run_blocks_a_second_run_of_the_same_file(work: Path) -> None:
     """Also pins the lock: a live entry must not be taken for a dead one."""
     victim = _victim(work)
@@ -1131,6 +1152,7 @@ SELFTEST_CASES = (
     _case_killed_run_is_undone_by_the_next,
     _case_killed_run_edited_since_is_refused,
     _case_recover_flag_undoes_a_killed_run,
+    _case_recover_refuses_a_misplaced_reject_exit,
     _case_live_run_blocks_a_second_run_of_the_same_file,
     _case_a_claim_blocks_before_any_mutation,
     _case_a_stuck_file_does_not_block_other_files,
