@@ -64,7 +64,7 @@ from typing import Callable, Optional
 # `__init__`, which imports it unconditionally, so it is already in
 # `sys.modules` before this line is reached. The cycle the local import really
 # was for is gone too — it does not import this module any more.
-from . import (clispec, console, costlog, exitlog, operator,
+from . import (clispec, console, costlog, ctrlc, exitlog, operator,
                projectroot, providers, runlifecycle, statlog, statusline, stopchannel,
                termio, textwidth)
 # The vocabulary of WORK — what a unit of it is, how it becomes an argv, and the
@@ -213,23 +213,18 @@ def _count_down_to(target_ts: float, should_stop=None) -> bool:
 
     The body every timed wait shares; they differ only in the lines they print
     around it, which is why this holds none of them. Returns True when it left
-    early because `should_stop()` asked it to. Ctrl+C is said here and raised
-    on to `run_loop`'s boundary (`runlifecycle.RunBoundary`), which closes the
-    run down and exits 130.
+    early because `should_stop()` or the run's Ctrl+C (`ctrlc.asked`) asked it
+    to; the caller tells the two apart.
     """
-    try:
-        while True:
-            now = time.time()
-            remaining = target_ts - now
-            if remaining <= 0:
-                return False
-            print(f"    … {fmt_left(remaining)} left (now {fmt_clock(now)})",
-                  flush=True)
-            if stopchannel.sleep_unless(min(remaining, 60), should_stop):
-                return True
-    except KeyboardInterrupt:
-        print("\nWait interrupted by user (Ctrl+C).")
-        raise
+    while True:
+        now = time.time()
+        remaining = target_ts - now
+        if remaining <= 0:
+            return False
+        print(f"    … {fmt_left(remaining)} left (now {fmt_clock(now)})",
+              flush=True)
+        if stopchannel.sleep_unless(min(remaining, 60), should_stop):
+            return True
 
 
 def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
@@ -238,9 +233,9 @@ def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
     Used after a probable token-limit error, or once the LimitPolicy decides the
     account's real usage figures leave no room: we idle until the 5-hour session
     window should have refreshed. `reason` overrides the default opening line.
-    Ctrl+C interrupts the wait and is raised on as KeyboardInterrupt — no
-    longer `SystemExit(130)`: inside a runner its boundary closes the run down
-    and exits 130, and a caller outside one handles the interrupt itself.
+    Inside a run Ctrl+C ends the wait and True is returned, the caller asking
+    the run's Interrupt (`ctrlc`) next; outside one it is Python's
+    KeyboardInterrupt.
 
     `should_stop` is the run's stop channels (see `stopchannel.sleep_unless`):
     a hold that can last hours must end the moment a human asks it to, and
@@ -252,7 +247,10 @@ def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
                   f"{fmt_clock(target_ts)} (until the 5-hour session window refreshes)…")
     print(f"  ⏳ {reason}")
     if _count_down_to(target_ts, should_stop):
-        print("  ⏹ Stop requested — leaving the wait.")
+        if ctrlc.current().requested:
+            print("\nWait interrupted by user (Ctrl+C).")
+        else:
+            print("  ⏹ Stop requested — leaving the wait.")
         return True
     print("  ▶ The session window should have refreshed — continuing the loop.")
     return False
@@ -323,6 +321,8 @@ def _interactive_start_wait(seconds: float, *, enabled: bool) -> bool:
                 terminal.paint(rows)
             if remaining <= 0:
                 return True
+            if ctrlc.current().requested:
+                raise KeyboardInterrupt     # the runner's Ctrl+C: see the caller
             try:
                 # Keypresses must not shift ticks away from second boundaries.
                 until_tick = 1.0 - ((time.monotonic() - started) % 1.0)
@@ -353,7 +353,9 @@ def wait_before_start(spec: str, *, interactive: bool = True) -> None:
     Lets you launch the script and walk away; work kicks off after the delay.
     Before the loop's status line exists, this wait owns its own keys: q exits,
     +/- adjusts the deadline by a minute, and Space starts immediately. Ctrl+C
-    exits with code 130. Without a terminal, wait silently after the opening line.
+    exits with `ctrlc.EXIT_CODE` — a press on the runner's Interrupt or, outside
+    a runner, a KeyboardInterrupt. Without a terminal, wait silently after the
+    opening line.
 
     The parser has already refused a malformed `spec` (`clispec.duration`); the
     refusal here covers a namespace a host builds past it.
@@ -369,15 +371,17 @@ def wait_before_start(spec: str, *, interactive: bool = True) -> None:
     print(f"  ⏳ --start-in {spec}: waiting until {fmt_clock(target_ts)} before starting…",
           flush=True)
     try:
-        if not _interactive_start_wait(seconds, enabled=interactive):
-            time.sleep(max(0, target_ts - time.time()))
+        if (not _interactive_start_wait(seconds, enabled=interactive)
+                and stopchannel.sleep_unless(max(0, target_ts - time.time()))):
+            raise KeyboardInterrupt         # the runner's Ctrl+C
     except KeyboardInterrupt:
         print("\nWait interrupted by user (Ctrl+C).")
-        sys.exit(130)
+        sys.exit(ctrlc.EXIT_CODE)
     print("  ▶ Starting the loop.")
 
 
 @stopchannel.stop_file_lifecycle()
+@ctrlc.captured()
 def run_loop(driver: Driver, args: argparse.Namespace,
              app_name: str = "runCycle", *, setup_logging: bool = True,
              wait_on_start: bool = True, progress=None) -> stopchannel.RunResult:
@@ -390,6 +394,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     `progress` is the whole invocation's InvocationProgress, for a wrapper that
     makes several runner calls in one process (see run_parallel); left None, this
     call is the invocation and owns its own figures.
+
+    Ctrl+C is the run's `ctrlc.Interrupt` for the whole call, not an exception:
+    every wait ends on it, a turn in flight is ended (`run_agent_streaming`),
+    and the loop leaves through `RunBoundary.interrupt` at its next look —
+    the loop head (every wait goes back there), or straight after a turn it
+    cut short.
     """
     pusher = OwnerThread("pusher", maxsize=1)
     push_abort = PushAbort()
@@ -535,14 +545,18 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
     pending_command = None
     refresh_pending_command = False
 
+    interrupt = ctrlc.current()
+
     def stop_pending() -> bool:
-        """Is a stop channel or state breakpoint asking for this run right now?
+        """Is Ctrl+C, a stop channel or a state breakpoint asking for this run
+        right now?
 
         Handed to every hold that can outlast an iteration (the usage gate, the
         post-refusal wait). It only reports — the loop head is the single place
         that decides what a request means, cancel grace included.
         """
-        return (stopchannel.pending_stop(app) is not None
+        return (interrupt.requested
+                or stopchannel.pending_stop(app) is not None
                 or (breakpoints is not None and breakpoints.reached() is not None))
 
     # The run's one epilogue boundary: usages open lazily inside the loop, and
@@ -561,6 +575,10 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
             # and the denominator (see `runlifecycle.knob_registry`).
             app.update(**progress.summary_fields(),
                        script_limits=ctx.registry.status_entries())
+            # Ctrl+C before every other request: it is the operator leaving,
+            # with no grace to count down and no state to consult.
+            if interrupt.requested:
+                boundary.interrupt()
             pending = stopchannel.pending_stop(app)
             if pending is stopchannel.StopSource.FILE and dry_run:
                 # The sentinel is removed only after the outer application has
@@ -578,6 +596,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                           "Left in place (a dry run never consumes it).")
                     stop_file_noted = True
             elif pending is not None and stopchannel.confirm_stop_request(app):
+                if interrupt.requested:     # pressed during the grace
+                    boundary.interrupt()
                 # Reason first, line second: `commit_stop` hands the line back
                 # instead of writing it (the order the parallel runner spends a
                 # lock on — see there). What this branch gets out of that order
@@ -683,18 +703,15 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
             except LoopStop as stop:
                 print(stop.message)
                 if stop.exit_code:
-                    # The reason FIRST, then the housekeeping: this ending is
-                    # already an abnormal one, and the record of why must not
-                    # depend on a push or a usage query surviving. Then the same
-                    # epilogue every other ending gets — an exit code is not a
-                    # licence to strand what the run committed or to swallow the
-                    # notes nobody delivered.
-                    exitlog.set_reason(
-                        f"the driver stopped the run (exit {stop.exit_code}): "
-                        f"{stop.message.splitlines()[0]}",
-                        iterations=iteration, completed=completed)
-                    boundary.exit(stop.exit_code,
-                                  ending="driver stopped the run")
+                    # The same epilogue every other ending gets — an exit code
+                    # is not a licence to strand what the run committed or to
+                    # swallow the notes nobody delivered. The door records the
+                    # reason before the housekeeping.
+                    boundary.exit(
+                        stop.exit_code, ending="driver stopped the run",
+                        reason=(f"the driver stopped the run (exit "
+                                f"{stop.exit_code}): "
+                                f"{stop.message.splitlines()[0]}"))
                 stop_reason = stopchannel.RunStopReason.DRIVER_STOP
                 break
             if command is None:
@@ -770,8 +787,11 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                     continue
 
             # A breakpoint may have been entered after selecting the command,
-            # including during a quota wait. Return to the boundary before launch.
-            if breakpoints is not None and breakpoints.reached() is not None:
+            # including during a quota wait — and Ctrl+C anywhere since the
+            # head, the opening usage snapshot included. Return to the boundary
+            # before launch.
+            if interrupt.requested or (breakpoints is not None
+                                       and breakpoints.reached() is not None):
                 continue
 
             # Notes typed while nothing was running (or while the transport was
@@ -867,6 +887,10 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                         cmd, provider, raw, partial=False, prompt=command.prompt,
                         mailbox=mailbox)
             app.job(1).finish()
+            # A turn Ctrl+C cut short is not an error to count or retry. One
+            # that got through before the press is credited; the head ends it.
+            if interrupt.requested and returncode != 0:
+                boundary.interrupt()
             timing = statlog.iteration_finished(
                 iteration, returncode, time.monotonic() - iteration_clock)
             console.record_timing(timing)
@@ -952,16 +976,13 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                                else "with the session under the allowed limit")
                 print(f"  ⚠ {consecutive_errors} errors in a row {quota_state} after "
                       f"{int(elapsed // 60)} min. Stopping.")
-                # The reason FIRST, then the housekeeping — see the driver-stop
-                # exit above for why that order. The epilogue matters most here:
-                # a run that gave up after five failures may have committed four
-                # good iterations, and the notes an operator typed at the console
-                # are the likeliest explanation of what went wrong.
-                exitlog.set_reason(
-                    f"{consecutive_errors} provider errors in a row "
-                    f"(last exit code {returncode})",
-                    iterations=iteration, completed=completed)
-                boundary.exit(returncode, ending="provider errors in a row")
+                # The epilogue matters most here: a run that gave up after five
+                # failures may have committed four good iterations, and the
+                # notes an operator typed at the console are the likeliest
+                # explanation of what went wrong.
+                boundary.exit(returncode, ending="provider errors in a row",
+                              reason=(f"{consecutive_errors} provider errors "
+                                      f"in a row (last exit code {returncode})"))
 
     with boundary:
         # This run's own closing line, if the driver has one (e.g. "Final

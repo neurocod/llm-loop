@@ -20,7 +20,8 @@ import time
 
 import pytest
 
-from llm_loop import console, gitpush, ownership, parallel, termio, usage
+from llm_loop import (console, ctrlc, gitpush, ownership, parallel, termio,
+                      usage)
 from llm_loop import statusline as sl
 from llm_loop.breakpoints import Breakpoints
 from llm_loop.limits import LimitPolicy, SessionLimit
@@ -789,7 +790,9 @@ def test_ctrl_c_over_a_stuck_console_still_stops_the_workers_and_reports(
     The Ctrl+C branch used to post its announcement BEFORE signalling anyone,
     and `run_parallel` closed the console with no timeout: with the queue full
     and the console stuck, Ctrl+C set nothing and the run never reached its
-    epilogue. Staged with a one-slot queue so "full" is one line away.
+    epilogue. Staged with a one-slot queue so "full" is one line away. The
+    run is on a thread of its own, so the press is the run's Interrupt (set
+    for a runner on any thread), not a signal.
     """
     owner = ownership.OwnerThread("console-lines", maxsize=1)
     monkeypatch.setattr(parallel, "_console", owner)
@@ -822,7 +825,7 @@ def test_ctrl_c_over_a_stuck_console_still_stops_the_workers_and_reports(
         while owner.backlog < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert owner.backlog == 2
-        raise KeyboardInterrupt
+        ctrlc.current().press()
 
     monkeypatch.setattr(parallel, "join_workers", interrupt)
     exit_codes = []

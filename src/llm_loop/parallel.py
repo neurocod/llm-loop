@@ -48,6 +48,7 @@ from . import clispec
 from . import compactline
 from . import console
 from . import costlog
+from . import ctrlc
 from . import exitlog
 from . import operator
 from . import ownership
@@ -159,70 +160,59 @@ def _close_console() -> None:
 
 
 class _Interrupt:
-    """The operator's Ctrl+C in one `run_parallel` — heard once, wherever it lands.
+    """What the fleet does about the run's Ctrl+C (`ctrlc.Interrupt`).
 
-    `set`/`is_set` are an Event's, because the pusher reads them from its own
-    thread (`push_turn`). `set` alone is a Ctrl+C that lands after the fleet —
-    the console's close, the closing report — where there is nothing left to
-    stop: it gives up its own wait and the run takes the interrupt's ending,
-    rather than the interrupt unwinding past the epilogue. `hear` is one inside
-    the status region.
+    `is_set` is the run's Interrupt, safe from any thread — the pusher reads it
+    from its own (`push_turn`). `hear` is the first press inside the status
+    region: the fleet stopped, announced, and waited for a bounded time.
+    `stop_workers` is the part of that every ending past the region needs, an
+    exception's included.
     """
 
-    def __init__(self, shared: "Shared", threads: "WorkerPool"):
+    def __init__(self, shared: "Shared", threads: "WorkerPool",
+                 interrupt: ctrlc.Interrupt):
         self._shared = shared
         self._threads = threads
-        self._requested = threading.Event()
+        self._interrupt = interrupt
         # The Ctrl+C line when the console's queue had no room for it (see
         # `hear`); the run prints it after its console has closed.
         self.announce_later: Optional[str] = None
-        # The two steps of `hear` a second Ctrl+C can cut short, each recorded
-        # once DONE, so the region's boundary finishes what a cut-short hearing
-        # left: `is_set` alone says only that one began.
-        self._announced = False
+        self._heard = False
         self._pool_closed = False
 
-    def set(self) -> None:
-        self._requested.set()
-
     def is_set(self) -> bool:
-        return self._requested.is_set()
+        return self._interrupt.requested
 
-    def hear(self, wait_for_workers: bool = True) -> None:
-        """What a Ctrl+C inside the status region does.
-
-        Every step is safe to repeat, and one that is done is not redone: a
-        second call completes a hearing a second Ctrl+C cut short.
-        """
+    def hear(self) -> None:
+        """What a Ctrl+C does to the fleet — once, however often it is asked."""
+        if self._heard:
+            return
+        self._heard = True
+        heard = self._interrupt.presses
         # Signal first, talk second: nothing about the console — a stalled
         # one included — may stand between Ctrl+C and the workers hearing it.
-        # And the stop before the pool: a second Ctrl+C in the pool's close
-        # must not leave the workers claiming, and a worker that a `+` holding
-        # the pool's lock starts anyway leaves on it (`WorkerPool.close`).
-        # Before `set` too, so a run that reads `is_set` finds the stop set.
-        self._shared.stop.set()
-        self.set()
         # Queued, not printed, so the line lands after what the workers had
         # already said — and never waited for: a queue that is full is a
         # console that is not being written, and this line is then deferred
         # to the closing report rather than blocking the interrupt behind it.
-        # Never waiting, it goes before the close, which can wait.
-        if not self._announced:
-            self._announced = True
-            if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
-                self.announce_later = INTERRUPT_ANNOUNCEMENT
         self.stop_workers()
-        if not wait_for_workers:
-            return
-        # A second Ctrl+C gives up waiting for the workers; the run's ending
+        if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
+            self.announce_later = INTERRUPT_ANNOUNCEMENT
+        # A further Ctrl+C gives up waiting for the workers; the run's ending
         # is this one either way. A worker the region never got to start has
-        # nothing to wait for.
-        try:
-            for t in self._threads:
-                if t.ident is not None:
-                    t.join(timeout=INTERRUPT_JOIN_TIMEOUT_S)
-        except KeyboardInterrupt:
-            pass
+        # nothing to wait for. Joined in slices: a thread join does not wake
+        # for a signal, and the press is an event polled here.
+        for t in self._threads:
+            if t.ident is None:
+                continue
+            deadline = time.monotonic() + INTERRUPT_JOIN_TIMEOUT_S
+            while t.is_alive() and not self._interrupt.since(heard):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                t.join(timeout=min(left, stopchannel.STOP_RECHECK_SECONDS))
+            if self._interrupt.since(heard):
+                return
 
     def stop_workers(self) -> None:
         """No further claim and no further worker — and no wait for either.
@@ -232,6 +222,8 @@ class _Interrupt:
         agents while the run closes down, and the process exits under them
         once it has. Neither announced nor joined, unlike `hear`: an
         exception says its own line, and nobody asked to wait for a turn.
+        The stop before the pool: a worker that a `+` holding the pool's lock
+        starts anyway leaves on it (`WorkerPool.close`).
         """
         self._shared.stop.set()
         if not self._pool_closed:
@@ -317,22 +309,25 @@ def emit_note(lines: compactline.LineWriter, note: str) -> None:
 
 
 def join_workers(threads) -> None:
-    """Wait for every worker to finish — the one place Ctrl+C lands.
+    """Wait for every worker to finish, or for the operator's Ctrl+C.
 
     A function of its own for one reason, and it is a real one: this is where a
-    run spends all of its time, so it is where `KeyboardInterrupt` is delivered,
-    and the interrupt's own ending (record the reason, push, snapshot, report the
-    undelivered notes, exit 130) cannot be pinned unless a test can stage the
-    interrupt HERE. Staging it by patching `threading.Thread.join` instead would
-    also hit the bounded re-join inside the handler, i.e. it would break the
-    code under test on its way in.
+    run spends all of its time, so it is where Ctrl+C is heard — the run's
+    `ctrlc.Interrupt`, asked every STOP_RECHECK_SECONDS, since a thread join
+    does not wake for a signal — and the interrupt's own ending (record the
+    reason, push, snapshot, report the undelivered notes, exit 130) cannot be
+    pinned unless a test can stage the press HERE. Staging it by patching
+    `threading.Thread.join` instead would also hit the bounded re-join in
+    `_Interrupt.hear`, i.e. it would break the code under test on its way in.
     """
+    interrupt = ctrlc.current()
     join_all = getattr(threads, "join_all", None)
     if join_all is not None:
-        join_all()
+        join_all(stop=lambda: interrupt.requested)
         return
     for t in threads:
-        t.join()
+        while t.is_alive() and not interrupt.requested:
+            t.join(timeout=stopchannel.STOP_RECHECK_SECONDS)
 
 
 class WorkerPool:
@@ -456,16 +451,23 @@ class WorkerPool:
         """
         self._accepting = False
 
-    def join_all(self) -> None:
+    def join_all(self, stop: Optional[Callable[[], bool]] = None) -> None:
+        """Wait for every worker, added ones included; with `stop`, also
+        return — leaving the pool open — as soon as `stop()` says so, asked
+        every STOP_RECHECK_SECONDS."""
         index = 0
         while True:
+            if stop is not None and stop():
+                return
             with self._lock:
                 if index >= len(self._threads):
                     self._accepting = False
                     return
                 thread = self._threads[index]
+            thread.join(None if stop is None
+                        else stopchannel.STOP_RECHECK_SECONDS)
+            if not thread.is_alive():
                 index += 1
-            thread.join()
 
 
 class ResizeWorkerPoolAction(statusline.Action):
@@ -1353,6 +1355,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
 
 
 @stopchannel.stop_file_lifecycle()
+@ctrlc.captured()
 def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
                  app_name: str = "parallel", *, setup_logging: bool = True,
                  wait_on_start: bool = True, progress=None) -> RunResult:
@@ -1366,6 +1369,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     wrapper that calls this once per batch: `args` are then BATCH arguments, so
     args.max is a slice size and this call cannot know the run's real work — the
     wrapper passes what it knows. Left None, this call is the invocation.
+
+    Ctrl+C is the run's `ctrlc.Interrupt` for the whole call, not an exception:
+    the join hears it (`join_workers`), the fleet is stopped (`_Interrupt.hear`)
+    and the run leaves through `RunBoundary.interrupt` once the region and the
+    console have closed.
     """
     # `runlifecycle.begin_run` is the prologue both runners share, under this
     # runner's own app name so its log does not fight the sequential one's.
@@ -1375,6 +1383,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     progress = ctx.progress
     run_settings = ctx.settings
     dry_run = ctx.dry_run
+    interrupt = ctrlc.current()
 
     # Worker count precedence: explicit -j/--jobs on the CLI, then the driver's
     # `jobs` attribute (a subclass may pin it), then the engine default. The
@@ -1516,8 +1525,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         #
         # Its life is the run's, not the fleet's: it keeps its cadence while the
         # workers wind down after a latched stop, and there is no wait for it
-        # between the workers' end and `close_run` for a Ctrl+C to land in outside
-        # the interrupt's boundary.
+        # between the workers' end and `close_run`.
         #
         # The first push is one interval in, not up front: the owner asks `idle`
         # right after the window's first post (see `pusher.start` below), and that
@@ -1583,8 +1591,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             [make_worker(j) for j in range(1, jobs + 1)],
             make_worker, prepare_worker, remove_worker, finish_removal)
         app.register_action(ResizeWorkerPoolAction(threads))
-        # Heard by the Ctrl+C branches below and read after the status region has
-        # been released. The interrupt does NOT exit from inside the `with app:`: the
+        # Heard after the join and read after the status region has been
+        # released. The interrupt does NOT exit from inside the `with app:`: the
         # closing report and the exit push would then be written over a pinned status
         # area, and the run would leave without either.
         #
@@ -1593,7 +1601,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # the area on every iteration and pushes there on every pass, so a few more
         # lines are what that area is already carrying. Here the workers' output is
         # the area, and this is the one moment it stops being written to.
-        interrupted = _Interrupt(shared, threads)
+        interrupted = _Interrupt(shared, threads, interrupt)
 
         # The region lives exactly as long as the workers do (run_loop releases it
         # the same way, before its final push): a batching wrapper alternates runs of
@@ -1611,60 +1619,46 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         with route_through(_console, post_timeout=CONSOLE_CLOSE_TIMEOUT_S):
             _console.start()
             try:
-                # The whole region is inside the interrupt's boundary, not only
-                # the join: `with app:` waits too — its start for the first
-                # frame, its `stop` for the services, the key reader and the
-                # last frame — and a Ctrl+C in one of those waits would
-                # otherwise unwind past the epilogue (no exit push, no
-                # snapshot, no notes). Heard once: a Ctrl+C in the teardown after one in
-                # the join is the same ending — it completes that hearing if
-                # a second Ctrl+C cut it short, and waits for no worker again.
-                try:
-                    with app:
-                        if source is not None:
-                            # Inside `with`, not before it: push_quotas is
-                            # silent until start() has marked the app
-                            # enabled. The reading is already paid for by the
-                            # start-of-run snapshot above, so this costs no
-                            # round-trip. The refresher only runs for a run
-                            # that talks to the usage endpoint at all — with
-                            # --ignore-usage `source` is None and nothing
-                            # polls.
-                            statusline.push_quotas(app, source, policy)
-                            app.add_service(statusline.QuotaRefresher(
-                                app, source, policy, provider=provider))
+                with app:
+                    if source is not None:
+                        # Inside `with`, not before it: push_quotas is
+                        # silent until start() has marked the app
+                        # enabled. The reading is already paid for by the
+                        # start-of-run snapshot above, so this costs no
+                        # round-trip. The refresher only runs for a run
+                        # that talks to the usage endpoint at all — with
+                        # --ignore-usage `source` is None and nothing
+                        # polls.
+                        statusline.push_quotas(app, source, policy)
+                        app.add_service(statusline.QuotaRefresher(
+                            app, source, policy, provider=provider))
+                    # A press before the fleet starts (the preparation, the
+                    # opening snapshot, the region's own start) starts none
+                    # of it.
+                    if not interrupt.requested:
                         threads.start_initial()
-                        # Started for EVERY run, including one launched with
-                        # `--git-push none`: the policy is a knob, so "there
-                        # is nothing to push on" is a fact about this instant,
-                        # not about the run. `maybe_git_push` is a no-op for
-                        # NONE, so the cost of a pump nobody has switched on
-                        # is one thread asleep between turns. The no-op
-                        # `first` is what makes `idle` due at all (an owner
-                        # never runs it before its window's first post).
-                        pusher.start(first=lambda: None)
-
-                        try:
-                            join_workers(threads)
-                        except KeyboardInterrupt:
-                            interrupted.hear()
-
-                        app.update(phase="idle")
-                except KeyboardInterrupt:
-                    try:
-                        interrupted.hear(
-                            wait_for_workers=not interrupted.is_set())
-                    except KeyboardInterrupt:
-                        pass    # the stop is set first; the ending is this one
+                    # Started for EVERY run, including one launched with
+                    # `--git-push none`: the policy is a knob, so "there
+                    # is nothing to push on" is a fact about this instant,
+                    # not about the run. `maybe_git_push` is a no-op for
+                    # NONE, so the cost of a pump nobody has switched on
+                    # is one thread asleep between turns. The no-op
+                    # `first` is what makes `idle` due at all (an owner
+                    # never runs it before its window's first post).
+                    pusher.start(first=lambda: None)
+                    join_workers(threads)
+                    # Still inside the region, so the announcement and the
+                    # wait for the workers' turns show under the pinned rows.
+                    if interrupt.requested:
+                        interrupted.hear()
+                    app.update(phase="idle")
             finally:
-                # A Ctrl+C while a stuck console is waited for gives up that
-                # wait (CONSOLE_CLOSE_TIMEOUT_S) and ends the run as an
-                # interrupt; an exception already unwinding goes on unwinding.
-                try:
-                    _close_console()
-                except KeyboardInterrupt:
-                    interrupted.set()
+                _close_console()
 
+        # A press in the region's teardown, after the join had returned, stops
+        # the fleet too; `hear` does nothing a second time.
+        if interrupt.requested:
+            interrupted.hear()
         if interrupted.announce_later is not None:
             print(interrupted.announce_later)
 
@@ -1676,28 +1670,23 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # waiting means sitting out a `git push` before a report that does not
         # mention pushing, and the exit push, which the report does precede,
         # comes after that push either way.
-        remaining = None
-        try:
-            remaining = driver.pending_total()
-            print(f"\nProcessed {shared.done} file(s) this run; "
-                  f"{remaining} still pending in {list_file_rel}.")
-            if shared.failed:
-                print(f"  ⚠ {len(shared.failed)} file(s) parked after "
-                      f"{MAX_ATTEMPTS} failed attempts:")
-                for line in sorted(shared.failed):
-                    print(f"      {os.path.basename(line.strip())}")
-        except KeyboardInterrupt:
-            interrupted.set()
+        remaining = driver.pending_total()
+        print(f"\nProcessed {shared.done} file(s) this run; "
+              f"{remaining} still pending in {list_file_rel}.")
+        if shared.failed:
+            print(f"  ⚠ {len(shared.failed)} file(s) parked after "
+                  f"{MAX_ATTEMPTS} failed attempts:")
+            for line in sorted(shared.failed):
+                print(f"      {os.path.basename(line.strip())}")
 
-        if interrupted.is_set():
+        if interrupt.requested:
             # An interrupt is not a `RunStopReason` — nobody returns from here,
             # so there is no `RunResult` to carry one — but it IS an ending, and
             # it gets the same epilogue as any other. It used to get none at
             # all: no reason recorded, no exit push, no closing snapshot, no
             # report of the notes nobody delivered, so an operator who pressed
             # Ctrl+C left the run's commits sitting local and its mailbox
-            # unread. The reason goes down first, so the record does not depend
-            # on the push surviving a second Ctrl+C.
+            # unread.
             #
             # THE COST, NAMED because an operator feels it: this can take
             # minutes. `close_run` hands the exit push to the pusher, and an
@@ -1709,10 +1698,8 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             # the same result, it is racing a second `git` against the first
             # one. The operator who will not wait presses Ctrl+C again: that
             # abandons the exit push (`close_run` says how), keeps the rest of
-            # the epilogue, and still leaves with 130 — a second Ctrl+C in
-            # the reason's record included (`RunBoundary.exit`'s `reason`).
-            boundary.exit(130, ending="interrupted",
-                          reason=runlifecycle.INTERRUPTED_REASON)
+            # the epilogue, and still leaves with 130.
+            boundary.interrupt()
 
         # `stop_reason` unset means no worker ever reached a verdict about the run:
         # every one of the endings — the cap, the drained queue, a latched stop —
@@ -1744,9 +1731,6 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # pushing every minute for the rest of the process — beside the next
         # run's pusher, under a batching wrapper.
         if interrupted is not None:
-            try:
-                interrupted.stop_workers()
-            except KeyboardInterrupt:
-                pass    # the stop is set first; the ending is `error`'s
+            interrupted.stop_workers()
         boundary.unwind(error)
         raise

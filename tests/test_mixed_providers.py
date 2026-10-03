@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from llm_loop import (cyclecore, providers, runlifecycle, statusline,
+from llm_loop import (ctrlc, cyclecore, providers, runlifecycle, statusline,
                       stopchannel)
 from llm_loop.agentwork import AgentCommand, Driver, LoopStop
 from llm_loop.drivers import StateFileDriver
@@ -217,7 +217,9 @@ def test_a_mixed_run_interrupted_mid_turn_closes_every_account_it_opened(
     It used to leave two `at start` lines in the log and no `at end` at all.
     """
     def interrupted(*args, **kwargs):
-        raise KeyboardInterrupt
+        # What a turn Ctrl+C cut short answers (`run_agent_streaming`).
+        ctrlc.current().press()
+        return ctrlc.EXIT_CODE
 
     monkeypatch.setattr(cyclecore, "run_agent_streaming", lambda *a, **k: 0)
     monkeypatch.setattr(cyclecore, "run_claude_streaming", interrupted)

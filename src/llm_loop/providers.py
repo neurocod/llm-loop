@@ -307,8 +307,8 @@ def _console_isolation() -> dict:
     (DETACHED_PROCESS would leave it none, and it would open a window).
 
     What it costs: Ctrl+C here no longer reaches the child as a console event.
-    It never had to — the runner turns it into KeyboardInterrupt and ends the
-    whole tree through `reap_agent_process` (`taskkill /T`).
+    It never had to — the runner hears it (`ctrlc`) and ends the whole tree
+    through `ask_agent_process_to_end` / `reap_agent_process` (`taskkill /T`).
     """
     if os.name != "nt":
         return {}
@@ -589,14 +589,15 @@ def reap_agent_process(proc) -> None:
     `wait()` are guarded against `OSError` for that reason and not a theoretical
     one: on Windows both raise it on a handle the OS has already reclaimed.
 
-    KeyboardInterrupt is caught here too, and only here. The sequential runner
-    calls this from the MAIN thread — the one Ctrl+C lands on — inside the
-    handler for the first Ctrl+C, and the ending it performs can take a few
-    seconds (`REAP_GRACE_S` twice over, plus `taskkill`). A second press during
-    that window would otherwise escape the `finally`, replace the `SystemExit`
-    the first press earned with a traceback, and change the exit code from 130
-    to 1 — while the child it interrupted stays alive, which is precisely what
-    the impatient second press was asking to end. So it is absorbed: the run is
+    KeyboardInterrupt is caught here too, and only here. Inside a runner
+    Ctrl+C raises nothing (`ctrlc`); outside one — an embedder calling
+    `streamrender.run_agent_streaming` itself — this runs on the MAIN thread,
+    the one Ctrl+C lands on, inside the handler for the first Ctrl+C, and the
+    ending it performs can take a few seconds (`REAP_GRACE_S` twice over, plus
+    `taskkill`). A second press during that window would otherwise escape the
+    `finally` and replace the first press's interrupt with a traceback — while
+    the child it interrupted stays alive, which is precisely what the
+    impatient second press was asking to end. So it is absorbed: the caller is
     already leaving, and the press only asks it to leave faster.
     """
     try:

@@ -32,7 +32,7 @@ import time
 
 import pytest
 
-from llm_loop import (cyclecore, exitlog, limits, operator, parallel,
+from llm_loop import (ctrlc, cyclecore, exitlog, limits, operator, parallel,
                       runlifecycle, statusline, stopchannel, streamrender,
                       usage)
 from llm_loop.agentwork import ClaudeCommand, Driver, LoopStop
@@ -47,6 +47,16 @@ from _runfixtures import (MemListDriver, OneShotDriver, StubPolicy, StubSource,
 # identity, so a run that printed SOME note would not satisfy a pin about THIS
 # one.
 NOTE = "please look at the third file"
+
+
+def press_ctrl_c():
+    """One Ctrl+C, as the run's SIGINT handler counts it (`ctrlc.captured`).
+
+    Inside a run Ctrl+C raises nothing, so a pin stages it where it lands by
+    pressing the run's Interrupt from that spot, and lets the staged call go
+    on — the way the real handler returns into whatever the run was doing.
+    """
+    ctrlc.current().press()
 
 
 class _AlwaysWorkDriver(Driver):
@@ -226,7 +236,7 @@ def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(
     """Interrupting a fleet must not strand its commits or its mailbox.
 
     The interrupt is staged at `join_workers`, which is where a real Ctrl+C
-    arrives: that call is where a parallel run spends all of its time.
+    is heard: that call is where a parallel run spends all of its time.
     """
     def interrupt(threads):
         # The real join first, so the queue is drained and the workers are gone
@@ -236,7 +246,7 @@ def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(
         for t in threads:
             t.join()
         loaded_mailbox.submit(NOTE)
-        raise KeyboardInterrupt
+        press_ctrl_c()
 
     monkeypatch.setattr(parallel, "join_workers", interrupt)
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: StubSource())
@@ -258,28 +268,30 @@ def test_ctrl_c_in_the_parallel_runner_still_closes_the_run_down(
 @pytest.mark.parametrize("where", ["start", "stop", "join and stop"])
 def test_ctrl_c_in_the_status_region_s_own_waits_still_closes_the_run_down(
         tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox, where):
-    """The status region's start and teardown wait too, and Ctrl+C lands there.
+    """The status region's start and teardown wait too, and Ctrl+C comes there.
 
     `StatusApp.stop` waits for the services, the key reader and the painter's
     last frame; an interrupt in it unwound `run_parallel` past both of its
     epilogues — no exit push, no snapshot, no notes. `start` waits for the
-    first frame, before any worker exists. Either is the interrupt's one
-    ending: exit push once, snapshot, notes, 130 — and a Ctrl+C in the
-    teardown after one in the join is still that one ending, heard once.
+    first frame, before any worker exists, and a press there starts no worker.
+    Either is the interrupt's one ending: exit push once, snapshot, notes,
+    130 — and a Ctrl+C in the teardown after one in the join is still that
+    one ending, heard once.
     """
     method = "start" if where == "start" else "stop"
     real = getattr(parallel.statusline.StatusApp, method)
 
     def interrupted(app):
         real(app)
-        # Typed here, where no worker is left to splice it (see above).
+        # Typed here, where no worker is left to splice it (see above): after
+        # `stop` the fleet is gone, and a press in `start` starts none.
         loaded_mailbox.submit(NOTE)
-        raise KeyboardInterrupt
+        press_ctrl_c()
 
     def interrupt(threads):
         for t in threads:
             t.join()
-        raise KeyboardInterrupt
+        press_ctrl_c()
 
     monkeypatch.setattr(parallel.statusline.StatusApp, method, interrupted)
     if where == "join and stop":
@@ -311,24 +323,23 @@ def test_ctrl_c_in_the_status_region_s_own_waits_still_closes_the_run_down(
 HELD_S = 10.0
 
 
-@pytest.mark.parametrize("cut_closes", [1, 2],
-                         ids=["second-ctrl-c", "second-and-third-ctrl-c"])
-def test_a_ctrl_c_in_the_pool_s_close_still_stops_the_workers(
-        tmp_path, monkeypatch, capsys, exit_pushes, cut_closes):
-    """A hearing cut short in `threads.close` must not leave the workers claiming.
+@pytest.mark.parametrize("second", [False, True],
+                         ids=["ctrl-c", "second-ctrl-c-gives-up-the-join"])
+def test_a_ctrl_c_while_a_worker_works_stops_the_fleet(
+        tmp_path, monkeypatch, capsys, exit_pushes, second):
+    """Ctrl+C with a worker inside its turn: no further claim, one ending.
 
-    `close` used to wait for the pool's lock, which a worker holds across its
-    claim, and that wait was where a second Ctrl+C landed (it waits no more —
-    see the stuck-claim pin below — but a Ctrl+C can still land in any step
-    of it). The hearing used to mark the
-    interrupt heard before it stopped the workers, so the boundary outside
-    skipped it, and the run did its housekeeping and left while its workers
-    went on claiming the queue. Staged: the first Ctrl+C lands in the join
-    while a worker is inside its turn, the next `cut_closes` in the pool's
-    close; the worker is let go only once the run has left. With a third
-    Ctrl+C the boundary's own close is cut short too, and only a stop set
-    BEFORE the close keeps the workers from claiming.
+    A hearing that a second Ctrl+C cut short in the pool's close used to leave
+    the workers claiming the queue while the run did its housekeeping and
+    left. A press cuts nothing short now, but the scenario stays: the first
+    Ctrl+C is heard in the join while a worker is inside its turn, and the run
+    waits for that turn a bounded time (INTERRUPT_JOIN_TIMEOUT_S, shortened
+    here) — or, with a second Ctrl+C during that wait, not at all. The worker
+    is let go only once the run has left, and it must claim nothing after its
+    turn.
     """
+    monkeypatch.setattr(parallel, "INTERRUPT_JOIN_TIMEOUT_S",
+                        HELD_S if second else 0.2)
     working = threading.Event()
     release = threading.Event()
     turns = []
@@ -342,15 +353,17 @@ def test_a_ctrl_c_in_the_pool_s_close_still_stops_the_workers(
 
     def ctrl_c_once_a_worker_works(threads):
         working.wait(timeout=HELD_S)
-        raise KeyboardInterrupt
+        press_ctrl_c()
+        if second:
+            # Pressed again once the run has settled into waiting for the
+            # turn; nothing else ends that wait before HELD_S.
+            threading.Timer(0.3, press_ctrl_c).start()
 
     pools = []
     real_close = parallel.WorkerPool.close
 
-    def ctrl_c_in_the_first_closes(pool):
+    def recorded_close(pool):
         pools.append(pool)
-        if len(pools) <= cut_closes:
-            raise KeyboardInterrupt     # a further Ctrl+C, in the lock wait
         real_close(pool)
 
     housekeeping = []
@@ -362,29 +375,30 @@ def test_a_ctrl_c_in_the_pool_s_close_still_stops_the_workers(
 
     monkeypatch.setattr(parallel, "run_job", held_first_turn)
     monkeypatch.setattr(parallel, "join_workers", ctrl_c_once_a_worker_works)
-    monkeypatch.setattr(parallel.WorkerPool, "close", ctrl_c_in_the_first_closes)
+    monkeypatch.setattr(parallel.WorkerPool, "close", recorded_close)
     monkeypatch.setattr(runlifecycle, "close_run", counted_close_run)
     monkeypatch.setattr(runlifecycle, "usage_source_for",
                         lambda provider: StubSource())
     driver = MemListDriver([f"products/item{i}.md" for i in range(5)])
 
+    started = time.monotonic()
     try:
         with pytest.raises(SystemExit) as exit_info:
             parallel.run_parallel(driver, _par_args(str(tmp_path)),
                                   app_name="pytest-abnormal",
                                   wait_on_start=False)
     finally:
+        elapsed = time.monotonic() - started
         release.set()
     assert turns, "no worker ever started its turn — nothing staged"
     turns[0].join(timeout=HELD_S)
 
+    assert elapsed < HELD_S / 2, (
+        f"the run sat out the held turn: {elapsed:.1f} s")
     assert not turns[0].is_alive(), "the held worker never finished"
     assert len(turns) == 1, (
         f"the workers went on claiming after the run left: {len(turns)} turns")
-    if cut_closes == 1:
-        assert pools and pools[0].grow() is None, (
-            "the pool still takes workers — the cut-short close was never "
-            "completed")
+    assert pools and pools[0].grow() is None, "the pool still takes workers"
     assert housekeeping == ["interrupted"], (
         f"the interrupt's housekeeping did not run exactly once: {housekeeping}")
     assert exit_info.value.code == 130
@@ -399,15 +413,16 @@ def test_ctrl_c_during_a_normal_ending_s_exit_push_exits_130(
         tmp_path, monkeypatch, capsys, loaded_mailbox):
     """Ctrl+C in `end_run`'s exit push ends the run the way Ctrl+C does elsewhere.
 
-    `close_run` gives up the push, keeps the rest, and raises the interrupt on;
-    `end_run` used to let it out as a bare KeyboardInterrupt, the one door of
-    either runner that did not record the interrupt and exit 130.
+    `close_run` gives up the push and keeps the rest; `end_run` used to let
+    the interrupt out as a bare KeyboardInterrupt, the one door of either
+    runner that did not record the interrupt and exit 130. A RETURN would be
+    worse: it tells a wrapper to start its next phase.
     """
     pushes = []
 
     def ctrl_c_in_the_push(policy, project_dir, abort=None):
         pushes.append((policy, project_dir))
-        raise KeyboardInterrupt
+        press_ctrl_c()
 
     def succeeds(*args, **kwargs):
         loaded_mailbox.submit(NOTE)
@@ -473,11 +488,13 @@ def _count_close_runs(monkeypatch) -> list:
 
 
 class _InterruptedStream:
-    """A provider process whose stream is cut by Ctrl+C mid-turn.
+    """A provider process whose stream Ctrl+C cuts mid-turn.
 
     Handed to the REAL `streamrender.run_agent_streaming`, so the pin covers
     what that function does with the interrupt, not what a stub does. The note
-    is typed while the turn runs (see the five-errors pin for why then).
+    is typed while the turn runs (see the five-errors pin for why then). The
+    line after the press is one the turn must not render: a press is acted on
+    at the stream's next item.
     """
 
     stdin = None
@@ -488,10 +505,11 @@ class _InterruptedStream:
     @property
     def stdout(self):
         self._mailbox.submit(NOTE)
-        raise KeyboardInterrupt
-        yield  # pragma: no cover — makes this a generator, as a pipe iterates
+        press_ctrl_c()
+        yield "printed after the press\n"
+        yield "never reached\n"  # pragma: no cover
 
-    def wait(self):  # pragma: no cover — the stream never ends
+    def wait(self):  # pragma: no cover — an interrupted turn never waits
         return 0
 
 
@@ -517,9 +535,9 @@ class _HoldingPolicy(LimitPolicy):
 
 
 class _SecondCommandDriver(Driver):
-    """One command, then `on_second` — raised, or returned when not an
-    exception — from the second `next_command`; `on_summary` likewise from
-    `final_summary`."""
+    """One command, then `on_second` from the second `next_command` — raised
+    when an exception, called when callable (and None returned: no more
+    work); `on_summary` likewise raised from `final_summary`."""
 
     def __init__(self, on_second=None, on_summary=None, policy=None):
         self.limit_policy = policy or StubPolicy()
@@ -533,6 +551,8 @@ class _SecondCommandDriver(Driver):
             return ClaudeCommand("do the thing", "", "the-thing")
         if isinstance(self.on_second, BaseException):
             raise self.on_second
+        if callable(self.on_second):
+            self.on_second()
         return None
 
     def final_summary(self):
@@ -551,7 +571,8 @@ def test_ctrl_c_anywhere_in_a_sequential_run_still_closes_it_down(
     with a `sys.exit(130)` of their own, straight past `close_run`: no exit
     push, no `at end` line, no report of the notes. Each is staged at the real
     site, so a site that exits on its own again is read here as an "exit 130"
-    ending, not as the interrupt's.
+    ending, not as the interrupt's. The turn's CLI is ended by the press itself
+    (its `on_press` hook), not by whatever the run does next.
     """
     endings = _count_close_runs(monkeypatch)
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
@@ -561,10 +582,17 @@ def test_ctrl_c_anywhere_in_a_sequential_run_still_closes_it_down(
         loaded_mailbox.submit(NOTE)
         return 0
 
+    def ctrl_c(seconds, should_stop=None):
+        press_ctrl_c()
+        return True
+
+    asked_to_end = []
     driver = _SecondCommandDriver()
     if where == "turn":
         monkeypatch.setattr(streamrender, "start_agent_process",
                             lambda *a: _InterruptedStream(loaded_mailbox))
+        monkeypatch.setattr(streamrender, "ask_agent_process_to_end",
+                            asked_to_end.append)
         monkeypatch.setattr(streamrender, "reap_agent_process", lambda proc: None)
     elif where == "quota hold":
         # Before the first turn, so the note staged by the fixture is still
@@ -572,10 +600,6 @@ def test_ctrl_c_anywhere_in_a_sequential_run_still_closes_it_down(
         driver = _SecondCommandDriver(policy=_HoldingPolicy())
         monkeypatch.setattr(runlifecycle, "usage_source_for",
                             lambda p: _OverTheCeiling())
-
-        def ctrl_c(seconds, should_stop=None):
-            raise KeyboardInterrupt
-
         monkeypatch.setattr(limits, "sleep_unless", ctrl_c)
     elif where == "refusal wait":
         driver = _AlwaysWorkDriver()
@@ -583,13 +607,9 @@ def test_ctrl_c_anywhere_in_a_sequential_run_still_closes_it_down(
         monkeypatch.setattr(
             cyclecore, "last_rate_limit_event",
             lambda: RateLimitEvent("rejected", "five_hour", time.time() + 3600))
-
-        def ctrl_c(seconds, should_stop=None):
-            raise KeyboardInterrupt
-
         monkeypatch.setattr(stopchannel, "sleep_unless", ctrl_c)
     else:
-        driver = _SecondCommandDriver(on_second=KeyboardInterrupt())
+        driver = _SecondCommandDriver(on_second=press_ctrl_c)
         monkeypatch.setattr(cyclecore, "run_claude_streaming", succeeds)
 
     try:
@@ -602,10 +622,14 @@ def test_ctrl_c_anywhere_in_a_sequential_run_still_closes_it_down(
     assert exit_info.value.code == 130
     assert endings == ["interrupted"], (
         f"the run was not closed down exactly once, as interrupted: {endings}")
-    _assert_closed_down(
+    if where == "turn":
+        assert len(asked_to_end) == 1, "the press did not end the turn's CLI"
+    out = _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
         snapshot="at end (claude: interrupted)",
         reason=runlifecycle.INTERRUPTED_REASON)
+    assert "printed after the press" not in out, (
+        "the turn went on rendering the stream after Ctrl+C")
 
 
 @pytest.mark.parametrize("where", ["driver", "final summary"])
@@ -668,15 +692,14 @@ def test_ctrl_c_in_an_exiting_door_s_push_exits_130(
         tmp_path, monkeypatch, capsys, loaded_mailbox, door):
     """The two `sys.exit` doors end a Ctrl+C in their push the way Ctrl+C ends.
 
-    `close_run` gives up the push and raises the interrupt on; the doors used
-    to let it out bare — neither 130 nor the driver's code, and no record of
-    the interrupt.
+    `close_run` gives up the push; the doors used to let the interrupt out
+    bare — neither 130 nor the driver's code, and no record of the interrupt.
     """
     pushes = []
 
     def ctrl_c_in_the_push(policy, project_dir, abort=None):
         pushes.append((policy, project_dir))
-        raise KeyboardInterrupt
+        press_ctrl_c()
 
     def turn(*args, **kwargs):
         loaded_mailbox.submit(NOTE)
@@ -707,27 +730,34 @@ def test_ctrl_c_in_an_exiting_door_s_push_exits_130(
         reason=runlifecycle.INTERRUPTED_REASON)
 
 
-@pytest.mark.parametrize("staged", [KeyboardInterrupt, RuntimeError],
-                         ids=["ctrl-c", "exception"])
+@pytest.mark.parametrize("staged", ["press", KeyboardInterrupt, RuntimeError],
+                         ids=["ctrl-c", "raised-keyboard-interrupt",
+                              "exception"])
 def test_an_ending_in_the_parallel_preparation_still_closes_the_run_down(
         tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox, staged):
     """Between `open_usage` and the status region the fleet had no boundary.
 
     Staged where the worker pool is built: the usage is open, the mailboxes
-    exist, the pusher has not started.
+    exist, the pusher has not started. A press there starts no worker; a
+    KeyboardInterrupt raised there — what SIGINT still is for a runner off
+    the main thread (`ctrlc.captured`) — is the same ending.
     """
     endings = _count_close_runs(monkeypatch)
     monkeypatch.setattr(runlifecycle, "usage_source_for",
                         lambda provider: StubSource())
+    real_pool = parallel.WorkerPool
 
     def pool_fails(*args, **kwargs):
+        if staged == "press":
+            press_ctrl_c()
+            return real_pool(*args, **kwargs)
         raise staged("staged: the pool could not be built")
 
     monkeypatch.setattr(parallel, "WorkerPool", pool_fails)
     driver = MemListDriver(["products/only.md"])
     args = _par_args(str(tmp_path))
 
-    if staged is KeyboardInterrupt:
+    if staged != RuntimeError:
         try:
             with pytest.raises(SystemExit) as exit_info:
                 parallel.run_parallel(driver, args, app_name="pytest-abnormal",
@@ -979,7 +1009,8 @@ class _ClosingSource(StubSource):
 
 
 class _FailingOpenPolicy(StubPolicy):
-    """The opening snapshot raises `staged`; every other one is recorded."""
+    """The opening snapshot raises `staged` — or calls it, when it is not an
+    exception; every snapshot is recorded."""
 
     def __init__(self, staged):
         super().__init__()
@@ -988,7 +1019,9 @@ class _FailingOpenPolicy(StubPolicy):
     def log_snapshot(self, source, label="", cache_value=True):
         super().log_snapshot(source, label, cache_value)
         if label.startswith("at start"):
-            raise self.staged
+            if isinstance(self.staged, BaseException):
+                raise self.staged
+            self.staged()
 
 
 @pytest.mark.parametrize("staged", [RuntimeError, KeyboardInterrupt],
@@ -1000,14 +1033,17 @@ def test_an_ending_in_the_opening_snapshot_still_closes_the_usage(
     """A usage whose opening snapshot failed is still the run's to close.
 
     The snapshot is a usage query, and the source may have started what it
-    keeps running (Codex's quota server) before the query raised or was cut
-    by Ctrl+C. The sequential runner stored the pair only once `open_usage`
-    returned, so the ending closed nothing; the parallel runner opened it
-    outside its boundary, so the ending had no epilogue at all.
+    keeps running (Codex's quota server) before the query raised or Ctrl+C was
+    pressed in it. The sequential runner stored the pair only once
+    `open_usage` returned, so the ending closed nothing; the parallel runner
+    opened it outside its boundary, so the ending had no epilogue at all. A
+    press there must not let the sequential run launch its turn either.
     """
     endings = _count_close_runs(monkeypatch)
     source = _ClosingSource()
-    policy = _FailingOpenPolicy(staged("staged: the usage endpoint broke"))
+    policy = _FailingOpenPolicy(
+        press_ctrl_c if staged is KeyboardInterrupt
+        else staged("staged: the usage endpoint broke"))
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: source)
     monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
     if runner == "sequential":
@@ -1101,13 +1137,13 @@ def test_a_second_ctrl_c_while_the_reason_is_recorded_abandons_the_push(
         real_set_reason(reason, **fields)
         if reason == runlifecycle.INTERRUPTED_REASON and not cut:
             cut.append(reason)
-            raise KeyboardInterrupt
+            press_ctrl_c()
 
     monkeypatch.setattr(exitlog, "set_reason", ctrl_c_in_the_write)
     if runner == "sequential":
         monkeypatch.setattr(cyclecore, "run_claude_streaming",
                             _noting_turn(loaded_mailbox))
-        driver = _SecondCommandDriver(on_second=KeyboardInterrupt())
+        driver = _SecondCommandDriver(on_second=press_ctrl_c)
         run = _seq_run_raising(driver, str(tmp_path))
         snapshot = "at end (claude: interrupted)"
     else:
@@ -1115,7 +1151,7 @@ def test_a_second_ctrl_c_while_the_reason_is_recorded_abandons_the_push(
             for t in threads:
                 t.join()
             loaded_mailbox.submit(NOTE)     # no worker left to splice it
-            raise KeyboardInterrupt
+            press_ctrl_c()
 
         monkeypatch.setattr(parallel, "join_workers", interrupt)
         monkeypatch.setattr(parallel, "run_job",
@@ -1155,8 +1191,10 @@ def test_a_ctrl_c_while_a_normal_ending_s_reason_is_recorded_exits_130(
         tmp_path, monkeypatch, capsys, exit_pushes, loaded_mailbox):
     """The first Ctrl+C, landing in `end_run`'s record, still ends with 130.
 
-    `end_run` records its reason after the housekeeping, and swallowing a
-    Ctrl+C there let the run RETURN its result as if nobody had pressed it.
+    Swallowing a Ctrl+C there let the run RETURN its result as if nobody had
+    pressed it. The record now comes before the housekeeping, so the press is
+    one inside the ending: it gives up the exit push before it starts, and
+    the snapshot and the notes still happen.
     """
     real_set_reason = exitlog.set_reason
     cut = []
@@ -1165,7 +1203,7 @@ def test_a_ctrl_c_while_a_normal_ending_s_reason_is_recorded_exits_130(
         real_set_reason(reason, **fields)
         if reason != runlifecycle.INTERRUPTED_REASON and not cut:
             cut.append(reason)
-            raise KeyboardInterrupt
+            press_ctrl_c()
 
     monkeypatch.setattr(exitlog, "set_reason", ctrl_c_in_the_write)
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
@@ -1182,10 +1220,13 @@ def test_a_ctrl_c_while_a_normal_ending_s_reason_is_recorded_exits_130(
 
     assert cut, "the normal ending's reason was never recorded — nothing staged"
     assert exit_info.value.code == 130, "the Ctrl+C was lost"
-    _assert_closed_down(
-        exit_pushes, driver.limit_policy, capsys, str(tmp_path),
-        snapshot="at end (claude)",
-        reason=runlifecycle.INTERRUPTED_REASON)
+    assert exit_pushes == [], "the push the operator abandoned was started"
+    assert driver.limit_policy.snapshots[-1] == "at end (claude)"
+    out = capsys.readouterr().out
+    assert "the exit push is abandoned" in out
+    assert NOTE in out and "undelivered operator note" in out
+    exitlog.finish()
+    assert runlifecycle.INTERRUPTED_REASON in capsys.readouterr().out
 
 
 def test_a_ctrl_c_in_the_region_s_teardown_keeps_the_door_s_exit(
@@ -1194,13 +1235,14 @@ def test_a_ctrl_c_in_the_region_s_teardown_keeps_the_door_s_exit(
 
     `StatusApp.stop` raises the first exception it meets, so a Ctrl+C there
     replaced the driver's `SystemExit(3)` with a bare KeyboardInterrupt, and
-    the boundary — already closed by the door — let it go.
+    the boundary — already closed by the door — let it go. A press after the
+    door has done its housekeeping changes nothing: the door's exit stands.
     """
     real_stop = statusline.StatusApp.stop
 
     def ctrl_c_in_the_teardown(app):
         real_stop(app)
-        raise KeyboardInterrupt
+        press_ctrl_c()
 
     monkeypatch.setattr(statusline.StatusApp, "stop", ctrl_c_in_the_teardown)
     monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **k: 0)
@@ -1228,10 +1270,12 @@ def test_a_ctrl_c_in_an_exception_s_exit_push_keeps_the_exception(
     """
     endings = _count_close_runs(monkeypatch)
     pushes = []
+    stuck = threading.Event()
 
     def ctrl_c_in_the_push(policy, project_dir, abort=None):
         pushes.append((policy, project_dir))
-        raise KeyboardInterrupt
+        press_ctrl_c()
+        stuck.wait(timeout=STUCK_PUSH_S)   # given up by the press, not done
 
     monkeypatch.setattr(runlifecycle, "final_git_push", ctrl_c_in_the_push)
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
@@ -1247,6 +1291,8 @@ def test_a_ctrl_c_in_an_exception_s_exit_push_keeps_the_exception(
                                app_name="pytest-abnormal", wait_on_start=False)
     except (KeyboardInterrupt, SystemExit) as replaced:
         pytest.fail(f"the Ctrl+C replaced the exception: {replaced!r}")
+    finally:
+        stuck.set()
 
     assert raised.value is staged
     assert endings == ["unhandled RuntimeError"], f"not closed once: {endings}"

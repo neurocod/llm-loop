@@ -39,6 +39,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
+from . import ctrlc
 from .console import fmt_clock, fmt_left, print_line, print_percents
 from .stopchannel import sleep_unless
 from .usage import (CLAUDE_SESSION_DURATION, QUOTA_BY_FIELD, Usage,
@@ -293,10 +294,9 @@ class LimitPolicy:
         worker parked in it — so it must be abandonable: the caller re-reads its
         own stop state after this returns and decides what to do about it.
 
-        Ctrl+C in the hold is raised on as KeyboardInterrupt — no longer
-        `SystemExit(130)`: inside a runner its boundary
-        (`runlifecycle.RunBoundary`) closes the run down and exits 130, and a
-        caller outside one handles the interrupt itself.
+        Inside a run Ctrl+C ends the hold the way a stop does (`ctrlc.asked`),
+        and the caller asks the run's Interrupt; outside one it is Python's
+        KeyboardInterrupt.
         """
         usage = source.get_usage(cache_value)
         now = time.time()
@@ -332,62 +332,60 @@ class LimitPolicy:
         Returns (True, session_start): session_start bumped to now if the session
         window reset during the wait, else unchanged.
 
-        A pending stop (`should_stop`) ends the hold immediately. It is reported
-        as a pause like any other, because that is what it was — what to do next
-        is the caller's decision, and it reads its own stop channels for that.
+        A pending stop (`should_stop`) or Ctrl+C (`ctrlc.asked`) ends the hold
+        immediately. It is reported as a pause like any other, because that is
+        what it was — what to do next is the caller's decision, and it reads
+        its own stop channels and the run's Interrupt for that.
         """
         usage = source.get_usage()  # snapshot, frozen until a window refreshes
         labels = ", ".join(r.label for r, _, _ in
                            self._violations(self._status(usage, time.time())))
         print_line(f"  ⏳ Over usage limit on: {labels} — holding until it "
                    f"clears or the window resets…")
-        try:
-            while True:
-                if should_stop is not None and should_stop():
-                    print_line("  ⏹ Stop requested while over the usage limit — "
-                               "leaving the wait without resuming.")
-                    return True, session_start
-                now = time.time()
-                status = self._status(usage, now)
-                violated = self._violations(status)
-                if not violated:
-                    # About to resume; force a fresh reading on the next check.
-                    source.invalidate()
-                    print_line(f"  ▶ Back under all usage limits "
-                               f"(now {fmt_clock(now)}) — resuming.")
-                    return True, session_start
+        while True:
+            if ctrlc.current().requested:
+                print_line("\nWait interrupted by user (Ctrl+C).")
+                return True, session_start
+            if should_stop is not None and should_stop():
+                print_line("  ⏹ Stop requested while over the usage limit — "
+                           "leaving the wait without resuming.")
+                return True, session_start
+            now = time.time()
+            status = self._status(usage, now)
+            violated = self._violations(status)
+            if not violated:
+                # About to resume; force a fresh reading on the next check.
+                source.invalidate()
+                print_line(f"  ▶ Back under all usage limits "
+                           f"(now {fmt_clock(now)}) — resuming.")
+                return True, session_start
 
-                # When will the next window refresh? Watch the soonest reset among
-                # the violated rules; if none carry a reset time, fall back to a
-                # full session-window wait.
-                resets = [rd.reset_ts for _, rd, _ in violated
-                          if rd.reset_ts is not None]
-                next_reset = min(resets) if resets else now + CLAUDE_SESSION_DURATION
+            # When will the next window refresh? Watch the soonest reset among
+            # the violated rules; if none carry a reset time, fall back to a
+            # full session-window wait.
+            resets = [rd.reset_ts for _, rd, _ in violated
+                      if rd.reset_ts is not None]
+            next_reset = min(resets) if resets else now + CLAUDE_SESSION_DURATION
 
-                if now >= next_reset:
-                    # A window refreshed — the frozen percentages are stale.
-                    print_line(f"  ▶ A usage window reset (now "
-                               f"{fmt_clock(now)}) — re-checking with fresh "
-                               f"figures.")
-                    # If it was the session window, restart the session clock.
-                    session = usage.session
-                    if session.reset_ts is not None and now >= session.reset_ts:
-                        session_start = now
-                    source.invalidate()
-                    usage = source.get_usage()
-                    continue
+            if now >= next_reset:
+                # A window refreshed — the frozen percentages are stale.
+                print_line(f"  ▶ A usage window reset (now "
+                           f"{fmt_clock(now)}) — re-checking with fresh "
+                           f"figures.")
+                # If it was the session window, restart the session clock.
+                session = usage.session
+                if session.reset_ts is not None and now >= session.reset_ts:
+                    session_start = now
+                source.invalidate()
+                usage = source.get_usage()
+                continue
 
-                over = ", ".join(
-                    f"{r.label} {rd.percent:.0f}% ≥ {c:.0f}%"
-                    for r, rd, c in violated)
-                print_percents(f"    … {over}; {fmt_left(next_reset - now)} "
-                               f"to next reset (now {fmt_clock(now)})")
-                sleep_unless(min(next_reset - now, 60), should_stop)
-        except KeyboardInterrupt:
-            # Raised on: the runner's boundary (`runlifecycle.RunBoundary`)
-            # closes the run down and exits 130.
-            print_line("\nWait interrupted by user (Ctrl+C).")
-            raise
+            over = ", ".join(
+                f"{r.label} {rd.percent:.0f}% ≥ {c:.0f}%"
+                for r, rd, c in violated)
+            print_percents(f"    … {over}; {fmt_left(next_reset - now)} "
+                           f"to next reset (now {fmt_clock(now)})")
+            sleep_unless(min(next_reset - now, 60), should_stop)
 
     def log_snapshot(self, source, label: str = "",
                      cache_value: bool = True) -> None:

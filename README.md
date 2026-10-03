@@ -520,6 +520,22 @@ and removes it on the way out — a record still on disk whose owner is gone is
 the report, and the next run prints it, naming the pid, the moment it was last
 alive and the item it was working on. `llm_loop.exitlog` is the whole of it.
 
+## Ctrl+C
+
+Inside a runner (`run_loop`, `run_parallel`) Ctrl+C raises no
+`KeyboardInterrupt`. The first press ends the turn in flight, its CLI included,
+and every wait; the run then leaves with exit code 130 after the same exit
+push, closing usage snapshot and report of undelivered notes as any other
+ending. A further press gives up what that ending still waits for — the exit
+push, the workers' turns — and nothing else.
+
+For an embedder this changes three public calls while a run is open:
+`run_agent_streaming` returns `ctrlc.EXIT_CODE` (130) for a turn the press cut
+short, and `LimitPolicy.check_and_wait` and `stopchannel.sleep_unless` return
+early as they do for a stop request; ask `llm_loop.ctrlc.current().requested`
+which it was. Outside a run they raise `KeyboardInterrupt` as before.
+`llm_loop.ctrlc` is the whole of it.
+
 ## Interactive status line
 
 On a terminal, a run pins a few rows at the bottom — iteration, provider/model,

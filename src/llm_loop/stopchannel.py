@@ -32,7 +32,7 @@ from contextlib import contextmanager
 from enum import Enum
 from typing import NamedTuple, Optional, Tuple
 
-from . import projectroot
+from . import ctrlc, projectroot
 
 
 class RunStopReason(Enum):
@@ -426,16 +426,12 @@ def sleep_unless(seconds: float, should_stop=None,
     ignores its own brakes: with the fleet parked on the usage gate there is
     nobody left to notice `s` or the stop file, and the keypress reads as "the
     program hung" — which from outside is exactly what it looks like.
-    `should_stop` None keeps the plain sleep, for callers with no stop channel
-    to watch.
+    `should_stop` None watches only Ctrl+C (`ctrlc.asked`): inside a run SIGINT
+    raises nothing, and a `time.sleep` the signal wakes goes back to sleep.
     """
-    if should_stop is None:
-        if seconds > 0:
-            time.sleep(seconds)
-        return False
     deadline = time.time() + seconds
     while True:
-        if should_stop():
+        if ctrlc.asked(should_stop):
             return True
         remaining = deadline - time.time()
         if remaining <= 0:
@@ -464,6 +460,8 @@ def confirm_stop_request(app=None, grace: float = STOP_GRACE_SECONDS,
     app.update(phase="stopping")
     deadline = time.time() + grace
     while True:
+        if ctrlc.current().requested:
+            return True     # the run is leaving anyway; no grace to sit out
         if pending_stop(app) is None:       # pressed `s` again — undo everything
             app.update(phase="idle", stop_pending="")
             app.note("stop cancelled — continuing")
@@ -508,7 +506,7 @@ def wait_while_paused(app=None, should_stop=None,
         return 0.0
     started = time.time()
     while pause_requested(app):
-        if should_stop is not None and should_stop():
+        if ctrlc.asked(should_stop):
             break
         time.sleep(poll)
     return time.time() - started
@@ -525,7 +523,8 @@ def wait_for_stop_file_clear() -> None:
     obeying it would exit before doing any work at all. So it waits instead —
     for the loop that owns the request to clear it on its way out, or for the
     user to delete the file by hand — and then starts clean. Ctrl+C interrupts
-    the wait and stops the script.
+    the wait and stops the script: exit `ctrlc.EXIT_CODE`, inside a runner (a
+    press on its Interrupt) and outside one (KeyboardInterrupt) alike.
 
     Not called on a dry run: that mode never touches the sentinel and reports it
     instead.
@@ -538,7 +537,8 @@ def wait_for_stop_file_clear() -> None:
     waited = 0
     try:
         while os.path.exists(sentinel):
-            time.sleep(STOP_POLL_SECONDS)
+            if sleep_unless(STOP_POLL_SECONDS):
+                raise KeyboardInterrupt     # the run's Ctrl+C, said below
             waited += STOP_POLL_SECONDS
             if waited % 60 == 0:
                 # The wall clock, spelled with the stdlib rather than borrowed
@@ -548,5 +548,5 @@ def wait_for_stop_file_clear() -> None:
                       f"{time.strftime('%H:%M:%S')})", flush=True)
     except KeyboardInterrupt:
         print("\nWait interrupted by user (Ctrl+C).")
-        sys.exit(130)
+        sys.exit(ctrlc.EXIT_CODE)
     print("  ▶ Stop file removed — starting.")

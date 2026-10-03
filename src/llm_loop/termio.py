@@ -15,9 +15,10 @@ Two halves, and they are not the same question:
     codes on Windows) into one symbolic `Key`, so nothing above this module
     learns which platform it is on.
 
-The one thing it imports from the package is `console.real_stream`, and for
-the reason stated there: `sys.stdout` is the mirror-log tee, and cursor-movement
-bytes in the log corrupt the run record `--cost` parses.
+What it imports from the package is `console.real_stream`, for the reason
+stated there (`sys.stdout` is the mirror-log tee, and cursor-movement bytes in
+the log corrupt the run record `--cost` parses), and `ctrlc.deliver`, where a
+Ctrl+C read as a key goes.
 """
 
 import os
@@ -27,7 +28,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from . import console, diaglog
+from . import console, ctrlc, diaglog
 
 __all__ = [
     "CSI_KEYS",
@@ -461,8 +462,9 @@ class TerminalInput(InputSource):
     """Raw-ish key reader: msvcrt on Windows, termios+select on POSIX.
 
     cbreak, never raw: ISIG stays on so Ctrl+C keeps behaving exactly as it does
-    today. On Windows msvcrt hands '\\x03' over instead, so it is turned back
-    into a KeyboardInterrupt on the main thread.
+    today. On Windows msvcrt hands '\\x03' over instead, so it is handed to
+    `ctrlc.deliver`: a press on the open run, or a KeyboardInterrupt on the
+    main thread outside one.
     """
 
     poll_seconds = 0.05
@@ -541,9 +543,7 @@ class TerminalInput(InputSource):
 
     def _emit(self, handler, char: str) -> None:
         if char == "\x03":  # Ctrl+C on the Windows path: keep the usual meaning
-            import _thread
-
-            _thread.interrupt_main()
+            ctrlc.deliver()
             return
         diaglog.trace("key read", f"{char!r} discarding={self._discarding}")
         if self._discarding:

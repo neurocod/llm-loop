@@ -25,7 +25,7 @@ import time
 
 import pytest
 
-from llm_loop import (cyclecore, exitlog, gitpush, operator, ownership,
+from llm_loop import (ctrlc, cyclecore, exitlog, gitpush, operator, ownership,
                       parallel, projectroot, runlifecycle)
 from llm_loop.stopchannel import RunStopReason
 
@@ -763,9 +763,10 @@ def test_exit_interrupt_cancels_queued_periodic_push(tmp_path, monkeypatch):
     assert pusher.try_post(lambda: gitpush.maybe_git_push(
         policy, 0.0, projectroot.project_dir(), abort=abort))
 
-    def interrupted_wait(owner, final, deadline_s=None):
+    def interrupted_wait(owner, final, deadline_s=None, abandoned=None):
+        # What the wait answers once the operator's Ctrl+C has given it up.
         owner.close(timeout=0, final=final)
-        raise KeyboardInterrupt
+        return runlifecycle.PushWait.ABANDONED
 
     monkeypatch.setattr(runlifecycle, "_wait_for_exit_push", interrupted_wait)
     closed = []
@@ -783,9 +784,8 @@ def test_exit_interrupt_cancels_queued_periodic_push(tmp_path, monkeypatch):
         settings=runlifecycle.RunSettings(git_push=policy),
         registry=None, status_enabled=False)
     try:
-        with pytest.raises(KeyboardInterrupt):
-            runlifecycle.close_run(ctx, usages=[ClosingUsage()], pusher=pusher,
-                                   push_abort=abort)
+        runlifecycle.close_run(ctx, usages=[ClosingUsage()], pusher=pusher,
+                               push_abort=abort)
     finally:
         fake.release.set()
         pusher.close(timeout=HELD_PUSH_TIMEOUT_S)
@@ -804,14 +804,16 @@ def test_ctrl_c_while_the_exit_push_is_waited_for_gives_up_the_push_only(
     `close_run` there — no closing snapshot, no report of the notes nobody
     delivered — while the exit push went on as a daemon, free to start a
     `git push` nobody wanted any more. Pinned: the snapshot and the notes
-    still happen, the push starts no further git, and the interrupt is raised
-    again afterwards, so it still ends the run.
+    still happen, the push starts no further git, and nothing is raised —
+    inside a run Ctrl+C is the run's `ctrlc.Interrupt`, and what the press
+    does to the ending is the door's (`end_run`, `exit_run`).
 
-    The Ctrl+C is `_thread.interrupt_main`, which — measured 2026-09-29 on
-    3.13 and 3.14 alike — does not wake an unbounded lock wait, just as a real
-    Ctrl+C does not up to 3.13. So a close_run that waited on the pusher in
-    one unbounded wait hears it only after the push, on every version — and
-    here the push is held until the interrupt has been handled.
+    The Ctrl+C is `_thread.interrupt_main` under `ctrlc.captured`, i.e. the
+    run's real SIGINT handler. It — measured 2026-09-29 on 3.13 and 3.14
+    alike — does not wake an unbounded lock wait, just as a real Ctrl+C does
+    not up to 3.13. So a close_run that waited on the pusher in one unbounded
+    wait hears it only after the push, on every version — and here the push
+    is held until the interrupt has been handled.
     """
     fake = _HeldCountGit()
     monkeypatch.setattr(gitpush, "subprocess", fake)
@@ -836,26 +838,27 @@ def test_ctrl_c_while_the_exit_push_is_waited_for_gives_up_the_push_only(
 
     interrupter = threading.Thread(target=ctrl_c_once_the_exit_push_runs,
                                    daemon=True)
-    interrupter.start()
     raised = []
     try:
-        try:
-            runlifecycle.close_run(ctx, usages=[usage], ending="interrupted",
-                                   mailbox=mailbox, pusher=pusher)
-        except KeyboardInterrupt:
-            raised.append("from close_run")
-        # A close_run that did not wait returns before the Ctrl+C is sent; it
-        # lands here, not in the pytest machinery after the test.
-        interrupter.join(timeout=HELD_PUSH_TIMEOUT_S)
-        time.sleep(CTRL_C_SETTLE_S)
-    except KeyboardInterrupt:
-        raised.append("after close_run returned")
+        with ctrlc.captured() as interrupt:
+            interrupter.start()
+            try:
+                runlifecycle.close_run(ctx, usages=[usage],
+                                       ending="interrupted", mailbox=mailbox,
+                                       pusher=pusher)
+                returned_after = interrupt.presses
+                # A close_run that did not wait returns before the Ctrl+C is
+                # sent; it is then heard here, still inside the capture.
+                interrupter.join(timeout=HELD_PUSH_TIMEOUT_S)
+                time.sleep(CTRL_C_SETTLE_S)
+            except KeyboardInterrupt:
+                raised.append("a bare KeyboardInterrupt")
     finally:
         fake.release.set()
 
-    assert raised == ["from close_run"], (
-        "the Ctrl+C did not come back out of close_run once its housekeeping "
-        f"was done: {raised}")
+    assert raised == [], "Ctrl+C inside a run was raised, not pressed"
+    assert returned_after == 1, (
+        f"close_run returned before the Ctrl+C was heard: {returned_after}")
     assert pusher.close(timeout=HELD_PUSH_TIMEOUT_S), \
         "the abandoned exit push never finished"
     assert fake.pushes == [], (
@@ -1097,7 +1100,7 @@ def test_no_periodic_push_starts_once_the_operator_pressed_ctrl_c(
             t.join()
         at_interrupt.append(fake.pushed.wait(timeout=PUMP_WAIT_S))
         at_interrupt.append(len(fake.pushes))
-        raise KeyboardInterrupt
+        ctrlc.current().press()
 
     real_close_console = parallel._close_console
 

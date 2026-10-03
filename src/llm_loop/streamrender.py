@@ -28,7 +28,7 @@ import json
 import sys
 from typing import Optional
 
-from . import compactline, costlog, projectroot, statusline, wire
+from . import compactline, costlog, ctrlc, projectroot, statusline, wire
 from .console import (
     LINES,
     MarkdownStream,
@@ -38,6 +38,7 @@ from .console import (
     render_markdown_block,
 )
 from .providers import (
+    ask_agent_process_to_end,
     note_channel,
     provider_spec,
     reap_agent_process,
@@ -278,10 +279,13 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     that aims at the npm `.cmd` shim and leaves the CLI — a GRANDCHILD —
     running with the terminal's stdout in hand.
 
-    Ctrl+C is said here and raised on as KeyboardInterrupt — no longer
-    `SystemExit(130)` — to the runner's boundary (`runlifecycle.RunBoundary`),
-    which closes the run down and exits 130; a caller outside a runner
-    handles the interrupt itself.
+    Inside a run Ctrl+C is the run's `ctrlc.Interrupt`, not an exception: a
+    press ends the CLI (`ask_agent_process_to_end`, run as the press's hook,
+    so a press read by the key reader ends the stream at once), the turn is
+    said to be interrupted and `ctrlc.EXIT_CODE` is returned — whatever the
+    CLI had done, since the operator asked for the run, not the turn, to end.
+    The runner asks its Interrupt next and takes its interrupt ending. Outside
+    a run Ctrl+C is Python's KeyboardInterrupt, and the `finally` still reaps.
     """
     global _last_rate_limit_event, _turn_cost_base
     _last_rate_limit_event = None
@@ -296,9 +300,13 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
 
     provider_failed = False
     codex_outcome = wire.CodexOutcome()
+    interrupt = ctrlc.current()
     try:
-        with note_channel(proc, provider, mailbox) as channel:
+        with note_channel(proc, provider, mailbox) as channel, \
+                interrupt.on_press(lambda: ask_agent_process_to_end(proc)):
             for item in proc.stdout:
+                if interrupt.requested:
+                    break
                 if isinstance(item, dict):
                     # An app-server event arrives decoded
                     # (`providers._CodexEventStream`); `raw` re-encodes it.
@@ -341,6 +349,11 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                     _render_claude_event(ev, partial, mailbox)
                 else:
                     _render_codex_event(ev, mailbox)
+        if interrupt.requested:
+            # The press may have come before the turn did (a run checks at its
+            # boundaries, not in between): this turn is not the run's to start.
+            print("\nInterrupted by user (Ctrl+C).")
+            return ctrlc.EXIT_CODE
         # Outside the `with`, so the pipe is already closed: waiting on a
         # process whose stdin is still open is the hang this whole seam exists
         # to prevent.
@@ -352,6 +365,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
             return outcome_code
         return 1 if returncode == 0 and provider_failed else returncode
     except KeyboardInterrupt:
+        # Outside a run only: inside one SIGINT raises nothing (see above).
         print("\nInterrupted by user (Ctrl+C).")
         raise
     finally:
