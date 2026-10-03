@@ -1468,11 +1468,10 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     #
     # The run's one epilogue boundary, from that usage to `close_run` (see
     # `runlifecycle.RunBoundary`): every ending from here on closes the run
-    # down once — the two doors below, and through the `except` at the bottom
-    # whatever else unwinds it: the opening snapshot (the pair is registered
-    # before it is taken) and the preparation before the region included.
-    opened = []
-    shared = interrupted = None
+    # down once — the two doors below, and whatever else unwinds the `with`:
+    # the opening snapshot (the boundary holds the pair from before it is
+    # taken) and the preparation before the region included.
+    shared = None
     # The run's one hold on its git, shared by the pump's periodic checks and
     # the exit push (`close_run`): an exit push abandoned — by Ctrl+C or past
     # an exception's deadline — must cancel a periodic check still waiting
@@ -1482,16 +1481,14 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # `git push` after this run had left.
     push_abort = PushAbort()
     boundary = runlifecycle.RunBoundary(
-        ctx, usages=lambda: opened,
+        ctx,
         counts=lambda: ((shared.claimed, shared.done) if shared is not None
                         else (0, 0)),
         push_abort=push_abort)
-    try:
+    with boundary:
         usage = (None if args.ignore_usage
-                 else runlifecycle.open_usage(driver, provider,
-                                              name=f"parallel {provider}",
-                                              dry_run=dry_run,
-                                              register=opened.append))
+                 else boundary.open_usage(driver, provider,
+                                          name=f"parallel {provider}"))
         source, policy = runlifecycle.usage_halves(usage)
         usage_lock = threading.Lock()
         session_start_box = [time.time()]  # shared, refreshed when a window resets
@@ -1602,6 +1599,13 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # lines are what that area is already carrying. Here the workers' output is
         # the area, and this is the one moment it stops being written to.
         interrupted = _Interrupt(shared, threads, interrupt)
+        # Every ending stops the fleet before its housekeeping begins, an
+        # exception's included: workers left claiming went on starting agents
+        # through the exit push. The pump needs nothing of its own: `close_run`
+        # closes the pusher, and a closed owner starts no idle pass — so none
+        # is left pushing every minute beside the next run's pusher, under a
+        # batching wrapper.
+        boundary.on_ending(interrupted.stop_workers)
 
         # The region lives exactly as long as the workers do (run_loop releases it
         # the same way, before its final push): a batching wrapper alternates runs of
@@ -1718,19 +1722,3 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # in flight (see `pusher` above, and `close_run`).
         return boundary.end(
             RunResult(reason, shared.claimed, shared.done, remaining))
-    except BaseException as error:
-        # Whatever unwound the run past both doors: the opening snapshot, the
-        # preparation above, `_console.start()`, `route_through`'s entry or
-        # exit, an exception out of the region, the report. The fleet is
-        # stopped first (`stop_workers`): an exception out of the region used
-        # to leave the workers claiming the queue and starting agents through
-        # the exit push. The pump needs nothing of its own here: `close_run`'s
-        # close is what keeps it from starting a periodic push (an owner starts
-        # no idle pass once closed), and the moments before that close are the
-        # ones every ending has. `close_run` closes the pusher, so none is left
-        # pushing every minute for the rest of the process — beside the next
-        # run's pusher, under a batching wrapper.
-        if interrupted is not None:
-            interrupted.stop_workers()
-        boundary.unwind(error)
-        raise

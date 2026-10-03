@@ -482,18 +482,10 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
     usage_source, limit_policy = runlifecycle.usage_halves(usage)
     # Usage pairs and fallback session clocks belong to accounts, not the whole
     # mixed-provider run. Populate lazily: the launch default may never run.
+    # The pairs are opened through the run's boundary, which holds every one
+    # of them for the closing snapshots — all of them, not the selected one,
+    # so every ending answers every `at start (…)`.
     usage_states = {}
-
-    def opened_usages() -> list:
-        """Every account's usage this run opened, for the closing snapshots.
-
-        All of them, not the selected one, so every ending answers every
-        `at start (…)` (see `boundary` below). The selected `usage` is always
-        the object stored here — it is only ever assigned FROM
-        `usage_states` — so nothing has to be written back first; only the
-        session clock beside it moves, and closing ignores it.
-        """
-        return [opened for opened, _session_start in usage_states.values()]
 
     provider_refusals = {}
     quota_refresher = None
@@ -559,13 +551,13 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                 or stopchannel.pending_stop(app) is not None
                 or (breakpoints is not None and breakpoints.reached() is not None))
 
-    # The run's one epilogue boundary: usages open lazily inside the loop, and
-    # every ending from here on — the doors below, Ctrl+C wherever it lands,
+    # The run's one epilogue boundary: usages open lazily inside the loop,
+    # through it, and every ending from here on — the doors below, Ctrl+C,
     # an exception out of the driver — closes all of them, once. Outer to the
     # region, so the region is released before the housekeeping prints; the
     # doors inside the loop close down within it, as they always did.
     boundary = runlifecycle.RunBoundary(
-        ctx, usages=opened_usages, counts=lambda: (iteration, completed),
+        ctx, counts=lambda: (iteration, completed),
         mailbox=mailbox, pusher=pusher, push_abort=push_abort)
     with boundary, app:
         while True:
@@ -727,13 +719,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                 provider = selected_provider
                 spec = providers.provider_spec(provider)
                 if provider not in usage_states:
-                    def keep(opened, name=provider):
-                        # Before its opening snapshot, so an ending inside
-                        # that query still closes the pair (`open_usage`).
-                        usage_states[name] = (opened, time.time())
-
-                    runlifecycle.open_usage(driver, provider, dry_run=dry_run,
-                                            register=keep)
+                    usage_states[provider] = (
+                        boundary.open_usage(driver, provider), time.time())
                 usage, session_start = usage_states[provider]
                 usage_source, limit_policy = runlifecycle.usage_halves(usage)
                 ignore_usage_limits = (args.max is not None or usage_source is None

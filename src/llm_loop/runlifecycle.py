@@ -38,13 +38,14 @@ rather than to tidy it:
     `tests/test_git_push.py`.
 """
 
+import contextlib
 import os
 import sys
 import time
 import traceback
 from enum import Enum
-from typing import (Any, Callable, Iterable, NamedTuple, NoReturn, Optional,
-                    Tuple)
+from typing import (Any, Callable, Iterable, List, NamedTuple, NoReturn,
+                    Optional, Tuple)
 
 from . import (console, ctrlc, diaglog, exitlog, limits, operator,
                projectroot, statusline, stopchannel)
@@ -341,9 +342,10 @@ def open_usage(driver, provider: str, *, name: Optional[str] = None,
     and the status line read it) but no snapshot, because it is not a run.
 
     `register` is handed what this returns BEFORE the opening snapshot: the
-    snapshot is a usage query, which can raise or be cut by Ctrl+C after it
-    has started what the source keeps running (Codex's quota server), and a
-    runner's boundary (`RunBoundary`) can only close a pair it was told of.
+    snapshot is a usage query, which can raise after it has started what the
+    source keeps running (Codex's quota server), and a runner's boundary can
+    only close a pair it holds. The runners open through
+    `RunBoundary.open_usage`, which is that registration.
     """
     source = usage_source_for(provider)
     if source is None:
@@ -699,26 +701,39 @@ class RunBoundary:
     (`close_run`); an exception stays the ending, a door's ending turns into
     the interrupt's (`end_run`, `exit_run`).
 
-    What a run opens as it goes is read when the ending comes: `usages` and
-    `counts` (`(iterations, completed)` for the exit record) are callables, and
-    `mailbox`/`pusher` are attributes a runner sets once it has them.
+    What a run acquires as it goes, the boundary holds, and every ending
+    releases it exactly once — the way a destructor would:
+
+      * the usage pairs, opened through `open_usage` here, which holds each
+        one from BEFORE its opening snapshot (a query that can raise after
+        the source has started what it keeps running); closed by `close_run`;
+      * whatever must stop before the housekeeping begins — a fleet that
+        must not go on starting agents through the exit push — registered
+        with `on_ending` and released, last acquired first, as the ending
+        begins (`_begin_ending`).
+
+    `counts` (`(iterations, completed)` for the exit record) is read when the
+    ending comes, and `mailbox`/`pusher` are attributes a runner sets once it
+    has them.
 
     Used as a context manager (`with boundary, app:` — the region is released
     before the housekeeping prints) or by hand from an `except` (`unwind`).
     """
 
     def __init__(self, ctx: RunContext, *,
-                 usages: Callable[[], Iterable[Optional[RunUsage]]],
                  counts: Callable[[], Tuple[int, int]],
                  mailbox=None,
                  pusher: Optional[OwnerThread] = None,
                  push_abort: Optional[PushAbort] = None):
         self.ctx = ctx
-        self.usages = usages
         self.counts = counts
         self.mailbox = mailbox
         self.pusher = pusher
         self.push_abort = push_abort
+        # Every usage pair this run opened, each held from before its opening
+        # snapshot; None for an account without a usage endpoint.
+        self.usages: List[Optional[RunUsage]] = []
+        self._releases = contextlib.ExitStack()
         self.closed = False
 
     def __enter__(self) -> "RunBoundary":
@@ -729,13 +744,41 @@ class RunBoundary:
             self.unwind(error)
         return False
 
+    def open_usage(self, driver, provider: str, *,
+                   name: Optional[str] = None) -> Optional[RunUsage]:
+        """`open_usage` for this run, the pair held here from before its
+        opening snapshot, so every ending closes it."""
+        return open_usage(driver, provider, name=name,
+                          dry_run=self.ctx.dry_run,
+                          register=self.usages.append)
+
+    def on_ending(self, release: Callable[[], None]) -> None:
+        """Run `release` once as the run's ending begins, whichever ending it
+        is, before its housekeeping — after every release registered later."""
+        self._releases.callback(release)
+
+    def _begin_ending(self) -> None:
+        """Take the ending (`closed`) and release what `on_ending` holds.
+
+        A release that raises is reported on stderr and costs the releases
+        under it nothing (ExitStack runs them all), and never the ending: the
+        ending is already decided, and a failing release must not replace it.
+        """
+        self.closed = True
+        try:
+            self._releases.close()
+        except Exception:
+            print("  ⚠ releasing what the run held failed; it closes down "
+                  "anyway:", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
     def _close_kwargs(self) -> dict:
-        return dict(usages=self.usages(), mailbox=self.mailbox,
+        return dict(usages=list(self.usages), mailbox=self.mailbox,
                     pusher=self.pusher, push_abort=self.push_abort)
 
     def _door(self, code, *, ending: str, reason: str,
               push_deadline_s: Optional[float] = None) -> NoReturn:
-        self.closed = True
+        self._begin_ending()
         # Read before the record: a press during it is past this ending's own.
         heard = ctrlc.current().presses
         iterations, completed = self.counts()
@@ -750,7 +793,7 @@ class RunBoundary:
         last of them: a press since the one before is the run's ending."""
         if ctrlc.current().requested:
             self.interrupt()
-        self.closed = True
+        self._begin_ending()
         return end_run(self.ctx, result, **self._close_kwargs())
 
     def exit(self, code, *, ending: str, reason: str) -> NoReturn:
@@ -777,7 +820,7 @@ class RunBoundary:
             self._door(code, ending=f"exit {first_line}",
                        reason=exitlog.describe_exception(SystemExit, error),
                        push_deadline_s=UNWIND_PUSH_DEADLINE_S)
-        self.closed = True
+        self._begin_ending()
         try:
             close_run(self.ctx, ending=f"unhandled {type(error).__name__}",
                       push_deadline_s=UNWIND_PUSH_DEADLINE_S,

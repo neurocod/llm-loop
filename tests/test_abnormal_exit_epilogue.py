@@ -448,6 +448,45 @@ def test_ctrl_c_during_a_normal_ending_s_exit_push_exits_130(
         reason="interrupted by the operator (Ctrl+C)")
 
 
+@pytest.mark.parametrize("ending", ["exit", "exception"])
+def test_what_the_boundary_holds_is_released_once_last_first(capsys, ending):
+    """`RunBoundary.on_ending` is the run's destructor list.
+
+    Released as the ending begins — whichever ending — in reverse order of
+    registration, once however many doors the unwinding passes; a release
+    that raises costs the ones under it nothing and is reported, never put in
+    the ending's place.
+    """
+    ctx = runlifecycle.RunContext(
+        provider="claude", spec=None, dry_run=True, progress=None,
+        settings=runlifecycle.RunSettings(), registry=None,
+        status_enabled=False)
+    boundary = runlifecycle.RunBoundary(ctx, counts=lambda: (0, 0))
+    released = []
+
+    def broken():
+        released.append("broken")
+        raise RuntimeError("staged: a release broke")
+
+    boundary.on_ending(lambda: released.append("first"))
+    boundary.on_ending(broken)
+    boundary.on_ending(lambda: released.append("last"))
+    staged = ValueError("staged: the run broke")
+
+    with pytest.raises(SystemExit if ending == "exit" else ValueError) as left:
+        with boundary:
+            if ending == "exit":
+                boundary.exit(3, ending="staged", reason="staged exit")
+            raise staged
+
+    if ending == "exit":
+        assert left.value.code == 3, "a failing release replaced the exit"
+    else:
+        assert left.value is staged
+    assert released == ["last", "broken", "first"]
+    assert "staged: a release broke" in capsys.readouterr().err
+
+
 def test_the_two_doors_of_the_epilogue_run_the_same_housekeeping():
     """`end_run` must not grow a step `close_run` does not have.
 
