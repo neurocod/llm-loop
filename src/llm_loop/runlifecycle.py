@@ -379,7 +379,7 @@ def close_run(ctx: RunContext, *,
               mailbox=None,
               pusher: Optional[OwnerThread] = None,
               push_abort: Optional[PushAbort] = None,
-              push_deadline_s: Optional[float] = None,
+              budget: Optional["StopBudget"] = None,
               heard: Optional[int] = None) -> None:
     """The housekeeping half of the epilogue, for every ending a run can have.
 
@@ -412,17 +412,18 @@ def close_run(ctx: RunContext, *,
     on stderr, and the housekeeping below still runs.
 
     The wait for the push ends one of three ways (`_wait_for_exit_push`): the
-    push is done; `push_deadline_s` ran out, for an ending nobody may be there
-    to give the push up (see UNWIND_PUSH_DEADLINE_S); or the operator pressed
+    push is done; the ending's `budget` is spent (see StopBudget — None, an
+    ending with the operator present, has none); or the operator pressed
     Ctrl+C past the ending's own presses — `heard`, the run's
     `ctrlc.Interrupt.presses` as the ending began (None reads it here). Either
     of the last two abandons the push and says so: `push_abort` is set, so no
     further git starts, and a git call already running finishes on its own as
-    a daemon (see `gitpush.final_git_push`). A press heard before the push
-    began abandons it unstarted. What such a press does to the ENDING is the
-    door's question (`end_run`, `exit_run`), not this function's. The
-    sequential runner shares `push_abort` with its periodic checks so an
-    abandoned push also cancels checks queued behind the current one.
+    a daemon (see `gitpush.final_git_push`). Either of them already true when
+    the push would begin abandons it unstarted. What a press does to the
+    ENDING is the door's question (`end_run`, `exit_run`), not this
+    function's. The sequential runner shares `push_abort` with its periodic
+    checks so an abandoned push also cancels checks queued behind the current
+    one.
 
     `usages` is EVERY usage the run opened, not the one it ended on: a
     mixed-provider sequential run opens one per account it selects, and each is
@@ -459,10 +460,13 @@ def close_run(ctx: RunContext, *,
                   file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
+    def abandoned() -> bool:
+        return interrupt.since(mark)
+
     if ctx.dry_run:
         if pusher is not None:
             pusher.close()
-    elif interrupt.since(mark):
+    elif abandoned() or (budget is not None and budget.expired):
         # Closed so its own clock starts no further check; a git call it has
         # in flight finishes on its own as a daemon, and `abort` keeps
         # anything queued behind that from starting git. Bounded: an owner's
@@ -470,22 +474,16 @@ def close_run(ctx: RunContext, *,
         abort.set()
         if pusher is not None:
             pusher.close(timeout=EXIT_PUSH_POLL_S)
-        print(ABANDONED_PUSH)
+        _say_push_given_up(PushWait.ABANDONED if abandoned()
+                           else PushWait.DEADLINE, budget)
     else:
         if pusher is None or pusher.thread is None:
             pusher = OwnerThread("exit pusher").start()
-        outcome = _wait_for_exit_push(pusher, exit_push_on_pusher,
-                                      push_deadline_s,
-                                      abandoned=lambda: interrupt.since(mark))
+        outcome = _wait_for_exit_push(pusher, exit_push_on_pusher, budget,
+                                      abandoned=abandoned)
         if outcome is not PushWait.DONE:
             abort.set()
-        if outcome is PushWait.ABANDONED:
-            print(ABANDONED_PUSH)
-        elif outcome is PushWait.DEADLINE:
-            print(f"  ⚠ the exit push did not finish within "
-                  f"{push_deadline_s:g} s and is abandoned: no further git "
-                  f"starts, the one running finishes on its own — what is "
-                  f"still local stays local.", file=sys.stderr)
+            _say_push_given_up(outcome, budget)
 
     # End-of-run usage snapshots, one answering each `open_usage` that logged —
     # so each run records where every account it used finished. `ending` names
@@ -532,61 +530,101 @@ ABANDONED_PUSH = ("  ⚠ Ctrl+C: the exit push is abandoned — what is still lo
 EXIT_PUSH_POLL_S = 0.25
 
 
+class StopBudget:
+    """The time one ending may spend waiting, taken ONCE as the ending begins.
+
+    Every wait of the ending is given what is LEFT, never a bound of its own:
+    bounds set one per wait add up behind each other, and each of them was
+    found by a separate review (llm-loop 2255e6f, ce11713) — one budget is
+    one number to read and one place to change. Spent, no wait begins any
+    more: no further git starts, and the rest of the ending (the snapshots,
+    the notes) is done without waiting. `seconds` None is no budget: an
+    ending with the operator present, who gives a wait up with Ctrl+C.
+    """
+
+    def __init__(self, seconds: Optional[float]):
+        self.seconds = seconds
+        self._deadline = (None if seconds is None
+                          else time.monotonic() + seconds)
+
+    def left(self) -> Optional[float]:
+        """Seconds still to spend, 0.0 once spent, None without a budget."""
+        if self._deadline is None:
+            return None
+        return max(0.0, self._deadline - time.monotonic())
+
+    @property
+    def expired(self) -> bool:
+        left = self.left()
+        return left is not None and left <= 0
+
+
 class PushWait(Enum):
     """How the wait for an exit push ended (`_wait_for_exit_push`)."""
 
     DONE = "done"
-    DEADLINE = "deadline"       # `deadline_s` ran out first
+    DEADLINE = "deadline"       # the ending's StopBudget was spent first
     ABANDONED = "abandoned"     # the operator's Ctrl+C gave it up
 
 
+def _say_push_given_up(outcome: PushWait,
+                       budget: Optional[StopBudget]) -> None:
+    if outcome is PushWait.ABANDONED:
+        print(ABANDONED_PUSH)
+        return
+    print(f"  ⚠ the exit push did not finish within {budget.seconds:g} s "
+          f"and is abandoned: no further git starts, the one running "
+          f"finishes on its own — what is still local stays local.",
+          file=sys.stderr)
+
+
 def _wait_for_exit_push(pusher: OwnerThread, push,
-                        deadline_s: Optional[float] = None,
+                        budget: Optional[StopBudget] = None,
                         abandoned: Callable[[], bool] = lambda: False
                         ) -> PushWait:
     """Hand `push` to `pusher` as its `final` and wait until the owner has ended.
 
     Queued behind a push the owner has in flight, and waited for in short
     slices (EXIT_PUSH_POLL_S) so `abandoned` — the operator's Ctrl+C — is asked
-    at least that often. A wait that outlasts its first slice under a deadline
-    says so, since nobody may be watching to know why the run has gone quiet.
+    at least that often, and never past what is left of `budget`. A wait that
+    outlasts its first slice under a budget says so, since nobody may be
+    watching to know why the run has gone quiet.
     """
     if pusher.close(timeout=0, final=push):
         return PushWait.DONE
-    deadline = None if deadline_s is None else time.monotonic() + deadline_s
     announced = False
     while True:
         if abandoned():
             return PushWait.ABANDONED
         slice_s = EXIT_PUSH_POLL_S
-        if deadline is not None:
-            left = deadline - time.monotonic()
+        left = None if budget is None else budget.left()
+        if left is not None:
             if left <= 0:
                 return PushWait.DEADLINE
             slice_s = min(slice_s, left)
         if pusher.close(timeout=slice_s):
             return PushWait.DONE
-        if deadline is not None and not announced:
+        if left is not None and not announced:
             announced = True
-            print(f"  · waiting at most {deadline_s:g} s for the exit push "
-                  f"before the run goes on leaving…")
+            print(f"  · waiting at most {round(left, 1):g} s for the exit "
+                  f"push before the run goes on leaving…")
 
 
-# How long an ending no runner wrote — an exception or an exit unwinding the
-# run past its doors (`RunBoundary.unwind`) — waits for its exit push before it
-# goes on leaving. Bounded because nobody may be there to press Ctrl+C: a batch
-# run unwinding an exception otherwise sat out a push in flight and the whole
-# `final_git_push` behind it (a 300 s subprocess timeout per `git push`, and on
-# Windows a git descendant holding the pipe outlives even that — see
-# `gitpush._reap_killed`) before its traceback, in silence. A push that gets
-# through needs seconds: a `git push --dry-run` round trip took 2.5 s (the host
-# repository) and 1.1 s (llm-loop), measured 2026-10-03, and a real push
-# carries objects on top. A minute keeps a normal exit push and a periodic one
-# in flight ahead of it; past it the push is taken to be stuck. What is lost is
-# that push only: no further git starts (`PushAbort`), the one running finishes
-# on its own as a daemon, and the snapshots and the notes still follow. The
-# runners' own doors and Ctrl+C are not bounded: there an operator is present
-# to abandon the push.
+# The StopBudget of an ending no runner wrote — an exception or an exit
+# unwinding the run past its doors (`RunBoundary.unwind`); in practice what it
+# bounds is the exit push, the one wait such an ending has. Bounded because
+# nobody may be there to press Ctrl+C: a batch run unwinding an exception
+# otherwise sat out a push in flight and the whole `final_git_push` behind it
+# (a 300 s subprocess timeout per `git push`, and on Windows a git descendant
+# holding the pipe outlives even that — see `gitpush._reap_killed`) before its
+# traceback, in silence. A push that gets through needs seconds: a `git push
+# --dry-run` round trip took 2.5 s (the host repository) and 1.1 s (llm-loop),
+# measured 2026-10-03, and a real push carries objects on top. A minute keeps a
+# normal exit push and a periodic one in flight ahead of it; past it the push
+# is taken to be stuck. What is lost is that push only: no further git starts
+# (`PushAbort`), the one running finishes on its own as a daemon, and the
+# snapshots and the notes still follow. The runners' own doors have no budget:
+# there an operator is present to give the push up with Ctrl+C.
 UNWIND_PUSH_DEADLINE_S = 60.0
 
 
@@ -618,10 +656,13 @@ def end_run(ctx: RunContext, result: RunResult, *,
     housekeeping, as every door's is: the record must not depend on a push or
     a usage query surviving.
 
-    A Ctrl+C pressed while the run closes down gives up its waits (`close_run`)
-    and does not let the run RETURN: a returned result tells the caller to go
-    on — a wrapper to start its next phase — which is the opposite of what the
-    operator asked. It ends as the interrupt instead (`_exit_interrupted`).
+    The ending is chosen before the housekeeping and the housekeeping does not
+    rewrite it (`exit_run`), with ONE exception here: a Ctrl+C pressed while
+    the run closes down gives up its waits (`close_run`) and does not let the
+    run RETURN. A returned result tells the caller to go on — a wrapper to
+    start its next phase — which is the opposite of what the operator asked;
+    an exiting ending needs no such exception, the process is leaving anyway.
+    It ends as the interrupt instead (`_exit_interrupted`).
     """
     reason = result.reason
     counts = dict(iterations=result.attempted, completed=result.completed)
@@ -639,37 +680,30 @@ def end_run(ctx: RunContext, result: RunResult, *,
 def exit_run(ctx: RunContext, code, *,
              usages: Iterable[Optional[RunUsage]],
              ending: str,
-             iterations: int,
-             completed: int,
              mailbox=None,
              pusher: Optional[OwnerThread] = None,
              push_abort: Optional[PushAbort] = None,
-             push_deadline_s: Optional[float] = None,
+             budget: Optional[StopBudget] = None,
              heard: Optional[int] = None) -> NoReturn:
     """`close_run`, then `sys.exit(code)`: the door of every ending that exits.
 
-    The caller records its reason BEFORE calling this, so the record does not
-    depend on the push or a usage query surviving. A Ctrl+C pressed past the
-    ending's own presses (`heard`, see `close_run`) gives up the exit push and
-    ends the run as an interrupt instead, exactly as it does through
-    `end_run`: INTERRUPTED_REASON recorded over the caller's reason (with
-    `iterations`/`completed`), exit `ctrlc.EXIT_CODE`. Any exception out of
-    the housekeeping is reported on stderr and the run still leaves with
-    `code`: the ending is already decided and recorded, and a failing step of
-    closing it down must not turn exit 3 into a traceback and exit 1.
+    The ending — the caller's reason, recorded BEFORE this is called, and
+    `code` — is decided before the housekeeping, and nothing in the
+    housekeeping rewrites it. A Ctrl+C pressed past the ending's own presses
+    (`heard`, see `close_run`) gives up the exit push and nothing more: the
+    driver's exit 3 stays exit 3 and keeps the reason that explains it. Any
+    exception out of the housekeeping is reported on stderr and the run still
+    leaves with `code`: a failing step of closing it down must not turn exit
+    3 into a traceback and exit 1.
     """
-    interrupt = ctrlc.current()
-    mark = interrupt.presses if heard is None else heard
     try:
         close_run(ctx, usages=usages, ending=ending, mailbox=mailbox,
-                  pusher=pusher, push_abort=push_abort,
-                  push_deadline_s=push_deadline_s, heard=mark)
+                  pusher=pusher, push_abort=push_abort, budget=budget,
+                  heard=heard)
     except Exception:
         print(f"  ⚠ closing the run down failed; it still exits with its own "
               f"code ({code}):", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
-    if interrupt.since(mark):
-        _exit_interrupted(iterations, completed)
     sys.exit(code)
 
 
@@ -696,10 +730,12 @@ class RunBoundary:
         record. An exception the housekeeping raises itself is reported on
         stderr, never put in the original's place.
 
-    The last two wait for their exit push UNWIND_PUSH_DEADLINE_S at most. On
-    every ending a Ctrl+C pressed once it has begun gives up the exit push
-    (`close_run`); an exception stays the ending, a door's ending turns into
-    the interrupt's (`end_run`, `exit_run`).
+    The last two have a StopBudget of UNWIND_PUSH_DEADLINE_S, taken as
+    `unwind` begins; the doors have none, an operator being there to press
+    Ctrl+C. Every ending's code and reason are chosen before its housekeeping
+    and kept: a Ctrl+C pressed once it has begun gives up the exit push
+    (`close_run`) and nothing more — except that a RETURN turns into the
+    interrupt's exit (`end_run` says why).
 
     What a run acquires as it goes, the boundary holds, and every ending
     releases it exactly once — the way a destructor would:
@@ -777,15 +813,14 @@ class RunBoundary:
                     pusher=self.pusher, push_abort=self.push_abort)
 
     def _door(self, code, *, ending: str, reason: str,
-              push_deadline_s: Optional[float] = None) -> NoReturn:
+              budget: Optional[StopBudget] = None) -> NoReturn:
         self._begin_ending()
         # Read before the record: a press during it is past this ending's own.
         heard = ctrlc.current().presses
         iterations, completed = self.counts()
         exitlog.set_reason(reason, iterations=iterations, completed=completed)
-        exit_run(self.ctx, code, ending=ending, iterations=iterations,
-                 completed=completed, push_deadline_s=push_deadline_s,
-                 heard=heard, **self._close_kwargs())
+        exit_run(self.ctx, code, ending=ending, budget=budget, heard=heard,
+                 **self._close_kwargs())
 
     def end(self, result: RunResult) -> RunResult:
         """The normal ending: `end_run` — or `interrupt`, once Ctrl+C was
@@ -813,18 +848,19 @@ class RunBoundary:
             return
         if isinstance(error, KeyboardInterrupt):
             self.interrupt()
+        # Taken once, here: everything this ending waits for spends it.
+        budget = StopBudget(UNWIND_PUSH_DEADLINE_S)
         if isinstance(error, SystemExit):
             code = 0 if error.code is None else error.code
             # The first line only: `sys.exit("message")` may carry a paragraph.
             first_line = (str(code).splitlines() or [""])[0]
             self._door(code, ending=f"exit {first_line}",
                        reason=exitlog.describe_exception(SystemExit, error),
-                       push_deadline_s=UNWIND_PUSH_DEADLINE_S)
+                       budget=budget)
         self._begin_ending()
         try:
             close_run(self.ctx, ending=f"unhandled {type(error).__name__}",
-                      push_deadline_s=UNWIND_PUSH_DEADLINE_S,
-                      **self._close_kwargs())
+                      budget=budget, **self._close_kwargs())
         except Exception:
             print("  ⚠ closing the run down failed while an exception unwound "
                   "it:", file=sys.stderr)

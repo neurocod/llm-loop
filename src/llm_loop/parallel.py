@@ -101,12 +101,13 @@ FAILURE_TAIL_LINES = 5
 # makes (which repository to push) had no pin at all.
 PUSH_PUMP_INTERVAL_S = 60
 
-# How long an interrupted run waits for each worker to notice `shared.stop` and
-# come back before it closes the run down anyway. Bounded because the operator
-# has already asked to leave: a worker sitting in a provider turn cannot be made
-# to return, and its process is reaped by the worker's own `finally` either way.
-# The wait is per THREAD, so a fleet of ten can cost ten times this in the worst
-# case — which is the price of letting a worker that is nearly done finish.
+# How long an interrupted run waits for its workers to notice `shared.stop` and
+# come back before it closes the run down anyway — the whole fleet together,
+# one `runlifecycle.StopBudget`, not each thread in turn (a fleet of ten used
+# to cost ten times this). Bounded because the operator has already asked to
+# leave: a worker sitting in a provider turn cannot be made to return, and its
+# process is reaped by the worker's own `finally` either way. What it buys is a
+# worker that was nearly done getting to finish.
 INTERRUPT_JOIN_TIMEOUT_S = 5
 
 # Per-file retry budget: a path that fails this many times in a row is parked in
@@ -198,21 +199,20 @@ class _Interrupt:
         self.stop_workers()
         if not _console.try_post(print, INTERRUPT_ANNOUNCEMENT):
             self.announce_later = INTERRUPT_ANNOUNCEMENT
-        # A further Ctrl+C gives up waiting for the workers; the run's ending
-        # is this one either way. A worker the region never got to start has
-        # nothing to wait for. Joined in slices: a thread join does not wake
-        # for a signal, and the press is an event polled here.
+        # One budget for the whole fleet, and a further Ctrl+C gives up
+        # waiting at once; the run's ending is this one either way. A worker
+        # the region never got to start has nothing to wait for. Joined in
+        # slices: a thread join does not wake for a signal, and the press is
+        # an event polled here.
+        budget = runlifecycle.StopBudget(INTERRUPT_JOIN_TIMEOUT_S)
         for t in self._threads:
             if t.ident is None:
                 continue
-            deadline = time.monotonic() + INTERRUPT_JOIN_TIMEOUT_S
-            while t.is_alive() and not self._interrupt.since(heard):
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                t.join(timeout=min(left, stopchannel.STOP_RECHECK_SECONDS))
-            if self._interrupt.since(heard):
-                return
+            while t.is_alive():
+                if self._interrupt.since(heard) or budget.expired:
+                    return
+                t.join(timeout=min(budget.left(),
+                                   stopchannel.STOP_RECHECK_SECONDS))
 
     def stop_workers(self) -> None:
         """No further claim and no further worker — and no wait for either.

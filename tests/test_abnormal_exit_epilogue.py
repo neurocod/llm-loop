@@ -727,18 +727,24 @@ def test_a_provider_that_is_not_installed_still_closes_the_run_down(
 
 
 @pytest.mark.parametrize("door", ["driver stop", "provider errors"])
-def test_ctrl_c_in_an_exiting_door_s_push_exits_130(
+def test_ctrl_c_in_an_exiting_door_s_push_keeps_the_door_s_exit(
         tmp_path, monkeypatch, capsys, loaded_mailbox, door):
-    """The two `sys.exit` doors end a Ctrl+C in their push the way Ctrl+C ends.
+    """Ctrl+C in an exiting door's push gives up the push, not the ending.
 
-    `close_run` gives up the push; the doors used to let the interrupt out
-    bare — neither 130 nor the driver's code, and no record of the interrupt.
+    The doors used to let the interrupt out bare — neither 130 nor the
+    driver's code, and no record of the interrupt — and then turned the
+    ending into the interrupt's, 130 over exit 3. The ending is chosen
+    before the housekeeping now and kept: the press gives up the exit push,
+    the snapshot and the notes still happen, and the run leaves with the
+    door's code and the reason that explains it.
     """
     pushes = []
+    stuck = threading.Event()
 
     def ctrl_c_in_the_push(policy, project_dir, abort=None):
         pushes.append((policy, project_dir))
         press_ctrl_c()
+        stuck.wait(timeout=STUCK_PUSH_S)   # given up by the press, not done
 
     def turn(*args, **kwargs):
         loaded_mailbox.submit(NOTE)
@@ -755,18 +761,27 @@ def test_ctrl_c_in_an_exiting_door_s_push_exits_130(
         driver = _AlwaysWorkDriver()
         ending = "provider errors in a row"
 
+    started = time.monotonic()
     try:
         with pytest.raises(SystemExit) as exit_info:
             cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
                                app_name="pytest-abnormal", wait_on_start=False)
     except KeyboardInterrupt:
         pytest.fail("the Ctrl+C left the door as a bare KeyboardInterrupt")
+    finally:
+        elapsed = time.monotonic() - started
+        stuck.set()
 
-    assert exit_info.value.code == 130
-    _assert_closed_down(
+    assert elapsed < STUCK_PUSH_S / 2, (
+        f"the press did not give up the exit push: {elapsed:.1f} s")
+    assert exit_info.value.code == (3 if door == "driver stop" else 7), (
+        "the press rewrote the door's exit")
+    out = _assert_closed_down(
         pushes, driver.limit_policy, capsys, str(tmp_path),
         snapshot=f"at end (claude: {ending})",
-        reason=runlifecycle.INTERRUPTED_REASON)
+        reason=("the driver stopped the run (exit 3)" if door == "driver stop"
+                else "5 provider errors in a row (last exit code 7)"))
+    assert "the exit push is abandoned" in out
 
 
 @pytest.mark.parametrize("staged", ["press", KeyboardInterrupt, RuntimeError],
@@ -930,6 +945,71 @@ def test_an_exception_does_not_wait_out_a_stuck_exit_push(
         "the run went quiet without saying why")
     assert "did not finish within 0.5 s" in captured.err
     assert NOTE in captured.out and "undelivered operator note" in captured.out
+
+
+def test_a_spent_stop_budget_starts_no_exit_push(capsys, monkeypatch):
+    """A StopBudget spent before the push begins: no git starts at all."""
+    pushes = []
+    monkeypatch.setattr(runlifecycle, "final_git_push",
+                        lambda *args, **kwargs: pushes.append(args))
+    ctx = runlifecycle.RunContext(
+        provider="claude", spec=None, dry_run=False, progress=None,
+        settings=runlifecycle.RunSettings(), registry=None,
+        status_enabled=False)
+
+    runlifecycle.close_run(ctx, usages=[],
+                           budget=runlifecycle.StopBudget(0))
+
+    assert pushes == [], "a push started on a spent budget"
+    assert "did not finish within 0 s" in capsys.readouterr().err
+
+
+# The fleet's join budget in the pin below, and how many workers it holds:
+# waited per worker the run would take JOIN_BUDGET_S x HELD_WORKERS (6 s);
+# one budget for the fleet takes JOIN_BUDGET_S plus the run's own overhead
+# (0.51 s for a whole parallel run, measured 2026-10-03), so 4.5 s tells the
+# two apart with room either side.
+JOIN_BUDGET_S = 2.0
+HELD_WORKERS = 3
+
+
+def test_an_interrupted_fleet_waits_for_its_workers_one_budget_in_all(
+        tmp_path, monkeypatch, capsys, exit_pushes):
+    """INTERRUPT_JOIN_TIMEOUT_S is the fleet's, not each worker's."""
+    monkeypatch.setattr(parallel, "INTERRUPT_JOIN_TIMEOUT_S", JOIN_BUDGET_S)
+    release = threading.Event()
+    working = []
+    all_working = threading.Event()
+
+    def held_turn(job_id, command, mailbox=None):
+        working.append(job_id)
+        if len(working) == HELD_WORKERS:
+            all_working.set()
+        release.wait(timeout=HELD_S)
+        return 0, None, None
+
+    def ctrl_c_once_all_work(threads):
+        all_working.wait(timeout=HELD_S)
+        press_ctrl_c()
+
+    monkeypatch.setattr(parallel, "run_job", held_turn)
+    monkeypatch.setattr(parallel, "join_workers", ctrl_c_once_all_work)
+    driver = MemListDriver([f"products/item{i}.md" for i in range(5)])
+    args = par_args(str(tmp_path), jobs=HELD_WORKERS, no_statusline=True)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            parallel.run_parallel(driver, args, app_name="pytest-abnormal",
+                                  wait_on_start=False)
+    finally:
+        elapsed = time.monotonic() - started
+        release.set()
+
+    assert len(working) == HELD_WORKERS, f"not all held: {working}"
+    assert exit_info.value.code == 130
+    assert elapsed < 4.5, (
+        f"the fleet's join took {elapsed:.1f} s — a budget per worker?")
 
 
 def test_an_exception_out_of_the_parallel_region_stops_the_workers(
