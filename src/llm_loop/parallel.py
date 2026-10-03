@@ -146,8 +146,9 @@ _console = ownership.OwnerThread("console-lines")
 # when the process ends is lost. One stderr line says how much was left behind.
 CONSOLE_CLOSE_TIMEOUT_S = 30.0
 
-# What Ctrl+C prints. A constant because it can be printed from two places (see
-# the interrupt branch of `run_parallel`).
+# What Ctrl+C prints. A constant because it can be printed from two places:
+# posted to the console by `_Interrupt.hear`, or by `run_parallel` after the
+# console has closed when the queue had no room for it.
 INTERRUPT_ANNOUNCEMENT = ("\nInterrupted by user (Ctrl+C) — "
                           "signalling workers to stop…")
 
@@ -164,11 +165,9 @@ def _close_console() -> None:
 class _Interrupt:
     """What the fleet does about the run's Ctrl+C (`ctrlc.Interrupt`).
 
-    `is_set` is the run's Interrupt, safe from any thread — the pusher reads it
-    from its own (`push_turn`). `hear` is the first press inside the status
-    region: the fleet stopped, announced, and waited for a bounded time.
-    `stop_workers` is the part of that every ending past the region needs, an
-    exception's included.
+    `hear` is the first press inside the status region: the fleet stopped,
+    announced, and waited for a bounded time. `stop_workers` is the part of
+    that every ending past the region needs, an exception's included.
     """
 
     def __init__(self, shared: "Shared", threads: "WorkerPool",
@@ -180,10 +179,6 @@ class _Interrupt:
         # `hear`); the run prints it after its console has closed.
         self.announce_later: Optional[str] = None
         self._heard = False
-        self._pool_closed = False
-
-    def is_set(self) -> bool:
-        return self._interrupt.requested
 
     def hear(self) -> None:
         """What a Ctrl+C does to the fleet — once, however often it is asked."""
@@ -224,12 +219,11 @@ class _Interrupt:
         once it has. Neither announced nor joined, unlike `hear`: an
         exception says its own line, and nobody asked to wait for a turn.
         The stop before the pool: a worker that a `+` holding the pool's lock
-        starts anyway leaves on it (`WorkerPool.close`).
+        starts anyway leaves on it (`WorkerPool.close`). Both are one store,
+        safe to repeat — `hear` and the boundary's release both call this.
         """
         self._shared.stop.set()
-        if not self._pool_closed:
-            self._threads.close()
-            self._pool_closed = True
+        self._threads.close()
 
 
 def parse_args(argv=None, *, prog: str = "parallel",
@@ -1561,16 +1555,17 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # turn only sets the clock — so a run shorter than the interval pushes only
         # on the way out.
         #
-        # And none once the operator has pressed Ctrl+C (`interrupted`, below): the
-        # run is leaving, the exit push is still to come, and a periodic push begun
-        # in the wind-down is one more `git push` for the exit push to queue behind
-        # while the operator waits.
+        # And none once the operator has pressed Ctrl+C (the run's Interrupt,
+        # read here from the pusher's thread): the run is leaving, the exit push
+        # is still to come, and a periodic push begun in the wind-down is one
+        # more `git push` for the exit push to queue behind while the operator
+        # waits.
         last_push = 0.0
         pump_armed = False
 
         def push_turn() -> Optional[float]:
             nonlocal last_push, pump_armed
-            if interrupted.is_set():
+            if interrupt.requested:
                 return None
             if pump_armed:
                 # The policy is read HERE, at the push, off the live knobs — never
