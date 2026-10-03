@@ -35,14 +35,19 @@ line (`deliver`) comes on the key reader's thread and runs the turn's
 import contextlib
 import signal
 import threading
-from typing import Callable, Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional, Tuple
 
-__all__ = ["EXIT_CODE", "Interrupt", "asked", "captured", "current", "deliver"]
+__all__ = ["EXIT_CODE", "INTERRUPTED_REASON", "Interrupt", "asked", "captured",
+           "current", "deliver"]
 
 # The exit code of a run the operator ended with Ctrl+C: 128 + SIGINT, what a
 # shell reports for a process SIGINT killed. A constant so a wrapper telling an
 # interrupt from a failure (a phase that "gave up") names it rather than 130.
 EXIT_CODE = 130
+
+# What the exit record says about a run the operator ended with Ctrl+C —
+# from every door of the epilogue (`runlifecycle`) and from `captured`.
+INTERRUPTED_REASON = "interrupted by the operator (Ctrl+C)"
 
 
 class Interrupt:
@@ -51,12 +56,20 @@ class Interrupt:
     `press` is called by the SIGINT handler (on the main thread, between two
     bytecodes) or by the status line's key reader (on its own thread), and only
     counts; it never raises into whatever the run was doing.
+
+    `press` TAKES NO LOCK, and that is load-bearing: the SIGINT handler runs on
+    the main thread between any two bytecodes, the ones inside a `with lock:`
+    of the main thread's own included — `on_press` registers a hook every turn
+    — and a handler waiting for a plain lock its own thread holds waits for
+    ever (llm-loop review of 0072, F1). So a press is a `list.append` (atomic
+    under the GIL, from either thread) and the hooks are an immutable tuple,
+    REPLACED whole by `on_press`; `_lock` only orders two registrations.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._presses = 0
-        self._hooks: List[Callable[[], None]] = []
+        self._pressed: List[None] = []
+        self._hooks: Tuple[Callable[[], None], ...] = ()
 
     def press(self) -> None:
         """One Ctrl+C: counted, then every `on_press` hook run once for it.
@@ -64,10 +77,8 @@ class Interrupt:
         A hook that raises costs its own effect only — a handler must not be
         the thing that unwinds the run it is telling to stop.
         """
-        with self._lock:
-            self._presses += 1
-            hooks = list(self._hooks)
-        for hook in hooks:
+        self._pressed.append(None)
+        for hook in self._hooks:    # one read of an immutable tuple
             try:
                 hook()
             except Exception:       # noqa: BLE001 - see the docstring
@@ -75,12 +86,12 @@ class Interrupt:
 
     @property
     def presses(self) -> int:
-        return self._presses
+        return len(self._pressed)
 
     @property
     def requested(self) -> bool:
         """Has the operator pressed Ctrl+C in this run at all?"""
-        return self._presses > 0
+        return self.presses > 0
 
     def since(self, mark: int) -> bool:
         """Was Ctrl+C pressed after `mark` (an earlier reading of `presses`)?
@@ -88,22 +99,25 @@ class Interrupt:
         How an ending tells "the press that caused me" from "a press telling me
         to stop waiting": it reads `presses` as it begins and asks this.
         """
-        return self._presses > mark
+        return self.presses > mark
 
     @contextlib.contextmanager
     def on_press(self, hook: Callable[[], None]) -> Iterator[None]:
         """Run `hook` on every press made while the block runs.
 
         Not run for a press made before the block: a caller that must act on one
-        already heard asks `requested` first.
+        already heard asks `requested` first — AFTER entering the block, so a
+        press between its own check and the registration is not missed.
         """
         with self._lock:
-            self._hooks.append(hook)
+            self._hooks = self._hooks + (hook,)
         try:
             yield
         finally:
             with self._lock:
-                self._hooks.remove(hook)
+                hooks = list(self._hooks)
+                hooks.remove(hook)
+                self._hooks = tuple(hooks)
 
 
 class _Unheard(Interrupt):
@@ -148,6 +162,20 @@ def captured() -> Iterator[Interrupt]:
     Python's KeyboardInterrupt again. A runner opened inside an open run (a
     wrapper nesting them) shares the outer one's Interrupt: one press, one run
     of the process to stop.
+
+    A press the run never got to act on — after its last look (`RunBoundary.end`),
+    in what the runner does past its epilogue — does not let the block RETURN:
+    a returned result tells a wrapper to start its next phase, the opposite of
+    what the operator asked. It leaves as the interrupt instead,
+    INTERRUPTED_REASON and `SystemExit(EXIT_CODE)`. A block already leaving by
+    an exception or an exit keeps it (`runlifecycle.exit_run`: an ending is
+    chosen once); a wrapper that must tell "the phase failed" from "the
+    operator pressed Ctrl+C while the phase was failing" opens the capture
+    around the runner itself, and asks the Interrupt once the runner has left.
+
+    The handler is put back BEFORE the Interrupt stops being the open run's,
+    and the late press is looked for after both: a SIGINT in between is the
+    replaced handler's again (a KeyboardInterrupt), never a press nobody reads.
     """
     global _active
     if _active is not None:
@@ -167,11 +195,19 @@ def captured() -> Iterator[Interrupt]:
     try:
         yield interrupt
     finally:
-        _active = None
         if installed:
             signal.signal(signal.SIGINT,
                           previous if previous is not None
                           else signal.default_int_handler)
+        _active = None
+    # Reached only when the block returned: an exception or an exit has left
+    # through the `finally` above with its own ending.
+    if interrupt.requested:
+        # Local: exitlog is a run's record, and ctrlc stays importable below it.
+        from . import exitlog
+
+        exitlog.set_reason(INTERRUPTED_REASON)
+        raise SystemExit(EXIT_CODE)
 
 
 def deliver() -> None:

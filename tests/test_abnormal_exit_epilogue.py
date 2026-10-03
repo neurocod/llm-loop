@@ -276,7 +276,8 @@ def test_ctrl_c_in_the_status_region_s_own_waits_still_closes_the_run_down(
     first frame, before any worker exists, and a press there starts no worker.
     Either is the interrupt's one ending: exit push once, snapshot, notes,
     130 — and a Ctrl+C in the teardown after one in the join is still that
-    one ending, heard once.
+    one ending, heard once; being a press past the one that began it, it
+    gives up the exit push (`RunBoundary.interrupt`).
     """
     method = "start" if where == "start" else "stop"
     real = getattr(parallel.statusline.StatusApp, method)
@@ -310,12 +311,17 @@ def test_ctrl_c_in_the_status_region_s_own_waits_still_closes_the_run_down(
         pytest.fail("the Ctrl+C unwound the run past its epilogue")
 
     assert exit_info.value.code == 130
+    if where == "join and stop":
+        assert exit_pushes == [], "a second press did not give up the push"
+        # Stands in for the push `_assert_closed_down` asks after.
+        exit_pushes.append((None, str(tmp_path)))
     out = _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
         snapshot="at end (parallel claude: interrupted)",
         reason="interrupted by the operator (Ctrl+C)")
     assert out.count(parallel.INTERRUPT_ANNOUNCEMENT.strip()) == 1, (
         f"the interrupt was not heard exactly once:\n{out}")
+    assert (runlifecycle.ABANDONED_PUSH in out) == (where == "join and stop")
 
 
 # Upper bound on every wait of the second-Ctrl+C pin below; only a broken
@@ -334,9 +340,10 @@ def test_a_ctrl_c_while_a_worker_works_stops_the_fleet(
     left. A press cuts nothing short now, but the scenario stays: the first
     Ctrl+C is heard in the join while a worker is inside its turn, and the run
     waits for that turn a bounded time (INTERRUPT_JOIN_TIMEOUT_S, shortened
-    here) — or, with a second Ctrl+C during that wait, not at all. The worker
-    is let go only once the run has left, and it must claim nothing after its
-    turn.
+    here) — or, with a second Ctrl+C during that wait, not at all, and then
+    not the exit push either: the second press is past the one the ending
+    began at. The worker is let go only once the run has left, and it must
+    claim nothing after its turn.
     """
     monkeypatch.setattr(parallel, "INTERRUPT_JOIN_TIMEOUT_S",
                         HELD_S if second else 0.2)
@@ -354,10 +361,22 @@ def test_a_ctrl_c_while_a_worker_works_stops_the_fleet(
     def ctrl_c_once_a_worker_works(threads):
         working.wait(timeout=HELD_S)
         press_ctrl_c()
-        if second:
-            # Pressed again once the run has settled into waiting for the
-            # turn; nothing else ends that wait before HELD_S.
-            threading.Timer(0.3, press_ctrl_c).start()
+
+    # The second press lands where the fleet's join takes its budget: after
+    # `_Interrupt.hear` has read its mark, before the join waits — the one
+    # moment a press is "during the join", staged there rather than on a timer
+    # that may fire before the join or after it.
+    pressed_in_join = []
+    real_budget = runlifecycle.StopBudget
+
+    def budget_then_press(seconds):
+        budget = real_budget(seconds)
+        if second and seconds == HELD_S and not pressed_in_join:
+            pressed_in_join.append(ctrlc.current().presses)
+            press_ctrl_c()
+        return budget
+
+    monkeypatch.setattr(runlifecycle, "StopBudget", budget_then_press)
 
     pools = []
     real_close = parallel.WorkerPool.close
@@ -402,8 +421,14 @@ def test_a_ctrl_c_while_a_worker_works_stops_the_fleet(
     assert housekeeping == ["interrupted"], (
         f"the interrupt's housekeeping did not run exactly once: {housekeeping}")
     assert exit_info.value.code == 130
-    assert exit_pushes, "the interrupted run left without its exit push"
     out = capsys.readouterr().out
+    if second:
+        assert pressed_in_join == [1], "the second press was never staged"
+        assert exit_pushes == [], (
+            "a second press during the join still waited for the exit push")
+        assert runlifecycle.ABANDONED_PUSH in out
+    else:
+        assert exit_pushes, "the interrupted run left without its exit push"
     assert out.count(parallel.INTERRUPT_ANNOUNCEMENT.strip()) == 1, (
         f"the interrupt was not announced exactly once:\n{out}")
     exitlog.finish()
@@ -498,16 +523,40 @@ def test_the_two_doors_of_the_epilogue_run_the_same_housekeeping():
     import ast
     import inspect
 
-    for door in (runlifecycle.end_run, runlifecycle.exit_run):
-        tree = ast.parse(inspect.getsource(door))
-        called = {node.func.id for node in ast.walk(tree)
-                  if isinstance(node, ast.Call)
-                  and isinstance(node.func, ast.Name)}
+    def calls_close_run(statement) -> bool:
+        return (isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Name)
+                and statement.value.func.id == "close_run")
 
-        assert "close_run" in called, (
-            f"{door.__name__} stopped delegating to close_run — the normal "
-            f"ending and the sys.exit endings are doing different housekeeping "
-            f"again")
+    def reaches_close_run(body) -> bool:
+        """Is `close_run` called on the straight path through `body` — not
+        under a branch, and not after a statement that leaves (a `return`, a
+        `raise`, a call to `sys.exit` or to a door that exits)? Anywhere in
+        the source was not enough: a call made unreachable passed."""
+        for statement in body:
+            if calls_close_run(statement):
+                return True
+            if isinstance(statement, ast.Try) and reaches_close_run(
+                    statement.body):
+                return True
+            if isinstance(statement, (ast.Return, ast.Raise)):
+                return False
+            if (isinstance(statement, ast.Expr)
+                    and isinstance(statement.value, ast.Call)
+                    and (ast.unparse(statement.value.func) == "sys.exit"
+                         or ast.unparse(statement.value.func).startswith(
+                             "_exit_"))):
+                return False
+        return False
+
+    for door in (runlifecycle.end_run, runlifecycle.exit_run):
+        function = ast.parse(inspect.getsource(door)).body[0]
+
+        assert reaches_close_run(function.body), (
+            f"{door.__name__} stopped delegating to close_run on every path — "
+            f"the normal ending and the sys.exit endings are doing different "
+            f"housekeeping again")
 
 
 # --- the run's one boundary: endings no door of the runner wrote -------------
@@ -947,6 +996,53 @@ def test_an_exception_does_not_wait_out_a_stuck_exit_push(
     assert NOTE in captured.out and "undelivered operator note" in captured.out
 
 
+@pytest.mark.parametrize("door", ["driver stop", "provider errors"])
+def test_an_exiting_door_does_not_wait_out_a_stuck_exit_push(
+        tmp_path, monkeypatch, capsys, loaded_mailbox, door):
+    """The runner's own exiting doors are bounded the way an exception is.
+
+    The driver stopping the run and five provider errors in a row are what
+    ends a run left going overnight, with nobody there to press Ctrl+C: they
+    waited for a stuck exit push without limit. Their code and reason stay.
+    """
+    monkeypatch.setattr(runlifecycle, "UNWIND_PUSH_DEADLINE_S", 0.5)
+    stuck = threading.Event()
+    aborts = []
+
+    def stuck_push(policy, project_dir, abort=None):
+        aborts.append(abort)
+        stuck.wait(timeout=STUCK_PUSH_S)
+
+    monkeypatch.setattr(runlifecycle, "final_git_push", stuck_push)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda p: StubSource())
+    monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+    def turn(*args, **kwargs):
+        loaded_mailbox.submit(NOTE)     # see the five-errors pin for why here
+        return 0 if door == "driver stop" else 7
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", turn)
+    driver = (_StoppingDriver(commands=1) if door == "driver stop"
+              else _AlwaysWorkDriver())
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            cyclecore.run_loop(driver, _seq_args(str(tmp_path)),
+                               app_name="pytest-abnormal", wait_on_start=False)
+    finally:
+        elapsed = time.monotonic() - started
+        stuck.set()
+
+    assert elapsed < STUCK_PUSH_S / 2, (
+        f"the door waited out the stuck exit push: {elapsed:.1f} s")
+    assert exit_info.value.code == (3 if door == "driver stop" else 7)
+    assert aborts and aborts[0] is not None and aborts[0].is_set(), (
+        "the abandoned exit push may still start git")
+    captured = capsys.readouterr()
+    assert "did not finish within 0.5 s" in captured.err
+    assert NOTE in captured.out and "undelivered operator note" in captured.out
+
+
 def test_a_spent_stop_budget_starts_no_exit_push(capsys, monkeypatch):
     """A StopBudget spent before the push begins: no git starts at all."""
     pushes = []
@@ -979,10 +1075,12 @@ def test_an_interrupted_fleet_waits_for_its_workers_one_budget_in_all(
     monkeypatch.setattr(parallel, "INTERRUPT_JOIN_TIMEOUT_S", JOIN_BUDGET_S)
     release = threading.Event()
     working = []
+    workers = []
     all_working = threading.Event()
 
     def held_turn(job_id, command, mailbox=None):
         working.append(job_id)
+        workers.append(threading.current_thread())
         if len(working) == HELD_WORKERS:
             all_working.set()
         release.wait(timeout=HELD_S)
@@ -1005,9 +1103,18 @@ def test_an_interrupted_fleet_waits_for_its_workers_one_budget_in_all(
     finally:
         elapsed = time.monotonic() - started
         release.set()
+        # Joined here, not left to finish in a later test: a worker let go
+        # prints its "✓" into whatever test runs next.
+        for t in workers:
+            t.join(timeout=HELD_S)
 
     assert len(working) == HELD_WORKERS, f"not all held: {working}"
+    assert not any(t.is_alive() for t in workers), "a held worker never left"
     assert exit_info.value.code == 130
+    # Both ways: no wait at all passes the upper bound too, and the workers
+    # are held past the budget, so the fleet waits it out exactly once.
+    assert elapsed >= JOIN_BUDGET_S, (
+        f"the fleet's join took {elapsed:.1f} s — it never waited")
     assert elapsed < 4.5, (
         f"the fleet's join took {elapsed:.1f} s — a budget per worker?")
 

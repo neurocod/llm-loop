@@ -840,7 +840,9 @@ def test_ctrl_c_while_the_exit_push_is_waited_for_gives_up_the_push_only(
                                    daemon=True)
     raised = []
     try:
-        with ctrlc.captured() as interrupt:
+        # A press is in the block, so it leaves as the interrupt
+        # (`ctrlc.captured`); what is pinned is that nothing inside it raised.
+        with pytest.raises(SystemExit), ctrlc.captured() as interrupt:
             interrupter.start()
             try:
                 runlifecycle.close_run(ctx, usages=[usage],

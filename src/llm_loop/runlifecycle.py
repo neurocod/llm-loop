@@ -610,9 +610,12 @@ def _wait_for_exit_push(pusher: OwnerThread, push,
                   f"push before the run goes on leaving…")
 
 
-# The StopBudget of an ending no runner wrote — an exception or an exit
-# unwinding the run past its doors (`RunBoundary.unwind`); in practice what it
-# bounds is the exit push, the one wait such an ending has. Bounded because
+# The StopBudget of an ending nobody may be watching: one no runner wrote — an
+# exception or an exit unwinding the run past its doors (`RunBoundary.unwind`)
+# — and the runner's own `RunBoundary.exit` (the driver stopping the run, five
+# provider errors in a row: endings of a run left going overnight). In practice
+# what it bounds is the exit push, the one wait such an ending has; the closing
+# usage snapshots are network reads with their own timeouts, outside it. Bounded because
 # nobody may be there to press Ctrl+C: a batch run unwinding an exception
 # otherwise sat out a push in flight and the whole `final_git_push` behind it
 # (a 300 s subprocess timeout per `git push`, and on Windows a git descendant
@@ -623,14 +626,15 @@ def _wait_for_exit_push(pusher: OwnerThread, push,
 # normal exit push and a periodic one in flight ahead of it; past it the push
 # is taken to be stuck. What is lost is that push only: no further git starts
 # (`PushAbort`), the one running finishes on its own as a daemon, and the
-# snapshots and the notes still follow. The runners' own doors have no budget:
-# there an operator is present to give the push up with Ctrl+C.
+# snapshots and the notes still follow. The interrupt's door has no budget:
+# there an operator is present to give the push up with Ctrl+C again.
 UNWIND_PUSH_DEADLINE_S = 60.0
 
 
 # What the exit record says about a run the operator ended with Ctrl+C, from
-# any door of the epilogue (`end_run`, `exit_run`, `RunBoundary.interrupt`).
-INTERRUPTED_REASON = "interrupted by the operator (Ctrl+C)"
+# any door of the epilogue (`end_run`, `exit_run`, `RunBoundary.interrupt`) —
+# and from `ctrlc.captured`, for a press after the last of them.
+INTERRUPTED_REASON = ctrlc.INTERRUPTED_REASON
 
 
 def _exit_interrupted(iterations: int, completed: int) -> NoReturn:
@@ -730,9 +734,10 @@ class RunBoundary:
         record. An exception the housekeeping raises itself is reported on
         stderr, never put in the original's place.
 
-    The last two have a StopBudget of UNWIND_PUSH_DEADLINE_S, taken as
-    `unwind` begins; the doors have none, an operator being there to press
-    Ctrl+C. Every ending's code and reason are chosen before its housekeeping
+    The last two, and the `exit` door, have a StopBudget of
+    UNWIND_PUSH_DEADLINE_S, taken as the ending begins: nobody may be there.
+    `interrupt` has none, its operator being there to press Ctrl+C again,
+    and neither has `end` (a normal ending). Every ending's code and reason are chosen before its housekeeping
     and kept: a Ctrl+C pressed once it has begun gives up the exit push
     (`close_run`) and nothing more — except that a RETURN turns into the
     interrupt's exit (`end_run` says why).
@@ -813,10 +818,13 @@ class RunBoundary:
                     pusher=self.pusher, push_abort=self.push_abort)
 
     def _door(self, code, *, ending: str, reason: str,
-              budget: Optional[StopBudget] = None) -> NoReturn:
+              budget: Optional[StopBudget] = None,
+              heard: Optional[int] = None) -> NoReturn:
+        # This ending's own presses, read BEFORE the releases and the record:
+        # a press during either is past them, and gives up the exit push.
+        if heard is None:
+            heard = ctrlc.current().presses
         self._begin_ending()
-        # Read before the record: a press during it is past this ending's own.
-        heard = ctrlc.current().presses
         iterations, completed = self.counts()
         exitlog.set_reason(reason, iterations=iterations, completed=completed)
         exit_run(self.ctx, code, ending=ending, budget=budget, heard=heard,
@@ -832,14 +840,25 @@ class RunBoundary:
         return end_run(self.ctx, result, **self._close_kwargs())
 
     def exit(self, code, *, ending: str, reason: str) -> NoReturn:
-        """An ending the runner exits from: `reason` recorded, then `exit_run`."""
-        self._door(code, ending=ending, reason=reason)
+        """An ending the runner exits from: `reason` recorded, then `exit_run`
+        under a StopBudget of UNWIND_PUSH_DEADLINE_S — the driver stopping
+        the run and five provider errors in a row come in unattended runs."""
+        self._door(code, ending=ending, reason=reason,
+                   budget=StopBudget(UNWIND_PUSH_DEADLINE_S))
 
     def interrupt(self) -> NoReturn:
         """The operator's Ctrl+C: INTERRUPTED_REASON, "interrupted", exit
-        `ctrlc.EXIT_CODE`. A further press gives up the exit push."""
+        `ctrlc.EXIT_CODE`. Any press past the FIRST gives up the exit push.
+
+        The first, because that is where this ending began, whenever the
+        runner got to its door: the fleet's join (`parallel._Interrupt.hear`)
+        has already given a second press its meaning — stop waiting — and a
+        mark read here, after it, waited for a third press over a stuck push
+        (llm-loop review of 0072, F2). Zero for a KeyboardInterrupt with no
+        press behind it: then the first press is already past it."""
         self._door(ctrlc.EXIT_CODE, ending="interrupted",
-                   reason=INTERRUPTED_REASON)
+                   reason=INTERRUPTED_REASON,
+                   heard=min(ctrlc.current().presses, 1))
 
     def unwind(self, error: BaseException) -> None:
         """Close the run `error` is unwinding; returns only for an exception,

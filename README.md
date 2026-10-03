@@ -529,6 +529,11 @@ push, closing usage snapshot and report of undelivered notes as any other
 ending. A further press gives up what that ending still waits for — the exit
 push, the workers' turns — and nothing else.
 
+A runner that has heard a press never returns a result: it exits 130. An
+ending that exits with its own code (a driver's exit 3) keeps it; a wrapper
+that must still hear the press opens `ctrlc.captured()` around the runner call
+and asks that Interrupt after it.
+
 For an embedder this changes three public calls while a run is open:
 `run_agent_streaming` returns `ctrlc.EXIT_CODE` (130) for a turn the press cut
 short, and `LimitPolicy.check_and_wait` and `stopchannel.sleep_unless` return
