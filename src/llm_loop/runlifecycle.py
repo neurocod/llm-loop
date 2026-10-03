@@ -631,9 +631,7 @@ def _wait_for_exit_push(pusher: OwnerThread, push,
 UNWIND_PUSH_DEADLINE_S = 60.0
 
 
-# What the exit record says about a run the operator ended with Ctrl+C, from
-# any door of the epilogue (`end_run`, `exit_run`, `RunBoundary.interrupt`) —
-# and from `ctrlc.captured`, for a press after the last of them.
+# Re-exported: the doors here write it, and `ctrlc` owns the wording.
 INTERRUPTED_REASON = ctrlc.INTERRUPTED_REASON
 
 
@@ -737,8 +735,8 @@ class RunBoundary:
     The last two, and the `exit` door, have a StopBudget of
     UNWIND_PUSH_DEADLINE_S, taken as the ending begins: nobody may be there.
     `interrupt` has none, its operator being there to press Ctrl+C again,
-    and neither has `end` (a normal ending). Every ending's code and reason are chosen before its housekeeping
-    and kept: a Ctrl+C pressed once it has begun gives up the exit push
+    and neither has `end` (a normal ending). Every ending's code and reason
+    are chosen before its housekeeping and kept: a Ctrl+C pressed once it has begun gives up the exit push
     (`close_run`) and nothing more — except that a RETURN turns into the
     interrupt's exit (`end_run` says why).
 

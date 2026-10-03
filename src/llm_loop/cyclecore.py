@@ -495,7 +495,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
         nonlocal last_git_push
         # A check still queued once the run's ending has begun is the exit
         # push's job, made right behind it: run, it is one more `git push`
-        # the ending waits for (the parallel pump stops the same way).
+        # the ending waits for (the parallel pump stops at the press instead,
+        # its workers winding down after it).
         if boundary.closed:
             return
         last_git_push = maybe_git_push(run_settings.git_push, last_git_push,
