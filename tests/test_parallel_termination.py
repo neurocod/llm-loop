@@ -423,6 +423,115 @@ def test_a_dying_job_does_not_leave_the_provider_running(tmp_path, monkeypatch):
                 child.wait(timeout=REAP_WAIT_S)
 
 
+# A provider that says one thing and then works on, saying nothing: the turn a
+# Ctrl+C lands in. Lives `_ORPHAN_LIFETIME_S`, for the same reason as above.
+_QUIET_PROVIDER_SRC = ("import sys, time\nsys.stdout.write(%r)\n"
+                       "sys.stdout.flush()\ntime.sleep(%d)\n") % (
+    json.dumps({"type": "assistant", "message": {"content": []}}) + "\n",
+    _ORPHAN_LIFETIME_S,
+)
+
+
+def test_ctrl_c_ends_a_worker_s_provider_and_gives_its_file_back(
+        tmp_path, monkeypatch, capsys):
+    """The run's Ctrl+C ends each worker's CLI, and the turn is not a failure.
+
+    The child is started without a console of its own and never hears the
+    console's Ctrl+C, so it is the run's to end — and a run that gave up
+    joining its workers exits under them: daemon threads die without their
+    `finally`, the reap never came, and the agent went on editing the tree
+    after the run had left (review of 0072, F3). The press is made once the
+    worker has read the child's first event, so the CLI sits silent in its
+    turn — nothing but the press can end the read. The turn it cut short is
+    no failed attempt either: no "will retry", and the file goes back to
+    the list as it was (F9).
+    """
+    from llm_loop import ctrlc
+
+    children = []
+    first_event = threading.Event()
+
+    def quiet_provider(argv, provider, prompt, project_dir):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _QUIET_PROVIDER_SRC],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", bufsize=1)
+        children.append(proc)
+        return proc
+
+    real_observe = parallel.statusline.observe_claude_event
+
+    def observed(event):
+        real_observe(event)
+        first_event.set()
+
+    def ctrl_c_mid_turn(threads):
+        assert first_event.wait(timeout=HANG_TIMEOUT_S), "no turn ever ran"
+        ctrlc.current().press()
+
+    monkeypatch.setattr(parallel, "start_agent_process", quiet_provider)
+    monkeypatch.setattr(parallel.statusline, "observe_claude_event", observed)
+    monkeypatch.setattr(parallel, "join_workers", ctrl_c_mid_turn)
+    driver = MemListDriver(["products/only.md"])
+    try:
+        with pytest.raises(SystemExit) as left:
+            parallel.run_parallel(driver, par_args(tmp_path, jobs=1),
+                                  app_name="pytest-parallel",
+                                  wait_on_start=False)
+        assert left.value.code == 130
+        assert children, "the fake provider was never started — nothing staged"
+        assert not _outlived_the_run(children[0]), (
+            "the run left with its worker's provider still running")
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=REAP_WAIT_S)
+    out = capsys.readouterr().out
+    assert "will retry" not in out and "exit 130" not in out, (
+        f"the interrupted turn was counted as a failure:\n{out}")
+    assert driver.pending_lines() == ["products/only.md"]
+
+
+@pytest.mark.parametrize("pressed", ["before the claim", "in the claim"])
+def test_a_worker_starts_no_turn_once_ctrl_c_is_pressed(monkeypatch, pressed):
+    """The press itself stops a worker, not the main thread's word on it.
+
+    `shared.stop` is set only once the join has heard the press (a quarter
+    second on), and in between a worker went on to claim, start a fresh CLI
+    and count it a failure (review of 0072, F9). Asked at the loop's head —
+    no claim at all — and again just before the turn starts, the claim given
+    back.
+    """
+    from llm_loop import ctrlc
+
+    driver = MemListDriver(["products/only.md"])
+    shared = parallel.Shared(driver, runlifecycle.RunSettings())
+    turns = []
+    claims = []
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda *args, **kwargs: turns.append(args) or (0, None,
+                                                                       None))
+
+    def claim(job_id, worker_shared):
+        claims.append(job_id)
+        line = worker_shared.claim()
+        if pressed == "in the claim":
+            ctrlc.current().press()
+        return True, line
+
+    with pytest.raises(SystemExit), ctrlc.captured() as interrupt:
+        if pressed == "before the claim":
+            interrupt.press()
+        parallel.worker(1, shared, None, None, [0.0], threading.Lock(),
+                        claim_work=claim)
+    assert claims == ([] if pressed == "before the claim" else [1])
+    assert turns == [] and shared.running == set()
+    assert shared.in_progress == set() and shared.claimed == 0, (
+        "the claim was not given back")
+    assert shared.attempts == {}, "a turn nobody started was counted"
+
+
 def test_max_runs_closes_claims_without_cancelling_in_flight_work(
     tmp_path, monkeypatch
 ):

@@ -84,8 +84,8 @@ from .console import print_markup, route_through
 # guarded.
 from .gitpush import PushAbort, maybe_git_push
 from .stopchannel import RunResult, RunStopReason
-from .providers import (note_channel, provider_spec, reap_agent_process,
-                        start_agent_process)
+from .providers import (ask_agent_process_to_end, note_channel, provider_spec,
+                        reap_agent_process, start_agent_process)
 from .drivers import ListFileDriver
 
 # How many of a failed job's discarded non-JSON lines are kept as its failure
@@ -105,9 +105,10 @@ PUSH_PUMP_INTERVAL_S = 60
 # come back before it closes the run down anyway — the whole fleet together,
 # one `runlifecycle.StopBudget`, not each thread in turn (a fleet of ten used
 # to cost ten times this). Bounded because the operator has already asked to
-# leave: a worker sitting in a provider turn cannot be made to return, and its
-# process is reaped by the worker's own `finally` either way. What it buys is a
-# worker that was nearly done getting to finish.
+# leave. Every turn's CLI was already ended by the press itself (`run_job`'s
+# `on_press` hook), so what is waited for is each worker reaping it and giving
+# its claim back; a worker that outlasts this is a daemon the exit kills, its
+# CLI's tree ended at the press, not by the reap it never gets to.
 INTERRUPT_JOIN_TIMEOUT_S = 5
 
 # Per-file retry budget: a path that fails this many times in a row is parked in
@@ -535,6 +536,14 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # `exit 1` and no cause anywhere. Kept as a bounded tail — a chatty CLI must
     # not be able to grow a worker's memory — and printed only if the job fails.
     diagnostics = collections.deque(maxlen=FAILURE_TAIL_LINES)
+    # The run's Ctrl+C ends this turn's CLI from the press itself, the way
+    # `streamrender.run_agent_streaming` ends the sequential one's. Not left
+    # to the console: the child is started without one of its own
+    # (`providers._console_isolation`) and never hears Ctrl+C, and a run that
+    # gives up joining this worker exits under it — a daemon thread dies
+    # without its `finally`, so the reap below never comes and an agent nobody
+    # sees goes on editing the tree after the run has left (review of 0072, F3).
+    interrupt = ctrlc.current()
     # Everything from here down to `proc.wait()` runs with a child process
     # alive, and every step of it can raise: formatting an `out.*` line (and,
     # with no run open, the console write behind it), `note_channel`'s close, a
@@ -542,8 +551,15 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # reaps, so an exception used to walk away from a running provider — see
     # `providers.reap_agent_process`.
     try:
-        with note_channel(proc, provider, mailbox) as channel:
+        with note_channel(proc, provider, mailbox) as channel, \
+                interrupt.on_press(lambda: ask_agent_process_to_end(proc)):
+            # A press between the worker's last look and the hook going in
+            # had nobody to end this CLI: asked here, after it is in.
+            if interrupt.requested:
+                ask_agent_process_to_end(proc)
             for item in proc.stdout:
+                if interrupt.requested:
+                    break
                 if isinstance(item, dict):
                     # An app-server event arrives decoded
                     # (`providers._CodexEventStream`).
@@ -655,6 +671,11 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                         console.record_timing(costlog.pool_result(
                             job_id, dur, (result_cost - previous_cost
                                           if result_cost is not None else None)))
+        if interrupt.requested:
+            # Whatever the CLI had done: the operator asked for the run, not
+            # this turn, to end. The worker gives the claim back (`worker`).
+            out.line("⏹ interrupted (Ctrl+C)", "yellow")
+            return ctrlc.EXIT_CODE, cost_usd, duration_s
         # Outside the `with`, so the pipe is closed before we wait on the process:
         # a worker waiting on a CLI whose stdin is still open never returns, and a
         # run whose final join() never finishes is the whole fleet.
@@ -827,16 +848,16 @@ class Shared:
         """Return a claimed-but-unprocessed line to the queue.
 
         Used when a worker claims a line but then bails out before running it
-        (the run was stopped while it sat in the session-limit gate): drop it from
+        (the run was stopped while it sat in the session-limit gate), or when
+        Ctrl+C cut its turn short: drop it from
         `in_progress` so the drained check stays accurate, and undo its --max
         reservation so the count reflects only files actually processed.
         """
         with self.lock:
             self.in_progress.discard(line)
-            # Defence only: every release today happens before start_turn, so
-            # there is no running turn to forget. Kept because the alternative —
-            # a release that leaves a line in `running` — would make busy() true
-            # forever and hang every later stop request.
+            # A turn Ctrl+C cut short is released too (`worker`), after its
+            # `start_turn`: a release that left the line in `running` would
+            # make busy() true forever and hang every later stop request.
             self.running.discard(line)
             if self.claimed > 0:
                 self.claimed -= 1
@@ -1127,7 +1148,11 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                 else statusline.InvocationProgress())
     job = app.job(job_id)
     out = job_lines(job_id)
-    while not shared.stop.is_set():
+    # Asked beside `shared.stop`, not left to it: the main thread sets the stop
+    # only once its join has noticed the press (`_Interrupt.hear`, a quarter
+    # second later), and in between a worker went on to start a fresh CLI.
+    interrupt = ctrlc.current()
+    while not shared.stop.is_set() and not interrupt.requested:
         if retirement_requested is not None and retirement_requested(job_id):
             break
         if apply_stop_request(job_id, shared, app):
@@ -1238,7 +1263,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
                 # `shared.stop` rather than its return value: the loop has to end
                 # on a stop latched by ANY worker, not only on this call's answer.
                 apply_stop_request(job_id, shared, app)
-            if shared.stop.is_set():
+            if shared.stop.is_set() or interrupt.requested:
                 shared.release(line)
                 break
 
@@ -1324,6 +1349,13 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # no guard: `finish` discards `in_progress` first thing under the lock,
         # so whatever happens after that, the run can still read as drained.
         job.finish()
+        if rc != 0 and interrupt.requested:
+            # Cut short by Ctrl+C (`run_job`), not failed: no attempt counted
+            # against the file, no "will retry", no `item_finished` verdict on
+            # a turn nobody let finish. The line goes back as it was, for the
+            # next run to take.
+            shared.release(line)
+            break
         ok = rc == 0
         done_total, remaining = shared.finish(line, ok)
         # The summary counter moves on COMPLETION, not on the claim: a claimed
@@ -1696,7 +1728,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             # minutes. `close_run` hands the exit push to the pusher, and an
             # interrupt that lands while the pusher is inside `git push` waits
             # for a subprocess with a 300 s timeout (`gitpush.git_push`), on top
-            # of `jobs` × INTERRUPT_JOIN_TIMEOUT_S for the workers. Waited out
+            # of INTERRUPT_JOIN_TIMEOUT_S for the whole fleet. Waited out
             # rather than bounded, and that is the decision: the pusher is
             # PUSHING, so the alternative to waiting is not a faster exit with
             # the same result, it is racing a second `git` against the first

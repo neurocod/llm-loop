@@ -304,6 +304,9 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     try:
         with note_channel(proc, provider, mailbox) as channel, \
                 interrupt.on_press(lambda: ask_agent_process_to_end(proc)):
+            # A press before the hook went in had nobody to end this CLI.
+            if interrupt.requested:
+                ask_agent_process_to_end(proc)
             for item in proc.stdout:
                 if interrupt.requested:
                     break

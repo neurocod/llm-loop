@@ -307,8 +307,11 @@ def _console_isolation() -> dict:
     (DETACHED_PROCESS would leave it none, and it would open a window).
 
     What it costs: Ctrl+C here no longer reaches the child as a console event.
-    It never had to — the runner hears it (`ctrlc`) and ends the whole tree
-    through `ask_agent_process_to_end` / `reap_agent_process` (`taskkill /T`).
+    It never had to — but only because every turn ends its own tree from the
+    press: `streamrender.run_agent_streaming` and `parallel.run_job` each hold
+    an `on_press` hook (`ctrlc`) that calls `ask_agent_process_to_end`
+    (`taskkill /T`). A new caller of `start_agent_process` inside a run needs
+    the same hook, or its child outlives the run.
     """
     if os.name != "nt":
         return {}
