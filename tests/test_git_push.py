@@ -155,17 +155,32 @@ def test_the_sequential_runner_pushes_the_project_it_was_pointed_at(
     happened" would leave either site free to disappear; measured, when
     `final_git_push` was extracted: neutering its `git_push` left this file
     green.
+
+    The second pass's check is a handshake too: it is only posted, and a check
+    still queued when the run's ending begins stands down for the exit push
+    (`push_turn` reads the boundary). So the driver reports the queue empty only
+    once that check has pushed — without it, a slow CI worker saw two pushes.
     """
     fake = _FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
+
     def agent(*args, **kwargs):
         assert fake.pushed.wait(timeout=PUMP_WAIT_S)
+        # Re-armed for the second pass, whose check is posted after we return.
+        fake.pushed.clear()
         return 0
+
+    class EmptyOnceCheckedDriver(OneShotDriver):
+        def next_command(self):
+            if self.served:
+                assert fake.pushed.wait(timeout=PUMP_WAIT_S), \
+                    "the second pass's push check never pushed"
+            return super().next_command()
 
     monkeypatch.setattr(cyclecore, "run_claude_streaming", agent)
     root = root_not_cwd(tmp_path)
 
-    cyclecore.run_loop(OneShotDriver(), seq_args(root, git_push=PUSHING),
+    cyclecore.run_loop(EmptyOnceCheckedDriver(), seq_args(root, git_push=PUSHING),
                        app_name="pytest-gitpush")
 
     assert len(fake.pushes) == 3, \
