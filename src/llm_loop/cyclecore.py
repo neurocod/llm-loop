@@ -36,7 +36,8 @@ Claude token-limit handling is driven by the account's real usage figures rather
 guessed from error counts, in two layers:
 
   * proactive — before each iteration, and again immediately after any non-zero
-    Claude exit, the loop asks the Driver's `limit_policy` for the current
+    Claude exit, the loop asks the account's process-wide policy
+    (`limits.process_policy`, settled by the first run's Driver) for the current
     quota percentages and pauses if any watched one is at/over its ceiling. The
     reading lives in usage.py (UsageSource, an HTTP GET of the usage endpoint)
     and the pausing policy in limits.py (LimitPolicy and the ready-made
