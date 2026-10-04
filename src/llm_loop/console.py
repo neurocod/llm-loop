@@ -350,6 +350,12 @@ def _log_plain(text: str) -> None:
 # typing for proportionally more parses of a long block.
 LIVE_REFRESH_PER_SECOND = 12
 
+# Plain operator output must use the active Live's Console: writing beneath its
+# frame through stdout makes the next refresh erase that output. The lock orders
+# printing against start/stop; Live's refresh thread never takes it.
+_LIVE_OUTPUT_LOCK = threading.Lock()
+_live_console = None
+
 
 class MarkdownStream:
     """Render one assistant text block as live-updating Markdown.
@@ -388,6 +394,7 @@ class MarkdownStream:
         return self._parsed
 
     def start(self) -> None:
+        global _live_console
         self._buf = ""
         self._parsed_from = None
         self._parsed = None
@@ -399,12 +406,14 @@ class MarkdownStream:
                 console=self._console,
                 refresh_per_second=LIVE_REFRESH_PER_SECOND,
                 vertical_overflow="visible",
-                # Nothing else prints during a text block, so we don't need Rich
-                # to hijack stdout/stderr (which would fight with TeeToLog).
+                # Operator lines use this Console; redirecting stdout/stderr
+                # would fight with TeeToLog.
                 redirect_stdout=False,
                 redirect_stderr=False,
             )
-            self._live.start()
+            with _LIVE_OUTPUT_LOCK:
+                self._live.start()
+                _live_console = self._console
         else:
             print("\n💬 ", end="", flush=True)
 
@@ -414,10 +423,13 @@ class MarkdownStream:
             print(text, end="", flush=True)
 
     def stop(self) -> None:
+        global _live_console
         if self._live is not None:
             # `Live.stop` repaints once more through `_frame`, so the final
             # frame is the whole block even if no refresh saw the last delta.
-            self._live.stop()
+            with _LIVE_OUTPUT_LOCK:
+                self._live.stop()
+                _live_console = None
             self._live = None
             self._console = None
             # Guarantee the next output (tool calls, etc.) starts on a fresh line,
@@ -651,6 +663,15 @@ def _print_flushed(text: str) -> None:
     stream.flush()
 
 
+def _print_above_live(text: str) -> None:
+    with _LIVE_OUTPUT_LOCK:
+        if _live_console is not None:
+            _live_console.print(text, markup=False, highlight=False, soft_wrap=True)
+            _log_plain(text)
+            return
+    _print_flushed(text)
+
+
 def print_markup(plain: str, markup: str) -> None:
     """Print a status line from hand-written Rich markup: styled on screen, plain
     in the log. The low-level core of the print_* family — use `print_styled`
@@ -678,6 +699,14 @@ def print_line(text: str) -> None:
     moment earlier. Always flushed, like `print_markup` (`_render_markup`).
     """
     _on_console(_print_flushed, text)
+
+
+def print_operator_line(text: str) -> None:
+    """Print literal operator output above any live Markdown frame and log it.
+
+    Rich must not interpret markup or insert line breaks into a pasteable command.
+    """
+    _on_console(_print_above_live, text)
 
 
 # This runner's compact lines: no job tag, straight to the console. The sink is

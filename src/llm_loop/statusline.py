@@ -1365,10 +1365,10 @@ class HelpAction(Action):
                 sys.argv[1:], {}, executable=sys.executable,
                 script=os.path.abspath(sys.argv[0]))
         except cmdline.NotPasteable as exc:
-            console.print_line(f"Cannot render restart command: {exc}")
+            console.print_operator_line(f"Cannot render restart command: {exc}")
             return
         # The note row clips at terminal width; keep the full command in scrollback.
-        console.print_line("Restart command:\n" + command)
+        console.print_operator_line("Restart command:\n" + command)
 
 
 class Mode:
