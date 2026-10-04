@@ -371,12 +371,34 @@ def test_an_unavailable_action_leaves_the_legend():
     app.handle_event(tio.Key("z"))   # dispatch must not reach it either
 
 
-def test_help_key_writes_the_full_key_list_into_the_note_row():
+@pytest.mark.parametrize("key", ["h", "?"])
+@pytest.mark.parametrize("shell", [sl.cmdline.POSIX, sl.cmdline.POWERSHELL])
+def test_help_key_shows_keys_and_prints_the_restart_command(monkeypatch, capsys,
+                                                          key, shell):
+    argv = [os.path.join("some folder", "runCycle.py"), "--max-runs", "7",
+            "--wrapper-option", "a b;$value", "--", "x" * 300]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(sl.cmdline, "paste_shell", lambda: shell)
     app = sl.StatusApp(enabled=False)
 
-    app.handle_event(tio.Key("?"))
+    app.handle_event(tio.Key(key))
 
     assert "s stop" in app.status.note and "h/? help" in app.status.note
+    expected = sl.cmdline.quote(
+        [sys.executable, os.path.abspath(argv[0]), *argv[1:]], shell)
+    assert capsys.readouterr().out == "Restart command:\n" + expected + "\n"
+
+
+def test_help_keeps_working_when_a_restart_argument_is_not_pasteable(monkeypatch,
+                                                                   capsys):
+    monkeypatch.setattr(sys, "argv", ["runCycle.py", "line\nbreak"])
+    app = sl.StatusApp(enabled=False)
+
+    app.handle_event(tio.Key("h"))
+
+    assert "h/? help" in app.status.note
+    assert "Cannot render restart command:" in capsys.readouterr().out
+    assert isinstance(app.painter.terminal, tio.NullTerminal)
 
 
 def test_an_unknown_key_points_at_the_help_key():

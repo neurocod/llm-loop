@@ -1360,6 +1360,15 @@ class HelpAction(Action):
         parts = [f"{'/'.join(a.all_keys())} {a.help_text(app)}"
                  for a in app.actions if a.available(app)]
         app.note("keys — " + SEPARATOR.join(parts))
+        try:
+            command = cmdline.render(
+                sys.argv[1:], {}, executable=sys.executable,
+                script=os.path.abspath(sys.argv[0]))
+        except cmdline.NotPasteable as exc:
+            console.print_line(f"Cannot render restart command: {exc}")
+            return
+        # The note row clips at terminal width; keep the full command in scrollback.
+        console.print_line("Restart command:\n" + command)
 
 
 class Mode:
