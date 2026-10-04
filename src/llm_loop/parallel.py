@@ -731,6 +731,7 @@ class Shared:
         self.failed = set()           # raw lines parked after MAX_ATTEMPTS
         self.attempts = {}            # raw line -> failed-attempt count
         self.claimed = 0              # files claimed this run (for --max-runs)
+        self.started = 0              # provider turns started, including interrupted ones
         self.done = 0                 # files processed successfully
         self.stop = threading.Event()  # cancel/wake the run on stop-file / no-work
         self.claims_closed = threading.Event()  # max reached: finish in-flight work
@@ -832,7 +833,7 @@ class Shared:
             in_flight = sorted(os.path.basename(ln.strip())
                                for ln in self.in_progress)
             claimed, done = self.claimed, self.done
-            counts = (self.progress.record_counts(claimed, done)
+            counts = (self.progress.count_fields()
                       if self.progress is not None else
                       dict(iterations=claimed, completed=done))
         # Outside the lock — this writes a file, and every worker contends for
@@ -859,13 +860,14 @@ class Shared:
             self.running.discard(line)
             if self.claimed > 0:
                 self.claimed -= 1
-            if self.progress is not None:
-                self.progress.record_counts(self.claimed, self.done)
 
     def start_turn(self, line: str) -> None:
         """This claim is about to become a running provider turn (see busy())."""
         with self.lock:
             self.running.add(line)
+            self.started += 1
+            if self.progress is not None:
+                self.progress.record_counts(self.started, self.done)
 
     def abandon(self, line: str, started: bool) -> None:
         """Give a claim back when its worker is dying, so the run can still end.
@@ -925,7 +927,7 @@ class Shared:
             if ok:
                 self.done += 1
                 if self.progress is not None:
-                    self.progress.record_counts(self.claimed, self.done)
+                    self.progress.record_counts(self.started, self.done)
                 self.driver.strike(line)
                 self.attempts.pop(line, None)
             else:
@@ -1302,6 +1304,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             job.start(item=command.label, model=command.model,
                       prompt=command.prompt, now=started_at)
             app.update(**progress.summary_fields(), phase="running")
+            exitlog.note(**progress.count_fields())
             out.line(f"▶ {command.label}", "bold cyan")
             # The start-of-item hook (Driver.item_started), placed here so it
             # sees the command as it will actually be sent — operator notes
@@ -1507,7 +1510,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     push_abort = PushAbort()
     boundary = runlifecycle.RunBoundary(
         ctx,
-        counts=lambda: ((shared.claimed, shared.done) if shared is not None
+        counts=lambda: ((shared.started, shared.done) if shared is not None
                         else (0, 0)),
         push_abort=push_abort)
     with boundary:

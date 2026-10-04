@@ -18,7 +18,7 @@ import threading
 
 import pytest
 
-from llm_loop import cyclecore, exitlog, parallel, runlifecycle, stopchannel
+from llm_loop import ctrlc, cyclecore, exitlog, parallel, runlifecycle, stopchannel
 from llm_loop.agentwork import AgentCommand, Driver, LoopStop
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
@@ -791,9 +791,62 @@ def test_a_released_claim_preserves_earlier_stream_counts():
     shared = parallel.Shared(_MemDriver(["a"]), runlifecycle.RunSettings(),
                              progress=progress)
     line = shared.claim()
-    assert progress.count_fields() == dict(iterations=22, completed=20)
+    assert progress.count_fields() == dict(iterations=21, completed=20)
     shared.release(line)
     assert progress.count_fields() == dict(iterations=21, completed=20)
+    # The same reservation may be returned after Ctrl+C cuts its turn short.
+    # It no longer consumes the cap, but the provider iteration happened.
+    line = shared.claim()
+    shared.start_turn(line)
+    assert progress.count_fields() == dict(iterations=22, completed=20)
+    shared.release(line)
+    assert shared.claimed == 0
+    assert progress.count_fields() == dict(iterations=22, completed=20)
+
+
+@pytest.mark.parametrize("runner", ["parallel", "sequential"])
+def test_an_interrupted_turn_stays_in_the_invocation_exit_total(
+        tmp_path, monkeypatch, capsys, runner):
+    progress = sl.InvocationProgress()
+    progress.start_run()
+    progress.record_counts(20, 20)
+    promotion = progress.new_stream()
+    promotion.start_run()
+    promotion.record_counts(1, 1)
+
+    def interrupted(*args, **kwargs):
+        ctrlc.current().press()
+        return 130
+
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
+    monkeypatch.setattr(cyclecore, "run_agent_streaming", interrupted)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda *a, **k: (interrupted(), 0.0, 0.01))
+
+    class OneTurn(Driver):
+        provider = "codex"
+
+        def next_command(self):
+            return AgentCommand("work", "", "interrupted-turn")
+
+    with pytest.raises(SystemExit) as left:
+        if runner == "parallel":
+            parallel.run_parallel(
+                _CodexDriver(["products/a.md"]),
+                _codex_args(str(tmp_path), 1),
+                app_name="pytest-parallel-statusline", setup_logging=False,
+                wait_on_start=False, progress=progress)
+        else:
+            cyclecore.run_loop(
+                OneTurn(), seq_args(tmp_path, provider="codex", no_statusline=True),
+                app_name="pytest-parallel-statusline", setup_logging=False,
+                wait_on_start=False, progress=promotion)
+    assert left.value.code == ctrlc.EXIT_CODE
+    assert progress.count_fields() == dict(iterations=22, completed=21)
+    record = json.loads(exitlog.current().path.read_text(encoding="utf-8"))
+    assert (record["iterations"], record["completed"]) == (22, 21)
+    exitlog.finish()
+    assert "22 iteration(s), 21 completed" in capsys.readouterr().out
 
 
 def test_batches_of_one_invocation_share_one_rising_counter(tmp_path, monkeypatch):

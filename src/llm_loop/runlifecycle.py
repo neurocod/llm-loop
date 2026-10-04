@@ -645,6 +645,7 @@ def _exit_interrupted(iterations: int, completed: int) -> NoReturn:
 
 def end_run(ctx: RunContext, result: RunResult, *,
             usages: Iterable[Optional[RunUsage]],
+            local_counts: Optional[Tuple[int, int]] = None,
             mailbox=None,
             pusher: Optional[OwnerThread] = None,
             push_abort: Optional[PushAbort] = None) -> RunResult:
@@ -668,7 +669,11 @@ def end_run(ctx: RunContext, result: RunResult, *,
     It ends as the interrupt instead (`_exit_interrupted`).
     """
     reason = result.reason
-    counts = ctx.progress.record_counts(result.attempted, result.completed)
+    # A parallel RunResult counts cap reservations; a started turn interrupted
+    # by Ctrl+C returns that reservation but still belongs to the run total.
+    iterations, completed = (local_counts if local_counts is not None else
+                             (result.attempted, result.completed))
+    counts = ctx.progress.record_counts(iterations, completed)
     interrupt = ctrlc.current()
     mark = interrupt.presses
     exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
@@ -839,7 +844,8 @@ class RunBoundary:
         if ctrlc.current().requested:
             self.interrupt()
         self._begin_ending()
-        return end_run(self.ctx, result, **self._close_kwargs())
+        return end_run(self.ctx, result, local_counts=self.counts(),
+                       **self._close_kwargs())
 
     def exit(self, code, *, ending: str, reason: str) -> NoReturn:
         """An ending the runner exits from: `reason` recorded, then `exit_run`

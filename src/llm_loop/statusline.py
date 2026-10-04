@@ -770,7 +770,7 @@ class InvocationProgress:
         """Start a runner call; previous calls stay in the invocation totals.
 
         Calls sharing one stream must be sequential. Parallel workers report
-        their local counts under Shared.lock, including released reservations.
+        their started/completed counts under Shared.lock.
         """
         with self._counts.lock:
             self._run_counts = (0, 0)
@@ -781,8 +781,9 @@ class InvocationProgress:
 
         Queue reduction is not an iteration count: preflight can strike work
         without a provider turn, and retries can run without shrinking a queue.
-        Replacing local counts also lets a released parallel claim undo its
-        reservation without losing earlier batches or promotion iterations.
+        Parallel counts come from started turns, independently of cap
+        reservations: a turn cut short by Ctrl+C is still an iteration, while
+        a claim returned before its turn starts contributes nothing.
         """
         with self._counts.lock:
             previous_iterations, previous_completed = self._run_counts
