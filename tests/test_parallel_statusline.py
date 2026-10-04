@@ -95,6 +95,93 @@ def test_parallel_weekly_key_changes_the_shared_policy(tmp_path, monkeypatch):
     assert driver.limit_policy.rules[0].limit == 97
 
 
+def test_weekly_ceiling_finishes_active_tasks_and_names_waiting_rows(tmp_path,
+                                                                  monkeypatch):
+    """At 97% both admitted tasks finish; their successors wait without old context."""
+    from llm_loop.limits import LimitPolicy, WeeklyLimit
+    from llm_loop.usage import Usage, UsageReading
+
+    # 0.03 s measured 2026-10-04; retain generous headroom for loaded CI hosts.
+    wait_seconds = 20
+    made = _live_statusline(monkeypatch, {})
+    started = threading.Barrier(2, timeout=wait_seconds)
+    gate_entered = threading.Event()
+    release_budget = threading.Event()
+    all_waiting = threading.Event()
+    tasks = []
+
+    class Source:
+        percent = 96
+
+        def get_usage(self, cache_value=True):
+            return Usage(UsageReading(None, None), UsageReading(self.percent, None),
+                         UsageReading(None, None), [])
+
+        def invalidate(self):
+            pass
+
+    source = Source()
+    policy = LimitPolicy([WeeklyLimit(97)])
+
+    def hold_budget(source, session_start, should_stop=None):
+        gate_entered.set()
+        assert release_budget.wait(wait_seconds), "the test never released the usage gate"
+        return True, session_start
+
+    monkeypatch.setattr(policy, "_wait", hold_budget)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: source)
+    real_update = sl.Job.update
+
+    def watch_waiting(job, **fields):
+        real_update(job, **fields)
+        app = made.get("app")
+        if app is not None and all(j.waiting_for_usage for j in app.status.snapshot().jobs):
+            all_waiting.set()
+
+    monkeypatch.setattr(sl.Job, "update", watch_waiting)
+
+    def run(job_id, command, mailbox=None):
+        tasks.append(command.label)
+        job = made["app"].job(job_id)
+        assert job.running and not job.waiting_for_usage
+        job.update(context_tokens=88_764, context_window=258_400)
+        if job.iteration == 1:
+            started.wait()
+            source.percent = 97
+            if job_id == 1:
+                assert gate_entered.wait(wait_seconds), "the active turn never saw the other worker wait"
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", run)
+    driver = _MemDriver([f"products/f{i}.md" for i in range(4)])
+    driver.limit_policy = policy
+    args = par_args(tmp_path, jobs=2, provider="codex", ignore_usage=False)
+    done = None
+    try:
+        done, result = _run_in_thread(driver, args)
+        assert gate_entered.wait(wait_seconds), "the fleet never reached 97%"
+        all_waiting.clear()
+        if not all(j.waiting_for_usage for j in made["app"].status.snapshot().jobs):
+            assert all_waiting.wait(wait_seconds), "a worker waiting for the usage lock looked idle"
+        assert len(tasks) == 2
+        assert made["shared"].done == 2
+        assert not made["shared"].busy()
+        rows = made["app"].render(200)
+        job_rows = [row for row in rows if " job " in row]
+        assert len(job_rows) == 2
+        assert all("waiting for usage budget" in row for row in job_rows)
+        assert all("ctx" not in row and "▶" not in row for row in job_rows)
+        source.percent = 96
+    finally:
+        release_budget.set()
+        if done is not None:
+            assert done.wait(wait_seconds), "the released fleet did not finish"
+
+    assert result["value"].completed == 4
+    assert len(tasks) == 4 and driver.pending_lines() == []
+    assert all(not job.waiting_for_usage for job in made["app"].status.jobs)
+
+
 def _run_in_thread(driver, args, done=None):
     done = done or threading.Event()
     result = {}

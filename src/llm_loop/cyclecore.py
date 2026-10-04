@@ -764,9 +764,13 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
             # pending claim if the operator pauses or cancels a stop in this wait.
             if not dry_run and not ignore_usage_limits:
                 app.update(phase="waiting")
-                paused, session_start = limit_policy.check_and_wait(
-                    usage_source, session_start, should_stop=stop_pending,
-                    report_status=iteration == 0)
+                app.job(1).update(waiting_for_usage=True)
+                try:
+                    paused, session_start = limit_policy.check_and_wait(
+                        usage_source, session_start, should_stop=stop_pending,
+                        report_status=iteration == 0)
+                finally:
+                    app.job(1).update(waiting_for_usage=False)
                 statusline.push_quotas(app, usage_source, limit_policy)
                 app.update(phase="idle")
                 if paused:
@@ -934,9 +938,13 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                 # away from ending the run. The error itself is still counted and
                 # printed above — only the waiting is skipped.
                 app.update(phase="waiting")
-                paused, session_start = limit_policy.check_and_wait(
-                    usage_source, session_start, note=" (checked after error)",
-                    should_stop=stop_pending, report_status=False)
+                app.job(1).update(waiting_for_usage=True)
+                try:
+                    paused, session_start = limit_policy.check_and_wait(
+                        usage_source, session_start, note=" (checked after error)",
+                        should_stop=stop_pending, report_status=False)
+                finally:
+                    app.job(1).update(waiting_for_usage=False)
                 statusline.push_quotas(app, usage_source, limit_policy)
                 app.update(phase="idle")
                 if paused:

@@ -408,6 +408,8 @@ class Job:
     # Claude reports the window in `result`; Codex reports it with live usage.
     context_window: Optional[int] = None
     context_tokens: Optional[int] = None
+    # Includes waiting for the fleet's usage lock, before the provider starts.
+    waiting_for_usage: bool = False
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
@@ -458,6 +460,7 @@ class Job:
             self.prompt = prompt
             self.started_at = time.time() if now is None else now
             self.running = True
+            self.waiting_for_usage = False
 
     def select(self, model: str) -> None:
         """Name the NEXT step's model while the row is still idle.
@@ -473,10 +476,18 @@ class Job:
             self.context_tokens = None
 
     def finish(self) -> None:
-        """Release the iteration; the row goes idle and its clock stops."""
+        """Release the iteration and its context; occupancy is not task progress.
+
+        Keeping the final occupancy on an idle row made a fleet waiting at its
+        weekly ceiling look like unfinished agents frozen halfway through work.
+        The item and prompt remain available for inspecting the previous turn.
+        """
         with self._lock:
             self.running = False
             self.started_at = 0.0
+            self.context_tokens = None
+            self.context_window = None
+            self.waiting_for_usage = False
 
     def update(self, **fields) -> None:
         with self._lock:
@@ -521,7 +532,7 @@ class Job:
             return Job(self.job_id, self.running, self.iteration, self.item,
                        self.model, self.prompt, self.started_at,
                        self.resolved_model, self.context_window,
-                       self.context_tokens)
+                       self.context_tokens, self.waiting_for_usage)
 
 
 # The Job whose row describes the stream THIS thread is reading. Both renderers
@@ -1080,6 +1091,9 @@ class JobRow(Row):
             return ""
         glyph = "▶" if job.running else "·"
         item = job.item if (job.running and job.item) else "idle"
+        if not job.running and job.waiting_for_usage:
+            glyph = PHASE_GLYPHS["waiting"]
+            item = "waiting for usage budget"
         model = job.model_label()
         elapsed = format_elapsed(job.elapsed(now))
         # Same separator as every other row (the leading columns stay padded, so

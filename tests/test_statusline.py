@@ -926,6 +926,25 @@ def test_job_start_and_finish_move_only_the_job_clock():
     assert job.iteration == 2
 
 
+def test_finished_context_is_cleared_before_waiting_for_the_next_task():
+    job = sl.Job(1)
+    job.start(item="finished.md", model="codex", prompt="previous prompt", now=NOW)
+    job.update(context_tokens=88_764, context_window=258_400)
+    assert "ctx 88k" in job.context_label()
+    job.finish()
+    assert job.context_tokens is None and job.context_window is None
+    assert job.prompt == "previous prompt"
+    job.update(waiting_for_usage=True)
+    status = sl.LoopStatus(jobs=[job.snapshot()])
+    row = sl.JobRow(1).render(status, 200, now=NOW)
+    assert "waiting for usage budget" in row
+    assert "finished.md" not in row and "ctx" not in row
+    assert "▶" not in row and "0:00" not in row
+    job.start(item="next.md", now=NOW)
+    assert not job.waiting_for_usage
+    assert "next.md" in sl.JobRow(1).render(sl.LoopStatus(jobs=[job]), 200, now=NOW)
+
+
 def test_run_clock_is_latched_once():
     status = sl.LoopStatus()
 

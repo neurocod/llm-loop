@@ -202,9 +202,10 @@ class WeeklyLimit(LimitRule):
     Sonnet-only quota with `sonnet_only=True`.
 
     The weekly window is a week long, so there is no day/night rule and no
-    near-reset climb (the last few minutes of a week are negligible): pause at
-    `limit`% and wait out the window. In a composite this guards against the
-    weekly cap killing a run while the session still has budget.
+    near-reset climb (the last few minutes of a week are negligible): hold the
+    next task at `limit`% and wait out the window. Both runners check before
+    launching a task, so work already running can spend the remaining reserve
+    to finish; the ceiling never interrupts a provider turn in flight.
     Zero disables this ceiling, including at 100% reported usage; the provider's
     own rate limits and any other policy rules still apply.
     """

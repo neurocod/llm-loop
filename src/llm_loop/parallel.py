@@ -1211,32 +1211,22 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # time (cheap, the reading is TTL-cached), and a pause blocks every worker that
             # reaches it — so the whole fleet idles together when the budget is spent.
             if source is not None:
-                with usage_lock:
-                    if not shared.stop.is_set():
-                        # The pause watches both stop channels. Without that, a
-                        # fleet parked on the wall is a fleet with nobody left to
-                        # notice `s`: every worker is inside this hold (or blocked
-                        # on the lock in front of it), the loop head that reads the
-                        # request is unreachable, and the keypress looks like a
-                        # hung program until the window resets hours later.
-                        # A driver pause ends the hold too, and for the same
-                        # reason: with the fleet parked on the wall, every
-                        # worker is inside this hold or blocked on the lock in
-                        # front of it, so nothing is left to notice the request
-                        # — and the caller waiting for control back waits out
-                        # the whole quota window. Unlike `s` this one cannot be
-                        # withdrawn, so the claim below is given back rather
-                        # than held.
-                        paused, new_start = policy.check_and_wait(
-                            source, session_start_box[0],
-                            should_stop=lambda: (shared.stop_asked(app)
-                                                 or shared.handback.pending))
-                        if paused:
-                            session_start_box[0] = new_start
-                        # The check just paid for a usage reading; publishing it
-                        # here is what keeps the provider's live figures on the
-                        # pinned row without a second round-trip (cache serves it).
-                        statusline.push_quotas(app, source, policy)
+                job.update(waiting_for_usage=True)
+                try:
+                    with usage_lock:
+                        if not shared.stop.is_set():
+                            # Both stop channels and a driver handback must
+                            # release a fleet held here for a whole window.
+                            paused, new_start = policy.check_and_wait(
+                                source, session_start_box[0],
+                                should_stop=lambda: (shared.stop_asked(app)
+                                                     or shared.handback.pending))
+                            if paused:
+                                session_start_box[0] = new_start
+                            # Publish the reading the check already paid for.
+                            statusline.push_quotas(app, source, policy)
+                finally:
+                    job.update(waiting_for_usage=False)
 
             # A stop may have been latched, or a channel may have opened, while we
             # waited for the lock or paused on the budget. HOLD the claimed file
