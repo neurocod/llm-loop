@@ -1924,7 +1924,7 @@ class WeeklyLimitMode(Mode):
 
     def legend(self):
         return [("0-9", "limit"), ("↑/↓", "+1 / -1"),
-                ("0", "unlimited"),
+                ("0 / 100", "unlimited"),
                 ("Enter", "apply / close"), ("Esc", "clear / leave"),
                 ("←/→", "move"), ("^U", "erase")]
 
@@ -1945,7 +1945,7 @@ class WeeklyLimitMode(Mode):
             else:
                 self.rule.limit = float(self.editor.value)
                 self.app.status.refresh_quota_policy(self.rule)
-                self.app.note("weekly limit disabled (N/A)" if self.rule.limit == 0
+                self.app.note("weekly limit disabled (N/A)" if self.rule.limit in (0, 100)
                               else f"weekly limit set to {self.rule.limit:.0f}%")
                 self.app.pop_mode(discard_pending=True)
         else:

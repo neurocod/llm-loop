@@ -17,12 +17,13 @@ from datetime import datetime, timezone
 
 import pytest
 
-from llm_loop import console, cyclecore, providers, streamrender, usage
+from llm_loop import (console, cyclecore, parallel, providers, runlifecycle,
+                      streamrender, usage)
 from llm_loop.usage import RateLimitEvent
 from llm_loop.agentwork import ClaudeCommand, Driver
-from llm_loop.limits import DayNightLimit, LimitPolicy, WeeklyLimit
+from llm_loop.limits import DayNightLimit, LimitPolicy, SessionLimit, WeeklyLimit
 
-from _runfixtures import StubPolicy, isolated_run, seq_args
+from _runfixtures import MemListDriver, StubPolicy, isolated_run, par_args, seq_args
 
 
 # A response like the endpoint's, trimmed to the quotas the engine reads. The
@@ -210,15 +211,64 @@ def test_a_reading_without_a_reset_time_still_prints(capsys):
 
 
 @pytest.mark.parametrize("sonnet_only", [False, True])
-def test_zero_weekly_limit_does_not_wait_at_full_usage(monkeypatch, capsys, sonnet_only):
+@pytest.mark.parametrize("limit", [0, 100])
+def test_zero_weekly_limit_does_not_wait_at_full_usage(monkeypatch, capsys, sonnet_only, limit):
     field = "seven_day_sonnet" if sonnet_only else "seven_day"
     source = _StubSource({field: {"utilization": 100}})
-    rule = WeeklyLimit(0, sonnet_only=sonnet_only)
+    rule = WeeklyLimit(limit, sonnet_only=sonnet_only)
     policy = LimitPolicy([rule])
     monkeypatch.setattr(policy, "_wait", lambda *args: pytest.fail("disabled weekly limit waited"))
     assert policy.check_and_wait(source, 123) == (False, 123)
     assert "ceiling N/A" in capsys.readouterr().out
     assert "no ceiling" in policy.describe()
+
+
+@pytest.mark.parametrize("limit", [0, 100])
+@pytest.mark.parametrize("smart", [False, True])
+def test_explicit_unlimited_session_does_not_wait_at_full_usage(
+        monkeypatch, capsys, limit, smart):
+    source = _StubSource({"five_hour": {"utilization": 100,
+                                          "resets_at": _iso_in(2 * 3600)}})
+    rule = DayNightLimit(day=limit, night=limit) if smart else SessionLimit(limit)
+    policy = LimitPolicy([rule])
+    monkeypatch.setattr(policy, "_wait", lambda *a: pytest.fail("unlimited session waited"))
+    assert policy.check_and_wait(source, 123) == (False, 123)
+    assert "ceiling N/A" in capsys.readouterr().out
+    assert "no ceiling" in policy.describe()
+
+
+@pytest.mark.parametrize("rule", [SessionLimit(99), WeeklyLimit(99),
+                                  DayNightLimit(day=99, night=99)])
+def test_a_configured_99_still_pauses_at_its_ceiling(rule):
+    now = datetime(2026, 10, 4, 12).timestamp()
+    below = usage.parse_usage({"five_hour": {"utilization": 98.9},
+                               "seven_day": {"utilization": 98.9}})
+    at_limit = usage.parse_usage({"five_hour": {"utilization": 99},
+                                  "seven_day": {"utilization": 99}})
+    policy = LimitPolicy([rule])
+    assert not policy._violations(policy._status(below, now))
+    assert [r for r, _, _ in policy._violations(policy._status(at_limit, now))] == [rule]
+
+
+def test_dynamic_session_ceiling_reaching_100_keeps_the_usage_gate():
+    now = datetime(2026, 10, 4, 12).timestamp()
+    rule = DayNightLimit(day=96, night=96)
+    reading = usage.UsageReading(100, now)
+    assert rule.ceiling(reading, now) == 100
+    assert LimitPolicy._violations([(rule, reading, rule.ceiling(reading, now))])
+
+
+@pytest.mark.parametrize("night_unlimited", [False, True])
+def test_day_night_unlimited_applies_only_to_the_selected_base(night_unlimited):
+    morning = datetime(2026, 10, 4, 9).timestamp()
+    night = datetime(2026, 10, 4, 2).timestamp()
+    daytime = datetime(2026, 10, 4, 12).timestamp()
+    reading = usage.UsageReading(100, morning)
+    rule = DayNightLimit(day=96 if night_unlimited else 100,
+                         night=100 if night_unlimited else 96)
+    assert rule.ceiling(reading, night) == (float("inf") if night_unlimited else 96)
+    assert rule.ceiling(usage.UsageReading(100, None), daytime) == (
+        96 if night_unlimited else float("inf"))
 
 
 # -- the rate_limit_event backstop ---------------------------------------------
@@ -254,6 +304,32 @@ class _TwoShotDriver(Driver):
 
     def on_success(self, rc):
         self.succeeded += 1
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_new_codex_tasks_start_after_both_quotas_reach_100(
+        tmp_path, monkeypatch, runner):
+    source = _StubSource({"five_hour": {"utilization": 100},
+                          "seven_day": {"utilization": 100}})
+    policy = LimitPolicy([DayNightLimit(day=100, night=100), WeeklyLimit(100)])
+    monkeypatch.setattr(policy, "_wait", lambda *a: pytest.fail("100% blocked new tasks"))
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: source)
+    monkeypatch.setattr(cyclecore, "run_agent_streaming", lambda *a, **k: 0)
+    monkeypatch.setattr(parallel, "run_job", lambda *a, **k: (0, 0.0, 0.01))
+    if runner == "sequential":
+        driver = _TwoShotDriver()
+        driver.limit_policy = policy
+        result = cyclecore.run_loop(
+            driver, seq_args(tmp_path, provider="codex", no_statusline=True),
+            app_name="pytest-usage", wait_on_start=False)
+    else:
+        driver = MemListDriver(["products/a.md", "products/b.md"])
+        driver.limit_policy = policy
+        result = parallel.run_parallel(
+            driver, par_args(tmp_path, provider="codex", jobs=2, ignore_usage=False,
+                             no_statusline=True),
+            app_name="pytest-usage", wait_on_start=False)
+    assert result.completed == 2
 
 
 def _run_with_verdict(tmp_path, monkeypatch, verdict):

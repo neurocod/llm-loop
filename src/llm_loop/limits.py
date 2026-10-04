@@ -61,6 +61,17 @@ WEEKLY_USAGE_LIMIT = 90         # % — default weekly ceiling
 USAGE_RATE_PER_MIN = 1.5        # % of the session budget spent per minute of work
 
 
+def _configured_ceiling(limit: float) -> float:
+    """Explicit 0 or 100 disables the local quota ceiling.
+
+    Purchased ChatGPT credits can fund new turns after included usage reaches
+    100%. Pausing there prevents that transition, so an explicit 100 has the
+    same meaning as 0. Provider refusals still apply. A dynamic ceiling merely
+    reaching 100 near reset does not opt in to spending credits.
+    """
+    return float("inf") if limit in (0, 100) else float(limit)
+
+
 def _dynamic_ceiling(base: float, reset_ts: Optional[float], now: float,
                      rate: float) -> float:
     """Usable ceiling (%) given a base limit and how close the window is to reset.
@@ -135,6 +146,7 @@ class SessionLimit(LimitRule):
     The simplest session rule: pause once the session hits `limit`% and wait out
     the window. No day/night awareness and no near-reset climb — use DayNightLimit
     for those. "Total session limit" behaviour.
+    Explicit disabled values are defined by _configured_ceiling.
     """
 
     quota = "session"
@@ -144,9 +156,11 @@ class SessionLimit(LimitRule):
         self.limit = float(limit)
 
     def ceiling(self, reading: UsageReading, now: float) -> float:
-        return self.limit
+        return _configured_ceiling(self.limit)
 
     def describe(self) -> str:
+        if self.limit in (0, 100):
+            return f"{self.label}: no ceiling"
         return f"{self.label}: flat ceiling {self.limit:.0f}%"
 
 
@@ -159,6 +173,7 @@ class DayNightLimit(LimitRule):
     (it refreshes in the morning while we're likely still asleep), allow up to
     `night`%; otherwise cap at `day`%. The near-reset climb (_dynamic_ceiling)
     then reclaims budget that couldn't be spent before the reset anyway.
+    _configured_ceiling applies to the selected base before the near-reset climb.
     """
 
     quota = "session"
@@ -189,11 +204,16 @@ class DayNightLimit(LimitRule):
         return self.day
 
     def ceiling(self, reading: UsageReading, now: float) -> float:
-        base = self._base(reading.reset_ts, now)
+        base = _configured_ceiling(self._base(reading.reset_ts, now))
+        if base == float("inf"):
+            return base
         return _dynamic_ceiling(base, reading.reset_ts, now, self.rate_per_min)
 
     def describe(self) -> str:
-        return (f"{self.label}: day {self.day:.0f}% / night {self.night:.0f}% "
+        if self.day in (0, 100) and self.night in (0, 100):
+            return f"{self.label}: no ceiling"
+        return (f"{self.label}: day {_format_ceiling(_configured_ceiling(self.day))} "
+                f"/ night {_format_ceiling(_configured_ceiling(self.night))} "
                 f"(night before {self.deadline_hour:02d}:00 when the window "
                 f"resets by then), climbing toward 100% near reset")
 
@@ -207,8 +227,7 @@ class WeeklyLimit(LimitRule):
     next task at `limit`% and wait out the window. Both runners check before
     launching a task, so work already running can spend the remaining reserve
     to finish; the ceiling never interrupts a provider turn in flight.
-    Zero disables this ceiling, including at 100% reported usage; the provider's
-    own rate limits and any other policy rules still apply.
+    Explicit disabled values are defined by _configured_ceiling.
     """
 
     def __init__(self, limit: float = WEEKLY_USAGE_LIMIT, *,
@@ -218,10 +237,10 @@ class WeeklyLimit(LimitRule):
         self.label = QUOTA_BY_FIELD[self.quota].label
 
     def ceiling(self, reading: UsageReading, now: float) -> float:
-        return float("inf") if self.limit == 0 else self.limit
+        return _configured_ceiling(self.limit)
 
     def describe(self) -> str:
-        if self.limit == 0:
+        if self.limit in (0, 100):
             return f"{self.label}: no ceiling"
         return f"{self.label}: flat ceiling {self.limit:.0f}%"
 

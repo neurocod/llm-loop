@@ -86,12 +86,13 @@ def test_invalid_submission_stays_in_editor_without_changing_limit(text):
     assert "0 to 100" in app.status.note
 
 
-def test_zero_disables_weekly_limit_and_can_be_reenabled():
+@pytest.mark.parametrize("unlimited", ["0", "100"])
+def test_zero_disables_weekly_limit_and_can_be_reenabled(unlimited):
     weekly, session = WeeklyLimit(98), SessionLimit(80)
     policy = LimitPolicy([weekly, session])
     app, _ = make_app(policy)
     app.update(quotas=[sl.QuotaRow("week", 100, None, "ceil 98%")])
-    press(app, "w", "\x15", "0", "\r")
+    press(app, "w", "\x15", *unlimited, "\r")
     assert isinstance(app.mode, sl.NormalMode)
     assert app.status.quotas[0].policy == "ceil N/A"
     assert app.status.quotas[0].percent == 100
@@ -102,7 +103,7 @@ def test_zero_disables_weekly_limit_and_can_be_reenabled():
     busy = Usage(UsageReading(80, None), usage.week_all, usage.week_sonnet, [])
     assert [rule for rule, _, _ in policy._violations(policy._status(busy, 0))] == [session]
     press(app, "w")
-    assert app.mode.editor.buffer == "0"
+    assert app.mode.editor.buffer == unlimited
     press(app, "\x15", "9", "8", "\r")
     assert app.status.quotas[0].policy == "ceil 98%"
     assert [rule for rule, _, _ in policy._violations(policy._status(usage, 0))] == [weekly]
