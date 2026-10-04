@@ -97,7 +97,7 @@ def test_parallel_weekly_key_changes_the_shared_policy(tmp_path, monkeypatch):
 
 def test_weekly_ceiling_finishes_active_tasks_and_names_waiting_rows(tmp_path,
                                                                   monkeypatch):
-    """Admitted tasks finish past the policy ceiling; successors wait without old context."""
+    """Admitted tasks finish at the policy ceiling; successors wait without old context."""
     from llm_loop.limits import LimitPolicy, WeeklyLimit
     from llm_loop.usage import Usage, UsageReading
 
