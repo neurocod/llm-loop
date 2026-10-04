@@ -711,8 +711,9 @@ class Shared:
     is decided — see `max_items`.
     """
 
-    def __init__(self, driver: ListFileDriver, settings):
+    def __init__(self, driver: ListFileDriver, settings, *, progress=None):
         self.driver = driver
+        self.progress = progress
         self.log_session = uuid4().hex
         # The run's live knobs (runlifecycle.RunSettings), not a copy of the cap
         # taken here: `--max-runs` is editable from the status line, and the
@@ -831,11 +832,14 @@ class Shared:
             in_flight = sorted(os.path.basename(ln.strip())
                                for ln in self.in_progress)
             claimed, done = self.claimed, self.done
+            counts = (self.progress.record_counts(claimed, done)
+                      if self.progress is not None else
+                      dict(iterations=claimed, completed=done))
         # Outside the lock — this writes a file, and every worker contends for
         # that lock. It leaves behind what the run had in flight, which is what
         # a post-mortem of a killed run has to start from (see exitlog).
         exitlog.note(phase=f"in flight: {', '.join(in_flight)}",
-                     iterations=claimed, completed=done)
+                     **counts)
         return line
 
     def release(self, line: str) -> None:
@@ -855,6 +859,8 @@ class Shared:
             self.running.discard(line)
             if self.claimed > 0:
                 self.claimed -= 1
+            if self.progress is not None:
+                self.progress.record_counts(self.claimed, self.done)
 
     def start_turn(self, line: str) -> None:
         """This claim is about to become a running provider turn (see busy())."""
@@ -918,6 +924,8 @@ class Shared:
             self.running.discard(line)
             if ok:
                 self.done += 1
+                if self.progress is not None:
+                    self.progress.record_counts(self.claimed, self.done)
                 self.driver.strike(line)
                 self.attempts.pop(line, None)
             else:
@@ -1293,7 +1301,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             app.mark_run_started(started_at)
             job.start(item=command.label, model=command.model,
                       prompt=command.prompt, now=started_at)
-            app.update(phase="running")
+            app.update(**progress.summary_fields(), phase="running")
             out.line(f"▶ {command.label}", "bold cyan")
             # The start-of-item hook (Driver.item_started), placed here so it
             # sees the command as it will actually be sent — operator notes
@@ -1346,6 +1354,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
         # file is in flight, and counting it as progress would report N jobs'
         # worth of work that nothing has finished yet.
         progress.note_remaining(remaining)
+        exitlog.note(**progress.count_fields())
         app.update(**progress.summary_fields())
 
         bits = []
@@ -1514,7 +1523,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # --git-push the pusher and the exit push through `run_settings.git_push`.
         # Copying the push policy into a local is what once made that knob do
         # nothing in this mode.
-        shared = Shared(driver, run_settings)
+        shared = Shared(driver, run_settings, progress=progress)
         console.record_timing(costlog.pool_started(shared.log_session))
 
         # Each worker owns a mailbox for both live delivery and notes queued between

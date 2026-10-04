@@ -620,8 +620,9 @@ class LoopStatus:
     """
 
     jobs: List[Job] = field(default_factory=lambda: [Job(1)])
-    iteration: int = 0                       # iterations started across all Jobs
+    iteration: int = 0                       # queue progress, or turns without a queue
     max_iterations: Optional[int] = None
+    total_iterations: Optional[int] = None   # all streams, including promotion passes
     random_order: bool = False               # renders the `rand` marker
     provider: str = "claude"
     run_started_at: float = 0.0              # first iteration of the whole run
@@ -692,6 +693,7 @@ class LoopStatus:
                 jobs=[j.snapshot() for j in self.jobs],
                 iteration=self.iteration,
                 max_iterations=self.max_iterations,
+                total_iterations=self.total_iterations,
                 random_order=self.random_order,
                 provider=self.provider,
                 run_started_at=self.run_started_at,
@@ -703,6 +705,15 @@ class LoopStatus:
                 note=self.note,
             )
         return copy
+
+
+class _InvocationCounts:
+    """Attempted/completed runs shared by streams with independent queues."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.iterations = 0
+        self.completed = 0
 
 
 class InvocationProgress:
@@ -717,7 +728,7 @@ class InvocationProgress:
     live here, and the wrapper hands the same instance to every call it makes.
     A runner given none makes its own, which is the single-call case unchanged.
 
-    Two things are kept:
+    Three things are kept:
 
       * the Job pool, reused by job_id — the Job objects already ARE the
         per-worker state, so a worker resuming with the same Job keeps its count
@@ -725,14 +736,17 @@ class InvocationProgress:
       * queue progress, where `done` is DERIVED as (pending when the invocation
         began − pending now) rather than counted. That is self-correcting: items
         a preflight strikes, or work a previous run finished, move the figure
-        with the queue instead of leaving a counter to drift away from it.
+        with the queue instead of leaving a counter to drift away from it;
+      * actual attempted/completed counts, shared with other streams through
+        `new_stream`, so kit promotion turns join the invocation total without
+        consuming the product queue's cap or changing its progress.
 
     The cap is one global number for the whole invocation (`max_items`), never
     the wrapper's per-batch cap — a batch cap is an internal detail of how the
     work is sliced and says nothing about how much the run has to do.
     """
 
-    def __init__(self, max_items: Optional[int] = None):
+    def __init__(self, max_items: Optional[int] = None, *, _counts=None):
         self._lock = threading.Lock()
         self.max_items = max_items   # the invocation's --max (None = uncapped)
         self._pool = {}              # job_id -> Job, reused by every runner call
@@ -740,6 +754,49 @@ class InvocationProgress:
         self._baseline = None        # items pending when the invocation began
         self._remaining = None       # items pending now
         self._iterations = 0         # runs with no total count iterations instead
+        self._counts = _counts if _counts is not None else _InvocationCounts()
+        self._run_counts = (0, 0)
+        self._counting = False
+
+    def new_stream(self) -> "InvocationProgress":
+        """A separate queue and Job pool contributing to the same run totals.
+
+        Promotion passes must not consume a product cap or re-baseline its
+        queue, but every provider iteration still belongs to the invocation.
+        """
+        return InvocationProgress(_counts=self._counts)
+
+    def start_run(self) -> None:
+        """Start a runner call; previous calls stay in the invocation totals.
+
+        Calls sharing one stream must be sequential. Parallel workers report
+        their local counts under Shared.lock, including released reservations.
+        """
+        with self._counts.lock:
+            self._run_counts = (0, 0)
+            self._counting = True
+
+    def record_counts(self, iterations: int, completed: int) -> dict:
+        """Replace this call's counts and return the invocation's exit fields.
+
+        Queue reduction is not an iteration count: preflight can strike work
+        without a provider turn, and retries can run without shrinking a queue.
+        Replacing local counts also lets a released parallel claim undo its
+        reservation without losing earlier batches or promotion iterations.
+        """
+        with self._counts.lock:
+            previous_iterations, previous_completed = self._run_counts
+            self._counts.iterations += iterations - previous_iterations
+            self._counts.completed += completed - previous_completed
+            self._run_counts = (iterations, completed)
+            return dict(iterations=self._counts.iterations,
+                        completed=self._counts.completed)
+
+    def count_fields(self) -> dict:
+        """The shared source for the status header and the exit record."""
+        with self._counts.lock:
+            return dict(iterations=self._counts.iterations,
+                        completed=self._counts.completed)
 
     def worker_count(self, initial: int) -> int:
         """The parallel width for this invocation, first caller establishing it.
@@ -804,14 +861,16 @@ class InvocationProgress:
         when a preflight strikes extra items. A driver with no total counts its
         own iterations and gets a denominator only when one was actually given.
         """
+        counts = (dict(total_iterations=self.count_fields()["iterations"])
+                  if self._counting else {})
         with self._lock:
             if self._baseline is None:
                 return {"iteration": self._iterations,
-                        "max_iterations": self.max_items}
+                        "max_iterations": self.max_items, **counts}
             total = (self._baseline if self.max_items is None
                      else min(self._baseline, self.max_items))
             done = min(max(self._baseline - self._remaining, 0), total)
-            return {"iteration": done, "max_iterations": total}
+            return {"iteration": done, "max_iterations": total, **counts}
 
 
 # --- segments ------------------------------------------------------------------
@@ -861,6 +920,8 @@ class IterationSegment(Segment):
             text += f"/{status.max_iterations}"
         if status.random_order:
             text += " rand"
+        if status.total_iterations is not None:
+            text += f" · total {status.total_iterations}"
         return text
 
 

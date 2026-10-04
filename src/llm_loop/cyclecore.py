@@ -669,8 +669,8 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                     print(f"\n  {statusline.PAUSE_GLYPH} Paused — press p to "
                           f"resume, s to stop, m to queue a note for the next "
                           f"iteration.")
-                    exitlog.note(phase="paused (p key)", iterations=iteration,
-                                 completed=completed)
+                    exitlog.note(phase="paused (p key)",
+                                 **progress.record_counts(iteration, completed))
                 stopchannel.wait_while_paused(app, should_stop=stop_pending)
                 # Back to the head rather than on: a stop pressed during the hold
                 # is the head's to act on (with its cancel grace), and the caps
@@ -816,11 +816,12 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                              prompt=command.prompt, now=started_at)
             # Read only by a row with no total (InvocationProgress.summary_fields).
             progress.note_iteration()
+            counts = progress.record_counts(iteration, completed)
             app.update(**progress.summary_fields(), phase="running")
             # What a post-mortem needs from a run that never got to write an
             # ending: which item it was on when it stopped existing.
             exitlog.note(phase=f"iteration {iteration} — {state_label}",
-                         iterations=iteration, completed=completed)
+                         **counts)
             # Through the module, unlike the line helpers above: this is the one
             # printed line the run must be able to READ BACK (`costlog` parses
             # iteration 1's header as a run boundary, hence its wording comes
@@ -893,13 +894,14 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
             if returncode == 0:
                 consecutive_errors = 0
                 completed += 1
+                exitlog.note(**progress.record_counts(iteration, completed))
                 driver.on_success(returncode)
                 # on_success recorded the item, so the driver's own count now
                 # says how far the invocation has got.
                 remaining = driver.pending_total()
                 if remaining is not None:
                     progress.note_remaining(remaining)
-                    app.update(**progress.summary_fields())
+                app.update(**progress.summary_fields())
 
             # The end-of-item hook: after on_success, so the driver's own queue
             # is up to date, and after the outcome either way — a failed

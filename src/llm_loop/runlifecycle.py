@@ -186,6 +186,7 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     owns_progress = progress is None
     if owns_progress:
         progress = statusline.InvocationProgress(max_items=args.max)
+    progress.start_run()
 
     settings = RunSettings(max_runs=args.max,
                            git_push=GitPushPolicy(args.git_push))
@@ -667,7 +668,7 @@ def end_run(ctx: RunContext, result: RunResult, *,
     It ends as the interrupt instead (`_exit_interrupted`).
     """
     reason = result.reason
-    counts = dict(iterations=result.attempted, completed=result.completed)
+    counts = ctx.progress.record_counts(result.attempted, result.completed)
     interrupt = ctrlc.current()
     mark = interrupt.presses
     exitlog.set_reason(stopchannel.STOP_REASON_TEXT.get(reason, reason.value),
@@ -824,7 +825,10 @@ class RunBoundary:
             heard = ctrlc.current().presses
         self._begin_ending()
         iterations, completed = self.counts()
-        exitlog.set_reason(reason, iterations=iterations, completed=completed)
+        counts = (self.ctx.progress.record_counts(iterations, completed)
+                  if self.ctx.progress is not None else
+                  dict(iterations=iterations, completed=completed))
+        exitlog.set_reason(reason, **counts)
         exit_run(self.ctx, code, ending=ending, budget=budget, heard=heard,
                  **self._close_kwargs())
 
@@ -875,6 +879,9 @@ class RunBoundary:
                        reason=exitlog.describe_exception(SystemExit, error),
                        budget=budget)
         self._begin_ending()
+        iterations, completed = self.counts()
+        if self.ctx.progress is not None:
+            exitlog.note(**self.ctx.progress.record_counts(iterations, completed))
         try:
             close_run(self.ctx, ending=f"unhandled {type(error).__name__}",
                       budget=budget, **self._close_kwargs())

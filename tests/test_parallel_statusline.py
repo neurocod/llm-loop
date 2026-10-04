@@ -13,11 +13,13 @@ Two things are pinned here, and only the first is cosmetic:
     boundary (a cap is not a request).
 """
 
+import json
 import threading
 
 import pytest
 
-from llm_loop import cyclecore, parallel, runlifecycle, stopchannel
+from llm_loop import cyclecore, exitlog, parallel, runlifecycle, stopchannel
+from llm_loop.agentwork import AgentCommand, Driver, LoopStop
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
 
@@ -62,8 +64,8 @@ def _live_statusline(monkeypatch, made, *, live=True):
 
     real_shared_class = parallel.Shared
 
-    def _shared(driver, settings):
-        shared = real_shared_class(driver, settings)
+    def _shared(driver, settings, **kwargs):
+        shared = real_shared_class(driver, settings, **kwargs)
         made["shared"] = shared
         return shared
 
@@ -714,6 +716,84 @@ def _batch(driver, args, progress):
     return parallel.run_parallel(
         driver, args, app_name="pytest-parallel-statusline",
         setup_logging=False, wait_on_start=False, progress=progress)
+
+
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("promotion_ending", ["return", "exit", "exception"])
+def test_product_and_promotion_counts_share_the_header_and_exit_record(
+        tmp_path, monkeypatch, capsys, live, promotion_ending):
+    """20 products + one kit turn + 11 products survive every phase ending."""
+    made = _live_statusline(monkeypatch, {}, live=live)
+    samples = []
+    progress = sl.InvocationProgress()
+
+    def finish_product(job_id, command, mailbox=None):
+        samples.append(made["app"].status.total_iterations)
+        return 0, 0.0, 0.01
+
+    class Promotion(Driver):
+        provider = "codex"
+        served = False
+
+        def next_command(self):
+            if not self.served:
+                self.served = True
+                return AgentCommand("promote the kit", "", "promotion")
+            if promotion_ending == "exit":
+                raise LoopStop("promotion made no progress", exit_code=1)
+            if promotion_ending == "exception":
+                raise RuntimeError("promotion failed")
+            return None
+
+    monkeypatch.setattr(parallel, "run_job", finish_product)
+    monkeypatch.setattr(cyclecore, "run_agent_streaming", lambda *a, **k: 0)
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: None)
+    driver = _CodexDriver([f"products/f{i}.md" for i in range(40)])
+    first = _batch(driver, _codex_args(str(tmp_path), 2, max_runs=20), progress)
+    assert (first.attempted, first.completed) == (20, 20)
+
+    def promote():
+        return cyclecore.run_loop(
+            Promotion(), seq_args(tmp_path, provider="codex", no_statusline=not live),
+            app_name="pytest-parallel-statusline", setup_logging=False,
+            wait_on_start=False, progress=progress.new_stream())
+
+    if promotion_ending == "return":
+        promote()
+    else:
+        error = SystemExit if promotion_ending == "exit" else RuntimeError
+        with pytest.raises(error):
+            promote()
+    assert progress.count_fields() == dict(iterations=21, completed=21)
+    record = json.loads(exitlog.current().path.read_text(encoding="utf-8"))
+    assert (record["iterations"], record["completed"]) == (21, 21)
+
+    second = _batch(driver, _codex_args(str(tmp_path), 2, max_runs=11), progress)
+    # RunResult stays local: wrappers subtract it from the product-only cap.
+    assert (second.attempted, second.completed) == (11, 11)
+    assert min(samples[20:]) >= 22
+    assert made["app"].status.iteration == 31   # completed products, same queue
+    assert made["app"].status.total_iterations == 32
+    assert "total 32" in sl.IterationSegment().text(made["app"].status.snapshot())
+    assert progress.count_fields() == dict(iterations=32, completed=32)
+    exitlog.finish()
+    assert "32 iteration(s), 32 completed" in capsys.readouterr().out
+
+
+def test_a_released_claim_preserves_earlier_stream_counts():
+    progress = sl.InvocationProgress()
+    progress.start_run()
+    progress.record_counts(20, 19)  # one failed attempt must remain visible
+    promotion = progress.new_stream()
+    promotion.start_run()
+    promotion.record_counts(1, 1)
+    progress.start_run()
+    shared = parallel.Shared(_MemDriver(["a"]), runlifecycle.RunSettings(),
+                             progress=progress)
+    line = shared.claim()
+    assert progress.count_fields() == dict(iterations=22, completed=20)
+    shared.release(line)
+    assert progress.count_fields() == dict(iterations=21, completed=20)
 
 
 def test_batches_of_one_invocation_share_one_rising_counter(tmp_path, monkeypatch):
