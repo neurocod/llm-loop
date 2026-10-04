@@ -137,7 +137,8 @@ class Driver:
     #   limit_policy = LimitPolicy([SessionLimit(80)])            # flat session
     #   limit_policy = LimitPolicy([WeeklyLimit(90)])             # weekly cap
     #   limit_policy = LimitPolicy([DayNightLimit(), WeeklyLimit(90)])  # composite
-    # A class-level policy shares console ceiling edits across driver instances.
+    # Only the first run of a process to open an account settles its policy;
+    # later runs share it, console edits included (limits.process_policy).
     limit_policy = None
 
     @classmethod

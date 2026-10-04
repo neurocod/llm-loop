@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from llm_loop import console, exitlog, projectroot, scriptlock
+from llm_loop import console, exitlog, limits, projectroot, scriptlock
 
 from _runfixtures import finish_record
 
@@ -108,6 +108,12 @@ def _put_back(item) -> list:
 def _leak_message(item, leaks) -> str:
     return (f"{item.nodeid} left {'; '.join(leaks)} — run it inside "
             f"`_runfixtures.isolated_run`")
+
+
+@pytest.fixture(autouse=True)
+def isolate_process_policies(monkeypatch):
+    """Each test settles its own accounts' policies (`limits.process_policy`)."""
+    monkeypatch.setattr(limits, "_PROCESS_POLICIES", {})
 
 
 @pytest.fixture(autouse=True)

@@ -74,6 +74,38 @@ def test_opening_falls_back_to_the_providers_default_policy(monkeypatch):
     assert default.snapshots == [], "a dry run is not a run: no opening snapshot"
 
 
+def test_a_later_run_keeps_the_accounts_policy_and_its_edit(monkeypatch, capsys):
+    """One policy per account per process, whatever driver the next run has.
+
+    runGenerateModels chains a kit-promotion run (no policy of its own) and a
+    product batch (its own): a weekly ceiling edited with `w` in one was gone
+    in the other, which opened a policy of its own.
+    """
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: object())
+    first = limits.LimitPolicy([limits.WeeklyLimit(96)])
+
+    opened = runlifecycle.open_usage(_Driver(first), "codex", dry_run=True)
+    opened.policy.rules[0].limit = 100      # what the `w` editor does
+    plain = runlifecycle.open_usage(_Driver(), "codex", dry_run=True)
+    other = runlifecycle.open_usage(
+        _Driver(limits.LimitPolicy([limits.WeeklyLimit(90)])), "codex",
+        dry_run=True)
+
+    assert plain.policy is first and other.policy is first
+    assert first.rules[0].limit == 100
+    assert "this driver's own is not used" in capsys.readouterr().out
+
+
+def test_each_account_settles_its_own_policy(monkeypatch):
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: object())
+    claude = runlifecycle.open_usage(_Driver(), "claude", dry_run=True)
+    codex = runlifecycle.open_usage(_Driver(), "codex", dry_run=True)
+
+    assert claude.policy is not codex.policy
+    assert runlifecycle.open_usage(_Driver(), "claude",
+                                   dry_run=True).policy is claude.policy
+
+
 def test_the_closing_snapshot_answers_the_opening_one():
     source, policy = object(), StubPolicy()
     usage = runlifecycle.RunUsage(source, policy, "claude")

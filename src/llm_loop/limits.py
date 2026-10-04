@@ -35,6 +35,7 @@ statusline.quota_rows), and a rule only adds its half — its ceiling — next t
 window it watches.
 """
 
+import threading
 import time
 from datetime import datetime
 from typing import Optional
@@ -408,6 +409,41 @@ class LimitPolicy:
         print_line(head)
         for ln in lines:
             print_percents(f"      {ln}")
+
+
+# The policy each provider's account is gated on, for the whole process (see
+# `process_policy`). Keyed by provider: a ceiling is about an account.
+_PROCESS_POLICIES = {}
+_PROCESS_POLICIES_LOCK = threading.Lock()
+
+
+def process_policy(provider: str,
+                   declared: Optional[LimitPolicy] = None) -> LimitPolicy:
+    """The ONE policy `provider`'s account is gated on in this process.
+
+    A wrapper may chain several runs with different drivers in one process
+    (runGenerateModels alternates a kit-promotion run and a product batch), and
+    the operator's `w` edit mutates the policy of the run on screen. Resolved
+    per driver, that edit was gone when the next run opened a policy of its own,
+    and each phase gated on different ceilings. So the first run to open the
+    account settles it — the driver's `declared` policy, else the provider's
+    default — and every later run gets the same object, edits included.
+
+    A later driver declaring a DIFFERENT policy is told it is not used rather
+    than silently overridden; a wrapper whose drivers share one policy object
+    never sees that line.
+    """
+    with _PROCESS_POLICIES_LOCK:
+        policy = _PROCESS_POLICIES.get(provider)
+        if policy is None:
+            policy = declared or default_policy(provider)
+            _PROCESS_POLICIES[provider] = policy
+            return policy
+    if declared is not None and declared is not policy:
+        print_line(f"  · {provider} usage limit policy: keeping the one this "
+                   f"process already gates on ({policy.describe()}); this "
+                   f"driver's own is not used")
+    return policy
 
 
 def default_policy(provider: str = "claude") -> LimitPolicy:

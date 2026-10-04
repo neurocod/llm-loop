@@ -337,8 +337,8 @@ def open_usage(driver, provider: str, *, name: Optional[str] = None,
 
     None when the provider has no usage endpoint (`usage_source_for`); whether
     to open one at all is the runner's call. `name` labels the snapshots and
-    defaults to the provider. The policy is the Driver's specialisation when it
-    has one, the provider's default otherwise. A dry run gets the pair (the gate
+    defaults to the provider. The policy is the process's one for that account
+    (`limits.process_policy`), settled by the first run that opens it. A dry run gets the pair (the gate
     and the status line read it) but no snapshot, because it is not a run.
 
     `register` is handed what this returns BEFORE the opening snapshot: the
@@ -353,7 +353,7 @@ def open_usage(driver, provider: str, *, name: Optional[str] = None,
             register(None)
         return None
     usage = RunUsage(source,
-                     driver.limit_policy or limits.default_policy(provider),
+                     limits.process_policy(provider, driver.limit_policy),
                      name or provider)
     if register is not None:
         register(usage)
