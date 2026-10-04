@@ -109,7 +109,9 @@ def test_help_command_is_printed_above_the_live_frame(monkeypatch, logged):
 
     out = io.StringIO()
     monkeypatch.setattr(sys, "stdout", out)
-    monkeypatch.setattr(sys, "argv", ["runCycle.py", "--max-runs", "7"])
+    literal_arg = "[red]:rocket:" + "x" * 200
+    monkeypatch.setattr(sys, "argv", ["runCycle.py", "--max-runs", "7",
+                                    "--wrapper-option", literal_arg])
     monkeypatch.setattr(console, "_RichConsole", lambda **kwargs: Console(
         **kwargs, force_terminal=True, force_interactive=True,
         legacy_windows=False, _environ={"TERM": "xterm"}, width=100, height=40))
@@ -131,6 +133,7 @@ def test_help_command_is_printed_above_the_live_frame(monkeypatch, logged):
         # Its next refresh can therefore erase only the assistant block.
         assert "\x1b[2K" in printed.split("Restart command:")[0]
         assert "assistant row 6" in printed.split("--max-runs 7")[1]
+        assert literal_arg in printed
         assert logged[0].startswith("Restart command:\n")
         assert "--max-runs 7" in logged[0]
         stream._live.refresh()

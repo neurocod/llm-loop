@@ -666,10 +666,11 @@ def _print_flushed(text: str) -> None:
 def _print_above_live(text: str) -> None:
     with _LIVE_OUTPUT_LOCK:
         if _live_console is not None:
-            _live_console.print(text, markup=False, highlight=False, soft_wrap=True)
+            _live_console.print(text, markup=False, highlight=False, emoji=False,
+                                soft_wrap=True)
             _log_plain(text)
             return
-    _print_flushed(text)
+        _print_flushed(text)
 
 
 def print_markup(plain: str, markup: str) -> None:
