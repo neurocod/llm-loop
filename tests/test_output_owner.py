@@ -853,6 +853,41 @@ def test_ctrl_c_over_a_stuck_console_still_stops_the_workers_and_reports(
     assert console._route is None, "the interrupted run left the console routed"
 
 
+def test_a_worker_waits_out_a_stuck_console_instead_of_writing_past_it(
+        monkeypatch, capsys):
+    """Workers keep the unbounded post (`parallel._emit_markup`), even inside a
+    route whose posters give up after `post_timeout`: a worker writing its own
+    line past a queue still holding its earlier ones would print its
+    transcript out of order. Every line is the owner's, in the order said."""
+    owner, stall = _stuck_and_full("console-lines")
+    monkeypatch.setattr(parallel, "_console", owner)
+    watched = _WatchedConsole()
+    monkeypatch.setattr(parallel, "print_markup", watched)
+    said = threading.Event()
+
+    def worker():
+        lines = parallel.job_lines(1)
+        for n in range(3):
+            lines.line(f"line {n}")
+        said.set()
+
+    try:
+        with console.route_through(owner, post_timeout=0.01):
+            threading.Thread(target=worker, name="worker-1", daemon=True).start()
+            # A worker on the route's policy is done in ~0.01 s (one wait of
+            # post_timeout, then try_post); this waits a hundred times that.
+            assert not said.wait(1.0), "a worker wrote past a stuck console"
+            stall.release.set()
+            assert said.wait(WAIT_S)
+            assert owner.drain(WAIT_S)
+    finally:
+        stall.release.set()
+        assert owner.close(WAIT_S)
+
+    assert watched.writers == {"console-lines"}
+    assert [line.rsplit(" ", 1)[1] for line in watched.lines] == ["0", "1", "2"]
+
+
 # --- the lines of threads the runner does not own: console.route_through --------
 
 

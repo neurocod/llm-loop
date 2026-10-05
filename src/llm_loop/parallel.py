@@ -262,7 +262,28 @@ def _write_markup(plain: str, markup: str) -> None:
 
 
 def _emit_markup(plain: str, markup: str) -> None:
-    """The sink under every worker's line: post it, do not write it."""
+    """The sink under every worker's line: post it, do not write it.
+
+    An UNBOUNDED post, unlike the bounded wait every other line of the run gets
+    from `console.route_through` (the usage gate, the pusher). Deliberate, not
+    an oversight — the reasons for that bound do not apply here, and its cost
+    does:
+
+      * the bound exists because those posters hold something others wait
+        for: the gate holds `usage_lock`, the exit push waits for the pusher.
+        A worker emits holding no lock (`Shared.latch_stop` writes after
+        releasing `shared.lock`, for this reason). The run itself waits for
+        its workers only until a Ctrl+C (`join_workers`), and past one for
+        `INTERRUPT_JOIN_TIMEOUT_S` (`_Interrupt.hear`);
+      * the bound's cost is order: past it the route writes the line on the
+        poster's thread while earlier ones are still queued. For a worker that
+        would put its own transcript out of order — "✓ done" ahead of the tool
+        calls it closes — where one FIFO and one writer keep every job's lines
+        in the order said;
+      * and what it would buy is nothing: a queue full for that long means the
+        console is stuck, and the worker's direct write would block there too
+        (the route says as much of its own direct writes).
+    """
     _console.post(_write_markup, plain, markup)
 
 

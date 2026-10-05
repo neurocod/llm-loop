@@ -624,6 +624,10 @@ def route_through(owner, *, post_timeout: float):
         drop is the right answer for a diagnostic repeated per event (backlog
         0763), not for a line said once.
 
+    A parallel run's WORKERS post to the owner directly, not through this
+    route, and wait without a bound: why they differ is
+    `parallel._emit_markup`'s to say.
+
     A queue full for the whole of `post_timeout` means the console itself is
     stuck, so the direct write may block there as well — which is where the
     write blocked before this route existed, so the worst case is the old
