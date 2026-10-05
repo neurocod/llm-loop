@@ -13,7 +13,10 @@ Three layers, pinned in that order:
     request, and a key, a resize or a `disable` is a call posted to it.
 """
 
+import os
+import subprocess
 import sys
+import textwrap
 import threading
 import time
 
@@ -1612,6 +1615,47 @@ def test_a_frozen_stderr_does_not_hold_start_after_its_first_frame_timed_out(
     assert _wait_for(lambda: "the first frame not done within 0.05 s"
                      in "".join(stderr.chunks)), \
         "the warning never landed once the console thawed"
+
+
+# The child below imports the statusline and exits after a 0.3 s join: the
+# whole pin 0.82 s and 0.77 s, measured 2026-10-05; a crashing exit adds the
+# interpreter's ~1 s wait for the stderr lock. The bound is many times both.
+FROZEN_EXIT_S = 20.0
+
+_EXITS_WITH_A_STUCK_WARNING = textwrap.dedent("""
+    import threading
+    from llm_loop import statusline as sl
+    # Bigger than any pipe buffer: the write is stuck until the parent reads.
+    writer = threading.Thread(target=sl._stderr_writer("x" * (4 << 20)),
+                              daemon=True)
+    writer.start()
+    writer.join(0.3)
+    print("main done", flush=True)
+""")
+
+
+def test_a_warning_stuck_on_a_frozen_stderr_does_not_crash_the_exit():
+    """`Painter.open` leaves its warning to a daemon thread past
+    OPEN_WARNING_WAIT_SECONDS. A daemon stuck in `print` holds the stderr
+    `BufferedWriter` lock, and the interpreter's shutdown aborted on it with
+    "Fatal Python error: _enter_buffered_busy" (0xC0000409) — or, staged
+    here with a `print` restored (2026-10-05), never exited at all. Staged in
+    a child whose stderr pipe nobody reads until it has exited.
+    """
+    package_root = os.path.dirname(os.path.dirname(sl.__file__))
+    env = dict(os.environ, PYTHONPATH=package_root)
+    child = subprocess.Popen([sys.executable, "-c", _EXITS_WITH_A_STUCK_WARNING],
+                             env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+    deadline = time.monotonic() + FROZEN_EXIT_S
+    while child.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    exited_while_frozen = child.poll() is not None
+    out, err = child.communicate()
+    assert exited_while_frozen, "the child waited for its frozen stderr"
+    assert b"main done" in out
+    assert b"Fatal Python error" not in err, err.replace(b"x", b"")[-600:]
+    assert child.returncode == 0, err.replace(b"x", b"")[-600:]
 
 
 def test_ctrl_c_in_a_service_stop_still_stops_the_rest_and_releases_the_region():

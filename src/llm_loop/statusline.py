@@ -133,8 +133,9 @@ PAINTER_JOIN_SECONDS = 1.0
 # selection, which thaws on the next key). Written on the opener, it held a
 # parallel run's main thread BEFORE `parallel.join_workers`, the one place that
 # hears Ctrl+C. A healthy write returns long before this bound, so the line keeps
-# its place in the output; past it the opener goes on and the line lands when
-# the console thaws.
+# its place in the output; past it the opener goes on and the line lands if
+# the console thaws before the process exits, and is lost (without a crash, see
+# `_stderr_writer`) if it does not.
 OPEN_WARNING_WAIT_SECONDS = 1.0
 
 # The painter thread's name: the pins tell "written on the painter" from
@@ -2825,7 +2826,7 @@ class Painter:
         if wait is None:
             _print_stderr(line)
             return
-        writer = threading.Thread(target=_print_stderr, args=(line,),
+        writer = threading.Thread(target=_stderr_writer(line),
                                   name=f"{PAINTER_THREAD_NAME}-warning",
                                   daemon=True)
         writer.start()
@@ -2837,6 +2838,43 @@ def _print_stderr(line: str) -> None:
         print(line, file=sys.stderr)
     except Exception:
         pass
+
+
+def _stderr_writer(line: str) -> Callable[[], None]:
+    """(caller) A write of `line` for a daemon thread that may outlive the
+    process's main thread.
+
+    A daemon stuck in `print` on a frozen stderr holds the `BufferedWriter`
+    lock, and the interpreter's shutdown then waits for that lock about a
+    second and aborts with "Fatal Python error: _enter_buffered_busy"
+    (exit 0xC0000409), losing the line anyway. So the text layer is flushed
+    here, on the caller, and the daemon writes the encoded bytes to the raw
+    stream underneath, which takes no Python-level lock: a write still stuck
+    at exit dies with the process, and the line is lost without a crash.
+    A stderr without a raw stream (a test's stand-in) is printed to as is.
+    """
+    stream = sys.stderr
+    raw = getattr(getattr(stream, "buffer", None), "raw", None)
+    if raw is None:
+        return lambda: _print_stderr(line)
+    try:
+        stream.flush()
+        data = (line + os.linesep).encode(stream.encoding or "utf-8",
+                                          stream.errors or "backslashreplace")
+    except Exception:
+        return lambda: None
+
+    def write() -> None:
+        view = memoryview(data)
+        try:
+            while view:
+                written = raw.write(view)
+                if not written:
+                    return
+                view = view[written:]
+        except Exception:
+            pass
+    return write
 
 
 class StatusApp:

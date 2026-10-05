@@ -361,9 +361,10 @@ def render(argv: List[str], overrides: Dict[str, Any], *,
     for Windows PowerShell 5.1 (`powershell.exe`, present on every Windows); it
     carries no pre-escape for 5.1's native-argument passing, so pwsh 7.3+,
     which passes arguments properly, should read it the same - pinned only
-    where pwsh is installed (the GitHub Windows runner, not the author's
-    machine; the `pwsh` cases of test_cmdline.py). cmd.exe is not a target: it would reject
-    the leading `& ` and read `%` and `^` in values; the older CreateProcess-only
+    where pwsh 7.3+ is installed (the GitHub Windows runner, not the author's
+    machine; the `pwsh` cases of test_cmdline.py). cmd.exe is not a target: it
+    would reject the leading `& ` and read `%` and `^` in values; the older
+    CreateProcess-only
     line (`list2cmdline`) worked there and in no shell the author uses. Raises
     NotPasteable when an argument cannot be written for the shell (see
     `quote`); the caller shows that message instead of a line.

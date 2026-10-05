@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from _pwsh import (PWSH, invocation, needs_powershell, needs_pwsh, ps_quote,
+from _pwsh import (invocation, needs_powershell, needs_pwsh, ps_quote,
                    run_powershell)
 from llm_loop import clispec, cmdline
 from llm_loop.cmdline import (POSIX, POWERSHELL, NotPasteable, paste_shell,
@@ -415,7 +415,7 @@ def _deliver_by_powershell(line, tmp_path):
 
 
 def _deliver_by_pwsh(line, tmp_path):
-    return run_powershell(line, shell=PWSH)
+    return run_powershell(line, shell="7")
 
 
 def _deliver_by_bash(line, tmp_path):
@@ -519,7 +519,7 @@ def test_the_refused_words_are_where_5_1_and_pwsh_part(tmp_path, shell, word):
     echo = tmp_path / "echo_argv.py"
     echo.write_text(_ECHO_ARGV, encoding="utf-8")
     line = invocation([sys.executable, str(echo)], ps_quote(word), "SENTINEL")
-    result = run_powershell(line, shell=PWSH if shell == "7" else None)
+    result = run_powershell(line, shell=shell)
     assert result.returncode == 0, line + "\n" + result.stdout + result.stderr
     delivered = json.loads(result.stdout)
     if shell == "7":

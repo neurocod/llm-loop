@@ -35,14 +35,37 @@ needs_powershell = pytest.mark.skipif(
            "re-parses the pasted line)")
 
 # pwsh 7.3+ passes native arguments properly ($PSNativeCommandArgumentPassing),
-# which is what `cmdline._powershell_word`'s refusals rest on. Windows only, like
-# POWERSHELL: the pins paste Windows-shaped lines.
-PWSH = shutil.which("pwsh.exe") if os.name == "nt" else None
+# which is what `cmdline._powershell_word`'s refusals rest on; 7.0-7.2 still
+# pass them the 5.1 way, so a pwsh older than this is no pwsh for the pins.
+PWSH_MIN_VERSION = (7, 3)
+
+
+def _pwsh_version(path: str) -> Optional[tuple]:
+    """(major, minor) of the pwsh at `path`, or None if it does not say."""
+    try:
+        done = subprocess.run(
+            [path, "-NoProfile", "-NonInteractive", "-Command",
+             "$PSVersionTable.PSVersion.ToString()"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=TIMEOUT_S)
+        major, minor = done.stdout.strip().split(".")[:2]
+        return int(major), int(minor)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+# Windows only, like POWERSHELL: the pins paste Windows-shaped lines.
+_PWSH_FOUND = shutil.which("pwsh.exe") if os.name == "nt" else None
+_PWSH_VERSION = _pwsh_version(_PWSH_FOUND) if _PWSH_FOUND else None
+PWSH = (_PWSH_FOUND if _PWSH_VERSION is not None
+        and _PWSH_VERSION >= PWSH_MIN_VERSION else None)
 
 needs_pwsh = pytest.mark.skipif(
     PWSH is None,
-    reason="no pwsh 7 here (the GitHub Windows runner has it): the claim that "
-           "7.3+ reads the PowerShell line as 5.1 does goes unmeasured")
+    reason=("no pwsh here (the GitHub Windows runner has it)" if not _PWSH_FOUND
+            else f"pwsh at {_PWSH_FOUND} is {_PWSH_VERSION}, not 7.3+")
+    + ": the claim that 7.3+ reads the PowerShell line as 5.1 does goes "
+      "unmeasured")
 
 
 # PowerShell reads these four as the single quote too, so inside '...' each
@@ -69,9 +92,11 @@ def invocation(program: Sequence[str], *words: str) -> str:
 
 
 def run_powershell(line: str, *, timeout: float = TIMEOUT_S,
-                   shell: Optional[str] = None) -> subprocess.CompletedProcess:
+                   shell: str = "5.1") -> subprocess.CompletedProcess:
     """Run one line of PowerShell source that calls a native program, in
-    `shell` (POWERSHELL when None; PWSH for pwsh 7).
+    `shell`: "5.1" for POWERSHELL, "7" for PWSH (pwsh 7.3+). A name, not a
+    path, so a missing pwsh is an assertion naming the mark to add rather
+    than a quiet run in 5.1.
 
     The exit code is the native program's. Anything else is a failure, never
     0: a native program that never ran (the name not found) or a failing
@@ -92,14 +117,19 @@ def run_powershell(line: str, *, timeout: float = TIMEOUT_S,
     reads it when no command reaches it (the gate's hook mode) would otherwise
     wait for input that never comes, until the timeout.
     """
-    if shell is None:
+    if shell == "5.1":
         assert POWERSHELL is not None, "mark the test with needs_powershell"
-        shell = POWERSHELL
+        program = POWERSHELL
+    elif shell == "7":
+        assert PWSH is not None, "mark the test with needs_pwsh"
+        program = PWSH
+    else:
+        raise ValueError(f"shell is '5.1' or '7', not {shell!r}")
     source = ("$ErrorActionPreference = 'Stop'; " + line
               + "; exit $(if ($null -eq $LASTEXITCODE) { 255 } "
                 "else { $LASTEXITCODE })")
     encoded = base64.b64encode(source.encode("utf-16-le")).decode("ascii")
-    return subprocess.run([shell, "-NoProfile", "-NonInteractive",
+    return subprocess.run([program, "-NoProfile", "-NonInteractive",
                            "-EncodedCommand", encoded],
                           stdin=subprocess.DEVNULL, capture_output=True,
                           text=True, encoding="utf-8", errors="replace",

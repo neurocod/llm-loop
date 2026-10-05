@@ -60,5 +60,5 @@ def test_run_powershell_never_reports_success_for_what_did_not_run(line,
                                                                    expected,
                                                                    shell):
     result = run_powershell(line.replace("{py}", ps_quote(sys.executable)),
-                            shell=_pwsh.PWSH if shell == "7" else None)
+                            shell=shell)
     assert result.returncode == expected, result.stdout + result.stderr
