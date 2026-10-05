@@ -519,9 +519,9 @@ def test_every_git_call_of_a_parallel_run_is_made_by_the_pusher(
         f"made whole behind the pusher's: {fake.beside_a_push}")
 
 
-# How long the pin below gives an abort's `set` to return while a git
-# start is held: one that does not wait returns inside it. Only the
-# failing case depends on it.
+# How long `test_an_abort_waits_out_a_git_start_in_progress` gives an
+# abort's `set` to return while a git start is held: one that does not
+# wait returns inside it. Only the failing case depends on it.
 SETTLE_S = 0.1
 
 
