@@ -16,7 +16,8 @@ import sys
 
 import pytest
 
-from _pwsh import needs_powershell, run_powershell
+from _pwsh import (PWSH, invocation, needs_powershell, needs_pwsh, ps_quote,
+                   run_powershell)
 from llm_loop import clispec, cmdline
 from llm_loop.cmdline import (POSIX, POWERSHELL, NotPasteable, paste_shell,
                               quote, rebuild_argv, render)
@@ -413,6 +414,10 @@ def _deliver_by_powershell(line, tmp_path):
     return run_powershell(line)
 
 
+def _deliver_by_pwsh(line, tmp_path):
+    return run_powershell(line, shell=PWSH)
+
+
 def _deliver_by_bash(line, tmp_path):
     # From a file, not `bash -c`: the line then reaches bash untouched by any
     # command-line quoting of our own. MSYS rewrites POSIX-looking arguments to
@@ -431,6 +436,9 @@ def _deliver_by_bash(line, tmp_path):
 SHELLS = [
     pytest.param(POWERSHELL, _deliver_by_powershell, id="powershell",
                  marks=needs_powershell),
+    # The same PowerShell line, pasted into pwsh 7.3+: `render` says it reads
+    # the line as 5.1 does.
+    pytest.param(POWERSHELL, _deliver_by_pwsh, id="pwsh", marks=needs_pwsh),
     pytest.param(POSIX, _deliver_by_bash, id="bash", marks=pytest.mark.skipif(
         BASH is None, reason="no bash to paste into (on Windows: no Git Bash)")),
 ]
@@ -496,6 +504,28 @@ def test_the_rendered_line_round_trips_through_its_shell(
     for flag, value in overrides.items():
         pairs += [flag, str(value)]
     assert _parse_outcome(delivered) == _parse_outcome(pairs)
+
+
+@pytest.mark.parametrize("shell", [
+    pytest.param("5.1", marks=needs_powershell),
+    pytest.param("7", marks=needs_pwsh)])
+@pytest.mark.parametrize("word", ["", 'a"b', "C:\\my dir\\"],
+                         ids=["empty", "double-quote",
+                              "space-and-trailing-backslash"])
+def test_the_refused_words_are_where_5_1_and_pwsh_part(tmp_path, shell, word):
+    """The premise of three of `_powershell_word`'s refusals: 5.1 mangles
+    each word as quoted, and pwsh 7.3+ delivers it as typed — so a
+    pre-escape that repaired 5.1 would break pwsh."""
+    echo = tmp_path / "echo_argv.py"
+    echo.write_text(_ECHO_ARGV, encoding="utf-8")
+    line = invocation([sys.executable, str(echo)], ps_quote(word), "SENTINEL")
+    result = run_powershell(line, shell=PWSH if shell == "7" else None)
+    assert result.returncode == 0, line + "\n" + result.stdout + result.stderr
+    delivered = json.loads(result.stdout)
+    if shell == "7":
+        assert delivered == [word, "SENTINEL"], line
+    else:
+        assert delivered != [word, "SENTINEL"], line
 
 
 def _parse_outcome(argv):

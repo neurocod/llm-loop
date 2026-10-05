@@ -11,7 +11,8 @@ import sys
 import pytest
 
 import _pwsh
-from _pwsh import invocation, needs_powershell, ps_quote, run_powershell
+from _pwsh import (invocation, needs_powershell, needs_pwsh, ps_quote,
+                   run_powershell)
 from llm_loop import cmdline
 
 _ECHO = "import json, sys; print(json.dumps(sys.argv[1:]))"
@@ -43,7 +44,9 @@ def test_ps_quote_round_trips_through_powershell():
     assert json.loads(result.stdout) == [text]
 
 
-@needs_powershell
+@pytest.mark.parametrize("shell", [
+    pytest.param("5.1", marks=needs_powershell),
+    pytest.param("7", marks=needs_pwsh)])
 @pytest.mark.parametrize("line, expected", [
     ("& {py} -c 'import sys; sys.exit(3)'", 3),
     ("& {py} -c 'pass'", 0),
@@ -54,6 +57,8 @@ def test_ps_quote_round_trips_through_powershell():
 ], ids=["native-exit-code", "native-success", "native-never-ran",
         "failing-cmdlet-last", "no-native-program"])
 def test_run_powershell_never_reports_success_for_what_did_not_run(line,
-                                                                   expected):
-    result = run_powershell(line.replace("{py}", ps_quote(sys.executable)))
+                                                                   expected,
+                                                                   shell):
+    result = run_powershell(line.replace("{py}", ps_quote(sys.executable)),
+                            shell=_pwsh.PWSH if shell == "7" else None)
     assert result.returncode == expected, result.stdout + result.stderr
