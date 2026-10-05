@@ -31,7 +31,7 @@ overnight.
 | Quota / rate limits | run until the CLI dies | the account's real figures are read over the provider's API **before** each iteration, and the loop waits under configurable ceilings (session / day-night / weekly), with a reactive `rate_limit_event` backstop |
 | Parallelism | sequential (fan-out only *inside* one agent) | `-j N` concurrent CLI workers draining a work-queue file, one item per job |
 | Stopping | Ctrl+C | `s` key (this run only), `stop` sentinel file (every run in the root), `--max-runs`, an `error` state that halts for a human, and a `done` / `complete` state that ends the run cleanly |
-| Steering | stop it, edit the prompt, start again | `m` types a note into the turn already running (or queues it for the next one); `p` holds the loop at an iteration boundary so the files it reads can be edited, `p` again lets it go |
+| Steering | stop it, edit the prompt, start again | `m` sends a note into the current iteration at the model's next turn boundary (or queues it for the next iteration when none is running); `p` holds the loop at an iteration boundary so the files it reads can be edited, `p` again lets it go |
 | Providers | whatever the pipe points at | Claude and Codex adapters (argv vs. stdin prompt transport, both stream-json rendered) |
 | Observability | terminal scrollback | pinned status line (iteration, model, elapsed, live quota, per-job rows), rotating mirror log, optional Markdown rendering |
 | git | your problem | `--git-push none\|after_new_commits\|each_hour` |
@@ -619,8 +619,8 @@ Only the second line means the run is standing still and the files are yours.
 (`pause_state` in `statusline.py` is the whole rule.)
 
 Held, a run still answers everything else: `s` ends the hold and stops the run
-(with its usual cancel countdown), the `stop` file does the same, and `m` queues
-a note that rides the next iteration's prompt. Like `s`, `p` is in-process and
+(with its usual cancel countdown), the `stop` file does the same, and `m` still
+accepts notes (see below). Like `s`, `p` is in-process and
 writes nothing to disk — it holds the run whose terminal it was typed into, and
 the ones next door work on.
 
@@ -664,13 +664,14 @@ every key are decoded, so the same bindings work on Windows and POSIX.
 
 What you type reaches the agent one of two ways:
 
-* **into the turn already running**, over its stdin, if one is in flight. It
-  lands at the model's next turn boundary (a tool call in progress is not
-  interrupted), so advice about the CURRENT task arrives while it can still
-  change the outcome. The note may also be answered right after the turn it was
-  typed in, as a continuation of the same session — either way it is answered.
-* **queued for the next iteration** otherwise (between iterations, or with
-  `--no-live-messages`), appended to that prompt as a named section. The legend
+* **into the current iteration**, if one is running. The agent receives the
+  note at the model's next turn boundary — for example, after a tool call
+  returns — and continues the same iteration with that guidance. A tool call
+  already in progress is allowed to finish. The note may also be answered as a
+  continuation of the same session if it arrives as the active turn ends.
+* **queued for the next iteration** otherwise (between iterations, including
+  a fully `PAUSED` run, or with `--no-live-messages`), appended to that prompt as
+  a named section. The legend
   counts what is waiting: `m message (2 queued)`.
 
 Notes are framed before the agent sees them: who is speaking, and that a note is
