@@ -197,6 +197,7 @@ src/
     gitpush.py       when a run pushes what it has committed, and where
     providers.py     Claude/Codex executable flags, argv construction, and the
                      ending owed to a provider child
+    procend.py       ending a child process tree: ask, wait, kill, wait
     drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)
     parallel.py      run_parallel: N concurrent LLM workers over a list file
     ownership.py     one thread owns a shared resource, the rest post to it

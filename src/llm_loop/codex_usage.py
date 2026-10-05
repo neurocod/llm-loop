@@ -21,6 +21,7 @@ from typing import Callable, List, Optional
 
 from . import wire
 from .console import print_line
+from .procend import REAP_GRACE_S, end_process_tree
 from .usage import EMPTY_READING, EMPTY_USAGE, Usage, UsageReading, summary_line
 
 # The bound on one request — the handshake of a fresh server included. A wait
@@ -196,15 +197,12 @@ class _QuotaServer:
 
         On Windows `proc` is usually the npm shim's `cmd.exe` and the CLI a
         grandchild, so the escalation goes through the turn process's
-        tree-aware `ask_agent_process_to_end` (`taskkill /T`), not the
-        shim-only `terminate`. A grandchild that survives anyway keeps the
-        stdout write end: the pump then stays in `readline`, and closing
-        stdout would block on the lock that read holds (19.0 s measured
-        2026-10-02 against a 20 s grandchild) — so the stream is left to the
-        daemon pump instead.
+        tree-aware `end_process_tree` (`taskkill /T`), not the shim-only
+        `terminate`. A grandchild that survives anyway keeps the stdout write
+        end: the pump then stays in `readline`, and closing stdout would block
+        on the lock that read holds (19.0 s measured 2026-10-02 against a 20 s
+        grandchild) — so the stream is left to the daemon pump instead.
         """
-        # Imported here: `providers` imports this module.
-        from .providers import REAP_GRACE_S, ask_agent_process_to_end
         proc = self.proc
         try:
             proc.stdin.close()
@@ -213,15 +211,7 @@ class _QuotaServer:
         try:
             proc.wait(timeout=REAP_GRACE_S)
         except subprocess.TimeoutExpired:
-            ask_agent_process_to_end(proc)
-            try:
-                proc.wait(timeout=REAP_GRACE_S)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    proc.kill()
-                    proc.wait(timeout=REAP_GRACE_S)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
+            end_process_tree(proc)
         except OSError:
             pass
         self._pump.join(timeout=REAP_GRACE_S)
