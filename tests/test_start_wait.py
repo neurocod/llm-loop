@@ -21,10 +21,22 @@ class _Waiting(SimpleNamespace):
         return bool(self.terminal and self.terminal.releases)
 
 
+class _LoggedTerminal(RecordingTerminal):
+    """Puts its release into the wait's one event log, beside the reader's."""
+
+    def __init__(self, log, **kwargs):
+        super().__init__(**kwargs)
+        self._log = log
+
+    def release(self):
+        self._log.append("release")
+        return super().release()
+
+
 @pytest.fixture
 def waiting(monkeypatch):
     state = _Waiting(now=0.0, actions=[], stopped=False, terminal=None,
-                     width=80)
+                     width=80, log=[])
 
     class Reader:
         def usable(self):
@@ -35,6 +47,7 @@ def waiting(monkeypatch):
 
         def stop(self):
             state.stopped = True
+            state.log.append("stop")
 
     class Events:
         def put(self, event):
@@ -56,7 +69,8 @@ def waiting(monkeypatch):
         # What the real factory answers for a disabled UI; a console otherwise.
         if not enabled:
             return termio.NullTerminal()
-        state.terminal = RecordingTerminal(columns=state.width, lines=24)
+        state.terminal = _LoggedTerminal(state.log, columns=state.width,
+                                         lines=24)
         return state.terminal
 
     def sleep(seconds):
@@ -116,23 +130,34 @@ def test_quit_never_starts_and_restores_terminal(waiting, capsys, action, code):
 
 
 @pytest.mark.parametrize("interactive", [True, False])
-def test_the_run_s_ctrl_c_leaves_the_start_wait(waiting, capsys, interactive):
+def test_the_run_s_ctrl_c_leaves_the_start_wait(
+        waiting, capsys, monkeypatch, interactive):
     """Inside a run the press raises nothing: the wait itself must leave.
 
     The outer capture would turn a returned wait into exit 130 as well, so
-    the pin reads what was said: the wait's line, and no start.
+    the pin reads what was said: the wait's line, and no start. The
+    countdown says it while it still owns the terminal — before the reader
+    stops and the rows are released — and says it through `ctrlc.leave_wait`;
+    the plain fallback has already stopped its reader by then.
     """
+    leave_wait = ctrlc.leave_wait
+
+    def spy():
+        waiting.log.append("leave_wait")
+        leave_wait()
+
+    monkeypatch.setattr(ctrlc, "leave_wait", spy)
     with pytest.raises(SystemExit) as caught:
         with ctrlc.captured() as interrupt:
             interrupt.press()
             cyclecore.wait_before_start("2h", interactive=interactive)
     assert caught.value.code == ctrlc.EXIT_CODE
     out = capsys.readouterr().out
-    assert ctrlc.WAIT_INTERRUPTED_LINE in out
+    assert out.count(ctrlc.WAIT_INTERRUPTED_LINE) == 1
     assert "Starting the loop" not in out
     assert waiting.now == 0
-    if interactive:
-        assert waiting.stopped and waiting.released
+    assert waiting.log == (["leave_wait", "stop", "release"] if interactive
+                           else ["stop", "leave_wait"])
 
 
 def test_disabled_ui_waits_silently(waiting, capsys):

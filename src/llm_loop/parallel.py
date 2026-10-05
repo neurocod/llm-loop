@@ -104,10 +104,11 @@ PUSH_PUMP_INTERVAL_S = 60
 # come back before it closes the run down anyway — the whole fleet together,
 # one `runlifecycle.StopBudget`, not each thread in turn (a fleet of ten used
 # to cost ten times this). Bounded because the operator has already asked to
-# leave. Every turn's CLI was already ended by the press itself (`run_job`'s
-# `on_press` hook), so what is waited for is each worker reaping it and giving
-# its claim back; a worker that outlasts this is a daemon the exit kills, its
-# CLI's tree ended at the press, not by the reap it never gets to.
+# leave. Every turn's CLI was already ended by the press itself
+# (`providers.ended_on_press`), so what is waited for is each worker reaping
+# it and giving its claim back; a worker that outlasts this is a daemon the
+# exit kills, its CLI's tree ended at the press, not by the reap it never gets
+# to.
 INTERRUPT_JOIN_TIMEOUT_S = 5
 
 # Per-file retry budget: a path that fails this many times in a row is parked in

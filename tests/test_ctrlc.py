@@ -146,10 +146,18 @@ def test_a_quota_hold_ends_on_ctrl_c_and_says_so(capsys):
 def test_the_stop_file_wait_leaves_on_the_run_s_ctrl_c(
         tmp_path, monkeypatch, capsys):
     """Held back by a stop file, a launch leaves on the press, not on the
-    file going away — and does not go on to start."""
+    file going away — and does not go on to start. It says so through
+    `ctrlc.leave_wait`, the one way every wait leaves on Ctrl+C."""
     sentinel = tmp_path / "stop"
     sentinel.write_text("")
     monkeypatch.setattr(stopchannel, "stop_file_path", lambda: str(sentinel))
+    leave_wait, left = ctrlc.leave_wait, []
+
+    def spy():
+        left.append(1)
+        leave_wait()
+
+    monkeypatch.setattr(ctrlc, "leave_wait", spy)
     # The backstop: a wait deaf to the press ends when the file goes, and
     # fails below instead of hanging the suite.
     backstop = threading.Timer(5, sentinel.unlink)
@@ -161,7 +169,7 @@ def test_the_stop_file_wait_leaves_on_the_run_s_ctrl_c(
     finally:
         backstop.cancel()
     out = capsys.readouterr().out
-    assert ctrlc.WAIT_INTERRUPTED_LINE in out
+    assert out.count(ctrlc.WAIT_INTERRUPTED_LINE) == 1 and left == [1]
     assert "Stop file removed" not in out
 
 
