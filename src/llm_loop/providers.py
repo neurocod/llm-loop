@@ -552,7 +552,7 @@ def reap_agent_process(proc) -> None:
     Ctrl+C raises nothing (`ctrlc`); outside one — an embedder calling
     `streamrender.run_agent_streaming` itself — this runs on the MAIN thread,
     the one Ctrl+C lands on, inside the handler for the first Ctrl+C, and the
-    ending it performs can take a few seconds (`REAP_GRACE_S` twice over, plus
+    ending it performs can take a few seconds (`procend.REAP_GRACE_S` twice over, plus
     `taskkill`). A second press during that window would otherwise escape the
     `finally` and replace the first press's interrupt with a traceback — while
     the child it interrupted stays alive, which is precisely what the

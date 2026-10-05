@@ -196,8 +196,8 @@ class _QuotaServer:
         """Close stdin and reap; escalate to ending the tree, then kill.
 
         On Windows `proc` is usually the npm shim's `cmd.exe` and the CLI a
-        grandchild, so the escalation goes through the turn process's
-        tree-aware `end_process_tree` (`taskkill /T`), not the shim-only
+        grandchild, so the escalation goes through the shared tree-aware
+        `procend.end_process_tree` (`taskkill /T`), not the shim-only
         `terminate`. A grandchild that survives anyway keeps the stdout write
         end: the pump then stays in `readline`, and closing stdout would block
         on the lock that read holds (19.0 s measured 2026-10-02 against a 20 s
