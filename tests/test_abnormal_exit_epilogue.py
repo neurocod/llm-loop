@@ -27,26 +27,23 @@ these runs are launched `--git-push none` so that stays true of them, which it
 was not at first (see `_seq_args`).
 """
 
+import _thread
 import threading
 import time
 
 import pytest
 
-from llm_loop import (ctrlc, cyclecore, exitlog, limits, operator, parallel,
-                      runlifecycle, statusline, stopchannel, streamrender,
-                      usage)
+from llm_loop import (ctrlc, cyclecore, exitlog, gitpush, limits, operator,
+                      ownership, parallel, projectroot, runlifecycle,
+                      statusline, stopchannel, streamrender, usage)
 from llm_loop.agentwork import ClaudeCommand, Driver, LoopStop
 from llm_loop.drivers import StateFileDriver
 from llm_loop.limits import LimitPolicy, SessionLimit
 from llm_loop.usage import RateLimitEvent
 
-from _runfixtures import (MemListDriver, OneShotDriver, StubPolicy, StubSource,
-                          isolated_run, par_args, record_exit_pushes, seq_args)
-
-# What the operator typed and never got delivered. One string, asserted by
-# identity, so a run that printed SOME note would not satisfy a pin about THIS
-# one.
-NOTE = "please look at the third file"
+from _runfixtures import (NOTE, HeldCountGit, MemListDriver, OneShotDriver,
+                          StubPolicy, StubSource, isolated_run, par_args,
+                          record_exit_pushes, seq_args, stage_undelivered_note)
 
 
 def press_ctrl_c():
@@ -116,39 +113,45 @@ def exit_pushes(monkeypatch):
 
 @pytest.fixture
 def loaded_mailbox(monkeypatch):
-    """Every run in this file gets a mailbox holding one undelivered note.
-
-    Put there by replacing the constructor, because the mailbox is the RUN's —
-    made inside `run_loop` / `run_parallel` and never handed to the caller — so a
-    test that wants to know what happens to a note nobody delivered has no other
-    way to stage one.
-    """
-    box = operator.Mailbox()
-    box.submit(NOTE)
-    monkeypatch.setattr(operator, "Mailbox", lambda: box)
-    return box
+    """Every run in this file gets a mailbox holding one undelivered note
+    (`stage_undelivered_note`, typed before the run)."""
+    return stage_undelivered_note(monkeypatch)
 
 
-def _assert_closed_down(pushes, policy, capsys, project_dir, *, snapshot, reason):
+def _assert_closed_down(pushes, policy, capsys, project_dir, *, snapshot, reason,
+                        exit_pushed=True):
     """The three steps of the epilogue, plus the ending's own record.
 
-    Returns what the run printed up to the record's closing line.
+    `pushes` are the exit pushes, as `(policy, project_dir)` pairs. With
+    `exit_pushed` False the ending gave its push up and `pushes` must be empty —
+    any record of pushes will do then, a fake git's `pushes` included.
+    `reason` None is a pin that drove `close_run` itself, outside any run: the
+    record and its reason are the door's (`end_run`, `exit_run`), not
+    `close_run`'s, so there is none to read.
+
+    Returns what the run printed, up to the record's closing line, as
+    `capsys.readouterr()` returned it (`.out`, `.err`).
     """
-    out = capsys.readouterr().out
-    assert [where for _policy, where in pushes] == [project_dir], (
-        f"the exit push did not run once against the run's own project: {pushes}")
+    captured = capsys.readouterr()
+    if exit_pushed:
+        assert [where for _policy, where in pushes] == [project_dir], (
+            f"the exit push did not run once against the run's own project: "
+            f"{pushes}")
+    else:
+        assert pushes == [], f"the given-up exit push still pushed: {pushes}"
     if snapshot is None:
         assert policy.snapshots == [], "no provider was selected before the stop"
     else:
         assert policy.snapshots[-1] == snapshot, (
             f"the closing usage snapshot is missing or mislabelled: "
             f"{policy.snapshots}")
-    assert "undelivered operator note" in out, (
+    assert "undelivered operator note" in captured.out, (
         "the run exited holding a note and never said so")
-    assert NOTE in out
-    exitlog.finish()
-    assert reason in capsys.readouterr().out
-    return out
+    assert NOTE in captured.out
+    if reason is not None:
+        exitlog.finish()
+        assert reason in capsys.readouterr().out
+    return captured
 
 
 def test_five_provider_errors_in_a_row_still_close_the_run_down(
@@ -318,14 +321,15 @@ def test_ctrl_c_in_the_status_region_s_own_waits_still_closes_the_run_down(
     out = _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
         snapshot="at end (parallel claude: interrupted)",
-        reason="interrupted by the operator (Ctrl+C)")
+        reason="interrupted by the operator (Ctrl+C)").out
     assert out.count(parallel.INTERRUPT_ANNOUNCEMENT.strip()) == 1, (
         f"the interrupt was not heard exactly once:\n{out}")
     assert (runlifecycle.ABANDONED_PUSH in out) == (where == "join and stop")
 
 
-# Upper bound on every wait of the second-Ctrl+C pin below; only a broken
-# staging comes near it.
+# Upper bound on every wait of the second-Ctrl+C pin below and of the pin
+# about Ctrl+C while the exit push is waited for; only a broken staging comes
+# near it.
 HELD_S = 10.0
 
 
@@ -471,6 +475,135 @@ def test_ctrl_c_during_a_normal_ending_s_exit_push_exits_130(
         pushes, driver.limit_policy, capsys, str(tmp_path),
         snapshot="at end (claude)",
         reason="interrupted by the operator (Ctrl+C)")
+
+
+def test_an_exit_push_that_raises_does_not_cost_a_parallel_run_its_ending(
+        tmp_path, monkeypatch, capsys):
+    """On the pusher, a failed exit push is reported, and the run still returns.
+
+    Made on the main thread it unwound `close_run` and `end_run` with it: no
+    closing usage snapshot, no report of undelivered notes, no recorded
+    reason — a push failing is not what ended the run, and it must not be what
+    its record says. So the run here HAS all three to lose: a usage source (its
+    closing snapshot), a note nobody delivered, and a reason to record.
+
+    The failure is reported whole — with its traceback, on stderr, which the
+    tee carries to the mirror log — and not through the owner's one-line
+    report, which drops a failure worded like one it already reported.
+    """
+    pushes = []
+
+    def exit_push_fails(policy, project_dir, abort=None):
+        pushes.append((policy, project_dir))
+        raise OSError("staged: the repository is not reachable")
+
+    monkeypatch.setattr(runlifecycle, "final_git_push", exit_push_fails)
+    monkeypatch.setattr(runlifecycle, "usage_source_for",
+                        lambda provider: StubSource())
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None: (0, None, None))
+    stage_undelivered_note(monkeypatch, after_workers=True)
+    driver = MemListDriver(["products/only.md"])
+
+    result = parallel.run_parallel(driver, _par_args(str(tmp_path)),
+                                   app_name="pytest-abnormal",
+                                   wait_on_start=False)
+
+    assert result.reason == stopchannel.RunStopReason.NO_WORK
+    err = _assert_closed_down(
+        pushes, driver.limit_policy, capsys, str(tmp_path),
+        snapshot="at end (parallel claude)",
+        reason="=== run ended: no more work in the queue").err
+    assert "the exit push failed" in err
+    assert "Traceback" in err, "the failed exit push lost its traceback"
+    assert "OSError: staged: the repository is not reachable" in err
+
+
+# How long the pin below lets the main thread settle into its wait before it
+# interrupts it, and afterwards lets a late interrupt land. Only the failing
+# cases depend on it (an unbounded wait, a close_run that does not wait).
+CTRL_C_SETTLE_S = 0.1
+
+
+def test_ctrl_c_while_the_exit_push_is_waited_for_gives_up_the_push_only(
+        tmp_path, monkeypatch, capsys, loaded_mailbox):
+    """Ctrl+C during the exit push abandons the push, not the run's ending.
+
+    The wait for the pusher is where a parallel run sits when its operator
+    loses patience with a slow `git push`. Unguarded, the interrupt unwound
+    `close_run` there — no closing snapshot, no report of the notes nobody
+    delivered — while the exit push went on as a daemon, free to start a
+    `git push` nobody wanted any more. Pinned: the snapshot and the notes
+    still happen, the push starts no further git, and nothing is raised —
+    inside a run Ctrl+C is the run's `ctrlc.Interrupt`, and what the press
+    does to the ending is the door's (`end_run`, `exit_run`).
+
+    The Ctrl+C is `_thread.interrupt_main` under `ctrlc.captured`, i.e. the
+    run's real SIGINT handler. It — measured 2026-09-29 on 3.13 and 3.14
+    alike — does not wake an unbounded lock wait, just as a real Ctrl+C does
+    not up to 3.13. So a close_run that waited on the pusher in one unbounded
+    wait hears it only after the push, on every version — and here the push
+    is held until the interrupt has been handled.
+
+    The real `final_git_push` runs, over a fake git whose count is held: what
+    is pinned of the push is that it started no `git push`, so this pin, alone
+    in this file, counts git calls rather than recording the exit push.
+    """
+    fake = HeldCountGit(hold_timeout_s=HELD_S)
+    monkeypatch.setattr(gitpush, "subprocess", fake)
+    projectroot.set_project_root(str(tmp_path))
+    policy = StubPolicy()
+    usage = runlifecycle.RunUsage(StubSource(), policy, "parallel claude")
+    ctx = runlifecycle.RunContext(
+        provider="claude", spec=None, dry_run=False, progress=None,
+        settings=runlifecycle.RunSettings(
+            git_push=gitpush.GitPushPolicy.AFTER_NEW_COMMITS),
+        registry=None, status_enabled=False)
+    pusher = ownership.OwnerThread("pusher").start()
+
+    def ctrl_c_once_the_exit_push_runs():
+        if fake.counting.wait(timeout=HELD_S):
+            # Settled into its wait first: an interrupt landing before the
+            # wait starts would pass an unbounded wait too.
+            time.sleep(CTRL_C_SETTLE_S)
+            _thread.interrupt_main()
+
+    interrupter = threading.Thread(target=ctrl_c_once_the_exit_push_runs,
+                                   daemon=True)
+    raised = []
+    try:
+        # A press is in the block, so it leaves as the interrupt
+        # (`ctrlc.captured`); what is pinned is that nothing inside it raised.
+        with pytest.raises(SystemExit), ctrlc.captured() as interrupt:
+            interrupter.start()
+            try:
+                runlifecycle.close_run(ctx, usages=[usage],
+                                       ending="interrupted",
+                                       mailbox=loaded_mailbox, pusher=pusher)
+                returned_after = interrupt.presses
+                # A close_run that did not wait returns before the Ctrl+C is
+                # sent; it is then heard here, still inside the capture.
+                interrupter.join(timeout=HELD_S)
+                time.sleep(CTRL_C_SETTLE_S)
+            except KeyboardInterrupt:
+                raised.append("a bare KeyboardInterrupt")
+    finally:
+        fake.release.set()
+
+    assert raised == [], "Ctrl+C inside a run was raised, not pressed"
+    assert returned_after == 1, (
+        f"close_run returned before the Ctrl+C was heard: {returned_after}")
+    assert pusher.close(timeout=HELD_S), \
+        "the abandoned exit push never finished"
+    out = _assert_closed_down(
+        fake.pushes, policy, capsys, str(tmp_path),
+        snapshot="at end (parallel claude: interrupted)", reason=None,
+        exit_pushed=False).out
+    assert len(policy.snapshots) == 1, (
+        f"close_run took more than its closing snapshot: {policy.snapshots}")
+    assert "the exit push is abandoned" in out
+    assert "final git push on exit" not in out, \
+        "the abandoned exit push still announced a push it was not going to make"
 
 
 @pytest.mark.parametrize("ending", ["exit", "exception"])
@@ -715,7 +848,7 @@ def test_ctrl_c_anywhere_in_a_sequential_run_still_closes_it_down(
     out = _assert_closed_down(
         exit_pushes, driver.limit_policy, capsys, str(tmp_path),
         snapshot="at end (claude: interrupted)",
-        reason=runlifecycle.INTERRUPTED_REASON)
+        reason=runlifecycle.INTERRUPTED_REASON).out
     assert "printed after the press" not in out, (
         "the turn went on rendering the stream after Ctrl+C")
 
@@ -829,7 +962,7 @@ def test_ctrl_c_in_an_exiting_door_s_push_keeps_the_door_s_exit(
         pushes, driver.limit_policy, capsys, str(tmp_path),
         snapshot=f"at end (claude: {ending})",
         reason=("the driver stopped the run (exit 3)" if door == "driver stop"
-                else "5 provider errors in a row (last exit code 7)"))
+                else "5 provider errors in a row (last exit code 7)")).out
     assert "the exit push is abandoned" in out
 
 

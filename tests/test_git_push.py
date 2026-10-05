@@ -15,7 +15,6 @@ that is provably not the directory pytest is standing in — and asserts the
 directory git was actually handed, never merely that a push happened.
 """
 
-import _thread
 import os
 import signal
 import subprocess
@@ -25,12 +24,11 @@ import time
 
 import pytest
 
-from llm_loop import (ctrlc, cyclecore, exitlog, gitpush, operator, ownership,
-                      parallel, projectroot, runlifecycle)
-from llm_loop.stopchannel import RunStopReason
+from llm_loop import (ctrlc, cyclecore, gitpush, ownership, parallel,
+                      projectroot, runlifecycle)
 
-from _runfixtures import (FakeGitModule, MemListDriver, OneShotDriver,
-                          StubPolicy, StubSource, capture_run_context,
+from _runfixtures import (FakeGitModule, HeldCountGit, MemListDriver,
+                          OneShotDriver, StubSource, capture_run_context,
                           isolated_run, par_args, record_exit_pushes,
                           root_not_cwd, seq_args)
 from llm_loop.agentwork import ClaudeCommand
@@ -521,112 +519,16 @@ def test_every_git_call_of_a_parallel_run_is_made_by_the_pusher(
         f"made whole behind the pusher's: {fake.beside_a_push}")
 
 
-def test_an_exit_push_that_raises_does_not_cost_a_parallel_run_its_ending(
-        tmp_path, monkeypatch, capsys):
-    """On the pusher, a failed exit push is reported, and the run still returns.
-
-    Made on the main thread it unwound `close_run` and `end_run` with it: no
-    closing usage snapshot, no report of undelivered notes, no recorded
-    reason — a push failing is not what ended the run, and it must not be what
-    its record says. So the run here HAS all three to lose: a usage source (its
-    closing snapshot), a note nobody delivered, and a reason to record.
-
-    The failure is reported whole — with its traceback, on stderr, which the
-    tee carries to the mirror log — and not through the owner's one-line
-    report, which drops a failure worded like one it already reported.
-    """
-    def exit_push_fails(policy, project_dir, abort=None):
-        raise OSError("staged: the repository is not reachable")
-
-    monkeypatch.setattr(runlifecycle, "final_git_push", exit_push_fails)
-    monkeypatch.setattr(runlifecycle, "usage_source_for",
-                        lambda provider: StubSource())
-    monkeypatch.setattr(parallel, "run_job",
-                        lambda job_id, command, mailbox=None: (0, None, None))
-    box = _undelivered_note(monkeypatch)
-    driver = MemListDriver(["products/only.md"])
-
-    result = parallel.run_parallel(driver,
-                                   par_args(root_not_cwd(tmp_path), jobs=1,
-                                            git_push=PUSHING,
-                                            ignore_usage=False,
-                                            no_statusline=True),
-                                   app_name="pytest-gitpush")
-
-    assert result.reason == RunStopReason.NO_WORK
-    assert driver.limit_policy.snapshots[-1] == "at end (parallel claude)", (
-        f"the closing usage snapshot was lost: {driver.limit_policy.snapshots}")
-    captured = capsys.readouterr()
-    assert "undelivered operator note" in captured.out and NOTE in captured.out, \
-        "the note nobody delivered was never reported"
-    assert box.submitted, "the staged note was never typed"
-    assert "the exit push failed" in captured.err
-    assert "Traceback" in captured.err, "the failed exit push lost its traceback"
-    assert "OSError: staged: the repository is not reachable" in captured.err
-    exitlog.finish()
-    assert "=== run ended: no more work in the queue" in capsys.readouterr().out
-
-
-# What the operator typed and nobody delivered (see `_undelivered_note`).
-NOTE = "please look at the third file"
-
-
-class _NoteBox:
-    """The run's one mailbox, with NOTE typed after the workers have ended.
-
-    Typed then, not before the run: a note in the mailbox while a worker still
-    claims is spliced into that worker's prompt, and is delivered after all.
-    """
-
-    def __init__(self):
-        self.box = operator.Mailbox()
-        self.submitted = False
-
-    def type_note(self):
-        self.box.submit(NOTE)
-        self.submitted = True
-
-
-def _undelivered_note(monkeypatch) -> _NoteBox:
-    """Give the run one mailbox holding NOTE once `join_workers` has returned."""
-    note = _NoteBox()
-    monkeypatch.setattr(operator, "Mailbox", lambda: note.box)
-    real_join = parallel.join_workers
-
-    def join_then_type(threads):
-        real_join(threads)
-        note.type_note()
-
-    monkeypatch.setattr(parallel, "join_workers", join_then_type)
-    return note
-
-
-# How long the Ctrl+C pin lets the main thread settle into its wait before it
-# interrupts it, and afterwards lets a late interrupt land. Only the failing
-# cases depend on it (an unbounded wait, a close_run that does not wait).
-CTRL_C_SETTLE_S = 0.1
-
-
-class _HeldCountGit(FakeGitModule):
-    """`FakeGitModule` whose `rev-list` — the exit push's first git call —
-    waits for `release`; `counting` says it has started."""
-
-    def __init__(self):
-        super().__init__()
-        self.counting = threading.Event()
-        self.release = threading.Event()
-
-    def run(self, argv, **kwargs):
-        if tuple(argv)[:2] == ("git", "rev-list"):
-            self.counting.set()
-            self.release.wait(timeout=HELD_PUSH_TIMEOUT_S)
-        return super().run(argv, **kwargs)
+# How long the pin below gives an abort's `set` to return while a git
+# start is held: one that does not wait returns inside it. Only the
+# failing case depends on it.
+SETTLE_S = 0.1
 
 
 def test_aborting_a_periodic_count_starts_no_push(tmp_path, monkeypatch):
     # Under 0.005 s measured 2026-10-02; the existing 10 s bound leaves room
     # for CI scheduling while still failing a lost release.
-    fake = _HeldCountGit()
+    fake = HeldCountGit(hold_timeout_s=HELD_PUSH_TIMEOUT_S)
     monkeypatch.setattr(gitpush, "subprocess", fake)
     abort = gitpush.PushAbort()
     pusher = threading.Thread(
@@ -731,86 +633,6 @@ def test_exit_interrupt_cancels_queued_periodic_push(tmp_path, monkeypatch):
         f"a periodic push started after Ctrl+C abandoned it: {fake.calls}"
 
 
-def test_ctrl_c_while_the_exit_push_is_waited_for_gives_up_the_push_only(
-        tmp_path, monkeypatch, capsys):
-    """Ctrl+C during the exit push abandons the push, not the run's ending.
-
-    The wait for the pusher is where a parallel run sits when its operator
-    loses patience with a slow `git push`. Unguarded, the interrupt unwound
-    `close_run` there — no closing snapshot, no report of the notes nobody
-    delivered — while the exit push went on as a daemon, free to start a
-    `git push` nobody wanted any more. Pinned: the snapshot and the notes
-    still happen, the push starts no further git, and nothing is raised —
-    inside a run Ctrl+C is the run's `ctrlc.Interrupt`, and what the press
-    does to the ending is the door's (`end_run`, `exit_run`).
-
-    The Ctrl+C is `_thread.interrupt_main` under `ctrlc.captured`, i.e. the
-    run's real SIGINT handler. It — measured 2026-09-29 on 3.13 and 3.14
-    alike — does not wake an unbounded lock wait, just as a real Ctrl+C does
-    not up to 3.13. So a close_run that waited on the pusher in one unbounded
-    wait hears it only after the push, on every version — and here the push
-    is held until the interrupt has been handled.
-    """
-    fake = _HeldCountGit()
-    monkeypatch.setattr(gitpush, "subprocess", fake)
-    projectroot.set_project_root(root_not_cwd(tmp_path))
-    policy = StubPolicy()
-    usage = runlifecycle.RunUsage(StubSource(), policy, "parallel claude")
-    mailbox = operator.Mailbox()
-    mailbox.submit(NOTE)
-    ctx = runlifecycle.RunContext(
-        provider="claude", spec=None, dry_run=False, progress=None,
-        settings=runlifecycle.RunSettings(
-            git_push=gitpush.GitPushPolicy(PUSHING)),
-        registry=None, status_enabled=False)
-    pusher = ownership.OwnerThread("pusher").start()
-
-    def ctrl_c_once_the_exit_push_runs():
-        if fake.counting.wait(timeout=HELD_PUSH_TIMEOUT_S):
-            # Settled into its wait first: an interrupt landing before the
-            # wait starts would pass an unbounded wait too.
-            time.sleep(CTRL_C_SETTLE_S)
-            _thread.interrupt_main()
-
-    interrupter = threading.Thread(target=ctrl_c_once_the_exit_push_runs,
-                                   daemon=True)
-    raised = []
-    try:
-        # A press is in the block, so it leaves as the interrupt
-        # (`ctrlc.captured`); what is pinned is that nothing inside it raised.
-        with pytest.raises(SystemExit), ctrlc.captured() as interrupt:
-            interrupter.start()
-            try:
-                runlifecycle.close_run(ctx, usages=[usage],
-                                       ending="interrupted", mailbox=mailbox,
-                                       pusher=pusher)
-                returned_after = interrupt.presses
-                # A close_run that did not wait returns before the Ctrl+C is
-                # sent; it is then heard here, still inside the capture.
-                interrupter.join(timeout=HELD_PUSH_TIMEOUT_S)
-                time.sleep(CTRL_C_SETTLE_S)
-            except KeyboardInterrupt:
-                raised.append("a bare KeyboardInterrupt")
-    finally:
-        fake.release.set()
-
-    assert raised == [], "Ctrl+C inside a run was raised, not pressed"
-    assert returned_after == 1, (
-        f"close_run returned before the Ctrl+C was heard: {returned_after}")
-    assert pusher.close(timeout=HELD_PUSH_TIMEOUT_S), \
-        "the abandoned exit push never finished"
-    assert fake.pushes == [], (
-        f"the abandoned exit push still ran `git push`: {fake.calls}")
-    assert policy.snapshots == ["at end (parallel claude: interrupted)"], (
-        f"Ctrl+C cost the closing usage snapshot: {policy.snapshots}")
-    out = capsys.readouterr().out
-    assert "the exit push is abandoned" in out
-    assert "final git push on exit" not in out, \
-        "the abandoned exit push still announced a push it was not going to make"
-    assert "undelivered operator note" in out and NOTE in out, \
-        "Ctrl+C cost the report of the notes nobody delivered"
-
-
 def test_ctrl_c_during_the_exit_push_announcement_starts_no_push(
         tmp_path, monkeypatch):
     """An abort heard while the push prints its announcement stops the push.
@@ -878,7 +700,7 @@ def test_an_abort_waits_out_a_git_start_in_progress():
         setter.start()
         # A `set` that does not wait returns inside this; one that does is
         # still waiting at its end. Only the failing case depends on it.
-        setter.join(timeout=CTRL_C_SETTLE_S)
+        setter.join(timeout=SETTLE_S)
     finally:
         let_spawn.set()
     starter.join(timeout=HELD_PUSH_TIMEOUT_S)

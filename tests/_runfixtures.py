@@ -1,7 +1,8 @@
 """What the runner pins hand `run_loop` / `run_parallel`: arguments, drivers, a
 quota policy, the two "provably elsewhere" project roots, the git a pusher
-runs (`FakeGitModule`) — and `isolated_run`,
-which keeps what such a run leaves in the process inside the test.
+runs (`FakeGitModule`), a note nobody delivered (`stage_undelivered_note`) —
+and `isolated_run`, which keeps what such a run leaves in the process inside
+the test.
 
 Imported by name (`from _runfixtures import ...`), never through an autouse
 `conftest.py`: a pin that reads a helper it can see explains itself, and one that
@@ -24,8 +25,8 @@ import sys
 import threading
 from contextlib import contextmanager
 
-from llm_loop import (clispec, console, exitlog, projectroot, providers,
-                      runlifecycle)
+from llm_loop import (clispec, console, exitlog, operator, parallel,
+                      projectroot, providers, runlifecycle)
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
 
@@ -165,6 +166,41 @@ def record_exit_pushes(monkeypatch) -> list:
     return calls
 
 
+# What the operator typed and never got delivered. One string, asserted by
+# identity, so a run that printed SOME note would not satisfy a pin about THIS
+# one.
+NOTE = "please look at the third file"
+
+
+def stage_undelivered_note(monkeypatch, *, after_workers: bool = False
+                           ) -> "operator.Mailbox":
+    """Give the run one mailbox holding NOTE, and return that mailbox.
+
+    Put there by replacing the constructor, because the mailbox is the RUN's —
+    made inside `run_loop` / `run_parallel` and never handed to the caller — so
+    a pin that wants to know what happens to a note nobody delivered has no
+    other way to stage one. The pin may type more notes into the returned box.
+
+    By default NOTE is typed now, before the run. `after_workers` types it once
+    `parallel.join_workers` has returned instead: a note in the mailbox while a
+    parallel worker still claims is spliced into that worker's prompt, and is
+    delivered after all.
+    """
+    box = operator.Mailbox()
+    monkeypatch.setattr(operator, "Mailbox", lambda: box)
+    if not after_workers:
+        box.submit(NOTE)
+        return box
+    real_join = parallel.join_workers
+
+    def join_then_type(threads):
+        real_join(threads)
+        box.submit(NOTE)
+
+    monkeypatch.setattr(parallel, "join_workers", join_then_type)
+    return box
+
+
 class FakeGitModule:
     """Stands in for `gitpush.subprocess`, recording (argv, cwd) per call.
 
@@ -239,6 +275,24 @@ class FakeGitModule:
         left every pin in test_git_push green.
         """
         return [call for call in self.calls if call[0][:2] == ("git", "push")]
+
+
+class HeldCountGit(FakeGitModule):
+    """`FakeGitModule` whose `rev-list` — the first git call of a push check
+    and of the exit push — waits for `release` (at most `hold_timeout_s`);
+    `counting` says it has started."""
+
+    def __init__(self, *, hold_timeout_s: float = 10.0, **kwargs):
+        super().__init__(**kwargs)
+        self.counting = threading.Event()
+        self.release = threading.Event()
+        self._hold_timeout_s = hold_timeout_s
+
+    def run(self, argv, **kwargs):
+        if tuple(argv)[:2] == ("git", "rev-list"):
+            self.counting.set()
+            self.release.wait(timeout=self._hold_timeout_s)
+        return super().run(argv, **kwargs)
 
 
 class _FakeGitProcess:
