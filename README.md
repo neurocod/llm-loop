@@ -619,7 +619,10 @@ Only the second line means the run is standing still and the files are yours.
 (`pause_state` in `statusline.py` is the whole rule.)
 
 Held, a run still answers everything else: `s` ends the hold and stops the run
-(with its usual cancel countdown), the `stop` file does the same.
+(with its usual cancel countdown), the `stop` file does the same, and `m` queues
+a note that rides the next iteration's prompt. Like `s`, `p` is in-process and
+writes nothing to disk — it holds the run whose terminal it was typed into, and
+the ones next door work on.
 
 Create a file named `stop` in the project root to halt **every** loop rooted
 there at its next iteration boundary; it is removed on stop so the next launch
@@ -637,10 +640,6 @@ consume it: it waits (sequential and parallel alike, before `--start-in`) until
 the file goes away — cleared by the run it was meant for, or removed by hand —
 and only then begins. So queueing the next run behind a stop you just requested
 works, and a leftover `stop` never costs a run its first iteration.
-
-`m` queues a note that rides the next iteration's prompt. Like `s`, `p` is in-process and
-writes nothing to disk — it holds the run whose terminal it was typed into, and
-the ones next door work on.
 
 What a hold does **not** do is keep a finished run alive: a sequential run that
 has reached `--max-runs`, and a parallel one whose queue drained or hit its item
