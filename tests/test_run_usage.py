@@ -221,9 +221,7 @@ def test_a_parallel_run_that_returns_closes_the_usage_it_opened(
 def test_both_runners_open_usage_through_the_shared_path(runner):
     """Checked on the SOURCE: a runner that built its own pair again would still
     pass every behavioural pin whose stub source it happened to receive."""
-    # The sequential public entry owns cleanup; its body opens usage.
-    body = cyclecore._run_loop if runner is cyclecore.run_loop else runner
-    tree = ast.parse(inspect.getsource(body))
+    tree = ast.parse(inspect.getsource(runner))
     names = {node.attr if isinstance(node, ast.Attribute) else node.id
              for node in ast.walk(tree)
              if isinstance(node, (ast.Attribute, ast.Name))}

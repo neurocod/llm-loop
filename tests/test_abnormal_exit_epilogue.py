@@ -28,6 +28,7 @@ was not at first (see `_seq_args`).
 """
 
 import _thread
+import contextlib
 import threading
 import time
 
@@ -646,6 +647,151 @@ def test_what_the_boundary_holds_is_released_once_last_first(capsys, ending):
     assert "staged: a release broke" in capsys.readouterr().err
 
 
+class _CountingProgress:
+    def record_counts(self, iterations, completed):
+        return dict(iterations=iterations, completed=completed)
+
+
+class _ClosingPusher:
+    """Records the boundary's last word on its pusher (`close_run` is stubbed
+    below, so the boundary's own close is the only one)."""
+
+    def __init__(self, log):
+        self._log = log
+
+    def close(self, timeout=None, final=None):
+        self._log.append(f"pusher closed (timeout={timeout})")
+        return True
+
+
+# What each ending leaves in the log, in order: `region` and `console` are
+# what the runner holds (`RunBoundary.hold`, the console first, as the parallel
+# runner holds them), `housekeeping` is `close_run`.
+_UNWOUND_FIRST = ["region", "console", "housekeeping"]
+_DOOR_UNDER_THEM = ["housekeeping", "region", "console"]
+
+
+@pytest.mark.parametrize("ending, expected, code", [
+    ("normal", _UNWOUND_FIRST, None),
+    ("exception", _UNWOUND_FIRST, None),
+    ("keyboard interrupt", _UNWOUND_FIRST, ctrlc.EXIT_CODE),
+    ("unwritten exit", _UNWOUND_FIRST, 2),
+    ("exit door", _DOOR_UNDER_THEM, 3),
+    ("interrupt door", _DOOR_UNDER_THEM, ctrlc.EXIT_CODE),
+])
+def test_the_boundary_orders_what_it_holds_against_the_housekeeping(
+        monkeypatch, ending, expected, code):
+    """The order of the two halves of an ending is the boundary's, not the
+    runner's (`RunBoundary.hold`).
+
+    An ending that unwinds the block — and the normal one, whose runner
+    releases them where its work ends — releases the region and the console
+    before the housekeeping prints; a door taken inside them (the sequential
+    loop's) closes the run down under them, and they go as its exit leaves.
+    Each is released once, last held first, and the pusher gets the
+    boundary's last word on every ending.
+    """
+    log = []
+    monkeypatch.setattr(runlifecycle, "close_run",
+                        lambda ctx, **kw: log.append("housekeeping"))
+    ctx = runlifecycle.RunContext(
+        provider="claude", spec=None, dry_run=True,
+        progress=_CountingProgress(),
+        settings=runlifecycle.RunSettings(), registry=None,
+        status_enabled=False)
+    boundary = runlifecycle.RunBoundary(ctx, counts=lambda: (0, 0),
+                                        pusher=_ClosingPusher(log))
+
+    @contextlib.contextmanager
+    def held(name):
+        yield
+        log.append(name)
+
+    staged = ValueError("staged: the run broke")
+
+    def run():
+        with boundary:
+            boundary.hold(held("console"))
+            boundary.hold(held("region"))
+            if ending == "normal":
+                boundary.release_held()
+                return boundary.end(stopchannel.RunResult(
+                    stopchannel.RunStopReason.NO_WORK))
+            if ending == "exception":
+                raise staged
+            if ending == "keyboard interrupt":
+                raise KeyboardInterrupt
+            if ending == "unwritten exit":
+                raise SystemExit(2)
+            if ending == "exit door":
+                boundary.exit(3, ending="staged", reason="staged exit")
+            boundary.interrupt()
+
+    if code is None and ending == "normal":
+        run()
+    elif code is None:
+        with pytest.raises(ValueError) as left:
+            run()
+        assert left.value is staged
+    else:
+        with pytest.raises(SystemExit) as left:
+            run()
+        assert left.value.code == code
+    assert log == expected + ["pusher closed (timeout=0)"]
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_a_runner_releases_its_region_before_it_reports_and_closes_down(
+        tmp_path, monkeypatch, exit_pushes, runner):
+    """What each runner hands its boundary, and where it releases it.
+
+    The sequential loop: its region, released before the driver's closing
+    line. The parallel runner: its console window outside its region, so the
+    region stops while the console owner still writes what it says, and the
+    console is closed after it — both before the housekeeping.
+    """
+    log = []
+    stop = statusline.StatusApp.stop
+
+    def logged_stop(app):
+        log.append("region")
+        return stop(app)
+
+    monkeypatch.setattr(statusline.StatusApp, "stop", logged_stop)
+    real_close_run = runlifecycle.close_run
+
+    def logged_close_run(*args, **kwargs):
+        log.append("housekeeping")
+        return real_close_run(*args, **kwargs)
+
+    monkeypatch.setattr(runlifecycle, "close_run", logged_close_run)
+    if runner == "sequential":
+        class _ReportingDriver(OneShotDriver):
+            def final_summary(self):
+                log.append("report")
+                return None
+
+        monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **k: 0)
+        monkeypatch.setattr(cyclecore, "last_rate_limit_event", lambda: None)
+        cyclecore.run_loop(_ReportingDriver(), _seq_args(str(tmp_path)),
+                           app_name="pytest-abnormal", wait_on_start=False)
+        assert log == ["region", "report", "housekeeping"]
+        return
+    close_console = parallel._close_console
+
+    def logged_close_console():
+        log.append("console")
+        close_console()
+
+    monkeypatch.setattr(parallel, "_close_console", logged_close_console)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda job_id, command, mailbox=None: (0, None, None))
+    parallel.run_parallel(MemListDriver(["products/only.md"]),
+                          par_args(str(tmp_path), jobs=1, no_statusline=True),
+                          app_name="pytest-abnormal", wait_on_start=False)
+    assert log == ["region", "console", "housekeeping"]
+
+
 def test_the_two_doors_of_the_epilogue_run_the_same_housekeeping():
     """`end_run` must not grow a step `close_run` does not have.
 
@@ -781,6 +927,49 @@ class _SecondCommandDriver(Driver):
         if isinstance(self.on_summary, BaseException):
             raise self.on_summary
         return None
+
+
+@pytest.mark.parametrize("wait", ["stop file", "start-in"])
+def test_ctrl_c_in_a_wait_before_the_boundary_records_the_interrupt_only(
+        tmp_path, monkeypatch, capsys, exit_pushes, wait):
+    """The waits ahead of the sequential run's boundary leave on Ctrl+C with
+    the interrupt's reason in the exit record (`ctrlc.leave_wait`) — it read
+    "reason not recorded", the prologue having opened the record — and with
+    nothing else of an ending: no housekeeping, no exit push, and no pusher
+    ever started, so none is left to release (`RunBoundary`)."""
+    endings = _count_close_runs(monkeypatch)
+    sentinel = tmp_path / "stop-sentinel"
+    if wait == "stop file":
+        sentinel.write_text("")
+    monkeypatch.setattr(stopchannel, "stop_file_path", lambda: str(sentinel))
+
+    def ctrl_c(seconds, should_stop=None):
+        press_ctrl_c()
+        return True
+
+    monkeypatch.setattr(stopchannel, "sleep_unless", ctrl_c)
+    started = []
+    start = ownership.OwnerThread.start
+
+    def recording_start(owner, *args, **kwargs):
+        started.append(owner.name)
+        return start(owner, *args, **kwargs)
+
+    monkeypatch.setattr(ownership.OwnerThread, "start", recording_start)
+    args = _seq_args(str(tmp_path))
+    if wait == "start-in":
+        args.start_in = "1m"
+
+    with pytest.raises(SystemExit) as exit_info:
+        cyclecore.run_loop(_AlwaysWorkDriver(), args, app_name="pytest-abnormal",
+                           wait_on_start=(wait == "stop file"))
+
+    assert exit_info.value.code == ctrlc.EXIT_CODE
+    assert endings == [] and exit_pushes == []
+    assert "pusher" not in started, f"a pusher started before the boundary: {started}"
+    assert capsys.readouterr().out.count(ctrlc.WAIT_INTERRUPTED_LINE) == 1
+    exitlog.finish()
+    assert runlifecycle.INTERRUPTED_REASON in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("where", ["turn", "quota hold", "refusal wait",

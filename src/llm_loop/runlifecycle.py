@@ -407,10 +407,11 @@ def close_run(ctx: RunContext, *,
     the parallel preparation fails between the two), on a throwaway owner.
     Never on the caller: a push made inline is a wait nothing can give up, and
     an owner that never started runs its `final` inline. The pusher is closed
-    here on every ending that reaches this function, a dry run's included (the
-    runner closes it on the ones that do not). The policy is read AT the push,
-    off the live settings. A push that raises is reported with its traceback
-    on stderr, and the housekeeping below still runs.
+    here on every ending that reaches this function, a dry run's included
+    (`RunBoundary` says what happens to it on the ones that do not). The
+    policy is read AT the push, off the live settings. A push that raises is
+    reported with its traceback on stderr, and the housekeeping below still
+    runs.
 
     The wait for the push ends one of three ways (`_wait_for_exit_push`): the
     push is done; the ending's `budget` is spent (see StopBudget — None, an
@@ -753,14 +754,39 @@ class RunBoundary:
       * whatever must stop before the housekeeping begins — a fleet that
         must not go on starting agents through the exit push — registered
         with `on_ending` and released, last acquired first, as the ending
-        begins (`_begin_ending`).
+        begins (`_begin_ending`);
+      * the pusher, the owner of the run's git (`pusher`, set by the runner
+        once it has one): `close_run` hands it the exit push and closes it on
+        every ending, and `__exit__` tells it to close once more, without
+        waiting, for an ending whose housekeeping raised before it got there.
+        Before the boundary opens there is no pusher to release: neither
+        runner STARTS one outside its boundary, so an exit before it — the
+        waits for a stale stop file and for `--start-in`, a report, the
+        prologue failing — leaves no git owner behind and needs no path of
+        its own. One the run made and had not started yet is `close_run`'s
+        throwaway-owner case;
+      * what is shown while the run works — the status region, and the
+        parallel runner's console route with its owner — entered through
+        `hold` and released, last held first, at `release_held`: where the
+        runner's work ends on a normal ending, and at the latest as the
+        `with` block is left. That makes the order of the two halves of the
+        ending the boundary's, not the caller's:
+
+          - an ending that UNWINDS the block (an exception, a SystemExit nobody
+            wrote, a KeyboardInterrupt) releases them FIRST and is closed down
+            after, so the housekeeping is not printed over a pinned region;
+          - a door taken while they are still held closes the run down UNDER
+            them, and they are released as its exit leaves the block. Only
+            the sequential loop does that, and correctly: it prints inside
+            its region on every iteration and pushes there on every pass, so
+            a few more lines are what that region already carries. The
+            parallel runner releases them before any of its doors.
 
     `counts` (`(iterations, completed)` for the exit record) is read when the
     ending comes, and `mailbox`/`pusher` are attributes a runner sets once it
     has them.
 
-    Used as a context manager (`with boundary, app:` — the region is released
-    before the housekeeping prints) or by hand from an `except` (`unwind`).
+    Used as a context manager, or by hand from an `except` (`unwind`).
     """
 
     def __init__(self, ctx: RunContext, *,
@@ -777,15 +803,44 @@ class RunBoundary:
         # snapshot; None for an account without a usage endpoint.
         self.usages: List[Optional[RunUsage]] = []
         self._releases = contextlib.ExitStack()
+        self._held = contextlib.ExitStack()
         self.closed = False
 
     def __enter__(self) -> "RunBoundary":
         return self
 
     def __exit__(self, exc_type, error, traceback_) -> bool:
-        if error is not None and not self.closed:
-            self.unwind(error)
+        try:
+            try:
+                self.release_held()
+            except BaseException as released:
+                # Raised past the original, as a nested `with` would have: the
+                # region's own teardown failing (a Ctrl+C in its bounded waits)
+                # is the ending the block now unwinds with.
+                if not self.closed:
+                    self.unwind(released)
+                raise
+            if error is not None and not self.closed:
+                self.unwind(error)
+        finally:
+            if self.pusher is not None:
+                self.pusher.close(timeout=0)
         return False
+
+    def hold(self, resource):
+        """Enter `resource` (a context manager) and hold it until
+        `release_held`; returns what its `__enter__` returned. One whose
+        `__enter__` raised is not held, as with `with`."""
+        return self._held.enter_context(resource)
+
+    def release_held(self) -> None:
+        """Release what `hold` holds, last held first; once — a second call,
+        and the boundary's own at the end of its block, find nothing left.
+
+        Released without the exception that may be unwinding the block: none
+        of them asks. One that raises costs the ones under it nothing
+        (ExitStack runs them all) and is raised once they have run."""
+        self._held.close()
 
     def open_usage(self, driver, provider: str, *,
                    name: Optional[str] = None) -> Optional[RunUsage]:

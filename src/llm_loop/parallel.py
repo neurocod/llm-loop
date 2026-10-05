@@ -36,6 +36,7 @@ processed this run (across all workers), not iterations.
 
 import argparse
 import collections
+import contextlib
 import os
 import sys
 import threading
@@ -160,6 +161,24 @@ def _close_console() -> None:
     print(f"  ⚠ {_console.name}: {_console.backlog} line(s) still unwritten "
           f"after {CONSOLE_CLOSE_TIMEOUT_S:g} s — reporting without them.",
           file=sys.stderr)
+
+
+@contextlib.contextmanager
+def _console_window():
+    """`_console` running, with every console write of the run routed to it.
+
+    The route is opened before the owner starts and closed after it has been
+    closed, so no write is routed to an owner that has not got, or no longer
+    has, the lines before it (see `console.route_through`). A poster waits for
+    room as long as the close waits for the whole backlog: both are "this
+    console is stuck", from the same measurement.
+    """
+    with route_through(_console, post_timeout=CONSOLE_CLOSE_TIMEOUT_S):
+        _console.start()
+        try:
+            yield
+        finally:
+            _close_console()
 
 
 class _Interrupt:
@@ -1617,15 +1636,12 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             make_worker, prepare_worker, remove_worker, finish_removal)
         app.register_action(ResizeWorkerPoolAction(threads))
         # Heard after the join and read after the status region has been
-        # released. The interrupt does NOT exit from inside the `with app:`: the
+        # released. The interrupt does NOT exit from inside the region: the
         # closing report and the exit push would then be written over a pinned status
-        # area, and the run would leave without either.
-        #
-        # A fact about THIS runner, not a rule — the sequential loop's two `sys.exit`
-        # endings do close down inside its region, and correctly: it prints inside
-        # the area on every iteration and pushes there on every pass, so a few more
-        # lines are what that area is already carrying. Here the workers' output is
-        # the area, and this is the one moment it stops being written to.
+        # area, and the run would leave without either. A fact about THIS
+        # runner, not a rule: the sequential loop's doors close down inside
+        # its region (`RunBoundary` says why). Here the workers' output is the
+        # area, and this is the one moment it stops being written to.
         interrupted = _Interrupt(shared, threads, interrupt)
         # Every ending stops the fleet before its housekeeping begins, an
         # exception's included: workers left claiming went on starting agents
@@ -1639,53 +1655,42 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # the same way, before its final push): a batching wrapper alternates runs of
         # this runner with sequential ones, and two status areas pinned at
         # once would fight over the same rows. The console's owner lives as long as
-        # the region, and its `close` in the `finally` is what puts every line the
+        # the region, and its close (`_console_window`) is what puts every line the
         # workers posted on screen BEFORE the closing report below (within
         # CONSOLE_CLOSE_TIMEOUT_S — see there for a console that never comes back).
-        #
-        # The route is opened before the owner starts and closed after it has been
-        # closed, so no write is routed to an owner that has not got, or no longer
-        # has, the lines before it (see `console.route_through`). A poster waits for
-        # room as long as the close waits for the whole backlog: both are "this
-        # console is stuck", from the same measurement.
-        with route_through(_console, post_timeout=CONSOLE_CLOSE_TIMEOUT_S):
-            _console.start()
-            try:
-                with app:
-                    if source is not None:
-                        # Inside `with`, not before it: push_quotas is
-                        # silent until start() has marked the app
-                        # enabled. The reading is already paid for by the
-                        # start-of-run snapshot above, so this costs no
-                        # round-trip. The refresher only runs for a run
-                        # that talks to the usage endpoint at all — with
-                        # --ignore-usage `source` is None and nothing
-                        # polls.
-                        statusline.push_quotas(app, source, policy)
-                        app.add_service(statusline.QuotaRefresher(
-                            app, source, policy, provider=provider))
-                    # A press before the fleet starts (the preparation, the
-                    # opening snapshot, the region's own start) starts none
-                    # of it.
-                    if not interrupt.requested:
-                        threads.start_initial()
-                    # Started for EVERY run, including one launched with
-                    # `--git-push none`: the policy is a knob, so "there
-                    # is nothing to push on" is a fact about this instant,
-                    # not about the run. `maybe_git_push` is a no-op for
-                    # NONE, so the cost of a pump nobody has switched on
-                    # is one thread asleep between turns. The no-op
-                    # `first` is what makes `idle` due at all (an owner
-                    # never runs it before its window's first post).
-                    pusher.start(first=lambda: None)
-                    join_workers(threads)
-                    # Still inside the region, so the announcement and the
-                    # wait for the workers' turns show under the pinned rows.
-                    if interrupt.requested:
-                        interrupted.hear()
-                    app.update(phase="idle")
-            finally:
-                _close_console()
+        # Both are held by the boundary, which releases the region first and
+        # the console after it, at `release_held` below or as anything unwinds
+        # the run before it.
+        boundary.hold(_console_window())
+        boundary.hold(app)
+        if source is not None:
+            # Inside the region, not before it: push_quotas is silent until
+            # start() has marked the app enabled. The reading is already paid
+            # for by the start-of-run snapshot above, so this costs no
+            # round-trip. The refresher only runs for a run that talks to the
+            # usage endpoint at all — with --ignore-usage `source` is None and
+            # nothing polls.
+            statusline.push_quotas(app, source, policy)
+            app.add_service(statusline.QuotaRefresher(
+                app, source, policy, provider=provider))
+        # A press before the fleet starts (the preparation, the opening
+        # snapshot, the region's own start) starts none of it.
+        if not interrupt.requested:
+            threads.start_initial()
+        # Started for EVERY run, including one launched with `--git-push
+        # none`: the policy is a knob, so "there is nothing to push on" is a
+        # fact about this instant, not about the run. `maybe_git_push` is a
+        # no-op for NONE, so the cost of a pump nobody has switched on is one
+        # thread asleep between turns. The no-op `first` is what makes `idle`
+        # due at all (an owner never runs it before its window's first post).
+        pusher.start(first=lambda: None)
+        join_workers(threads)
+        # Still inside the region, so the announcement and the wait for the
+        # workers' turns show under the pinned rows.
+        if interrupt.requested:
+            interrupted.hear()
+        app.update(phase="idle")
+        boundary.release_held()
 
         # A press in the region's teardown, after the join had returned, stops
         # the fleet too; `hear` does nothing a second time.

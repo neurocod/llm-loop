@@ -225,10 +225,16 @@ def leave(**counts) -> NoReturn:
 def leave_wait() -> NoReturn:
     """A wait before the run's boundary that Ctrl+C ended: said, exit EXIT_CODE.
 
-    The press inside a run, and a KeyboardInterrupt outside one, alike. Writes
-    no reason to the exit record, unlike `leave`.
+    The press inside a run, and a KeyboardInterrupt outside one, alike. The
+    reason is `leave`'s, without counts: the run's prologue has already opened
+    its exit record (`runlifecycle.begin_run`), which otherwise closed as
+    "reason not recorded". Nothing else of an ending: no usage is open yet,
+    and no pusher is started (see `runlifecycle.RunBoundary`).
     """
+    from . import exitlog
+
     print(WAIT_INTERRUPTED_LINE)
+    exitlog.set_reason(INTERRUPTED_REASON)
     raise SystemExit(EXIT_CODE)
 
 

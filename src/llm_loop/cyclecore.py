@@ -401,25 +401,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     the loop head (every wait goes back there), or straight after a turn it
     cut short.
     """
-    pusher = OwnerThread("pusher", maxsize=1)
-    push_abort = PushAbort()
-    try:
-        return _run_loop(driver, args, app_name, setup_logging=setup_logging,
-                         wait_on_start=wait_on_start, progress=progress,
-                         pusher=pusher, push_abort=push_abort)
-    finally:
-        # An exit before `_run_loop`'s boundary bypasses close_run and leaves
-        # the owner started with nothing posted to it — the first push check is
-        # posted inside the boundary, which hands every later ending to
-        # close_run — so this only ends the thread. Idle owner close: 0.1 ms
-        # median, 0.98 ms worst of 600 closes measured 2026-09-29; 0.5 s lets
-        # close acquire its short lock.
-        pusher.close(timeout=0.5)
-
-
-def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
-              setup_logging: bool, wait_on_start: bool, progress,
-              pusher: OwnerThread, push_abort: PushAbort) -> stopchannel.RunResult:
     # --cost/--stat: read the mirror log and exit, without touching
     # the loop, the tee, git, or the usage gate. BEFORE the prologue, whose first
     # act is to raise the tee and open an exit record: a report is not a run, and
@@ -489,6 +470,13 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
 
     provider_refusals = {}
     quota_refresher = None
+    # The owner of the run's git: the periodic checks below and the exit push
+    # (`close_run`). Started as the boundary opens, never before it, so an exit
+    # ahead of it has no git owner to release (see `RunBoundary`).
+    pusher = OwnerThread("pusher", maxsize=1)
+    # The run's one hold on its git, shared by the periodic checks and the
+    # exit push: an abandoned exit push also cancels the checks behind it.
+    push_abort = PushAbort()
     last_git_push = 0.0           # owned by the pusher thread
 
     def push_turn() -> None:
@@ -502,8 +490,6 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
         last_git_push = maybe_git_push(run_settings.git_push, last_git_push,
                                        projectroot.project_dir(), abort=push_abort)
 
-    if not dry_run:
-        pusher.start()
     if ignore_usage_limits:
         print(f"  · usage limit policy: disabled (bounded run, "
               f"--max {run_settings.max_runs})")
@@ -554,13 +540,17 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
 
     # The run's one epilogue boundary: usages open lazily inside the loop,
     # through it, and every ending from here on — the doors below, Ctrl+C,
-    # an exception out of the driver — closes all of them, once. Outer to the
-    # region, so the region is released before the housekeeping prints; the
-    # doors inside the loop close down within it, as they always did.
+    # an exception out of the driver — closes all of them, once. It holds the
+    # pusher and the region too, and so decides when each is released
+    # (`RunBoundary`): the region before the housekeeping of an ending that
+    # unwinds the loop, after it for the doors taken inside the loop.
     boundary = runlifecycle.RunBoundary(
         ctx, counts=lambda: (iteration, completed),
         mailbox=mailbox, pusher=pusher, push_abort=push_abort)
-    with boundary, app:
+    with boundary:
+        if not dry_run:
+            pusher.start()
+        boundary.hold(app)
         while True:
             # The caps are read LIVE (see RunSettings) and republished here, so an
             # edit made while the run is going is what the pinned row shows at
@@ -982,7 +972,9 @@ def _run_loop(driver: Driver, args: argparse.Namespace, app_name: str, *,
                               reason=(f"{consecutive_errors} provider errors "
                                       f"in a row (last exit code {returncode})"))
 
-    with boundary:
+        # The region ends with the loop: the closing report and the
+        # housekeeping are printed below it, not over it.
+        boundary.release_held()
         # This run's own closing line, if the driver has one (e.g. "Final
         # state: …"). Before the shared epilogue, which is housekeeping: the
         # run reports on its work first, then the run is closed down.
