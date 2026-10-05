@@ -621,8 +621,8 @@ def route_through(owner, *, post_timeout: float):
       * over `try_post` with a counted drop: these lines are the run's record —
         the mirror log is written by the same call — and a quota pause or a
         failed push missing from it is worse than one that is out of order. A
-        drop is the right answer for a diagnostic repeated per event (backlog
-        0763), not for a line said once.
+        drop is the right answer for a diagnostic repeated per event, not for
+        a line said once.
 
     A parallel run's WORKERS post to the owner directly, not through this
     route, and wait without a bound: why they differ is

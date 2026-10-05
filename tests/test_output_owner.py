@@ -1566,6 +1566,54 @@ def test_ctrl_c_while_start_waits_for_its_first_frame_puts_the_terminal_back():
     assert not app._atexit_registered
 
 
+class _FrozenStderr:
+    """A console frozen by a selection: a write comes back once `thaw` is set."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.thaw = threading.Event()
+        self.chunks = []
+
+    def write(self, text):
+        self.entered.set()
+        self.thaw.wait(WAIT_S)
+        self.chunks.append(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+def test_a_frozen_stderr_does_not_hold_start_after_its_first_frame_timed_out(
+        monkeypatch):
+    """start() names a first frame that timed out on stderr — the same frozen
+    console, most likely. Written on the opener, that line held a parallel
+    run's main thread before `join_workers`, the one place that hears Ctrl+C.
+    """
+    monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
+    monkeypatch.setattr(sl, "OPEN_WARNING_WAIT_SECONDS", 0.05)
+    terminal = _paint_log()
+    terminal.arm_stall(WAIT_S)                 # the first frame is stuck
+    stderr = _FrozenStderr()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    try:
+        returned, _ = _returns_within(0.1 + BOUND_SLACK_S, app.start)
+        assert returned, "start() waited for a frozen stderr"
+        assert stderr.entered.wait(WAIT_S), \
+            "the timed-out first frame was not named"
+    finally:
+        stderr.thaw.set()
+        terminal.unstall.set()
+    painter = app.painter.thread
+    app.stop()
+    painter.join(WAIT_S)
+    assert _wait_for(lambda: "the first frame not done within 0.05 s"
+                     in "".join(stderr.chunks)), \
+        "the warning never landed once the console thawed"
+
+
 def test_ctrl_c_in_a_service_stop_still_stops_the_rest_and_releases_the_region():
     """Every step of stop() runs past an interrupted one, then it re-raises.
 

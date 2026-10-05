@@ -126,6 +126,17 @@ NOTE_TTL = 8.0
 # `stop`).
 PAINTER_JOIN_SECONDS = 1.0
 
+# How long `Painter.open` waits for its own "first frame not done" stderr line
+# before going on without it. The line is written on a short-lived thread of its
+# own: a first frame that timed out means a terminal write is stuck, and stderr
+# is very likely the same frozen console (a Windows console frozen by a mouse
+# selection, which thaws on the next key). Written on the opener, it held a
+# parallel run's main thread BEFORE `parallel.join_workers`, the one place that
+# hears Ctrl+C. A healthy write returns long before this bound, so the line keeps
+# its place in the output; past it the opener goes on and the line lands when
+# the console thaws.
+OPEN_WARNING_WAIT_SECONDS = 1.0
+
 # The painter thread's name: the pins tell "written on the painter" from
 # "written beside it" by it.
 PAINTER_THREAD_NAME = "statusline-paint"
@@ -2455,7 +2466,8 @@ class Painter:
         self._frame_posted = False
         self._owner.start(first=functools.partial(self._open_region, on_refused))
         if not self.drain(timeout):
-            self._warn_stuck("the first frame", timeout)
+            self._warn_stuck("the first frame", timeout,
+                             wait=OPEN_WARNING_WAIT_SECONDS)
 
     def close(self, timeout: float) -> bool:
         """The last frame and the release, on the painter, then no painter;
@@ -2790,23 +2802,41 @@ class Painter:
         self._warn(text)
         self._note(text)
 
-    def _warn_stuck(self, what: str, seconds: float) -> None:
+    def _warn_stuck(self, what: str, seconds: float, *,
+                    wait: Optional[float] = None) -> None:
         """Name a wait on the painter that timed out: a stuck painter is
-        otherwise invisible, since its own frames are what is stuck."""
+        otherwise invisible, since its own frames are what is stuck. `wait`
+        as for `_warn`."""
         self._warn(f"{what} not done within {seconds:g} s — a terminal write "
-                   f"is stuck; the painter carries on once it returns")
+                   f"is stuck; the painter carries on once it returns",
+                   wait=wait)
 
-    def _warn(self, text: str) -> None:
-        """One stderr line, not repeated back to back."""
+    def _warn(self, text: str, *, wait: Optional[float] = None) -> None:
+        """One stderr line, not repeated back to back.
+
+        With `wait`, the line is written on a thread of its own and the caller
+        waits for it at most that long (see OPEN_WARNING_WAIT_SECONDS).
+        """
         line = f"{PAINTER_THREAD_NAME}: {text}"
         if line == self._last_warning:
             return
         self._last_warning = line
         diaglog.record("Painter warning", text)
-        try:
-            print(line, file=sys.stderr)
-        except Exception:
-            pass
+        if wait is None:
+            _print_stderr(line)
+            return
+        writer = threading.Thread(target=_print_stderr, args=(line,),
+                                  name=f"{PAINTER_THREAD_NAME}-warning",
+                                  daemon=True)
+        writer.start()
+        writer.join(wait)
+
+
+def _print_stderr(line: str) -> None:
+    try:
+        print(line, file=sys.stderr)
+    except Exception:
+        pass
 
 
 class StatusApp:
