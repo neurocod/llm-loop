@@ -34,8 +34,9 @@ import time
 import pytest
 
 from llm_loop import (ctrlc, cyclecore, exitlog, gitpush, limits, operator,
-                      ownership, parallel, projectroot, runlifecycle,
-                      statusline, stopchannel, streamrender, usage)
+                      ownership, parallel, projectroot, providers,
+                      runlifecycle, statusline, stopchannel, streamrender,
+                      usage)
 from llm_loop.agentwork import ClaudeCommand, Driver, LoopStop
 from llm_loop.drivers import StateFileDriver
 from llm_loop.limits import LimitPolicy, SessionLimit
@@ -812,7 +813,7 @@ def test_ctrl_c_anywhere_in_a_sequential_run_still_closes_it_down(
     if where == "turn":
         monkeypatch.setattr(streamrender, "start_agent_process",
                             lambda *a: _InterruptedStream(loaded_mailbox))
-        monkeypatch.setattr(streamrender, "ask_agent_process_to_end",
+        monkeypatch.setattr(providers, "ask_agent_process_to_end",
                             asked_to_end.append)
         monkeypatch.setattr(streamrender, "reap_agent_process", lambda proc: None)
     elif where == "quota hold":

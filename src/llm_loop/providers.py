@@ -6,7 +6,8 @@ and the second is the larger half:
   * WHAT to run — executable names, non-interactive flags, argv construction,
     and which quota source answers for a provider.
   * THE CHILD PROCESS ITSELF, from `Popen` to the ending owed to it:
-    `start_agent_process`, `note_channel`, `reap_agent_process`. Whoever starts
+    `start_agent_process`, `note_channel`, `ended_on_press`,
+    `reap_agent_process`. Whoever starts
     a process owes it an ending, and it is started here — so both runners take
     the whole lifecycle from this module rather than keeping a copy each. That
     is not a preference: the copies had already drifted, in a way that left
@@ -22,13 +23,11 @@ import os
 import shutil
 import subprocess
 import threading
-from typing import Optional, Protocol
+from typing import Iterator, Optional, Protocol
 
-from . import operator, wire
+from . import ctrlc, operator, wire
 from .codex_usage import CodexUsageSource
 from .operator import user_message_line
-# `ask_agent_process_to_end` is re-exported: the runners (`parallel`,
-# `streamrender`) take it from here, beside `reap_agent_process`.
 from .procend import ask_agent_process_to_end, end_process_tree
 from .usage import UsageSource
 
@@ -311,10 +310,7 @@ def _console_isolation() -> dict:
 
     What it costs: Ctrl+C here no longer reaches the child as a console event.
     It never had to — but only because every turn ends its own tree from the
-    press: `streamrender.run_agent_streaming` and `parallel.run_job` each hold
-    an `on_press` hook (`ctrlc`) that calls `ask_agent_process_to_end`
-    (`taskkill /T`). A new caller of `start_agent_process` inside a run needs
-    the same hook, or its child outlives the run.
+    press (`taskkill /T`): its stream is read through `ended_on_press`.
     """
     if os.name != "nt":
         return {}
@@ -518,6 +514,51 @@ def note_channel(proc, provider: str, mailbox: Optional[object] = None):
         yield channel
     finally:
         channel.close()
+
+
+class TurnStream:
+    """A provider's output lines, read until the run's Ctrl+C.
+
+    Iterating stops at the first item read after a press; `pressed` then says
+    why, so the runner takes its interrupt ending instead of `proc.wait()`.
+    `proc.stdout` is not touched until the iteration starts.
+    """
+
+    def __init__(self, proc, interrupt: ctrlc.Interrupt) -> None:
+        self._proc = proc
+        self._interrupt = interrupt
+
+    @property
+    def pressed(self) -> bool:
+        return self._interrupt.requested
+
+    def __iter__(self) -> Iterator:
+        for item in self._proc.stdout:
+            if self._interrupt.requested:
+                return
+            yield item
+
+
+@contextmanager
+def ended_on_press(proc) -> Iterator[TurnStream]:
+    """A turn's stream, with the run's Ctrl+C ending the CLI from the press.
+
+    The child is started off the runner's console (`_console_isolation`) and
+    never hears Ctrl+C itself, so every caller of `start_agent_process` inside
+    a run reads its stream through this, or its child outlives the run: a
+    run that gives up joining a worker exits under it, and a daemon thread
+    dies without its `finally` (review of 0072, F3). The press's hook runs
+    `ask_agent_process_to_end` at once — a press read as a key by the status
+    line then ends the stream from the key reader's thread — and a press made
+    before the hook went in is asked for once it is in (`Interrupt.on_press`).
+
+    Opened INSIDE `note_channel`, so the hook is gone before the pipe closes.
+    """
+    interrupt = ctrlc.current()
+    with interrupt.on_press(lambda: ask_agent_process_to_end(proc)):
+        if interrupt.requested:
+            ask_agent_process_to_end(proc)
+        yield TurnStream(proc, interrupt)
 
 
 def reap_agent_process(proc) -> None:

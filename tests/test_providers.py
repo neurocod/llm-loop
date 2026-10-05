@@ -6,9 +6,9 @@ import sys
 
 import pytest
 
-from llm_loop import (codex_usage, compactline, console, cyclecore, limits,
-                      parallel, providers, statusline, streamrender, textwidth,
-                      wire)
+from llm_loop import (codex_usage, compactline, console, ctrlc, cyclecore,
+                      limits, parallel, providers, statusline, streamrender,
+                      textwidth, wire)
 from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
@@ -796,6 +796,51 @@ def test_a_failed_prompt_handover_does_not_leave_the_provider_running(monkeypatc
     assert started, "no process was started — the pin proved nothing"
     assert not _outlived_the_runner(started[0]), \
         "start_agent_process raised past a live provider child: orphaned, not reaped"
+
+
+class _ListedProcess:
+    """A provider process that is nothing but its stdout lines."""
+
+    def __init__(self, lines):
+        self.stdout = lines
+
+
+def test_a_press_before_the_turn_s_hook_still_ends_its_cli(monkeypatch):
+    """A press between the runner's last look and `ended_on_press` going in.
+
+    The hook runs only for presses made inside the block, and the child never
+    hears the console's Ctrl+C (`_console_isolation`): unasked, the CLI of a
+    turn the operator already stopped runs on. Asked exactly once — the hook
+    does not fire for a press it was not there for — and nothing is read.
+    """
+    ended = []
+    monkeypatch.setattr(providers, "ask_agent_process_to_end", ended.append)
+    proc = _ListedProcess(["never read\n"])
+    with pytest.raises(SystemExit):
+        with ctrlc.captured() as interrupt:
+            interrupt.press()
+            with providers.ended_on_press(proc) as stream:
+                assert list(stream) == []
+            assert stream.pressed
+    assert ended == [proc]
+
+
+def test_a_turn_s_stream_stops_at_the_first_line_after_a_press(monkeypatch):
+    """The press's hook ends the CLI, and the stream ends with it."""
+    ended = []
+    monkeypatch.setattr(providers, "ask_agent_process_to_end", ended.append)
+
+    def lines():
+        yield "first\n"
+        ctrlc.current().press()
+        yield "after the press\n"
+
+    proc = _ListedProcess(lines())
+    with pytest.raises(SystemExit):
+        with ctrlc.captured():
+            with providers.ended_on_press(proc) as stream:
+                assert list(stream) == ["first\n"]
+    assert ended == [proc]
 
 
 def test_codex_events_render_message_commands_and_usage(capsys):

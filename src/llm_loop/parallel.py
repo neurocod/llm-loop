@@ -83,7 +83,7 @@ from .console import print_markup, route_through
 # guarded.
 from .gitpush import PushAbort, maybe_git_push
 from .stopchannel import RunResult, RunStopReason
-from .providers import (ask_agent_process_to_end, note_channel, provider_spec,
+from .providers import (ended_on_press, note_channel, provider_spec,
                         reap_agent_process, start_agent_process)
 from .drivers import ListFileDriver
 
@@ -529,14 +529,6 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # `exit 1` and no cause anywhere. Kept as a bounded tail — a chatty CLI must
     # not be able to grow a worker's memory — and printed only if the job fails.
     diagnostics = collections.deque(maxlen=FAILURE_TAIL_LINES)
-    # The run's Ctrl+C ends this turn's CLI from the press itself, the way
-    # `streamrender.run_agent_streaming` ends the sequential one's. Not left
-    # to the console: the child is started without one of its own
-    # (`providers._console_isolation`) and never hears Ctrl+C, and a run that
-    # gives up joining this worker exits under it — a daemon thread dies
-    # without its `finally`, so the reap below never comes and an agent nobody
-    # sees goes on editing the tree after the run has left (review of 0072, F3).
-    interrupt = ctrlc.current()
     # Everything from here down to `proc.wait()` runs with a child process
     # alive, and every step of it can raise: formatting an `out.*` line (and,
     # with no run open, the console write behind it), `note_channel`'s close, a
@@ -544,15 +536,10 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # reaps, so an exception used to walk away from a running provider — see
     # `providers.reap_agent_process`.
     try:
+        # The run's Ctrl+C ends this turn's CLI from the press itself.
         with note_channel(proc, provider, mailbox) as channel, \
-                interrupt.on_press(lambda: ask_agent_process_to_end(proc)):
-            # A press between the worker's last look and the hook going in
-            # had nobody to end this CLI: asked here, after it is in.
-            if interrupt.requested:
-                ask_agent_process_to_end(proc)
-            for item in proc.stdout:
-                if interrupt.requested:
-                    break
+                ended_on_press(proc) as stream:
+            for item in stream:
                 ev, line = wire.decode_stream_item(item)
                 if ev is None:
                     if line is not None:
@@ -655,7 +642,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
                         console.record_timing(costlog.pool_result(
                             job_id, dur, (result_cost - previous_cost
                                           if result_cost is not None else None)))
-        if interrupt.requested:
+        if stream.pressed:
             # Whatever the CLI had done: the operator asked for the run, not
             # this turn, to end. The worker gives the claim back (`worker`).
             out.line("⏹ interrupted (Ctrl+C)", "yellow")

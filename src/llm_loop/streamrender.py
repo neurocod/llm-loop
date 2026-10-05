@@ -38,7 +38,7 @@ from .console import (
     render_markdown_block,
 )
 from .providers import (
-    ask_agent_process_to_end,
+    ended_on_press,
     note_channel,
     provider_spec,
     reap_agent_process,
@@ -280,8 +280,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     running with the terminal's stdout in hand.
 
     Inside a run Ctrl+C is the run's `ctrlc.Interrupt`, not an exception: a
-    press ends the CLI (`ask_agent_process_to_end`, run as the press's hook,
-    so a press read by the key reader ends the stream at once), the turn is
+    press ends the CLI (`providers.ended_on_press`), the turn is
     said to be interrupted and `ctrlc.EXIT_CODE` is returned — whatever the
     CLI had done, since the operator asked for the run, not the turn, to end.
     The runner asks its Interrupt next and takes its interrupt ending. Outside
@@ -300,16 +299,10 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
 
     provider_failed = False
     codex_outcome = wire.CodexOutcome()
-    interrupt = ctrlc.current()
     try:
         with note_channel(proc, provider, mailbox) as channel, \
-                interrupt.on_press(lambda: ask_agent_process_to_end(proc)):
-            # A press before the hook went in had nobody to end this CLI.
-            if interrupt.requested:
-                ask_agent_process_to_end(proc)
-            for item in proc.stdout:
-                if interrupt.requested:
-                    break
+                ended_on_press(proc) as stream:
+            for item in stream:
                 ev, line = wire.decode_stream_item(item)
                 if ev is None:
                     if line is not None:
@@ -339,7 +332,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
                     _render_claude_event(ev, partial, mailbox)
                 else:
                     _render_codex_event(ev, mailbox)
-        if interrupt.requested:
+        if stream.pressed:
             # The press may have come before the turn did (a run checks at its
             # boundaries, not in between): this turn is not the run's to start.
             print("\nInterrupted by user (Ctrl+C).")
