@@ -737,7 +737,7 @@ def test_the_boundary_orders_what_it_holds_against_the_housekeeping(
         with pytest.raises(SystemExit) as left:
             run()
         assert left.value.code == code
-    assert log == expected + ["pusher closed (timeout=0)"]
+    assert log == expected + ["pusher closed (timeout=0.5)"]
 
 
 @pytest.mark.parametrize("runner", ["sequential", "parallel"])

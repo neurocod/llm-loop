@@ -824,7 +824,9 @@ class RunBoundary:
                 self.unwind(error)
         finally:
             if self.pusher is not None:
-                self.pusher.close(timeout=0)
+                # A short wait, not 0: close takes the owner's lock with this
+                # timeout, and a zero try can miss it and leave the pusher OPEN.
+                self.pusher.close(timeout=0.5)
         return False
 
     def hold(self, resource):
