@@ -1,5 +1,6 @@
 """What the runner pins hand `run_loop` / `run_parallel`: arguments, drivers, a
-quota policy, the two "provably elsewhere" project roots — and `isolated_run`,
+quota policy, the two "provably elsewhere" project roots, the git a pusher
+runs (`FakeGitModule`) — and `isolated_run`,
 which keeps what such a run leaves in the process inside the test.
 
 Imported by name (`from _runfixtures import ...`), never through an autouse
@@ -18,6 +19,7 @@ import argparse
 import atexit
 import logging
 import os
+import subprocess
 import sys
 import threading
 from contextlib import contextmanager
@@ -161,6 +163,107 @@ def record_exit_pushes(monkeypatch) -> list:
                         lambda policy, project_dir, abort=None: calls.append(
                             (policy, project_dir)))
     return calls
+
+
+class FakeGitModule:
+    """Stands in for `gitpush.subprocess`, recording (argv, cwd) per call.
+
+    Installed as `monkeypatch.setattr(gitpush, "subprocess", FakeGitModule())`.
+    A replacement MODULE rather than a patched `subprocess.run`: the real
+    attribute is shared by every module in the process, so patching it would
+    also silently rewire the provider launcher and anything else a runner
+    reaches for during the same test.
+
+    Every `git` invocation succeeds. `rev-list --count` answers 1 until the
+    first push and `ahead_after_push` after it: the default 1 makes the policy
+    take each branch that runs git at all rather than short-circuiting on
+    "nothing to push"; 0 makes a pusher push exactly once, its later turns
+    finding nothing to push.
+
+    `pushed` fires on each `git push`: a pusher runs on a thread of its own,
+    and the only way to know it has taken a turn without guessing at a sleep is
+    to wait for the push itself. With `let_push` given, each `git push` first
+    waits for that event (failing after `let_push_timeout_s`) — the gate that
+    holds a push until the pin has staged what must come before it.
+
+    `Popen` is the way in of a git call that carries a `PushAbort` (its child
+    is started under the abort's lock, see `gitpush._run_git`): by default the
+    call is made, and recorded, by `run` from the process's `communicate` —
+    i.e. after the start, outside the lock, where a real git call spends its
+    time. A pin about the child itself passes `popen`, a factory called as
+    `popen(argv, **kwargs)` in its place.
+    """
+
+    PIPE = subprocess.PIPE
+    STDOUT = subprocess.STDOUT
+    TimeoutExpired = subprocess.TimeoutExpired
+    CompletedProcess = subprocess.CompletedProcess
+
+    def __init__(self, *, ahead_after_push: int = 1,
+                 let_push: "threading.Event | None" = None,
+                 let_push_timeout_s: float = 10.0, popen=None):
+        self.calls = []
+        self.pushed = threading.Event()
+        self._ahead_after_push = ahead_after_push
+        self._let_push = let_push
+        self._let_push_timeout_s = let_push_timeout_s
+        self._popen = popen
+
+    def Popen(self, argv, **kwargs):
+        if self._popen is not None:
+            return self._popen(argv, **kwargs)
+        return _FakeGitProcess(self, argv, kwargs)
+
+    def run(self, argv, **kwargs):
+        self.calls.append((tuple(argv), kwargs.get("cwd")))
+        if tuple(argv)[:2] == ("git", "push"):
+            if self._let_push is not None:
+                assert self._let_push.wait(self._let_push_timeout_s), \
+                    "the pin never let the pusher push"
+            self.pushed.set()
+            return subprocess.CompletedProcess(argv, 0, stdout="")
+        ahead = self._ahead_after_push if self.pushed.is_set() else 1
+        return subprocess.CompletedProcess(argv, 0, stdout=str(ahead))
+
+    @property
+    def dirs(self):
+        return {cwd for _, cwd in self.calls}
+
+    @property
+    def pushes(self):
+        """Only the `git push` calls.
+
+        Asserting on `calls` cannot tell a push from the `rev-list` that decides
+        whether to push, so a run that stopped pushing entirely still filled
+        `calls` and still passed. Measured: neutering the exit push's `git_push`
+        left every pin in test_git_push green.
+        """
+        return [call for call in self.calls if call[0][:2] == ("git", "push")]
+
+
+class _FakeGitProcess:
+    """What `FakeGitModule.Popen` starts by default: `communicate` makes the
+    call."""
+
+    def __init__(self, git, argv, kwargs):
+        self._git = git
+        self._argv = argv
+        self._kwargs = kwargs
+        self.returncode = None
+
+    def communicate(self, timeout=None):
+        done = self._git.run(self._argv, timeout=timeout, **self._kwargs)
+        self.returncode = done.returncode
+        return done.stdout, None
+
+    def kill(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class StubSource:

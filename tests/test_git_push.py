@@ -29,9 +29,10 @@ from llm_loop import (ctrlc, cyclecore, exitlog, gitpush, operator, ownership,
                       parallel, projectroot, runlifecycle)
 from llm_loop.stopchannel import RunStopReason
 
-from _runfixtures import (MemListDriver, OneShotDriver, StubPolicy, StubSource,
-                          capture_run_context, isolated_run, par_args,
-                          record_exit_pushes, root_not_cwd, seq_args)
+from _runfixtures import (FakeGitModule, MemListDriver, OneShotDriver,
+                          StubPolicy, StubSource, capture_run_context,
+                          isolated_run, par_args, record_exit_pushes,
+                          root_not_cwd, seq_args)
 from llm_loop.agentwork import ClaudeCommand
 
 
@@ -45,94 +46,14 @@ def _isolated_run(tmp_path, monkeypatch):
         yield
 
 
-class _FakeGitModule:
-    """Stands in for `gitpush.subprocess`, recording (argv, cwd) per call.
-
-    A replacement MODULE rather than a patched `subprocess.run`: the real
-    attribute is shared by every module in the process, so patching it would
-    also silently rewire the provider launcher and anything else a runner
-    reaches for during the same test.
-
-    Every `git` invocation succeeds and `rev-list --count` answers 1, so the
-    policy takes each branch that runs git at all rather than short-circuiting
-    on "nothing to push".
-
-    `pushed` fires on each `git push`. The parallel pin needs it: its pusher
-    runs on a thread of its own, and the only way to know it has taken a turn
-    without guessing at a sleep is to wait for the push itself.
-
-    `Popen` is the exit push's way in (a push with a `PushAbort` starts its
-    child under the abort's lock, see `gitpush._run_git`): the call is made,
-    and recorded, by `run` from the process's `communicate` — i.e. after the
-    start, outside the lock, where a real git call spends its time.
-    """
-
-    PIPE = subprocess.PIPE
-    STDOUT = subprocess.STDOUT
-    TimeoutExpired = subprocess.TimeoutExpired
-    CompletedProcess = subprocess.CompletedProcess
-
-    def __init__(self):
-        self.calls = []
-        self.pushed = threading.Event()
-
-    def Popen(self, argv, **kwargs):
-        return _FakeProcess(self, argv, kwargs)
-
-    def run(self, argv, **kwargs):
-        self.calls.append((tuple(argv), kwargs.get("cwd")))
-        if tuple(argv)[:2] == ("git", "push"):
-            self.pushed.set()
-        return subprocess.CompletedProcess(argv, 0, stdout="1")
-
-    @property
-    def dirs(self):
-        return {cwd for _, cwd in self.calls}
-
-    @property
-    def pushes(self):
-        """Only the `git push` calls.
-
-        Asserting on `calls` cannot tell a push from the `rev-list` that decides
-        whether to push, so a run that stopped pushing entirely still filled
-        `calls` and still passed. Measured: neutering the exit push's `git_push`
-        left every pin in this file green.
-        """
-        return [call for call in self.calls if call[0][:2] == ("git", "push")]
-
-
-class _FakeProcess:
-    """What `_FakeGitModule.Popen` starts: `communicate` makes the call."""
-
-    def __init__(self, git, argv, kwargs):
-        self._git = git
-        self._argv = argv
-        self._kwargs = kwargs
-        self.returncode = None
-
-    def communicate(self, timeout=None):
-        done = self._git.run(self._argv, timeout=timeout, **self._kwargs)
-        self.returncode = done.returncode
-        return done.stdout, None
-
-    def kill(self):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
 # The runs below push under this policy: every branch of it that runs git at all
-# is taken (see `_FakeGitModule`), where the fixtures' default `none` takes none.
+# is taken (see `FakeGitModule`), where the fixtures' default `none` takes none.
 PUSHING = "after_new_commits"
 
 
 def test_git_runs_where_it_is_told_not_where_the_process_stands(tmp_path, monkeypatch):
     """The policy's own contract: the caller names the repository."""
-    fake = _FakeGitModule()
+    fake = FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
     root = root_not_cwd(tmp_path)
 
@@ -161,7 +82,7 @@ def test_the_sequential_runner_pushes_the_project_it_was_pointed_at(
     (`push_turn` reads the boundary). So the driver reports the queue empty only
     once that check has pushed — without it, a slow CI worker saw two pushes.
     """
-    fake = _FakeGitModule()
+    fake = FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
 
     def agent(*args, **kwargs):
@@ -192,7 +113,7 @@ def test_the_sequential_runner_pushes_the_project_it_was_pointed_at(
 def test_a_sequential_agent_starts_while_git_push_is_running(tmp_path, monkeypatch):
     # The test body took 0.02 s measured 2026-10-02; the existing 10 s
     # HELD_PUSH_TIMEOUT_S leaves room for slower CI while bounding a regression.
-    class HeldPushGit(_FakeGitModule):
+    class HeldPushGit(FakeGitModule):
         def __init__(self):
             super().__init__()
             self.push_started = threading.Event()
@@ -255,7 +176,7 @@ def test_a_sequential_run_an_exception_ends_runs_its_git_before_it_leaves(
     """
     # The test body took 0.02 s measured 2026-10-02; 10 s bounds a broken
     # handshake without making a loaded CI worker fail on normal scheduling.
-    class HeldPushGit(_FakeGitModule):
+    class HeldPushGit(FakeGitModule):
         def __init__(self):
             super().__init__()
             self.release = threading.Event()
@@ -332,7 +253,7 @@ def test_the_parallel_runner_pushes_the_project_it_was_pointed_at(
     item rather than none, because a run with an empty list reports "nothing to
     do" and returns BEFORE the exit push — see `MemListDriver`.
     """
-    fake = _FakeGitModule()
+    fake = FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(parallel, "run_job",
                         lambda job_id, command, mailbox=None: (0, None, None))
@@ -380,7 +301,7 @@ def test_the_parallel_pusher_pushes_the_project_it_was_pointed_at(
     nothing; what it records is that a push was seen WHILE a worker was still
     running, which only the pusher thread can produce.
     """
-    fake = _FakeGitModule()
+    fake = FakeGitModule()
     saw_push = []
 
     def held_job(job_id, command, mailbox=None):
@@ -419,7 +340,7 @@ def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
     skip creating a pusher thread at all, so a run that pushes ANYTHING here is
     a run that read the policy after the edit rather than before it.
     """
-    fake = _FakeGitModule()
+    fake = FakeGitModule()
     made = capture_run_context(monkeypatch)
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
@@ -448,8 +369,8 @@ def test_the_git_push_knob_is_live_in_a_parallel_run(tmp_path, monkeypatch):
         f"the parallel runner pushed the wrong repository: {fake.calls}"
 
 
-class _OverlapWatchingGit(_FakeGitModule):
-    """`_FakeGitModule` that HOLDS each `git push` and records who ran what.
+class _OverlapWatchingGit(FakeGitModule):
+    """`FakeGitModule` that HOLDS each `git push` and records who ran what.
 
     `threads` is the name of the thread each git call ran on. The run's git has
     one owner (the `pusher`), so the whole of this pin's claim is that this set
@@ -686,8 +607,8 @@ def _undelivered_note(monkeypatch) -> _NoteBox:
 CTRL_C_SETTLE_S = 0.1
 
 
-class _HeldCountGit(_FakeGitModule):
-    """`_FakeGitModule` whose `rev-list` — the exit push's first git call —
+class _HeldCountGit(FakeGitModule):
+    """`FakeGitModule` whose `rev-list` — the exit push's first git call —
     waits for `release`; `counting` says it has started."""
 
     def __init__(self):
@@ -755,7 +676,7 @@ def test_aborted_git_wait_does_not_wait_for_another_runs_push():
 def test_exit_interrupt_cancels_queued_periodic_push(tmp_path, monkeypatch):
     # Under 0.005 s measured 2026-10-02; the 10 s handshake bound fails a
     # stuck pusher without requiring a particular scheduler interleaving.
-    class HeldPushGit(_FakeGitModule):
+    class HeldPushGit(FakeGitModule):
         def __init__(self):
             super().__init__()
             self.release = threading.Event()
@@ -899,7 +820,7 @@ def test_ctrl_c_during_the_exit_push_announcement_starts_no_push(
     it still let `git push` start. Staged: the print is held, the abort set,
     the print let go.
     """
-    fake = _FakeGitModule()
+    fake = FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
     announcing = threading.Event()
     let_print = threading.Event()
@@ -1012,18 +933,12 @@ def test_a_timed_out_git_is_reaped_the_way_subprocess_run_does(
     """
     made = []
 
-    class _Git:
-        PIPE = subprocess.PIPE
-        STDOUT = subprocess.STDOUT
-        TimeoutExpired = subprocess.TimeoutExpired
-        CompletedProcess = subprocess.CompletedProcess
+    def start_timing_out(argv, **kwargs):
+        made.append(_TimingOutProcess(argv))
+        return made[-1]
 
-        @staticmethod
-        def Popen(argv, **kwargs):
-            made.append(_TimingOutProcess(argv))
-            return made[-1]
-
-    monkeypatch.setattr(gitpush, "subprocess", _Git)
+    monkeypatch.setattr(gitpush, "subprocess",
+                        FakeGitModule(popen=start_timing_out))
     monkeypatch.setattr(gitpush, "_WINDOWS", windows)
 
     with pytest.raises(subprocess.TimeoutExpired):
@@ -1106,7 +1021,7 @@ def test_no_periodic_push_starts_once_the_operator_pressed_ctrl_c(
     One turn may already be under way when the interrupt lands; none may start
     after it.
     """
-    fake = _FakeGitModule()
+    fake = FakeGitModule()
     monkeypatch.setattr(gitpush, "subprocess", fake)
     monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
     record_exit_pushes(monkeypatch)
@@ -1185,7 +1100,7 @@ def test_a_periodic_check_behind_another_run_s_git_starts_none_after_the_run(
     the region raises, the run leaves past its (shortened) deadline, and only
     then is the lock let go; no git may start after that.
     """
-    fake = _FakeGitModule()
+    fake = FakeGitModule()
     lock = _HeldGitLock()
     owners = []
     real_owner = ownership.OwnerThread

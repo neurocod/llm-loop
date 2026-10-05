@@ -13,7 +13,6 @@ Three layers, pinned in that order:
     request, and a key, a resize or a `disable` is a call posted to it.
 """
 
-import subprocess
 import sys
 import threading
 import time
@@ -26,8 +25,8 @@ from llm_loop import statusline as sl
 from llm_loop.breakpoints import Breakpoints
 from llm_loop.limits import LimitPolicy, SessionLimit
 
-from _runfixtures import (MemListDriver, isolated_run, par_args,
-                          record_exit_pushes)
+from _runfixtures import (FakeGitModule, MemListDriver, isolated_run,
+                          par_args, record_exit_pushes)
 from _termfixtures import KeysByHand, RecordingTerminal
 
 # Upper bound on every wait below but the frame waits (those take
@@ -903,60 +902,6 @@ def _as_plain_stdout(monkeypatch, out):
     return out
 
 
-class _OnePushGit:
-    """`gitpush.subprocess` for a pusher that pushes exactly once, when let.
-
-    `rev-list` answers one commit ahead until the push has happened and none
-    after it, so the pump's later turns find nothing to push; `git push` waits
-    for `let_push`, which is what puts the pusher's line behind the worker's.
-    """
-
-    PIPE = subprocess.PIPE
-    STDOUT = subprocess.STDOUT
-    TimeoutExpired = subprocess.TimeoutExpired
-    CompletedProcess = subprocess.CompletedProcess
-
-    def __init__(self):
-        self.let_push = threading.Event()
-        self.pushed = False
-
-    def Popen(self, argv, **kwargs):
-        # The pump's checks carry the run's `PushAbort`, and a git call with
-        # one is started through `Popen` (see `gitpush._run_git`).
-        return _OnePushProcess(self, argv)
-
-    def run(self, argv, **kwargs):
-        if tuple(argv)[:2] == ("git", "push"):
-            assert self.let_push.wait(WAIT_S), "the pin never let the pusher push"
-            self.pushed = True
-            return subprocess.CompletedProcess(argv, 0, stdout="")
-        return subprocess.CompletedProcess(argv, 0,
-                                           stdout="0" if self.pushed else "1")
-
-
-class _OnePushProcess:
-    """What `_OnePushGit.Popen` starts: `communicate` makes the call."""
-
-    def __init__(self, git, argv):
-        self._git = git
-        self._argv = argv
-        self.returncode = None
-
-    def communicate(self, timeout=None):
-        done = self._git.run(self._argv)
-        self.returncode = done.returncode
-        return done.stdout, None
-
-    def kill(self):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
 class _OverTheCeiling:
     """A usage source whose session is over any ceiling the pin sets."""
 
@@ -985,8 +930,13 @@ def test_quota_and_pusher_lines_are_written_by_the_owner_after_queued_worker_lin
     """
     out = _as_plain_stdout(monkeypatch, _ThreadedStdout())
     record_exit_pushes(monkeypatch)
-    git = _OnePushGit()
-    monkeypatch.setattr(gitpush, "subprocess", git)
+    # Pushes exactly once, when let: `let_push` is what puts the pusher's line
+    # behind the worker's, and nothing ahead after it keeps the pump's later
+    # turns from pushing (and printing) again.
+    let_push = threading.Event()
+    monkeypatch.setattr(gitpush, "subprocess",
+                        FakeGitModule(ahead_after_push=0, let_push=let_push,
+                                      let_push_timeout_s=WAIT_S))
     monkeypatch.setattr(parallel, "PUSH_PUMP_INTERVAL_S", 0.01)
     stall = _Stall()
     reached = []
@@ -1000,7 +950,7 @@ def test_quota_and_pusher_lines_are_written_by_the_owner_after_queued_worker_lin
                 lines.line(f"worker line {n}")
             LimitPolicy([SessionLimit(5)]).check_and_wait(
                 _OverTheCeiling(), time.time(), should_stop=lambda: True)
-            git.let_push.set()
+            let_push.set()
             # The stall, three worker lines, three gate lines, one push line —
             # a line that is not routed never arrives, and is asserted on below.
             reached.append(_wait_for(lambda: parallel._console.backlog >= 8))
