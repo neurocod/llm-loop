@@ -310,24 +310,11 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
             for item in proc.stdout:
                 if interrupt.requested:
                     break
-                if isinstance(item, dict):
-                    # An app-server event arrives decoded
-                    # (`providers._CodexEventStream`); `raw` re-encodes it.
-                    ev, line = item, None
-                else:
-                    line = item.rstrip("\n")
-                    if not line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                    except json.JSONDecodeError:
-                        # non-JSON line (e.g. CLI diagnostics) — print it as is
-                        print(line)
-                        continue
-                    if not isinstance(ev, dict):
-                        # A JSON scalar/array is diagnostic output, not an event.
-                        print(line)
-                        continue
+                ev, line = wire.decode_stream_item(item)
+                if ev is None:
+                    if line is not None:
+                        print(line)   # CLI diagnostics, printed as they came
+                    continue
                 event_type = wire.event_type(ev)
                 if provider == "claude":
                     # Before `raw`, so a raw run's row learns the model too.

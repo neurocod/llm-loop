@@ -32,7 +32,8 @@ What is NOT here: the tool-INPUT schema (`Bash`'s `command`, `Grep`'s `path`,
 stream's — and it already lives in one place, `compactline.describe_tool`.
 """
 
-from typing import Any, Optional
+import json
+from typing import Any, Optional, Union
 
 from . import compactline
 
@@ -130,6 +131,37 @@ VOCABULARY = frozenset(
 
 
 # --- reading one event ----------------------------------------------------
+
+def decode_stream_item(
+        item: Union[dict, str]) -> tuple[Optional[dict], Optional[str]]:
+    """One item of a provider's stdout as ``(event, line)``.
+
+    Both renderers iterate the same ``dict | str`` stream
+    (`providers._CodexEventStream` yields app-server events already decoded,
+    every other item is a raw line) and differ only in where a diagnostic
+    goes, so the decoding lives here once:
+
+      * ``(event, None)`` — an object that arrived decoded;
+      * ``(event, line)`` — a JSON object parsed from ``line`` (newline
+        stripped), which raw mode prints back as it arrived;
+      * ``(None, line)`` — not an event: not JSON, or JSON that is not an
+        object (a scalar or array is CLI diagnostic output too). The caller
+        routes ``line`` to its own diagnostic sink;
+      * ``(None, None)`` — an empty line, skipped.
+    """
+    if isinstance(item, dict):
+        return item, None
+    line = item.rstrip("\n")
+    if not line:
+        return None, None
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return None, line
+    if not isinstance(ev, dict):
+        return None, line
+    return ev, line
+
 
 def event_type(ev: dict) -> Optional[str]:
     """The event's own type — the value every dispatch below switches on."""

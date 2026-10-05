@@ -356,6 +356,36 @@ def test_codex_app_events_arrive_as_objects_and_diagnostics_as_lines():
     assert event["item"]["text"] == "корень готов"
 
 
+def test_one_decoder_splits_stream_items_into_events_and_diagnostics():
+    """Both renderers read `dict | str` items through `wire.decode_stream_item`."""
+    ev = {"type": "turn.completed"}
+    assert wire.decode_stream_item(ev) == (ev, None)
+    assert wire.decode_stream_item('{"type": "x"}\n') == (
+        {"type": "x"}, '{"type": "x"}')
+    assert wire.decode_stream_item("\n") == (None, None)
+    assert wire.decode_stream_item("npm warn\n") == (None, "npm warn")
+    assert wire.decode_stream_item("[1]\n") == (None, "[1]")
+    assert wire.decode_stream_item("42\n") == (None, "42")
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_a_json_non_object_is_a_diagnostic_in_both_renderers(
+        monkeypatch, capsys, runner):
+    """Printed live by one renderer, kept in the failure tail by the other."""
+    raw = _FakeAgentProcess(returncode=1, stdout=_app_server_stream(
+        "[1, 2, 3]\n", _ROOT_MESSAGE))
+    proc = providers._CodexAppProcess(raw, [], "root", "turn")
+    monkeypatch.setattr(streamrender, "start_agent_process", lambda *a: proc)
+    monkeypatch.setattr(parallel, "start_agent_process", lambda *a: proc)
+
+    if runner == "parallel":
+        parallel.run_job(1, AgentCommand("p", "gpt-test", "j", "codex"))
+    else:
+        streamrender.run_agent_streaming(["codex"], "codex", raw=False)
+
+    assert "[1, 2, 3]" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
 def test_both_renderers_take_codex_app_events_as_objects(
         monkeypatch, capsys, runner):
