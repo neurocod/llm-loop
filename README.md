@@ -687,7 +687,7 @@ of the message, not this end assuming the pipe was read.
 
 With one agent, `m` opens the editor directly. With several workers, `m` first
 asks for a job number; Enter selects it and opens an editor labelled with that
-job. Each job has its own queue, so a note typed between that worker's turns
+job. Each job has its own queue, so a note typed between that worker's iterations
 rides its next prompt rather than being picked up by whichever worker starts
 next.
 
