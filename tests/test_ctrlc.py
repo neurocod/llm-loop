@@ -143,6 +143,28 @@ def test_a_quota_hold_ends_on_ctrl_c_and_says_so(capsys):
     assert "Stop requested" not in out and asked == []
 
 
+def test_the_stop_file_wait_leaves_on_the_run_s_ctrl_c(
+        tmp_path, monkeypatch, capsys):
+    """Held back by a stop file, a launch leaves on the press, not on the
+    file going away — and does not go on to start."""
+    sentinel = tmp_path / "stop"
+    sentinel.write_text("")
+    monkeypatch.setattr(stopchannel, "stop_file_path", lambda: str(sentinel))
+    # The backstop: a wait deaf to the press ends when the file goes, and
+    # fails below instead of hanging the suite.
+    backstop = threading.Timer(5, sentinel.unlink)
+    backstop.start()
+    try:
+        with pressed_run() as interrupt:
+            interrupt.press()
+            stopchannel.wait_for_stop_file_clear()
+    finally:
+        backstop.cancel()
+    out = capsys.readouterr().out
+    assert ctrlc.WAIT_INTERRUPTED_LINE in out
+    assert "Stop file removed" not in out
+
+
 def test_a_runner_inside_a_run_shares_its_interrupt():
     with pressed_run() as outer:
         with ctrlc.captured() as inner:

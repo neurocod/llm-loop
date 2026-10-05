@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from llm_loop import cyclecore, termio
+from llm_loop import ctrlc, cyclecore, termio
 
 from _termfixtures import RecordingTerminal
 
@@ -113,6 +113,26 @@ def test_quit_never_starts_and_restores_terminal(waiting, capsys, action, code):
     assert waiting.now == 0
     assert "Starting the loop" not in capsys.readouterr().out
     assert waiting.stopped and waiting.released
+
+
+@pytest.mark.parametrize("interactive", [True, False])
+def test_the_run_s_ctrl_c_leaves_the_start_wait(waiting, capsys, interactive):
+    """Inside a run the press raises nothing: the wait itself must leave.
+
+    The outer capture would turn a returned wait into exit 130 as well, so
+    the pin reads what was said: the wait's line, and no start.
+    """
+    with pytest.raises(SystemExit) as caught:
+        with ctrlc.captured() as interrupt:
+            interrupt.press()
+            cyclecore.wait_before_start("2h", interactive=interactive)
+    assert caught.value.code == ctrlc.EXIT_CODE
+    out = capsys.readouterr().out
+    assert ctrlc.WAIT_INTERRUPTED_LINE in out
+    assert "Starting the loop" not in out
+    assert waiting.now == 0
+    if interactive:
+        assert waiting.stopped and waiting.released
 
 
 def test_disabled_ui_waits_silently(waiting, capsys):

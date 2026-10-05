@@ -365,7 +365,7 @@ class LimitPolicy:
                    f"clears or the window resets…")
         while True:
             if ctrlc.current().requested:
-                print_line("\nWait interrupted by user (Ctrl+C).")
+                print_line(ctrlc.WAIT_INTERRUPTED_LINE)
                 return True, session_start
             if should_stop is not None and should_stop():
                 print_line("  ⏹ Stop requested while over the usage limit — "

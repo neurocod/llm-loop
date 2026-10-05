@@ -35,10 +35,11 @@ line (`deliver`) comes on the key reader's thread and runs the turn's
 import contextlib
 import signal
 import threading
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Callable, Iterator, List, NoReturn, Optional, Tuple
 
-__all__ = ["EXIT_CODE", "INTERRUPTED_REASON", "Interrupt", "asked", "captured",
-           "current", "deliver"]
+__all__ = ["EXIT_CODE", "INTERRUPTED_REASON", "WAIT_INTERRUPTED_LINE",
+           "Interrupt", "asked", "captured", "current", "deliver", "leave",
+           "leave_wait"]
 
 # The exit code of a run the operator ended with Ctrl+C: 128 + SIGINT, what a
 # shell reports for a process SIGINT killed. A constant so a wrapper telling an
@@ -48,6 +49,10 @@ EXIT_CODE = 130
 # What the exit record says about a run the operator ended with Ctrl+C —
 # from every door of the epilogue (`runlifecycle`) and from `captured`.
 INTERRUPTED_REASON = "interrupted by the operator (Ctrl+C)"
+
+# What a wait Ctrl+C ended prints, from every wait — the quota hold, the
+# countdown after a refusal and the two before the run's boundary alike.
+WAIT_INTERRUPTED_LINE = "\nWait interrupted by user (Ctrl+C)."
 
 
 class Interrupt:
@@ -203,11 +208,28 @@ def captured() -> Iterator[Interrupt]:
     # Reached only when the block returned: an exception or an exit has left
     # through the `finally` above with its own ending.
     if interrupt.requested:
-        # Local: exitlog is a run's record, and ctrlc stays importable below it.
-        from . import exitlog
+        leave()
 
-        exitlog.set_reason(INTERRUPTED_REASON)
-        raise SystemExit(EXIT_CODE)
+
+def leave(**counts) -> NoReturn:
+    """The interrupt's ending: INTERRUPTED_REASON in the run's exit record,
+    then exit EXIT_CODE. `counts` (iterations=, completed=) go into the
+    record beside the reason."""
+    # Local: exitlog is a run's record, and ctrlc stays importable below it.
+    from . import exitlog
+
+    exitlog.set_reason(INTERRUPTED_REASON, **counts)
+    raise SystemExit(EXIT_CODE)
+
+
+def leave_wait() -> NoReturn:
+    """A wait before the run's boundary that Ctrl+C ended: said, exit EXIT_CODE.
+
+    The press inside a run, and a KeyboardInterrupt outside one, alike. Writes
+    no reason to the exit record, unlike `leave`.
+    """
+    print(WAIT_INTERRUPTED_LINE)
+    raise SystemExit(EXIT_CODE)
 
 
 def deliver() -> None:

@@ -637,10 +637,8 @@ INTERRUPTED_REASON = ctrlc.INTERRUPTED_REASON
 
 
 def _exit_interrupted(iterations: int, completed: int) -> NoReturn:
-    """The ending of a run Ctrl+C ended: INTERRUPTED_REASON, `ctrlc.EXIT_CODE`."""
-    exitlog.set_reason(INTERRUPTED_REASON, iterations=iterations,
-                       completed=completed)
-    sys.exit(ctrlc.EXIT_CODE)
+    """The ending of a run Ctrl+C ended, with the run's counts (`ctrlc.leave`)."""
+    ctrlc.leave(iterations=iterations, completed=completed)
 
 
 def end_run(ctx: RunContext, result: RunResult, *,

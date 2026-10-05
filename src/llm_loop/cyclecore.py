@@ -249,7 +249,7 @@ def wait_until(target_ts: float, reason: str = None, should_stop=None) -> bool:
     print(f"  ⏳ {reason}")
     if _count_down_to(target_ts, should_stop):
         if ctrlc.current().requested:
-            print("\nWait interrupted by user (Ctrl+C).")
+            print(ctrlc.WAIT_INTERRUPTED_LINE)
         else:
             print("  ⏹ Stop requested — leaving the wait.")
         return True
@@ -323,7 +323,7 @@ def _interactive_start_wait(seconds: float, *, enabled: bool) -> bool:
             if remaining <= 0:
                 return True
             if ctrlc.current().requested:
-                raise KeyboardInterrupt     # the runner's Ctrl+C: see the caller
+                ctrlc.leave_wait()          # the runner's Ctrl+C, like `q`
             try:
                 # Keypresses must not shift ticks away from second boundaries.
                 until_tick = 1.0 - ((time.monotonic() - started) % 1.0)
@@ -374,10 +374,9 @@ def wait_before_start(spec: str, *, interactive: bool = True) -> None:
     try:
         if (not _interactive_start_wait(seconds, enabled=interactive)
                 and stopchannel.sleep_unless(max(0, target_ts - time.time()))):
-            raise KeyboardInterrupt         # the runner's Ctrl+C
-    except KeyboardInterrupt:
-        print("\nWait interrupted by user (Ctrl+C).")
-        sys.exit(ctrlc.EXIT_CODE)
+            ctrlc.leave_wait()              # the runner's Ctrl+C
+    except KeyboardInterrupt:                # outside a runner only
+        ctrlc.leave_wait()
     print("  ▶ Starting the loop.")
 
 

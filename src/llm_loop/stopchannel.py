@@ -538,7 +538,7 @@ def wait_for_stop_file_clear() -> None:
     try:
         while os.path.exists(sentinel):
             if sleep_unless(STOP_POLL_SECONDS):
-                raise KeyboardInterrupt     # the run's Ctrl+C, said below
+                ctrlc.leave_wait()          # the run's Ctrl+C
             waited += STOP_POLL_SECONDS
             if waited % 60 == 0:
                 # The wall clock, spelled with the stdlib rather than borrowed
@@ -546,7 +546,6 @@ def wait_for_stop_file_clear() -> None:
                 # fewer between a stop channel and what a run prints with.
                 print(f"    … still waiting ({waited // 60} min, now "
                       f"{time.strftime('%H:%M:%S')})", flush=True)
-    except KeyboardInterrupt:
-        print("\nWait interrupted by user (Ctrl+C).")
-        sys.exit(ctrlc.EXIT_CODE)
+    except KeyboardInterrupt:                # outside a run only
+        ctrlc.leave_wait()
     print("  ▶ Stop file removed — starting.")
