@@ -2031,25 +2031,25 @@ def test_capture_only_diverts_the_thread_that_asked_for_it(capsys):
         print("from another thread")
         other.set()
 
-    with sl.capture_stdout_here() as chunks:
+    with console.capture_stdout_here() as chunks:
         print("mine")
         threading.Thread(target=elsewhere, daemon=True).start()
         other.wait(5)
 
     assert "".join(chunks) == "mine\n"
     assert capsys.readouterr().out == "from another thread\n"
-    assert not isinstance(sys.stdout, sl._ThreadScopedCapture)   # uninstalled
+    assert not isinstance(sys.stdout, console._ThreadScopedCapture)  # uninstalled
 
 
 def test_a_capture_still_holds_inside_a_console_route(capsys):
     """A parallel run routes `console.print_line` to its console's owner — a
     thread the capture does not cover — so a captured thread is kept out of
-    the route (`console.unrouted_here`), and the owner writes nothing."""
+    the route (`console._on_console`), and the owner writes nothing."""
     owner = ownership.OwnerThread("console-lines").start()
     captured = []
 
     def refresher_like():
-        with sl.capture_stdout_here() as chunks:
+        with console.capture_stdout_here() as chunks:
             console.print_line("  · no usage figures: 401")
         captured.append("".join(chunks))
 

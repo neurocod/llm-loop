@@ -2216,68 +2216,6 @@ def push_quotas(app: "StatusApp", usage_source, limit_policy=None, *,
                                  cache_value=cache_value))
 
 
-# Threads whose stdout writes are being diverted: ident -> list of chunks.
-_capture_lock = threading.Lock()
-_captured: dict = {}
-
-
-class _ThreadScopedCapture:
-    """A `sys.stdout` stand-in that diverts ONE thread's writes into a buffer.
-
-    Needed because the background quota poll reaches `usage.query_usage_json`,
-    which prints its diagnostics ("no usage figures: … 401 …"). Printed from a
-    daemon thread they land at an arbitrary point of the scrolling output —
-    possibly mid-token inside a rich `Live` block — and in the mirror log that
-    `--cost` parses. Replacing `sys.stdout` outright for the duration would
-    steal the LOOP's own output too, so the diversion is keyed on the thread
-    that asked for it; every other thread passes straight through.
-    """
-
-    def __init__(self, target):
-        self._target = target
-
-    def write(self, text):
-        buffer = _captured.get(threading.get_ident())
-        if buffer is None:
-            return self._target.write(text)
-        buffer.append(text)
-        return len(text)
-
-    def flush(self):
-        if _captured.get(threading.get_ident()) is None:
-            self._target.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._target, name)
-
-
-@contextmanager
-def capture_stdout_here():
-    """Collect THIS thread's stdout writes; yields the list of chunks.
-
-    `console.unrouted_here` too: inside a parallel run's `console.route_through`
-    a `console.print_line` would otherwise be written by the route's owner, on
-    its own thread, past this capture.
-    """
-    ident = threading.get_ident()
-    buffer: List[str] = []
-    with _capture_lock:
-        if not isinstance(sys.stdout, _ThreadScopedCapture):
-            sys.stdout = _ThreadScopedCapture(sys.stdout)
-        _captured[ident] = buffer
-    try:
-        with console.unrouted_here():
-            yield buffer
-    finally:
-        with _capture_lock:
-            _captured.pop(ident, None)
-            proxy = sys.stdout
-            # Uninstall only once nobody is capturing any more, and only if the
-            # proxy is still ours — the loop installs its own tee over stdout.
-            if not _captured and isinstance(proxy, _ThreadScopedCapture):
-                sys.stdout = proxy._target
-
-
 class QuotaRefresher:
     """Low-frequency background poll so the pinned figures do not go stale while
     a long iteration runs. Uses the shared cached source, hence the low rate."""
@@ -2349,10 +2287,10 @@ class QuotaRefresher:
                 continue
             # cache_value=False: this poll exists precisely to age out the cache.
             # Its diagnostics are captured, never printed — see
-            # `_ThreadScopedCapture` — and surfaced on the note row instead,
-            # which is the one place a background message can appear without
-            # corrupting the stream or the mirror log.
-            with capture_stdout_here() as chunks:
+            # `console.capture_stdout_here` — and surfaced on the note row
+            # instead, which is the one place a background message can appear
+            # without corrupting the stream or the mirror log.
+            with console.capture_stdout_here() as chunks:
                 rows = quota_rows(source, policy, cache_value=False)
             with self._source_lock:
                 if generation != self._generation or self._stop.is_set():

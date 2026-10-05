@@ -511,28 +511,72 @@ class _Route:
 _ROUTE_LOCK = threading.Lock()
 _route: Optional[_Route] = None
 
-# Threads inside `unrouted_here`, as a per-thread nesting depth.
-_UNROUTED = threading.local()
+# Threads whose stdout writes are being diverted: ident -> list of chunks.
+# Read without the lock by `_ThreadScopedCapture` and `_on_console` (one dict
+# lookup, atomic); written only under it.
+_capture_lock = threading.Lock()
+_captured: dict = {}
+
+
+class _ThreadScopedCapture:
+    """A `sys.stdout` stand-in that diverts ONE thread's writes into a buffer.
+
+    Needed because the status line's background quota poll reaches
+    `usage.query_usage_json`, which prints its diagnostics ("no usage
+    figures: … 401 …"). Printed from a daemon thread they land at an arbitrary
+    point of the scrolling output — possibly mid-token inside a rich `Live`
+    block — and in the mirror log that `--cost` parses. Replacing `sys.stdout`
+    outright for the duration would steal the LOOP's own output too, so the
+    diversion is keyed on the thread that asked for it; every other thread
+    passes straight through.
+    """
+
+    def __init__(self, target):
+        self._target = target
+
+    def write(self, text):
+        buffer = _captured.get(threading.get_ident())
+        if buffer is None:
+            return self._target.write(text)
+        buffer.append(text)
+        return len(text)
+
+    def flush(self):
+        if _captured.get(threading.get_ident()) is None:
+            self._target.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
 
 
 @contextlib.contextmanager
-def unrouted_here():
-    """While inside, THIS thread's console writes are made on it, never routed.
+def capture_stdout_here():
+    """Collect THIS thread's stdout writes; yields the list of chunks.
 
-    For a thread whose stdout is diverted away from the console by thread:
-    the status line's quota refresher collects a usage source's diagnostics
-    with `statusline.capture_stdout_here`, which is keyed on the thread that
-    writes. Posted to a route's owner, the line would be written on the
-    owner's thread — past the capture, onto the screen and into the mirror
-    log — and the refresher, having captured nothing, would read the source as
-    recovered. Nests; other threads are unaffected.
+    A captured thread is never routed (`_on_console`): posted to a route's
+    owner, its line would be written on the owner's thread — past the capture,
+    onto the screen and into the mirror log — and the status line's refresher,
+    having captured nothing, would read the source as recovered. That check
+    lives beside the route rather than as a flag the capturer must remember to
+    set, which is how backlog 0616's leak happened. Does not nest: an inner
+    capture on the same thread ends the outer one.
     """
-    depth = getattr(_UNROUTED, "depth", 0)
-    _UNROUTED.depth = depth + 1
+    ident = threading.get_ident()
+    buffer: list = []
+    with _capture_lock:
+        if not isinstance(sys.stdout, _ThreadScopedCapture):
+            sys.stdout = _ThreadScopedCapture(sys.stdout)
+        _captured[ident] = buffer
     try:
-        yield
+        yield buffer
     finally:
-        _UNROUTED.depth = depth
+        with _capture_lock:
+            _captured.pop(ident, None)
+            proxy = sys.stdout
+            # Uninstall only once nobody is capturing any more, and only if the
+            # proxy is still ours — the loop installs its own tee over stdout.
+            if not _captured and isinstance(proxy, _ThreadScopedCapture):
+                sys.stdout = proxy._target
 
 
 @contextlib.contextmanager
@@ -544,8 +588,8 @@ def route_through(owner, *, post_timeout: float):
     instead of making it, so a line printed by a thread the runner does not own
     (the usage gate on a worker, the background git pusher) lands in the one
     stream the owner writes, after every line already queued there. A thread
-    inside `unrouted_here` is not routed (the status line's refresher, whose
-    usage diagnostics are captured, not printed). Why this lives here and not
+    inside `capture_stdout_here` is not routed (the status line's refresher,
+    whose usage diagnostics are captured, not printed). Why this lives here and not
     with the runner: those threads reach the console through this module's
     names, imported by value, which the runner cannot intercept without
     patching another module's globals.
@@ -627,7 +671,7 @@ def _on_console(call, *args) -> None:
     on the owner's side and recurse there).
     """
     route = _route
-    if (route is not None and not getattr(_UNROUTED, "depth", 0)
+    if (route is not None and threading.get_ident() not in _captured
             and not route.owner.owns_current_thread
             and route.post(call, *args)):
         return
