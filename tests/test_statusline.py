@@ -1593,6 +1593,33 @@ def test_a_later_runner_call_opens_on_how_far_the_queue_got(tmp_path):
     assert (app.status.iteration, app.status.max_iterations) == (2, 5)
 
 
+def test_the_restart_command_rewrites_with_the_hosts_switches(monkeypatch,
+                                                              capsys, tmp_path):
+    """The run's own vocabulary reaches the help key: a host's value switch
+    given empty comes out as `--folder=`, the one spelling PowerShell 5.1
+    delivers, instead of an unpasteable `--folder ""` (`cmdline._empty_value`).
+    The switch is the host's alone, so only the projection of its table
+    (`clispec.flag_aliases`) can tell the rewriter that it takes a value."""
+    from llm_loop import modeswitch
+
+    switches = (modeswitch.ModeSwitch(("--folder",), "folder", True, "a dir"),)
+    argv = ["--folder", "", "--dry-run", "-C", str(tmp_path)]
+    args = cyclecore.parse_args(
+        argv, extra_options=lambda p: modeswitch.register(p, switches, "any"))
+    ctx = runlifecycle.begin_run(_QueueDriver(None), args, "pytest-statusline",
+                                 setup_logging=False)
+    app = runlifecycle.open_status(ctx, _QueueDriver(None), job_count=1,
+                                   messages=None)
+    monkeypatch.setattr(sys, "argv", ["runHost.py", *argv])
+    monkeypatch.setattr(sl.cmdline, "paste_shell", lambda: sl.cmdline.POWERSHELL)
+    capsys.readouterr()
+
+    app.handle_event(tio.Key("h"))
+
+    out = capsys.readouterr().out
+    assert out.startswith("Restart command:\n") and " --folder= " in out, out
+
+
 def test_a_paused_loop_holds_before_it_asks_the_driver_for_work(monkeypatch,
                                                                 tmp_path):
     """The hold is only worth anything where it is: the state file the driver

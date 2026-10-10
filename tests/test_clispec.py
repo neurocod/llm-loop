@@ -21,11 +21,20 @@ import argparse
 
 import pytest
 
-from llm_loop import clispec, cyclecore, parallel
+from llm_loop import clispec, cyclecore, modeswitch, parallel
 from llm_loop.cmdline import FLAG_ALIASES, rebuild_argv
+from llm_loop.modeswitch import ModeSwitch
 
 
 MODES = [clispec.SEQUENTIAL, clispec.PARALLEL]
+
+# A host's mode switches, a value-taking one among them: none is a row of
+# `clispec.OPTIONS`, and registering them is what declares them to the rewriter.
+HOST_SWITCHES = (
+    ModeSwitch(("-p", "--parallel"), "parallel", False, "run workers"),
+    ModeSwitch(("--random",), "random", False, "random order"),
+    ModeSwitch(("--finish",), "finish", True, "one folder", metavar="FOLDER"),
+)
 
 
 def _known_wrapper_options(parser):
@@ -35,12 +44,11 @@ def _known_wrapper_options(parser):
     `build_parser` is a loop over the table, so inside this package the only way
     an undeclared flag can reach a parser is through this hook — which means a
     gate that never passes one is checking the loop, not the seam where a host
-    project actually adds options. The flags used here are real ones a wrapper
-    registers (runGenerateModels does, for both), and they belong to the table:
-    a hook that stays inside it must leave the parser clean.
+    project actually adds options. The hook registers a mode-switch table, as a
+    host does: a hook that goes through `modeswitch.register` must leave the
+    parser clean.
     """
-    parser.add_argument("-p", "--parallel", action="store_true")
-    parser.add_argument("--random", action="store_true")
+    modeswitch.register(parser, HOST_SWITCHES, "any")
 
 
 def _built(mode, *, hooked=False):
@@ -70,8 +78,9 @@ def test_every_spelling_a_parser_offers_is_strippable(mode, hooked):
     problems = clispec.unstrippable_flags(_built(mode, hooked=hooked))
 
     assert problems == [], (
-        f"{mode} parser: {problems}. Declare the flag in clispec.OPTIONS instead "
-        f"of calling add_argument directly.")
+        f"{mode} parser: {problems}. Declare the flag in clispec.OPTIONS, or "
+        f"register it as a mode switch, instead of calling add_argument "
+        f"directly.")
 
 
 # --- ...and it bites: each failure the gate exists for, at the hook ------------
@@ -87,14 +96,20 @@ def test_an_undeclared_value_taking_flag_is_reported(mode):
     assert len(problems) == 1 and problems[0].startswith("--rogue "), problems
 
 
+# A boolean row the mode's parser does not offer, so a hook can add it.
+_UNOFFERED_SWITCH = {clispec.SEQUENTIAL: "--ignore-usage",
+                     clispec.PARALLEL: "--raw"}
+
+
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("spelling,kwargs", [
+@pytest.mark.parametrize("which,kwargs", [
     # boolean in the table, handed a value by the hook
-    ("--random", dict(nargs=1)),
+    ("switch", dict(nargs=1)),
     # value-taking in the table, registered as a switch
-    ("--finish", dict(action="store_true")),
+    ("value", dict(action="store_true")),
 ], ids=["switch-given-a-value", "value-made-a-switch"])
-def test_a_declared_flag_with_the_wrong_arity_is_reported(mode, spelling, kwargs):
+def test_a_declared_flag_with_the_wrong_arity_is_reported(mode, which, kwargs):
+    spelling = _UNOFFERED_SWITCH[mode] if which == "switch" else "--session-limit"
     problems = clispec.unstrippable_flags(_hooked(mode, ((spelling,), kwargs)))
 
     assert len(problems) == 1 and problems[0].startswith(f"{spelling}:"), problems
@@ -103,7 +118,7 @@ def test_a_declared_flag_with_the_wrong_arity_is_reported(mode, spelling, kwargs
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("spelling,kwargs", [
     # declared value flag whose value became optional: bare, it eats a neighbour
-    ("--finish", dict(nargs="?")),
+    ("--session-limit", dict(nargs="?")),
     # undeclared, two values: the second one is left behind as an orphan
     ("--rogue", dict(nargs=2)),
 ], ids=["declared-optional-value", "undeclared-two-values"])
@@ -152,7 +167,7 @@ def test_each_mode_names_only_rows_that_can_build_an_option(mode):
 
 
 def test_a_row_no_parser_offers_declares_no_parser_keywords():
-    """The encoding of "the wrapper reads this one itself".
+    """The encoding of "only the status line writes this one".
 
     Parser keywords on a row nobody builds are the residue of a half-finished
     wiring — the flag reads as supported and is not.
@@ -204,15 +219,58 @@ def test_the_alias_table_is_the_option_table():
 
     The comparison of KEYS is the load-bearing half. A projection that skipped
     the parser-less rows would still satisfy every other test in this file — the
-    parsers would look complete — while `--parallel`, `--grow-kit`, `--random`
-    and `--finish` silently left the rewriter's vocabulary. The order matters
-    for a different reason: overrides are appended in it, so a rendered command
-    line must not depend on dict insertion luck.
+    parsers would look complete — while `--session-limit` and `--weekly-limit`
+    silently left the rewriter's vocabulary. The order matters for a different
+    reason: overrides are appended in it, so a rendered command line must not
+    depend on dict insertion luck.
     """
     assert list(FLAG_ALIASES) == list(clispec.OPTIONS)
     for name, option in clispec.OPTIONS.items():
         assert FLAG_ALIASES[name] == clispec.Flag(option.aliases,
                                                   option.takes_value)
+
+
+# --- a host's mode switches, projected from its own table -----------------------
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_registered_switch_is_a_row_of_the_hosts_vocabulary(mode):
+    parser = _built(mode, hooked=True)
+    args = parser.parse_args([])
+
+    for source in (parser, args):
+        aliases = clispec.flag_aliases(source)
+        assert list(aliases)[:len(FLAG_ALIASES)] == list(FLAG_ALIASES)
+        assert aliases["--finish"] == clispec.Flag(("--finish",), True)
+        assert aliases["--parallel"] == clispec.Flag(("-p", "--parallel"), False)
+    assert clispec.flag_aliases(None) == FLAG_ALIASES
+
+
+def test_a_switch_that_is_an_engine_row_keeps_that_row():
+    # The sequential parser has no -j, so a host's -j/--jobs switch is
+    # registered there — and is the very row the parallel parser builds from.
+    jobs = (ModeSwitch(("-j", "--jobs"), "jobs", True, "workers", metavar="N",
+                       type=int),)
+    parser = clispec.build_parser(
+        clispec.SEQUENTIAL, prog="runGate.py",
+        extra_options=lambda p: modeswitch.register(p, jobs, "any"))
+
+    assert clispec.flag_aliases(parser) == FLAG_ALIASES
+    assert clispec.unstrippable_flags(parser) == []
+
+
+@pytest.mark.parametrize("aliases, takes_value", [
+    (("-s", "--soon"), True),           # one spelling of --start-in
+    (("--session-limit",), False),      # the row's spelling, the wrong arity
+])
+def test_a_switch_sharing_an_engine_spelling_is_refused(aliases, takes_value):
+    # A bare parser, so registering cannot collide with an engine option; the
+    # rewriter strips the ENGINE's spellings whatever the host's parser offers.
+    parser = argparse.ArgumentParser(prog="runGate.py")
+    modeswitch.register(parser, (ModeSwitch(aliases, "clash", takes_value, "x"),),
+                        "any")
+
+    with pytest.raises(ValueError, match="shares a spelling"):
+        clispec.flag_aliases(parser)
 
 
 # --- the two entry points still reach the same table ---------------------------

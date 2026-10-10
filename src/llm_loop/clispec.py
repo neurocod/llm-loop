@@ -16,15 +16,15 @@ So `OPTIONS` below is the single table, and everything else is DERIVED from it:
     happened to sit;
   * `FLAG_ALIASES` (re-exported by `cmdline`, which is where callers still name
     it) is the same table projected down to what an argv rewriter needs: every
-    spelling of a flag, and whether it eats the next token.
+    spelling of a flag, and whether it eats the next token. `flag_aliases(args)`
+    adds the mode switches a host registered (`modeswitch.register`) — the
+    host's own table, so no host's flags are rows here.
 
 A row that `build_parser` never adds is legitimate and carries `kwargs=None`:
-`--parallel`/`--grow-kit`/`--random`/`--finish` are a wrapper's mode switches,
-which the wrapper declares and registers itself (`modeswitch`) into whichever
-parser its argv scan picks, and `--session-limit`/`--weekly-limit` are ceilings
-the status line can edit into a command line that has no parser yet. The alias
-table must know those spellings anyway — it is what stops their values from
-being misread as free-standing tokens.
+`--session-limit`/`--weekly-limit` are ceilings the status line can edit into a
+command line that has no parser yet. The alias table must know those spellings
+anyway — it is what stops their values from being misread as free-standing
+tokens.
 
 The mode's option list and `OPTIONS` are checked against each other, and against
 what argparse actually built, by `tests/test_clispec.py`. That gate is the
@@ -50,10 +50,12 @@ __all__ = [
     "OPTION_ORDER",
     "Option",
     "PARALLEL",
+    "REGISTERED_SWITCHES",
     "SEQUENTIAL",
     "build_parser",
     "directory",
     "duration",
+    "flag_aliases",
     "log_file",
     "parse_duration",
     "unstrippable_flags",
@@ -188,9 +190,8 @@ class Option(NamedTuple):
     derives from `kwargs`, so the two cannot disagree quietly.
 
     `kwargs` is handed to `add_argument` verbatim (minus the flag strings and
-    `help`); `None` means `build_parser` never adds this flag - a host may
-    (a wrapper's mode switch, through `modeswitch.register`), and the status
-    line may write it into a command line; see the module header. `help` is
+    `help`); `None` means `build_parser` never adds this flag, which only the
+    status line writes into a command line; see the module header. `help` is
     what both modes print, and `parallel_help` replaces it in the parallel
     parser for the options the two runners genuinely mean differently (an
     iteration cap vs a total-files cap, and so on).
@@ -263,12 +264,6 @@ OPTIONS: Dict[str, Option] = {
     # already express an edited ceiling as a command line.
     "--session-limit": Option(aliases=("--session-limit",), takes_value=True),
     "--weekly-limit": Option(aliases=("--weekly-limit",), takes_value=True),
-    # Wrapper-only: runGenerateModels' mode switch, registered by the wrapper
-    # (`modeswitch`), not by `build_parser`. It takes a value, which is the
-    # reason it must be listed here anyway: an unlisted value-taking flag has its
-    # VALUE read as a free-standing token, and a folder or a count that happens
-    # to spell `-m` is then stripped along with the token after it.
-    "--finish": Option(aliases=("--finish",), takes_value=True),
     "--cost-log": Option(
         aliases=("--cost-log",),
         takes_value=True,
@@ -355,10 +350,6 @@ OPTIONS: Dict[str, Option] = {
                       f"instead (same as {providers.LIVE_MESSAGES_ENV}=0). "
                       "Notes need a single worker either way",
     ),
-    # Wrapper-only, all three: see --finish above.
-    "--parallel": Option(aliases=("-p", "--parallel"), takes_value=False),
-    "--grow-kit": Option(aliases=("--grow-kit",), takes_value=False),
-    "--random": Option(aliases=("--random",), takes_value=False),
 }
 
 
@@ -454,6 +445,46 @@ FLAG_ALIASES: Dict[str, Flag] = {
     for name, option in OPTIONS.items()
 }
 
+# The parser default — so also the attribute of every namespace that parser
+# returns — under which `modeswitch.register` records the switches it added:
+# {dest: ModeSwitch}. Named here, below `modeswitch`, so `flag_aliases` reads it
+# without importing that module.
+REGISTERED_SWITCHES = "_mode_switches"
+
+
+def flag_aliases(source: Any = None) -> Dict[str, Flag]:
+    """The rewriter's vocabulary for one host: `FLAG_ALIASES`, then a row per
+    mode switch `modeswitch.register` put into `source` — a parser, or a
+    namespace it parsed (None: the engine's rows alone).
+
+    A host's value-taking switch needs a row as much as an engine option does
+    (see `unstrippable_flags`), and its table already says everything a row
+    says — every spelling, and `takes_value` — so the row is projected from it
+    rather than declared a second time here. A switch that IS an engine row —
+    the parallel runner's -j/--jobs, which the sequential parser gets as a
+    switch — keeps that row. A switch sharing only some spellings with a row,
+    or differing in arity, is a ValueError: the rewriter would strip one flag
+    as the other.
+    """
+    if isinstance(source, argparse.ArgumentParser):
+        switches = source.get_default(REGISTERED_SWITCHES)
+    else:
+        switches = getattr(source, REGISTERED_SWITCHES, None)
+    table = dict(FLAG_ALIASES)
+    owner = {alias: name for name, flag in table.items() for alias in flag.aliases}
+    for switch in (switches or {}).values():
+        clash = sorted({owner[a] for a in switch.aliases if a in owner})
+        if not clash:
+            table[switch.name] = Flag(tuple(switch.aliases), switch.takes_value)
+            continue
+        same = (len(clash) == 1
+                and set(table[clash[0]].aliases) == set(switch.aliases)
+                and table[clash[0]].takes_value == switch.takes_value)
+        if not same:
+            raise ValueError(f"mode switch {switch.name} shares a spelling with "
+                             f"the engine's {clash}")
+    return table
+
 
 def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
     """What `cmdline.rebuild_argv` would get wrong about `parser`'s options, one
@@ -462,7 +493,10 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
     The contract of the `extra_options` / `Driver.add_cli_options` seam, published
     so every host can hold its own hook to it: `build_parser` is a loop over
     `OPTIONS`, so the hook is the only way a spelling the table has never heard
-    of reaches a parser. Three things break a rebuilt command line:
+    of reaches a parser. The table checked is the one the run's rewriter uses,
+    `flag_aliases(parser)`: a mode switch registered through
+    `modeswitch.register` is declared by being registered. Three things break
+    a rebuilt command line:
 
       * a VALUE-taking spelling the table does not declare. The rewriter copies
         an unknown flag through verbatim and then reads its value as a token of
@@ -477,14 +511,13 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
         `nargs=2` one leaves an orphan value behind.
 
     An undeclared switch (`nargs == 0`) is NOT reported: it has no value to
-    misread and is copied through as it stands, which is how a wrapper's own
-    booleans (runGenerateModels' `--prompt`) survive an override without the
-    engine's table carrying project detail.
+    misread and is copied through as it stands.
 
     Reads `parser._actions`: argparse offers no public walk of its options.
     """
+    aliases = flag_aliases(parser)
     owner = {alias: canonical
-             for canonical, flag in FLAG_ALIASES.items()
+             for canonical, flag in aliases.items()
              for alias in flag.aliases}
     problems = []
     for action in parser._actions:
@@ -501,11 +534,13 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
             if canonical is None:
                 if takes_value:
                     problems.append(
-                        f"{spelling} takes a value but is not declared in "
-                        f"clispec.OPTIONS, so a rebuilt argv misreads its value")
-            elif FLAG_ALIASES[canonical].takes_value != takes_value:
+                        f"{spelling} takes a value but is neither in "
+                        f"clispec.OPTIONS nor a registered mode switch "
+                        f"(modeswitch.register), so a rebuilt argv misreads "
+                        f"its value")
+            elif aliases[canonical].takes_value != takes_value:
                 problems.append(
-                    f"{spelling}: clispec.OPTIONS[{canonical!r}] says "
-                    f"takes_value={FLAG_ALIASES[canonical].takes_value}, "
+                    f"{spelling}: the rewriter's row {canonical!r} says "
+                    f"takes_value={aliases[canonical].takes_value}, "
                     f"argparse built nargs={action.nargs!r}")
     return problems

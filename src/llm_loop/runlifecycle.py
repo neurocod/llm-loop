@@ -44,10 +44,10 @@ import sys
 import time
 import traceback
 from enum import Enum
-from typing import (Any, Callable, Iterable, List, NamedTuple, NoReturn,
+from typing import (Any, Callable, Dict, Iterable, List, NamedTuple, NoReturn,
                     Optional, Tuple)
 
-from . import (console, ctrlc, diaglog, exitlog, limits, operator,
+from . import (clispec, console, ctrlc, diaglog, exitlog, limits, operator,
                projectroot, statusline, stopchannel)
 from .gitpush import (
     GIT_PUSH_POLICY,
@@ -144,6 +144,10 @@ class RunContext(NamedTuple):
     # Whether the pinned status area is drawn: never for a dry run, and not
     # under `--no-statusline`. Off, open_status hands back the Null app.
     status_enabled: bool
+    # The vocabulary the status line rewrites this run's argv with: the
+    # engine's rows plus the host's registered mode switches
+    # (`clispec.flag_aliases(args)`).
+    flag_aliases: Dict[str, clispec.Flag] = clispec.FLAG_ALIASES
 
 
 def begin_run(driver, args, app_name: str, progress=None, *,
@@ -243,7 +247,8 @@ def begin_run(driver, args, app_name: str, progress=None, *,
                       dry_run=dry_run, progress=progress,
                       settings=settings, registry=registry,
                       status_enabled=(not dry_run and
-                                      not getattr(args, "no_statusline", False)))
+                                      not getattr(args, "no_statusline", False)),
+                      flag_aliases=clispec.flag_aliases(args))
 
 
 def open_status(ctx: RunContext, driver, *, job_count: int,
@@ -273,7 +278,8 @@ def open_status(ctx: RunContext, driver, *, job_count: int,
     app = statusline.StatusApp(
         status=statusline.LoopStatus(jobs=progress.jobs(job_count)),
         messages=messages,
-        enabled=ctx.status_enabled)
+        enabled=ctx.status_enabled,
+        flag_aliases=ctx.flag_aliases)
     app.update(
         provider=ctx.provider,
         **progress.summary_fields(),

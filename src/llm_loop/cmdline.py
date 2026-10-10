@@ -8,9 +8,9 @@ with every existing spelling of each overridden flag removed and the new value
 appended.
 
 Starting from the original argv rather than from parsed values is what keeps the
-answer honest: flags this engine never parses - the host wrapper's -p/--parallel,
---grow-kit, --random, --finish FOLDER - survive untouched, without this
-module knowing what they mean.
+answer honest: flags this engine never parses - a host wrapper's mode switches,
+-p/--parallel or a `--finish FOLDER` - survive untouched, without this module
+knowing what they mean (it knows their arity only: `clispec.flag_aliases`).
 
 The module is deliberately PURE: no terminal, no I/O, and no import of cyclecore,
 limits or parallel. `statusline` imports this one (SettingsRegistry validates
@@ -85,8 +85,8 @@ def _lookup(arg: str, aliases: Dict[str, Flag]):
 def _empty_value(spelling: str, canonical: str) -> str:
     """The one token that gives the value-taking flag `spelling` an EMPTY value.
 
-    `--flag=` rather than the pair `--flag ""`: argparse (and the host wrapper's
-    own `--finish=` reader) takes both as the empty value, but only the single
+    `--flag=` rather than the pair `--flag ""`: argparse takes both as the
+    empty value, but only the single
     token survives the shell the line is pasted into. Windows PowerShell 5.1
     drops an empty argument to a native program, so a pasted `--project-dir ""`
     arrives as a bare `--project-dir`: argparse refuses it ("expected one
@@ -126,8 +126,9 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
     know are copied through verbatim - which is exactly how the wrapper-only
     switches survive - but a value-taking flag missing from the table can still
     have its value misread. A flag a parser offers cannot go missing any more
-    (the table is derived from the same declaration the parsers are built from);
-    a wrapper-only one still has to be declared in `clispec.OPTIONS` by hand.
+    (the table is derived from the same declaration the parsers are built from),
+    nor can a host's registered mode switch, as long as `aliases` is the run's
+    `clispec.flag_aliases(args)` — which is what the status line passes.
 
     An EMPTY value - an override of `""` or a copied `-C ""` - comes out as the
     single token `--flag=` (see `_empty_value`), so this is the one place a

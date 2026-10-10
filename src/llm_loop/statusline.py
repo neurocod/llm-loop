@@ -40,7 +40,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import (cmdline, console, diaglog, gitpush, ownership, stopchannel,
                termio, textwidth, wire)
@@ -1375,7 +1375,8 @@ class HelpAction(Action):
         try:
             command = cmdline.render(
                 sys.argv[1:], {}, executable=sys.executable,
-                script=os.path.abspath(sys.argv[0]))
+                script=os.path.abspath(sys.argv[0]),
+                aliases=app.flag_aliases)
         except cmdline.NotPasteable as exc:
             console.print_operator_line(f"Cannot render restart command: {exc}")
             return
@@ -2900,8 +2901,13 @@ class StatusApp:
                  messages=None,
                  enabled: bool = True, refresh: float = REFRESH_SECONDS,
                  stop_file: Optional[str] = None,
-                 default_actions: bool = True):
+                 default_actions: bool = True,
+                 flag_aliases: Optional[Dict[str, cmdline.Flag]] = None):
         self.status = status or LoopStatus()
+        # What the restart command is rewritten with (`HelpAction`): the
+        # engine's rows plus the host's mode switches (`clispec.flag_aliases`).
+        self.flag_aliases = (cmdline.FLAG_ALIASES if flag_aliases is None
+                             else flag_aliases)
         # This run's operator.Mailbox/MailboxSet, or None when there is nobody to
         # address (a dry run). Registering the key on the same condition keeps
         # the legend from offering what it cannot do.

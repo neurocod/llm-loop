@@ -18,9 +18,10 @@ import pytest
 
 from _pwsh import (invocation, needs_powershell, needs_pwsh, ps_quote,
                    run_powershell)
-from llm_loop import clispec, cmdline
+from llm_loop import clispec, cmdline, modeswitch
 from llm_loop.cmdline import (POSIX, POWERSHELL, NotPasteable, paste_shell,
                               quote, rebuild_argv, render)
+from llm_loop.modeswitch import ModeSwitch
 
 
 # --- removal: every spelling of one flag ---------------------------------------
@@ -82,13 +83,28 @@ def test_empty_overrides_is_a_no_op():
 
 
 def test_wrapper_only_flags_survive_an_override():
-    # `--finish` is the value-taking one: an unlisted flag of that shape has its
-    # VALUE read as a free-standing token, so the folder would be stripped too.
     argv = ["-p", "-j", "3", "--random", "--finish", "products/configs/x",
             "--max-runs", "5"]
     assert rebuild_argv(argv, {"--max-runs": 2}) == [
         "-p", "-j", "3", "--random", "--finish", "products/configs/x",
         "--max-runs", "2"]
+
+
+def test_a_host_value_switch_keeps_its_value_through_an_override():
+    # Without the host's row `--finish` is unknown, so its value is read as a
+    # token of its own — and a value spelled like an engine flag is stripped
+    # as that flag, together with its neighbour.
+    switches = (ModeSwitch(("--finish",), "finish", True, "one folder"),)
+    parser = clispec.build_parser(
+        clispec.SEQUENTIAL, prog="runHost.py",
+        extra_options=lambda p: modeswitch.register(p, switches, "any"))
+    argv = ["-p", "--finish", "-m", "--max-runs", "5"]
+
+    assert rebuild_argv(argv, {"--max-runs": 2},
+                        aliases=clispec.flag_aliases(parser)) == [
+        "-p", "--finish", "-m", "--max-runs", "2"]
+    assert rebuild_argv(argv, {"--max-runs": 2}) == [
+        "-p", "--finish", "5", "--max-runs", "2"]
 
 
 def test_unknown_flags_are_copied_verbatim():

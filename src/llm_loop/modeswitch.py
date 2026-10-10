@@ -159,9 +159,10 @@ def _scan_parser(switches: Sequence[ModeSwitch]) -> argparse.ArgumentParser:
     which dash-led token is a value (`-`, `"-x y"`, and since 3.14 `-1x` are
     values to argparse) and short flags combined into one token (`-dp`). Here
     the table's switches and every option of `clispec.OPTIONS` are declared
-    with their arity (a switch wins a spelling both declare), so argparse
-    tokenises the line exactly as the chosen parser will; `-h/--help` too,
-    since `-ph` combines with it.
+    with their arity, so argparse tokenises the line exactly as the chosen
+    parser will; `-h/--help` too, since `-ph` combines with it. A switch wins a
+    spelling both declare, which is the parallel runner's own -j/--jobs (see
+    `ModeSwitch`): there the two declarations agree.
 
     Two deliberate differences, neither of which can reach a runner:
       * `allow_abbrev=False`: an abbreviation is left unmatched, which is what
@@ -231,8 +232,10 @@ def scan(argv: Sequence[str], switches: Sequence[ModeSwitch]) -> Scan:
 # of every registered dest to its count, so a dest missing from it is one the
 # parser owns (see `ModeSwitch`).
 _COUNTS = "_mode_switch_counts"
-# Beside it, each registered dest's `ModeSwitch.name`, for a refusal to spell.
-_NAMES = "_mode_switch_names"
+# Beside it, the registered switches themselves, {dest: ModeSwitch}: a refusal
+# names them, and the argv rewriter takes its rows for them from here
+# (`clispec.flag_aliases`), so a host's switch is declared once, in its table.
+_SWITCHES = clispec.REGISTERED_SWITCHES
 
 
 class _Counted(argparse.Action):
@@ -264,7 +267,9 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
     Each registered switch also COUNTS its occurrences into the namespace
     (`_COUNTS`), whatever spelling argparse resolved, so `_refuse_disagreement`
     compares occurrences rather than spellings: `--finish=x --fin=x` is a
-    second --finish exactly as `--finish=x --finish=x` is.
+    second --finish exactly as `--finish=x --finish=x` is. And it is recorded
+    under `clispec.REGISTERED_SWITCHES`, where the status line's argv rewriter
+    finds its spellings and arity (`clispec.flag_aliases`).
 
     Reads `parser._option_string_actions`: argparse offers no public lookup.
     """
@@ -274,7 +279,7 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
               if listed else parser)
     owned = parser._option_string_actions
     counts = dict(parser.get_default(_COUNTS) or {})
-    names = dict(parser.get_default(_NAMES) or {})
+    registered = dict(parser.get_default(_SWITCHES) or {})
     for s in switches:
         taken = [alias for alias in s.aliases if alias in owned]
         if taken:
@@ -295,8 +300,8 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
         target.add_argument(*s.aliases, dest=s.dest, help=help_text,
                             action=_Counted, **kwargs)
         counts[s.dest] = 0
-        names[s.dest] = s.name
-    parser.set_defaults(**{_COUNTS: counts, _NAMES: names})
+        registered[s.dest] = s
+    parser.set_defaults(**{_COUNTS: counts, _SWITCHES: registered})
 
 
 class _Unreadable:
@@ -407,9 +412,9 @@ def refuse_undispatched(args: argparse.Namespace, prog: str) -> None:
     nothing there, so only a given one is refused.
     """
     counts = getattr(args, _COUNTS, {})
-    names = getattr(args, _NAMES, {})
+    switches = getattr(args, _SWITCHES, {})
     given = [dest for dest, n in counts.items() if n]
     if given:
-        _refuse(prog, f"{names.get(given[0], given[0])} is a mode switch this "
-                      f"entry point never reads; the wrapper has to dispatch "
-                      f"through llm_loop.modeswitch.parse")
+        _refuse(prog, f"{switches[given[0]].name} is a mode switch this entry "
+                      f"point never reads; the wrapper has to dispatch through "
+                      f"llm_loop.modeswitch.parse")
