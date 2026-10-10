@@ -258,6 +258,40 @@ def test_a_switch_that_is_an_engine_row_keeps_that_row():
     assert clispec.unstrippable_flags(parser) == []
 
 
+def test_a_switch_the_parser_already_offers_is_a_row_too():
+    # `register` adds no option for a switch the parser owns, but the parser
+    # reads it all the same, so the rewriter must know its arity: without the
+    # row `--finish ""` is copied as two tokens, which PowerShell 5.1 cannot
+    # deliver (`quote` refuses it), and the gate reports `--finish`.
+    def hook(parser):
+        parser.add_argument("--finish")
+        modeswitch.register(parser, HOST_SWITCHES, "any")
+    parser = clispec.build_parser(clispec.SEQUENTIAL, prog="runGate.py",
+                                  extra_options=hook)
+    args = parser.parse_args(["--finish", ""])
+
+    assert clispec.flag_aliases(args)["--finish"] == clispec.Flag(
+        ("--finish",), True)
+    assert clispec.unstrippable_flags(parser) == []
+    assert rebuild_argv(["--finish", ""], {},
+                        aliases=clispec.flag_aliases(args)) == ["--finish="]
+
+
+def test_an_option_over_the_switch_record_is_reported():
+    # Added after `register` (which refuses one added before it): the gate
+    # names it, and a value it parsed in place of the record is refused.
+    def hook(parser):
+        modeswitch.register(parser, HOST_SWITCHES, "any")
+        parser.add_argument("--record", dest=clispec.REGISTERED_SWITCHES)
+    parser = clispec.build_parser(clispec.SEQUENTIAL, prog="runGate.py",
+                                  extra_options=hook)
+
+    [problem] = clispec.unstrippable_flags(parser)
+    assert problem.startswith("--record: dest '_mode_switches'")
+    with pytest.raises(ValueError, match="an option uses it as its dest"):
+        clispec.flag_aliases(parser.parse_args(["--record", "x"]))
+
+
 @pytest.mark.parametrize("aliases, takes_value", [
     (("-s", "--soon"), True),           # one spelling of --start-in
     (("--session-limit",), False),      # the row's spelling, the wrong arity

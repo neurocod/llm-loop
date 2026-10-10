@@ -8,6 +8,8 @@ the registration are also pinned on their own.
 """
 
 import argparse
+import json
+import pickle
 
 import pytest
 
@@ -296,6 +298,36 @@ def test_the_switches_survive_a_rebuilt_command_line():
             mode, prog="runPin.py",
             extra_options=lambda p, m=mode: modeswitch.register(p, SWITCHES, m))
         assert clispec.unstrippable_flags(parser) == []
+
+
+def test_a_parsed_namespace_stays_plain_data():
+    # What `register` leaves in every namespace is counts and spellings, never
+    # the rows: a host may serialise its options, and a row carries frozensets
+    # and a `type` callable (a lambda does not pickle).
+    table = SWITCHES + (ModeSwitch(("--size",), "size", True, "x",
+                                   listed_in=frozenset({SEQ}),
+                                   type=lambda text: int(text)),)
+    parser = clispec.build_parser(
+        SEQ, prog="runPin.py",
+        extra_options=lambda p: modeswitch.register(p, table, SEQ))
+    args = parser.parse_args(["-p", "--size", "3"])
+
+    json.dumps(vars(args))
+    assert vars(pickle.loads(pickle.dumps(args))) == vars(args)
+
+
+@pytest.mark.parametrize("dest", ["_mode_switches", "_mode_switch_counts"])
+@pytest.mark.parametrize("where", ["switch", "option"])
+def test_a_dest_over_a_register_record_is_refused(dest, where):
+    parser = argparse.ArgumentParser(prog="runPin.py")
+    table = SWITCHES
+    if where == "switch":
+        table += (ModeSwitch(("--x",), dest, True, "x"),)
+    else:
+        parser.add_argument("--x", dest=dest)
+
+    with pytest.raises(ValueError, match="keeps its records"):
+        modeswitch.register(parser, table, SEQ)
 
 
 @pytest.mark.parametrize("bad, match", [

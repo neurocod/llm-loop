@@ -81,6 +81,38 @@ def test_an_entry_point_that_never_reads_a_switch_refuses_one(
             f"reads" in capsys.readouterr().err)
 
 
+class JobsDriver(HookedDriver):
+    """A table with a worker-count switch too: in the parallel parser -j/--jobs
+    is that parser's own option, which `register` adds nothing for."""
+
+    @classmethod
+    def add_cli_options(cls, parser):
+        modeswitch.register(parser, SWITCHES + (
+            ModeSwitch(("-j", "--jobs"), "jobs", True, "worker count",
+                       metavar="N", type=int),), "any")
+
+
+@pytest.mark.parametrize("entry_point, argv", [
+    ("main", []), ("main_parallel", []),
+    # The parallel parser's own option, not a switch it never reads.
+    ("main_parallel", ["-j", "2"]),
+])
+def test_an_entry_point_runs_a_line_that_gives_no_switch(entry_point, argv,
+                                                         monkeypatch):
+    # The other half of the refusal above: a host with a table must still run
+    # through these entry points when its line gives none of the switches.
+    ran = []
+    monkeypatch.setattr(cyclecore, "run_loop",
+                        lambda _driver, args, **_kwargs: ran.append(args))
+    monkeypatch.setattr(parallel, "run_parallel",
+                        lambda _driver, args, **_kwargs: ran.append(args))
+
+    getattr(JobsDriver, entry_point)(argv)
+
+    [args] = ran
+    assert args.jobs == (2 if argv else None)
+
+
 @pytest.mark.parametrize("parse", [cyclecore.parse_args, parallel.parse_args])
 def test_a_registered_switch_is_parsed_with_the_line(parse):
     # The switch is no longer taken out of argv first: the parser the scan

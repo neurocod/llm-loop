@@ -65,8 +65,9 @@ class ModeSwitch(NamedTuple):
     parser's to read.
 
     A switch whose every spelling the chosen parser already offers is that
-    parser's own option (the parallel runner's `-j/--jobs`): `register` leaves
-    it alone, its `dest` must be that option's, and the parser's reading of it
+    parser's own option (the parallel runner's `-j/--jobs`): `register` adds
+    no option for it (it only records the spellings for the argv rewriter),
+    its `dest` must be that option's, and the parser's reading of it
     is final — abbreviated or repeated, as for any other option of that parser
     (`-j 2 -j 3` runs 3 workers, as in every `main_parallel` host). That is
     sound only while the parser owning a switch is the one the switch itself
@@ -232,10 +233,18 @@ def scan(argv: Sequence[str], switches: Sequence[ModeSwitch]) -> Scan:
 # of every registered dest to its count, so a dest missing from it is one the
 # parser owns (see `ModeSwitch`).
 _COUNTS = "_mode_switch_counts"
-# Beside it, the registered switches themselves, {dest: ModeSwitch}: a refusal
-# names them, and the argv rewriter takes its rows for them from here
-# (`clispec.flag_aliases`), so a host's switch is declared once, in its table.
+# Beside it, each switch `register` was handed — the parser's own ones too —
+# as {dest: clispec.Flag}: a refusal names a switch by its last spelling, and
+# the argv rewriter takes its rows from here (`clispec.flag_aliases`), so a
+# host's switch is declared once, in its table. A projection rather than the
+# `ModeSwitch` row: both records end up in every namespace the parser returns,
+# which a host may `json.dumps(vars(args))` or pickle, and a row carries
+# frozensets and a `type` callable.
 _SWITCHES = clispec.REGISTERED_SWITCHES
+# Neither record may share its name with an option's dest: argparse would put
+# the option's value where `register` keeps the record, or `set_defaults` the
+# record into the option's default.
+_RECORDS = frozenset({_COUNTS, _SWITCHES})
 
 
 class _Counted(argparse.Action):
@@ -267,13 +276,23 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
     Each registered switch also COUNTS its occurrences into the namespace
     (`_COUNTS`), whatever spelling argparse resolved, so `_refuse_disagreement`
     compares occurrences rather than spellings: `--finish=x --fin=x` is a
-    second --finish exactly as `--finish=x --finish=x` is. And it is recorded
-    under `clispec.REGISTERED_SWITCHES`, where the status line's argv rewriter
-    finds its spellings and arity (`clispec.flag_aliases`).
+    second --finish exactly as `--finish=x --finish=x` is. And every switch,
+    a skipped one included, is recorded under `clispec.REGISTERED_SWITCHES`,
+    where the status line's argv rewriter finds its spellings and arity
+    (`clispec.flag_aliases`): the parser reads a skipped one as well, so a
+    rebuilt line has to strip it as well. A dest that collides with either
+    record (`_RECORDS`) is a ValueError; an option added after this call
+    under `REGISTERED_SWITCHES` is `clispec.unstrippable_flags`'s to report.
 
-    Reads `parser._option_string_actions`: argparse offers no public lookup.
+    Reads `parser._option_string_actions` and `parser._actions`: argparse
+    offers no public lookup.
     """
     _check_table(switches)
+    collide = sorted(_RECORDS & ({s.dest for s in switches}
+                                 | {a.dest for a in parser._actions}))
+    if collide:
+        raise ValueError(f"dest {collide} is where modeswitch.register keeps "
+                         f"its records; give that option another dest")
     listed = [s for s in switches if mode in s.listed_in]
     target = (parser.add_argument_group("modes", group_description)
               if listed else parser)
@@ -281,6 +300,7 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
     counts = dict(parser.get_default(_COUNTS) or {})
     registered = dict(parser.get_default(_SWITCHES) or {})
     for s in switches:
+        registered[s.dest] = clispec.Flag(tuple(s.aliases), s.takes_value)
         taken = [alias for alias in s.aliases if alias in owned]
         if taken:
             dests = {owned[alias].dest for alias in taken}
@@ -289,7 +309,7 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
                     f"{s.name}: the parser already offers {taken} (dest "
                     f"{sorted(dests)}); a mode switch must match all of an "
                     f"option's spellings and its dest, or none")
-            continue
+            continue                # the parser's own: recorded, not counted
         help_text = s.help if mode in s.listed_in else argparse.SUPPRESS
         if s.takes_value:
             kwargs = dict(default=None, metavar=s.metavar)
@@ -300,7 +320,6 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
         target.add_argument(*s.aliases, dest=s.dest, help=help_text,
                             action=_Counted, **kwargs)
         counts[s.dest] = 0
-        registered[s.dest] = s
     parser.set_defaults(**{_COUNTS: counts, _SWITCHES: registered})
 
 
@@ -409,12 +428,14 @@ def refuse_undispatched(args: argparse.Namespace, prog: str) -> None:
     they parse a driver's `add_cli_options` but never act on a mode switch,
     so a host that registered its table and then dispatched through them would
     run the default mode behind `-p`. A switch the line does not give changes
-    nothing there, so only a given one is refused.
+    nothing there, so only a given one is refused — and only a counted one: a
+    switch the parser owns (`-j` in `main_parallel`) is its own option there.
     """
     counts = getattr(args, _COUNTS, {})
     switches = getattr(args, _SWITCHES, {})
     given = [dest for dest, n in counts.items() if n]
     if given:
-        _refuse(prog, f"{switches[given[0]].name} is a mode switch this entry "
-                      f"point never reads; the wrapper has to dispatch through "
+        name = switches[given[0]].aliases[-1]
+        _refuse(prog, f"{name} is a mode switch this entry point never reads; "
+                      f"the wrapper has to dispatch through "
                       f"llm_loop.modeswitch.parse")

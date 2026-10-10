@@ -125,10 +125,13 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
     literally so named) must not be mistaken for one. Flags this table does not
     know are copied through verbatim - which is exactly how the wrapper-only
     switches survive - but a value-taking flag missing from the table can still
-    have its value misread. A flag a parser offers cannot go missing any more
-    (the table is derived from the same declaration the parsers are built from),
-    nor can a host's registered mode switch, as long as `aliases` is the run's
-    `clispec.flag_aliases(args)` — which is what the status line passes.
+    have its value misread. What the table holds: every row of
+    `clispec.OPTIONS`, which is every option `build_parser` adds (the parsers
+    are built from that declaration) and a few it does not; and, when
+    `aliases` is the run's `clispec.flag_aliases(args)` — what the status line
+    passes — every switch the host handed `modeswitch.register`. An option a
+    host's `add_cli_options` adds with a plain `add_argument` is in neither;
+    `clispec.unstrippable_flags` is the check that reports a value-taking one.
 
     An EMPTY value - an override of `""` or a copied `-C ""` - comes out as the
     single token `--flag=` (see `_empty_value`), so this is the one place a

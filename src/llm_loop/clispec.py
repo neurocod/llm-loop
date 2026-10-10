@@ -22,9 +22,9 @@ So `OPTIONS` below is the single table, and everything else is DERIVED from it:
 
 A row that `build_parser` never adds is legitimate and carries `kwargs=None`:
 `--session-limit`/`--weekly-limit` are ceilings the status line can edit into a
-command line that has no parser yet. The alias table must know those spellings
-anyway — it is what stops their values from being misread as free-standing
-tokens.
+command line although neither engine parser offers them (a host's own hook
+may). The alias table must know those spellings anyway — it is what stops their
+values from being misread as free-standing tokens.
 
 The mode's option list and `OPTIONS` are checked against each other, and against
 what argparse actually built, by `tests/test_clispec.py`. That gate is the
@@ -190,8 +190,8 @@ class Option(NamedTuple):
     derives from `kwargs`, so the two cannot disagree quietly.
 
     `kwargs` is handed to `add_argument` verbatim (minus the flag strings and
-    `help`); `None` means `build_parser` never adds this flag, which only the
-    status line writes into a command line; see the module header. `help` is
+    `help`); `None` means `build_parser` never adds this flag and the row
+    serves the argv rewriter alone; see the module header. `help` is
     what both modes print, and `parallel_help` replaces it in the parallel
     parser for the options the two runners genuinely mean differently (an
     iteration cap vs a total-files cap, and so on).
@@ -446,9 +446,9 @@ FLAG_ALIASES: Dict[str, Flag] = {
 }
 
 # The parser default — so also the attribute of every namespace that parser
-# returns — under which `modeswitch.register` records the switches it added:
-# {dest: ModeSwitch}. Named here, below `modeswitch`, so `flag_aliases` reads it
-# without importing that module.
+# returns — under which `modeswitch.register` records the switches it was
+# handed: {dest: Flag}. Named here, below `modeswitch`, so `flag_aliases` reads
+# it without importing that module.
 REGISTERED_SWITCHES = "_mode_switches"
 
 
@@ -464,24 +464,31 @@ def flag_aliases(source: Any = None) -> Dict[str, Flag]:
     the parallel runner's -j/--jobs, which the sequential parser gets as a
     switch — keeps that row. A switch sharing only some spellings with a row,
     or differing in arity, is a ValueError: the rewriter would strip one flag
-    as the other.
+    as the other. So is a record that is not a dict: an option's value, under
+    the dest `REGISTERED_SWITCHES` (`register` refuses such an option added
+    before it, `unstrippable_flags` one added after it, whatever its value).
     """
     if isinstance(source, argparse.ArgumentParser):
         switches = source.get_default(REGISTERED_SWITCHES)
     else:
         switches = getattr(source, REGISTERED_SWITCHES, None)
+    if switches is not None and not isinstance(switches, dict):
+        raise ValueError(f"{REGISTERED_SWITCHES} holds {switches!r}, not "
+                         f"modeswitch.register's record: an option uses it "
+                         f"as its dest")
     table = dict(FLAG_ALIASES)
     owner = {alias: name for name, flag in table.items() for alias in flag.aliases}
-    for switch in (switches or {}).values():
-        clash = sorted({owner[a] for a in switch.aliases if a in owner})
+    for aliases, takes_value in (switches or {}).values():
+        name = aliases[-1]
+        clash = sorted({owner[a] for a in aliases if a in owner})
         if not clash:
-            table[switch.name] = Flag(tuple(switch.aliases), switch.takes_value)
+            table[name] = Flag(tuple(aliases), takes_value)
             continue
         same = (len(clash) == 1
-                and set(table[clash[0]].aliases) == set(switch.aliases)
-                and table[clash[0]].takes_value == switch.takes_value)
+                and set(table[clash[0]].aliases) == set(aliases)
+                and table[clash[0]].takes_value == takes_value)
         if not same:
-            raise ValueError(f"mode switch {switch.name} shares a spelling with "
+            raise ValueError(f"mode switch {name} shares a spelling with "
                              f"the engine's {clash}")
     return table
 
@@ -511,7 +518,8 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
         `nargs=2` one leaves an orphan value behind.
 
     An undeclared switch (`nargs == 0`) is NOT reported: it has no value to
-    misread and is copied through as it stands.
+    misread and is copied through as it stands. An option whose dest is
+    `REGISTERED_SWITCHES` is: it shadows the record this table is read from.
 
     Reads `parser._actions`: argparse offers no public walk of its options.
     """
@@ -523,6 +531,12 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
     for action in parser._actions:
         if "--help" in action.option_strings:
             continue                # argparse's own; no table declares it
+        if action.dest == REGISTERED_SWITCHES:
+            problems.append(
+                f"{'/'.join(action.option_strings) or action.dest}: dest "
+                f"{REGISTERED_SWITCHES!r} is where modeswitch.register records "
+                f"the host's switches for the rewriter")
+            continue
         if action.option_strings and action.nargs not in (None, 0, 1):
             problems.append(
                 f"{action.option_strings[0]}: nargs={action.nargs!r}, but a "
