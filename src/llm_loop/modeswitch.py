@@ -159,9 +159,10 @@ def _scan_parser(switches: Sequence[ModeSwitch]) -> argparse.ArgumentParser:
     Hand-written, the scan was a second grammar that drifted from argparse's:
     which dash-led token is a value (`-`, `"-x y"`, and since 3.14 `-1x` are
     values to argparse) and short flags combined into one token (`-dp`). Here
-    the table's switches and every option of `clispec.OPTIONS` are declared
-    with their arity, so argparse tokenises the line exactly as the chosen
-    parser will; `-h/--help` too, since `-ph` combines with it. A switch wins a
+    the table's switches and every engine flag (`clispec.FLAG_ALIASES`: the
+    spellings and arity of `clispec.OPTIONS`) are declared with their arity,
+    so argparse tokenises the line exactly as the chosen parser will;
+    `-h/--help` too, since `-ph` combines with it. A switch wins a
     spelling both declare, which is the parallel runner's own -j/--jobs (see
     `ModeSwitch`): there the two declarations agree.
 
@@ -171,10 +172,10 @@ def _scan_parser(switches: Sequence[ModeSwitch]) -> argparse.ArgumentParser:
       * a value takes `nargs='?'`, so a missing value (`--finish -p`) reads
         None instead of failing the scan; the chosen parser then says
         "expected one argument".
-    A spelling neither the table nor `clispec.OPTIONS` declares (a host's own
-    option) is an unknown one: its value, if it has one, is read as a token of
-    its own — harmless, since a value that spells an option makes the chosen
-    parser refuse the line anyway.
+    A spelling neither the table nor `clispec.FLAG_ALIASES` declares (a host's
+    own option) is an unknown one: its value, if it has one, is read as a
+    token of its own — harmless, since a value that spells an option makes the
+    chosen parser refuse the line anyway.
     """
     parser = _ScanParser(prog="modeswitch.scan", add_help=False,
                          allow_abbrev=False)
@@ -182,9 +183,8 @@ def _scan_parser(switches: Sequence[ModeSwitch]) -> argparse.ArgumentParser:
         parser.add_argument(*s.aliases, dest=s.dest, action=_Occurrences,
                             nargs="?" if s.takes_value else 0, default=None)
     taken = set(parser._option_string_actions)
-    rows = [(("-h", "--help"), False)]
-    rows += [(option.aliases, option.takes_value)
-             for option in clispec.OPTIONS.values()]
+    rows = [clispec.Flag(("-h", "--help"), False),
+            *clispec.FLAG_ALIASES.values()]
     for n, (aliases, takes_value) in enumerate(rows):
         free = [alias for alias in aliases if alias not in taken]
         if not free:
