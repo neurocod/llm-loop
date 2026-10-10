@@ -1,18 +1,17 @@
-"""`modeswitch`: one table of a wrapper's mode switches, and the three functions
-that read it — the scan that picks a parser, the registration that puts the
-switches into that parser, and the check that the two readings agree.
+"""`modeswitch`: one table of a wrapper's mode switches, the registration that
+puts the switches into a driver's parser, and `parse`, the dispatch — the scan
+that picks a parser, the parse, and the check that the two readings agree.
 
-The pins build a real parser for each mode (`clispec.build_parser` with the
-table registered through `extra_options`, as a wrapper's `add_cli_options`
-does) and run a real argv through scan -> parse -> refuse, the way a wrapper
-dispatches.
+The pins dispatch a real argv through `modeswitch.parse` with two real drivers
+whose `add_cli_options` registers the table, as a wrapper does; the scan and
+the registration are also pinned on their own.
 """
 
 import argparse
 
 import pytest
 
-from llm_loop import clispec, modeswitch
+from llm_loop import ListFileDriver, clispec, cyclecore, modeswitch, parallel
 from llm_loop.modeswitch import ModeSwitch
 
 SEQ, PAR = clispec.SEQUENTIAL, clispec.PARALLEL
@@ -37,15 +36,32 @@ SWITCHES = (
 )
 
 
+class _PinDriver(ListFileDriver):
+    prog = "runPin.py"
+    list_file = "queue.md"
+
+    @classmethod
+    def add_cli_options(cls, parser):
+        modeswitch.register(parser, SWITCHES, SEQ)
+
+
+class _PinParallelDriver(_PinDriver):
+    prog = "runPinParallel.py"
+
+    @classmethod
+    def add_cli_options(cls, parser):
+        modeswitch.register(parser, SWITCHES, PAR)
+
+
+def _choose(scanned):
+    if scanned.parallel:
+        return modeswitch.Choice(_PinParallelDriver, parallel.parse_args)
+    return modeswitch.Choice(_PinDriver, cyclecore.parse_args)
+
+
 def _dispatch(argv):
-    """Scan, parse with the parser the scan picked, refuse a disagreement."""
-    scanned = modeswitch.scan(argv, SWITCHES)
-    mode = PAR if scanned.parallel else SEQ
-    parser = clispec.build_parser(
-        mode, prog="runPin.py",
-        extra_options=lambda p: modeswitch.register(p, SWITCHES, mode))
-    args = parser.parse_args(argv)
-    modeswitch.refuse_disagreement(args, scanned, "runPin.py")
+    """A wrapper's dispatch: `modeswitch.parse` with the two pin drivers."""
+    _choice, scanned, args = modeswitch.parse(argv, SWITCHES, _choose)
     return scanned, args
 
 
@@ -126,6 +142,33 @@ def test_the_scan_takes_a_value_exactly_when_argparse_does(value, capsys):
 
 
 # --- scan -> parse -> refuse ----------------------------------------------------
+
+@pytest.mark.parametrize("argv, driver, runner", [
+    ([], _PinDriver, cyclecore.parse_args),
+    (["-j", "2"], _PinParallelDriver, parallel.parse_args),
+])
+def test_parse_returns_the_choice_that_parsed_the_line(argv, driver, runner):
+    choice, scanned, args = modeswitch.parse(argv, SWITCHES, _choose)
+
+    assert choice == (driver, runner)
+    assert scanned.parallel is (driver is _PinParallelDriver)
+    assert hasattr(args, "raw") is (driver is _PinDriver)  # sequential-only
+
+
+def test_the_chosen_driver_labels_the_usage(capsys):
+    # Its prog, not the other driver's: the parser is built from the choice.
+    err = _refused(["-p", "--no-such-option"], capsys)
+
+    assert err.startswith("usage: runPinParallel.py")
+
+
+def test_no_argv_is_the_process_command_line(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["runPin.py", "--finish", "f"])
+
+    _choice, scanned, args = modeswitch.parse(None, SWITCHES, _choose)
+
+    assert scanned.finish == "f" and args.finish == "f"
+
 
 @pytest.mark.parametrize("argv", [
     ["-p", "-m", "2"], ["-j", "2"], ["--random", "--dry-run"],

@@ -63,6 +63,24 @@ def test_a_driver_without_the_hook_gets_the_help_it_always_had(capsys):
     assert MODE_FLAG not in _help_of(PlainDriver.main, capsys)
 
 
+@pytest.mark.parametrize("entry_point", ["main", "main_parallel"])
+def test_an_entry_point_that_never_reads_a_switch_refuses_one(
+        entry_point, monkeypatch, capsys):
+    # A host that registers its table but dispatches through the engine's
+    # own entry point would run the default mode behind the switch.
+    def run(*_args, **_kwargs):
+        pytest.fail("a runner started behind an unread mode switch")
+    monkeypatch.setattr(cyclecore, "run_loop", run)
+    monkeypatch.setattr(parallel, "run_parallel", run)
+
+    with pytest.raises(SystemExit) as exit_info:
+        getattr(HookedDriver, entry_point)([MODE_FLAG])
+
+    assert exit_info.value.code == 2
+    assert (f"error: {MODE_FLAG} is a mode switch this entry point never "
+            f"reads" in capsys.readouterr().err)
+
+
 @pytest.mark.parametrize("parse", [cyclecore.parse_args, parallel.parse_args])
 def test_a_registered_switch_is_parsed_with_the_line(parse):
     # The switch is no longer taken out of argv first: the parser the scan

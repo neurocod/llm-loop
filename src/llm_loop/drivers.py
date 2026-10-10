@@ -337,11 +337,13 @@ class ListFileDriver(Driver):
         the command line, the `jobs=` argument here, the driver's `jobs` attribute
         (class attribute or `self.jobs` set in __init__), then the engine default.
         """
+        from . import modeswitch
         from .parallel import run_parallel
         from .parallel import parse_args as parse_parallel_args
         args = parse_parallel_args(argv, prog=cls.resolved_prog(),
                                    description=cls.description,
                                    extra_options=cls.add_cli_options)
+        modeswitch.refuse_undispatched(args, cls.resolved_prog())
         driver = cls()
         if jobs is not None:
             driver.jobs = jobs

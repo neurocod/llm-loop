@@ -10,23 +10,26 @@ check that compares the scan with the parser, and an unpacking at the dispatch
 out of argv before parsing handed the parser a different line than the user
 typed: `-m -p 3` became `-m 3`, the word silently taking the flag's place.
 
-Here a wrapper declares a table of `ModeSwitch` rows and three functions work
-off it:
+Here a wrapper declares a table of `ModeSwitch` rows and makes two calls with
+it:
 
-  * `scan(argv, switches)` reads the switches off argv, leaving it intact, to
-    CHOOSE the parser. It only chooses;
-  * `register(parser, switches, mode)` puts every switch into the chosen parser
-    (`Driver.add_cli_options` is the seam), so that parser reads the WHOLE line,
-    switches included, with one grammar: a value flag followed by a switch is
-    argparse's "expected one argument", never a quiet substitution;
-  * `refuse_disagreement(args, scanned, prog)` exits 2 when the parser read a
-    switch differently from the scan — an abbreviation argparse resolves and
-    the scan does not (`--rand`), which would otherwise run the default mode
-    behind a flag that looks as if it worked.
+  * `register(parser, switches, mode)`, from each driver's `add_cli_options`,
+    puts every switch into that driver's parser, so the parser reads the WHOLE
+    line, switches included, with one grammar: a value flag followed by a
+    switch is argparse's "expected one argument", never a quiet substitution;
+  * `parse(argv, switches, choose)` is the dispatch: it scans the switches off
+    argv (leaving it intact) only to CHOOSE a driver and its parser, parses the
+    line with that parser, and exits 2 when the parser read a switch
+    differently from the scan — an abbreviation argparse resolves and the scan
+    does not (`--rand`), which would otherwise run the default mode behind a
+    flag that looks as if it worked.
 
-Only the three together read a switch: a host that registers the table and
-then dispatches through `Driver.main()` parses `-p` and ignores it. The whole
-dispatch is in the README's "Wrapper options in `--help`".
+`scan` stays public as a read-only question about argv (is `--prompt` on the
+line?); the steps of the dispatch are not offered separately, because a host
+that copied only some of them read a switch and then ignored it. For the same
+reason `Driver.main()` and `main_parallel()`, which never act on a switch,
+refuse a line that gives one (`refuse_undispatched`). The README's "Wrapper
+options in `--help`" shows a whole wrapper.
 
 A switch's `dest` names it everywhere: the scan result's attribute and the
 parsed namespace's are the same name.
@@ -40,9 +43,10 @@ from typing import (Any, Callable, Dict, FrozenSet, NamedTuple, Optional,
 from . import clispec
 
 __all__ = [
+    "Choice",
     "ModeSwitch",
     "Scan",
-    "refuse_disagreement",
+    "parse",
     "register",
     "scan",
 ]
@@ -161,7 +165,7 @@ def _scan_parser(switches: Sequence[ModeSwitch]) -> argparse.ArgumentParser:
 
     Two deliberate differences, neither of which can reach a runner:
       * `allow_abbrev=False`: an abbreviation is left unmatched, which is what
-        `refuse_disagreement` detects against the chosen parser;
+        `_refuse_disagreement` detects against the chosen parser;
       * a value takes `nargs='?'`, so a missing value (`--finish -p`) reads
         None instead of failing the scan; the chosen parser then says
         "expected one argument".
@@ -195,9 +199,13 @@ def scan(argv: Sequence[str], switches: Sequence[ModeSwitch]) -> Scan:
 
     With argparse's grammar (see `_scan_parser`): every full spelling
     (`--flag VALUE`, `--flag=VALUE`, `-fVALUE`, `-f=VALUE`, `-dp`), nothing
-    after `--`, and no abbreviation — that is `refuse_disagreement`'s case. A
+    after `--`, and no abbreviation — that is `_refuse_disagreement`'s case. A
     line argparse refuses outright reads as no switch at all: the parser that
     choice picks refuses it too, with its own usage.
+
+    A question about argv, not a dispatch: an abbreviated switch reads as
+    absent here. Choose a mode with `parse`, which holds the scan to the
+    parser's reading.
     """
     _check_table(switches)
     try:
@@ -223,6 +231,8 @@ def scan(argv: Sequence[str], switches: Sequence[ModeSwitch]) -> Scan:
 # of every registered dest to its count, so a dest missing from it is one the
 # parser owns (see `ModeSwitch`).
 _COUNTS = "_mode_switch_counts"
+# Beside it, each registered dest's `ModeSwitch.name`, for a refusal to spell.
+_NAMES = "_mode_switch_names"
 
 
 class _Counted(argparse.Action):
@@ -252,7 +262,7 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
     under only some spellings, or under another dest, is a conflict.
 
     Each registered switch also COUNTS its occurrences into the namespace
-    (`_COUNTS`), whatever spelling argparse resolved, so `refuse_disagreement`
+    (`_COUNTS`), whatever spelling argparse resolved, so `_refuse_disagreement`
     compares occurrences rather than spellings: `--finish=x --fin=x` is a
     second --finish exactly as `--finish=x --finish=x` is.
 
@@ -264,6 +274,7 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
               if listed else parser)
     owned = parser._option_string_actions
     counts = dict(parser.get_default(_COUNTS) or {})
+    names = dict(parser.get_default(_NAMES) or {})
     for s in switches:
         taken = [alias for alias in s.aliases if alias in owned]
         if taken:
@@ -284,7 +295,8 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
         target.add_argument(*s.aliases, dest=s.dest, help=help_text,
                             action=_Counted, **kwargs)
         counts[s.dest] = 0
-    parser.set_defaults(**{_COUNTS: counts})
+        names[s.dest] = s.name
+    parser.set_defaults(**{_COUNTS: counts, _NAMES: names})
 
 
 class _Unreadable:
@@ -312,8 +324,8 @@ def _read_alike(switch: ModeSwitch, parsed: Any, scanned: Any) -> bool:
     return parsed == scanned
 
 
-def refuse_disagreement(args: argparse.Namespace, scanned: Scan,
-                        prog: str) -> None:
+def _refuse_disagreement(args: argparse.Namespace, scanned: Scan,
+                         prog: str) -> None:
     """Exit 2 unless the parser read every registered switch as `scanned` did.
 
     They differ when argparse resolves a spelling the scan leaves unmatched —
@@ -349,3 +361,55 @@ def refuse_disagreement(args: argparse.Namespace, scanned: Scan,
                           f"out in full and on its own: an abbreviation, or a "
                           f"short flag combined with one the scan does not "
                           f"know, is resolved by the parser alone.")
+
+
+class Choice(NamedTuple):
+    """What a `parse` chooser returns in the plain case: the driver class whose
+    `resolved_prog`, `description` and `add_cli_options` label and extend the
+    parser, and the engine function that builds and runs that parser
+    (`parse_args` or `parse_parallel_args`). A host may return any object with
+    these two attributes — a richer row of its own that also names the mode."""
+
+    driver: type
+    parse: Callable[..., argparse.Namespace]
+
+
+def parse(argv: Optional[Sequence[str]], switches: Sequence[ModeSwitch],
+          choose: Callable[[Scan], Any]) -> Tuple[Any, Scan, argparse.Namespace]:
+    """A wrapper's whole dispatch: `(choice, scanned, args)` for `argv`.
+
+    `scan` reads the switches, `choose(scanned)` picks the driver and its
+    parser (see `Choice`), that parser reads the whole line — the switches
+    included, through the driver's `add_cli_options`, which is expected to
+    `register` this same table — and the two readings are held equal
+    (`_refuse_disagreement`). A usage error, `--help` and a disagreement all
+    exit here, before the host does anything. `argv` None is `sys.argv[1:]`,
+    as for the engine's own parsers.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    scanned = scan(argv, switches)
+    choice = choose(scanned)
+    driver = choice.driver
+    prog = driver.resolved_prog()
+    args = choice.parse(argv, prog=prog, description=driver.description,
+                        extra_options=driver.add_cli_options)
+    _refuse_disagreement(args, scanned, prog)
+    return choice, scanned, args
+
+
+def refuse_undispatched(args: argparse.Namespace, prog: str) -> None:
+    """Exit 2 when `args` carries a registered switch the line gave.
+
+    For the engine's own entry points, `Driver.main()` and `main_parallel()`:
+    they parse a driver's `add_cli_options` but never act on a mode switch,
+    so a host that registered its table and then dispatched through them would
+    run the default mode behind `-p`. A switch the line does not give changes
+    nothing there, so only a given one is refused.
+    """
+    counts = getattr(args, _COUNTS, {})
+    names = getattr(args, _NAMES, {})
+    given = [dest for dest, n in counts.items() if n]
+    if given:
+        _refuse(prog, f"{names.get(given[0], given[0])} is a mode switch this "
+                      f"entry point never reads; the wrapper has to dispatch "
+                      f"through llm_loop.modeswitch.parse")

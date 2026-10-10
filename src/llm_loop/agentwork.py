@@ -170,9 +170,9 @@ class Driver:
         as a `modeswitch.ModeSwitch` table and call `modeswitch.register` here:
         the same table drives the scan, so a spelling cannot drift between
         what is listed and what is recognised, and the parser then reads the
-        whole line, switches included. Such a wrapper dispatches itself
-        (README, "Wrapper options in `--help`"): main() parses a switch and
-        never acts on it.
+        whole line, switches included. Such a wrapper dispatches itself, with
+        `modeswitch.parse` (README, "Wrapper options in `--help`"): main()
+        never acts on a switch, so it refuses a line that gives one.
         """
 
     def next_command(self) -> Optional[AgentCommand]:
@@ -302,8 +302,10 @@ class Driver:
         for the parallel runner: the runner imports this module for the contract,
         so the entry point can only borrow it back locally.
         """
+        from . import modeswitch
         from .cyclecore import parse_args, run_loop
         args = parse_args(argv, prog=cls.resolved_prog(),
                           description=cls.description,
                           extra_options=cls.add_cli_options)
+        modeswitch.refuse_undispatched(args, cls.resolved_prog())
         return run_loop(cls(), args, app_name=cls.resolved_app_name())
