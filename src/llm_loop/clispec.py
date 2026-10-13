@@ -46,11 +46,12 @@ __all__ = [
     "DEFAULT_JOBS",
     "FLAG_ALIASES",
     "Flag",
+    "MODE_SWITCH_COUNTS",
     "OPTIONS",
     "OPTION_ORDER",
     "Option",
     "PARALLEL",
-    "RESERVED_DEST_PREFIX",
+    "REGISTERED_SWITCHES",
     "SEQUENTIAL",
     "build_parser",
     "directory",
@@ -447,19 +448,20 @@ FLAG_ALIASES: Dict[str, Flag] = {
     for name, option in OPTIONS.items()
 }
 
-# Every dest starting with this is the engine's: the parser defaults it keeps
-# records under (`record_flags`'s, and `modeswitch.register`'s occurrence
-# counts) end up as attributes of every namespace the parser returns, so an
-# option under such a dest would overwrite a record with its value, or have
-# `set_defaults` overwrite its default with a record. One prefix rather than a
-# list of names, so this module refuses `modeswitch`'s record without naming it.
-RESERVED_DEST_PREFIX = "_llm_loop_"
-# The parser default `record_flags` writes: {dest: Flag}.
-_RECORD = RESERVED_DEST_PREFIX + "flags"
-
-
-def _reserved(dests) -> List[str]:
-    return sorted({d for d in dests if d.startswith(RESERVED_DEST_PREFIX)})
+# The parser default — so also the attribute of every namespace that parser
+# returns — under which `record_flags` keeps the rewriter's record of a host's
+# flags: {dest: Flag}. The name predates `record_flags`, when only
+# `modeswitch.register` wrote it.
+REGISTERED_SWITCHES = "_mode_switches"
+# Beside it, the parser default `modeswitch.register` counts each switch's
+# occurrences into: {dest: int}. Named here rather than there so this module
+# refuses an option over either record without importing `modeswitch`, which
+# imports it.
+MODE_SWITCH_COUNTS = "_mode_switch_counts"
+# Neither record may share its name with an option's dest: argparse would put
+# the option's value where the record is kept, or `set_defaults` the record
+# into the option's default. Exactly these two; any other dest is the host's.
+_RECORDS = frozenset({REGISTERED_SWITCHES, MODE_SWITCH_COUNTS})
 
 
 def record_flags(parser: argparse.ArgumentParser,
@@ -473,38 +475,46 @@ def record_flags(parser: argparse.ArgumentParser,
     way. Repeated calls add to the record, a dest given again replacing its
     row. The rows are bare `Flag`s, never a host's richer row (a `ModeSwitch`
     carries frozensets and a `type` callable): the record ends up in every
-    namespace, which a host may `json.dumps(vars(args))` or pickle. A dest under `RESERVED_DEST_PREFIX`, among `flags` or the parser's
-    options, is a ValueError; an option added under one after this call is
-    `unstrippable_flags`'s to report.
+    namespace, which a host may `json.dumps(vars(args))` or pickle.
+
+    A dest that is one of the engine's records (`REGISTERED_SWITCHES`,
+    `MODE_SWITCH_COUNTS`), among `flags` or the parser's options,
+    is a ValueError and the record stays as it was; an option added under one
+    after this call is `unstrippable_flags`'s to report.
 
     Reads `parser._actions`: argparse offers no public walk of its options.
     """
-    collide = _reserved(set(flags) | {a.dest for a in parser._actions})
-    if collide:
-        raise ValueError(f"dest {collide} starts with {RESERVED_DEST_PREFIX!r}, "
-                         f"where llm_loop keeps its records; give that option "
-                         f"another dest")
+    _refuse_record_dests(set(flags) | {a.dest for a in parser._actions})
     record = dict(recorded_flags(parser))
     record.update((dest, Flag(tuple(flag.aliases), flag.takes_value))
                   for dest, flag in flags.items())
-    parser.set_defaults(**{_RECORD: record})
+    parser.set_defaults(**{REGISTERED_SWITCHES: record})
+
+
+def _refuse_record_dests(dests) -> None:
+    """ValueError when any of `dests` is where the engine keeps a record."""
+    collide = sorted(_RECORDS & set(dests))
+    if collide:
+        raise ValueError(f"dest {collide} is where llm_loop keeps its records; "
+                         f"give that option another dest")
 
 
 def recorded_flags(source: Any) -> Dict[str, Flag]:
     """What `record_flags` put into `source` — a parser, or a namespace it
     parsed — as {dest: Flag}; empty when nothing (None included).
 
-    A record that is not a dict is a ValueError: an option's value, under a
-    reserved dest (`record_flags` refuses such an option added before it,
-    `unstrippable_flags` one added after it, whatever its value).
+    A record that is not a dict is a ValueError: an option's value, under the
+    dest `REGISTERED_SWITCHES` (`record_flags` refuses such an option added
+    before it, `unstrippable_flags` one added after it, whatever its value).
     """
     if isinstance(source, argparse.ArgumentParser):
-        record = source.get_default(_RECORD)
+        record = source.get_default(REGISTERED_SWITCHES)
     else:
-        record = getattr(source, _RECORD, None)
+        record = getattr(source, REGISTERED_SWITCHES, None)
     if record is not None and not isinstance(record, dict):
-        raise ValueError(f"{_RECORD} holds {record!r}, not record_flags's "
-                         f"record: an option uses it as its dest")
+        raise ValueError(f"{REGISTERED_SWITCHES} holds {record!r}, not "
+                         f"record_flags's record: an option uses it as its "
+                         f"dest")
     return record or {}
 
 
@@ -560,9 +570,10 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
         `nargs=2` one leaves an orphan value behind.
 
     An undeclared switch (`nargs == 0`) is NOT reported: it has no value to
-    misread and is copied through as it stands. An option of any arity under a
-    `RESERVED_DEST_PREFIX` dest is: it shadows a record the engine reads, this
-    table's own or the mode switches' occurrence counts.
+    misread and is copied through as it stands. An option of any arity whose
+    dest is one of the engine's records is: it shadows a record the engine
+    reads, this table's own (`REGISTERED_SWITCHES`) or the mode switches'
+    occurrence counts (`MODE_SWITCH_COUNTS`).
 
     Reads `parser._actions`: argparse offers no public walk of its options.
     """
@@ -574,11 +585,10 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
     for action in parser._actions:
         if "--help" in action.option_strings:
             continue                # argparse's own; no table declares it
-        if _reserved([action.dest]):
+        if action.dest in _RECORDS:
             problems.append(
                 f"{'/'.join(action.option_strings) or action.dest}: dest "
-                f"{action.dest!r} starts with {RESERVED_DEST_PREFIX!r}, where "
-                f"llm_loop keeps its records")
+                f"{action.dest!r} is where llm_loop keeps its records")
             continue
         if action.option_strings and action.nargs not in (None, 0, 1):
             problems.append(

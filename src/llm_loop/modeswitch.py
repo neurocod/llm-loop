@@ -231,11 +231,10 @@ def scan(argv: Sequence[str], switches: Sequence[ModeSwitch]) -> Scan:
 
 # The namespace attribute `register`'s actions count occurrences into: a dict
 # of every registered dest to its count, so a dest missing from it is one the
-# parser owns (see `ModeSwitch`). Under `clispec.RESERVED_DEST_PREFIX`, so an
-# option over it is refused (`clispec.record_flags`, which `register` calls
-# first) or reported (`clispec.unstrippable_flags`) as one over clispec's own
-# record is.
-_COUNTS = clispec.RESERVED_DEST_PREFIX + "mode_switch_counts"
+# parser owns (see `ModeSwitch`). Its name is clispec's, so an option over it
+# is refused (`clispec.record_flags`, which `register` calls) or reported
+# (`clispec.unstrippable_flags`) as one over clispec's own record is.
+_COUNTS = clispec.MODE_SWITCH_COUNTS
 
 
 class _Counted(argparse.Action):
@@ -271,31 +270,40 @@ def register(parser: argparse.ArgumentParser, switches: Sequence[ModeSwitch],
     a skipped one included, is recorded for the status line's argv rewriter
     (`clispec.record_flags`), so a host's switch is declared once, in its
     table: the parser reads a skipped one as well, so a rebuilt line has to
-    strip it as well. Recording comes first, so a dest under
-    `clispec.RESERVED_DEST_PREFIX` — where both records live — is a ValueError
-    before the parser changes.
+    strip it as well. A conflict, or a dest that is one of the records
+    (`clispec.record_flags`), is a ValueError before anything is recorded or
+    added: a refused parser is the parser it was.
 
     Reads `parser._option_string_actions`: argparse offers no public lookup.
     """
     _check_table(switches)
+    # Spelling -> dest, the parser's and then each switch's this call adds, so
+    # a table repeating a spelling is caught here too, not by add_argument
+    # halfway through the additions.
+    owned = {alias: action.dest
+             for alias, action in parser._option_string_actions.items()}
+    added = []
+    for s in switches:
+        taken = [alias for alias in s.aliases if alias in owned]
+        if not taken:
+            added.append(s)
+            owned.update((alias, s.dest) for alias in s.aliases)
+            continue
+        dests = {owned[alias] for alias in taken}
+        if len(taken) != len(s.aliases) or dests != {s.dest}:
+            raise ValueError(
+                f"{s.name}: the parser already offers {taken} (dest "
+                f"{sorted(dests)}); a mode switch must match all of an "
+                f"option's spellings and its dest, or none")
+        # else the parser's own: recorded below, not counted
     clispec.record_flags(parser, {
         s.dest: clispec.Flag(tuple(s.aliases), s.takes_value)
         for s in switches})
     listed = [s for s in switches if mode in s.listed_in]
     target = (parser.add_argument_group("modes", group_description)
               if listed else parser)
-    owned = parser._option_string_actions
     counts = dict(parser.get_default(_COUNTS) or {})
-    for s in switches:
-        taken = [alias for alias in s.aliases if alias in owned]
-        if taken:
-            dests = {owned[alias].dest for alias in taken}
-            if len(taken) != len(s.aliases) or dests != {s.dest}:
-                raise ValueError(
-                    f"{s.name}: the parser already offers {taken} (dest "
-                    f"{sorted(dests)}); a mode switch must match all of an "
-                    f"option's spellings and its dest, or none")
-            continue                # the parser's own: recorded, not counted
+    for s in added:
         help_text = s.help if mode in s.listed_in else argparse.SUPPRESS
         if s.takes_value:
             kwargs = dict(default=None, metavar=s.metavar)

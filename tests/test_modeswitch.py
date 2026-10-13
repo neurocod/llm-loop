@@ -316,8 +316,14 @@ def test_a_parsed_namespace_stays_plain_data():
     assert vars(pickle.loads(pickle.dumps(args))) == vars(args)
 
 
-@pytest.mark.parametrize("dest", [clispec._RECORD, modeswitch._COUNTS,
-                                  clispec.RESERVED_DEST_PREFIX + "x"])
+def _parser_state(parser):
+    """Everything `register` may change: options, groups, the records."""
+    return (list(parser._actions), list(parser._action_groups),
+            clispec.recorded_flags(parser), parser.get_default(modeswitch._COUNTS))
+
+
+# The names are literal: they are attributes of every namespace a host parses.
+@pytest.mark.parametrize("dest", ["_mode_switches", "_mode_switch_counts"])
 @pytest.mark.parametrize("where", ["switch", "option"])
 def test_a_dest_over_a_register_record_is_refused(dest, where):
     parser = argparse.ArgumentParser(prog="runPin.py")
@@ -326,12 +332,54 @@ def test_a_dest_over_a_register_record_is_refused(dest, where):
         table += (ModeSwitch(("--x",), dest, True, "x"),)
     else:
         parser.add_argument("--x", dest=dest)
-
-    before = list(parser._actions)
+    before = _parser_state(parser)
 
     with pytest.raises(ValueError, match="keeps its records"):
         modeswitch.register(parser, table, SEQ)
-    assert parser._actions == before    # refused before the parser changed
+    assert _parser_state(parser) == before  # refused before the parser changed
+
+
+def test_a_dest_merely_near_a_record_is_the_hosts():
+    parser = argparse.ArgumentParser(prog="runPin.py")
+    parser.add_argument("--cache", dest="_mode_switches_cache")
+    clispec.record_flags(parser, {
+        "_mode_switches_cache": clispec.Flag(("--cache",), True)})
+
+    modeswitch.register(parser, SWITCHES, SEQ)
+
+    assert clispec.unstrippable_flags(parser) == []
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["fresh", "registered"])
+def test_a_conflict_leaves_the_parser_as_it_was(first):
+    # The clashing switch comes first in its table, so nothing of the table may
+    # be recorded or added before the clash is found; over an earlier
+    # `register`, its record is what stays.
+    parser = argparse.ArgumentParser(prog="runPin.py")
+    parser.add_argument("--existing")
+    if not first:
+        modeswitch.register(parser, SWITCHES, SEQ)
+    clash = (ModeSwitch(("--existing",), "other", True, "x",
+                        listed_in=frozenset({SEQ})),
+             ModeSwitch(("--fresh",), "fresh", True, "x",
+                        listed_in=frozenset({SEQ})))
+    before = _parser_state(parser)
+
+    with pytest.raises(ValueError, match="already offers"):
+        modeswitch.register(parser, clash, SEQ)
+    assert _parser_state(parser) == before
+    clispec.flag_aliases(parser)            # the record still reads
+
+
+def test_a_table_repeating_a_spelling_is_refused_before_any_addition():
+    parser = argparse.ArgumentParser(prog="runPin.py")
+    table = (ModeSwitch(("--a",), "a", False, "x"),
+             ModeSwitch(("--a", "--b"), "b", False, "x"))
+    before = _parser_state(parser)
+
+    with pytest.raises(ValueError, match="already offers"):
+        modeswitch.register(parser, table, SEQ)
+    assert _parser_state(parser) == before
 
 
 @pytest.mark.parametrize("bad, match", [

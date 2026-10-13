@@ -9,8 +9,9 @@ appended.
 
 Starting from the original argv rather than from parsed values is what keeps the
 answer honest: flags this engine never parses - a host wrapper's mode switches,
--p/--parallel or a `--finish FOLDER` - survive untouched, without this module
-knowing what they mean (it knows their arity only: `clispec.flag_aliases`).
+-p/--parallel or a `--finish FOLDER`, and its other recorded flags - survive
+untouched, without this module knowing what they mean (it knows their arity
+only: `clispec.flag_aliases`).
 
 The module is deliberately PURE: no terminal, no I/O, and no import of cyclecore,
 limits or parallel. `statusline` imports this one (SettingsRegistry validates
@@ -129,9 +130,11 @@ def rebuild_argv(argv: List[str], overrides: Dict[str, Any], *,
     `clispec.OPTIONS`, which is every option `build_parser` adds (the parsers
     are built from that declaration) and a few it does not; and, when
     `aliases` is the run's `clispec.flag_aliases(args)` — what the status line
-    passes — every switch the host handed `modeswitch.register`. An option a
-    host's `add_cli_options` adds with a plain `add_argument` is in neither;
-    `clispec.unstrippable_flags` is the check that reports a value-taking one.
+    passes — every flag the host recorded with `clispec.record_flags`, the
+    switches it handed `modeswitch.register` among them. An option a host's
+    `add_cli_options` adds with a plain `add_argument` and never records is in
+    neither; `clispec.unstrippable_flags` is the check that reports a
+    value-taking one.
 
     An EMPTY value - an override of `""` or a copied `-C ""` - comes out as the
     single token `--flag=` (see `_empty_value`), so this is the one place a

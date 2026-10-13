@@ -287,10 +287,10 @@ def _record_shadowed(dest, **kwargs):
                                 extra_options=hook)
 
 
-# The counts record is `modeswitch`'s, which this module never names: the gate
-# reaches it through the shared prefix alone. A boolean, so no other row of the
-# gate can be what reports it.
-@pytest.mark.parametrize("dest", [clispec._RECORD, modeswitch._COUNTS],
+# The counts record is `modeswitch`'s, which `clispec` never imports: the gate
+# knows its name all the same. A boolean, so no other row of the gate can be
+# what reports it.
+@pytest.mark.parametrize("dest", [clispec.REGISTERED_SWITCHES, modeswitch._COUNTS],
                          ids=["flag-record", "switch-counts"])
 def test_an_option_over_a_record_is_reported(dest):
     [problem] = clispec.unstrippable_flags(
@@ -300,7 +300,7 @@ def test_an_option_over_a_record_is_reported(dest):
 
 
 def test_a_value_parsed_over_the_flag_record_is_refused():
-    parser = _record_shadowed(clispec._RECORD)
+    parser = _record_shadowed(clispec.REGISTERED_SWITCHES)
 
     with pytest.raises(ValueError, match="an option uses it as its dest"):
         clispec.flag_aliases(parser.parse_args(["--record", "x"]))
@@ -308,7 +308,7 @@ def test_a_value_parsed_over_the_flag_record_is_refused():
 
 def test_a_hosts_value_flag_is_recorded_without_being_a_switch():
     # An ordinary option of the host's hook: recorded, it is a row of the
-    # rewriter's vocabulary, and the argv scan that picks a mode never sees it.
+    # rewriter's vocabulary, and still no mode switch — nothing counts it.
     def hook(parser):
         parser.add_argument("--size", type=int)
         clispec.record_flags(parser, {"size": clispec.Flag(("--size",), True)})
@@ -316,6 +316,7 @@ def test_a_hosts_value_flag_is_recorded_without_being_a_switch():
                                   extra_options=hook)
     args = parser.parse_args(["--size", "3"])
 
+    assert not hasattr(args, modeswitch._COUNTS)
     assert clispec.unstrippable_flags(parser) == []
     assert clispec.flag_aliases(args)["--size"] == clispec.Flag(("--size",), True)
     assert rebuild_argv(["--size", "3", "-m", "1"], {"--max-runs": 2},
@@ -323,10 +324,10 @@ def test_a_hosts_value_flag_is_recorded_without_being_a_switch():
         "--size", "3", "--max-runs", "2"]
 
 
+@pytest.mark.parametrize("dest", ["_mode_switches", "_mode_switch_counts"])
 @pytest.mark.parametrize("where", ["flag", "option"])
-def test_record_flags_refuses_a_reserved_dest(where):
+def test_record_flags_refuses_a_records_dest(dest, where):
     parser = argparse.ArgumentParser(prog="runGate.py")
-    dest = clispec.RESERVED_DEST_PREFIX + "mine"
     flags = {"size": clispec.Flag(("--size",), True)}
     if where == "flag":
         flags[dest] = clispec.Flag(("--mine",), True)
