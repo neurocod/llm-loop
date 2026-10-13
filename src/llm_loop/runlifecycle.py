@@ -145,8 +145,8 @@ class RunContext(NamedTuple):
     # under `--no-statusline`. Off, open_status hands back the Null app.
     status_enabled: bool
     # The vocabulary the status line rewrites this run's argv with: the
-    # engine's rows plus the host's registered mode switches
-    # (`clispec.flag_aliases(args)`).
+    # engine's rows plus the host's recorded flags, its mode switches among
+    # them (`clispec.flag_aliases(args)`).
     flag_aliases: Dict[str, clispec.Flag] = clispec.FLAG_ALIASES
 
 

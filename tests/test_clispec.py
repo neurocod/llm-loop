@@ -79,8 +79,8 @@ def test_every_spelling_a_parser_offers_is_strippable(mode, hooked):
 
     assert problems == [], (
         f"{mode} parser: {problems}. Declare the flag in clispec.OPTIONS, or "
-        f"register it as a mode switch, instead of calling add_argument "
-        f"directly.")
+        f"record it for the rewriter (clispec.record_flags), instead of "
+        f"calling add_argument alone.")
 
 
 # --- ...and it bites: each failure the gate exists for, at the hook ------------
@@ -277,19 +277,65 @@ def test_a_switch_the_parser_already_offers_is_a_row_too():
                         aliases=clispec.flag_aliases(args)) == ["--finish="]
 
 
-def test_an_option_over_the_switch_record_is_reported():
-    # Added after `register` (which refuses one added before it): the gate
-    # names it, and a value it parsed in place of the record is refused.
+def _record_shadowed(dest, **kwargs):
+    """A parser whose hook adds an option under `dest` AFTER `register`, which
+    refuses one added before it."""
     def hook(parser):
         modeswitch.register(parser, HOST_SWITCHES, "any")
-        parser.add_argument("--record", dest=clispec.REGISTERED_SWITCHES)
-    parser = clispec.build_parser(clispec.SEQUENTIAL, prog="runGate.py",
-                                  extra_options=hook)
+        parser.add_argument("--record", dest=dest, **kwargs)
+    return clispec.build_parser(clispec.SEQUENTIAL, prog="runGate.py",
+                                extra_options=hook)
 
-    [problem] = clispec.unstrippable_flags(parser)
-    assert problem.startswith("--record: dest '_mode_switches'")
+
+# The counts record is `modeswitch`'s, which this module never names: the gate
+# reaches it through the shared prefix alone. A boolean, so no other row of the
+# gate can be what reports it.
+@pytest.mark.parametrize("dest", [clispec._RECORD, modeswitch._COUNTS],
+                         ids=["flag-record", "switch-counts"])
+def test_an_option_over_a_record_is_reported(dest):
+    [problem] = clispec.unstrippable_flags(
+        _record_shadowed(dest, action="store_true"))
+
+    assert problem.startswith(f"--record: dest {dest!r}"), problem
+
+
+def test_a_value_parsed_over_the_flag_record_is_refused():
+    parser = _record_shadowed(clispec._RECORD)
+
     with pytest.raises(ValueError, match="an option uses it as its dest"):
         clispec.flag_aliases(parser.parse_args(["--record", "x"]))
+
+
+def test_a_hosts_value_flag_is_recorded_without_being_a_switch():
+    # An ordinary option of the host's hook: recorded, it is a row of the
+    # rewriter's vocabulary, and the argv scan that picks a mode never sees it.
+    def hook(parser):
+        parser.add_argument("--size", type=int)
+        clispec.record_flags(parser, {"size": clispec.Flag(("--size",), True)})
+    parser = clispec.build_parser(clispec.SEQUENTIAL, prog="runGate.py",
+                                  extra_options=hook)
+    args = parser.parse_args(["--size", "3"])
+
+    assert clispec.unstrippable_flags(parser) == []
+    assert clispec.flag_aliases(args)["--size"] == clispec.Flag(("--size",), True)
+    assert rebuild_argv(["--size", "3", "-m", "1"], {"--max-runs": 2},
+                        aliases=clispec.flag_aliases(args)) == [
+        "--size", "3", "--max-runs", "2"]
+
+
+@pytest.mark.parametrize("where", ["flag", "option"])
+def test_record_flags_refuses_a_reserved_dest(where):
+    parser = argparse.ArgumentParser(prog="runGate.py")
+    dest = clispec.RESERVED_DEST_PREFIX + "mine"
+    flags = {"size": clispec.Flag(("--size",), True)}
+    if where == "flag":
+        flags[dest] = clispec.Flag(("--mine",), True)
+    else:
+        parser.add_argument("--mine", dest=dest)
+
+    with pytest.raises(ValueError, match="keeps its records"):
+        clispec.record_flags(parser, flags)
+    assert clispec.recorded_flags(parser) == {}
 
 
 @pytest.mark.parametrize("aliases, takes_value", [

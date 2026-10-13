@@ -407,7 +407,14 @@ flag followed by a switch is a usage error instead of the switch's neighbour
 quietly becoming the value.
 
 Hold the hook to [`clispec.unstrippable_flags`](src/llm_loop/clispec.py) in a
-test of your own, over every parser your entry points build.
+test of your own, over every parser your entry points build. `register` tells
+the status line's argv rewriter about your switches; a value-taking option of
+your own that is not a switch needs the same, through `clispec.record_flags`:
+
+```python
+parser.add_argument("--size", type=int)
+clispec.record_flags(parser, {"size": clispec.Flag(("--size",), True)})
+```
 
 ### Reacting to the world around a run
 

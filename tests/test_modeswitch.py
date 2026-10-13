@@ -316,7 +316,8 @@ def test_a_parsed_namespace_stays_plain_data():
     assert vars(pickle.loads(pickle.dumps(args))) == vars(args)
 
 
-@pytest.mark.parametrize("dest", ["_mode_switches", "_mode_switch_counts"])
+@pytest.mark.parametrize("dest", [clispec._RECORD, modeswitch._COUNTS,
+                                  clispec.RESERVED_DEST_PREFIX + "x"])
 @pytest.mark.parametrize("where", ["switch", "option"])
 def test_a_dest_over_a_register_record_is_refused(dest, where):
     parser = argparse.ArgumentParser(prog="runPin.py")
@@ -326,8 +327,11 @@ def test_a_dest_over_a_register_record_is_refused(dest, where):
     else:
         parser.add_argument("--x", dest=dest)
 
+    before = list(parser._actions)
+
     with pytest.raises(ValueError, match="keeps its records"):
         modeswitch.register(parser, table, SEQ)
+    assert parser._actions == before    # refused before the parser changed
 
 
 @pytest.mark.parametrize("bad, match", [

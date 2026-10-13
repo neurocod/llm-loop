@@ -17,8 +17,8 @@ So `OPTIONS` below is the single table, and everything else is DERIVED from it:
   * `FLAG_ALIASES` (re-exported by `cmdline`, which is where callers still name
     it) is the same table projected down to what an argv rewriter needs: every
     spelling of a flag, and whether it eats the next token. `flag_aliases(args)`
-    adds the mode switches a host registered (`modeswitch.register`) — the
-    host's own table, so no host's flags are rows here.
+    adds the flags a host recorded (`record_flags`; `modeswitch.register` for
+    its mode switches), so no host's flags are rows here.
 
 A row that `build_parser` never adds is legitimate and carries `kwargs=None`:
 `--session-limit`/`--weekly-limit` are ceilings the status line can edit into a
@@ -50,7 +50,7 @@ __all__ = [
     "OPTION_ORDER",
     "Option",
     "PARALLEL",
-    "REGISTERED_SWITCHES",
+    "RESERVED_DEST_PREFIX",
     "SEQUENTIAL",
     "build_parser",
     "directory",
@@ -58,6 +58,8 @@ __all__ = [
     "flag_aliases",
     "log_file",
     "parse_duration",
+    "record_flags",
+    "recorded_flags",
     "unstrippable_flags",
 ]
 
@@ -445,40 +447,80 @@ FLAG_ALIASES: Dict[str, Flag] = {
     for name, option in OPTIONS.items()
 }
 
-# The parser default — so also the attribute of every namespace that parser
-# returns — under which `modeswitch.register` records the switches it was
-# handed: {dest: Flag}. Named here, below `modeswitch`, so `flag_aliases` reads
-# it without importing that module.
-REGISTERED_SWITCHES = "_mode_switches"
+# Every dest starting with this is the engine's: the parser defaults it keeps
+# records under (`record_flags`'s, and `modeswitch.register`'s occurrence
+# counts) end up as attributes of every namespace the parser returns, so an
+# option under such a dest would overwrite a record with its value, or have
+# `set_defaults` overwrite its default with a record. One prefix rather than a
+# list of names, so this module refuses `modeswitch`'s record without naming it.
+RESERVED_DEST_PREFIX = "_llm_loop_"
+# The parser default `record_flags` writes: {dest: Flag}.
+_RECORD = RESERVED_DEST_PREFIX + "flags"
+
+
+def _reserved(dests) -> List[str]:
+    return sorted({d for d in dests if d.startswith(RESERVED_DEST_PREFIX)})
+
+
+def record_flags(parser: argparse.ArgumentParser,
+                 flags: Dict[str, Flag]) -> None:
+    """Tell the argv rewriter about `parser`'s own flags, {dest: Flag}: each
+    becomes a row of `flag_aliases(parser)` and of every namespace it parses.
+
+    A host's value-taking flag needs a row as much as an engine option does
+    (see `unstrippable_flags`); `modeswitch.register` records a host's mode
+    switches through here, and a hook records an ordinary value flag the same
+    way. Repeated calls add to the record, a dest given again replacing its
+    row. The rows are bare `Flag`s, never a host's richer row (a `ModeSwitch`
+    carries frozensets and a `type` callable): the record ends up in every
+    namespace, which a host may `json.dumps(vars(args))` or pickle. A dest under `RESERVED_DEST_PREFIX`, among `flags` or the parser's
+    options, is a ValueError; an option added under one after this call is
+    `unstrippable_flags`'s to report.
+
+    Reads `parser._actions`: argparse offers no public walk of its options.
+    """
+    collide = _reserved(set(flags) | {a.dest for a in parser._actions})
+    if collide:
+        raise ValueError(f"dest {collide} starts with {RESERVED_DEST_PREFIX!r}, "
+                         f"where llm_loop keeps its records; give that option "
+                         f"another dest")
+    record = dict(recorded_flags(parser))
+    record.update((dest, Flag(tuple(flag.aliases), flag.takes_value))
+                  for dest, flag in flags.items())
+    parser.set_defaults(**{_RECORD: record})
+
+
+def recorded_flags(source: Any) -> Dict[str, Flag]:
+    """What `record_flags` put into `source` — a parser, or a namespace it
+    parsed — as {dest: Flag}; empty when nothing (None included).
+
+    A record that is not a dict is a ValueError: an option's value, under a
+    reserved dest (`record_flags` refuses such an option added before it,
+    `unstrippable_flags` one added after it, whatever its value).
+    """
+    if isinstance(source, argparse.ArgumentParser):
+        record = source.get_default(_RECORD)
+    else:
+        record = getattr(source, _RECORD, None)
+    if record is not None and not isinstance(record, dict):
+        raise ValueError(f"{_RECORD} holds {record!r}, not record_flags's "
+                         f"record: an option uses it as its dest")
+    return record or {}
 
 
 def flag_aliases(source: Any = None) -> Dict[str, Flag]:
     """The rewriter's vocabulary for one host: `FLAG_ALIASES`, then a row per
-    mode switch `modeswitch.register` put into `source` — a parser, or a
-    namespace it parsed (None: the engine's rows alone).
+    flag recorded into `source` (`recorded_flags`; None: the engine's rows
+    alone).
 
-    A host's value-taking switch needs a row as much as an engine option does
-    (see `unstrippable_flags`), and its table already says everything a row
-    says — every spelling, and `takes_value` — so the row is projected from it
-    rather than declared a second time here. A switch that IS an engine row —
-    the parallel runner's -j/--jobs, which the sequential parser gets as a
-    switch — keeps that row. A switch sharing only some spellings with a row,
-    or differing in arity, is a ValueError: the rewriter would strip one flag
-    as the other. So is a record that is not a dict: an option's value, under
-    the dest `REGISTERED_SWITCHES` (`register` refuses such an option added
-    before it, `unstrippable_flags` one added after it, whatever its value).
+    A recorded flag that IS an engine row — the parallel runner's -j/--jobs,
+    which the sequential parser gets as a host's mode switch — keeps that row.
+    One sharing only some spellings with a row, or differing in arity, is a
+    ValueError: the rewriter would strip one flag as the other.
     """
-    if isinstance(source, argparse.ArgumentParser):
-        switches = source.get_default(REGISTERED_SWITCHES)
-    else:
-        switches = getattr(source, REGISTERED_SWITCHES, None)
-    if switches is not None and not isinstance(switches, dict):
-        raise ValueError(f"{REGISTERED_SWITCHES} holds {switches!r}, not "
-                         f"modeswitch.register's record: an option uses it "
-                         f"as its dest")
     table = dict(FLAG_ALIASES)
     owner = {alias: name for name, flag in table.items() for alias in flag.aliases}
-    for aliases, takes_value in (switches or {}).values():
+    for aliases, takes_value in recorded_flags(source).values():
         name = aliases[-1]
         clash = sorted({owner[a] for a in aliases if a in owner})
         if not clash:
@@ -488,7 +530,7 @@ def flag_aliases(source: Any = None) -> Dict[str, Flag]:
                 and set(table[clash[0]].aliases) == set(aliases)
                 and table[clash[0]].takes_value == takes_value)
         if not same:
-            raise ValueError(f"mode switch {name} shares a spelling with "
+            raise ValueError(f"recorded flag {name} shares a spelling with "
                              f"the engine's {clash}")
     return table
 
@@ -501,9 +543,9 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
     so every host can hold its own hook to it: `build_parser` is a loop over
     `OPTIONS`, so the hook is the only way a spelling the table has never heard
     of reaches a parser. The table checked is the one the run's rewriter uses,
-    `flag_aliases(parser)`: a mode switch registered through
-    `modeswitch.register` is declared by being registered. Three things break
-    a rebuilt command line:
+    `flag_aliases(parser)`: a host's flag is declared by being recorded
+    (`record_flags`, which `modeswitch.register` calls for a host's mode
+    switches). Three things break a rebuilt command line:
 
       * a VALUE-taking spelling the table does not declare. The rewriter copies
         an unknown flag through verbatim and then reads its value as a token of
@@ -518,8 +560,9 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
         `nargs=2` one leaves an orphan value behind.
 
     An undeclared switch (`nargs == 0`) is NOT reported: it has no value to
-    misread and is copied through as it stands. An option whose dest is
-    `REGISTERED_SWITCHES` is: it shadows the record this table is read from.
+    misread and is copied through as it stands. An option of any arity under a
+    `RESERVED_DEST_PREFIX` dest is: it shadows a record the engine reads, this
+    table's own or the mode switches' occurrence counts.
 
     Reads `parser._actions`: argparse offers no public walk of its options.
     """
@@ -531,11 +574,11 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
     for action in parser._actions:
         if "--help" in action.option_strings:
             continue                # argparse's own; no table declares it
-        if action.dest == REGISTERED_SWITCHES:
+        if _reserved([action.dest]):
             problems.append(
                 f"{'/'.join(action.option_strings) or action.dest}: dest "
-                f"{REGISTERED_SWITCHES!r} is where modeswitch.register records "
-                f"the host's switches for the rewriter")
+                f"{action.dest!r} starts with {RESERVED_DEST_PREFIX!r}, where "
+                f"llm_loop keeps its records")
             continue
         if action.option_strings and action.nargs not in (None, 0, 1):
             problems.append(
@@ -549,9 +592,9 @@ def unstrippable_flags(parser: argparse.ArgumentParser) -> List[str]:
                 if takes_value:
                     problems.append(
                         f"{spelling} takes a value but is neither in "
-                        f"clispec.OPTIONS nor a registered mode switch "
-                        f"(modeswitch.register), so a rebuilt argv misreads "
-                        f"its value")
+                        f"clispec.OPTIONS nor recorded for the rewriter "
+                        f"(clispec.record_flags, which modeswitch.register "
+                        f"calls), so a rebuilt argv misreads its value")
             elif aliases[canonical].takes_value != takes_value:
                 problems.append(
                     f"{spelling}: the rewriter's row {canonical!r} says "

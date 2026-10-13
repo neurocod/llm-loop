@@ -2905,7 +2905,7 @@ class StatusApp:
                  flag_aliases: Optional[Dict[str, cmdline.Flag]] = None):
         self.status = status or LoopStatus()
         # What the restart command is rewritten with (`HelpAction`): the
-        # engine's rows plus the host's mode switches (`clispec.flag_aliases`).
+        # engine's rows plus the host's recorded flags (`clispec.flag_aliases`).
         self.flag_aliases = (cmdline.FLAG_ALIASES if flag_aliases is None
                              else flag_aliases)
         # This run's operator.Mailbox/MailboxSet, or None when there is nobody to
