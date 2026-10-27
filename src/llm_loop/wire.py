@@ -736,7 +736,20 @@ def codex_app_token_usage(message: dict) -> Optional[dict]:
 
 def codex_app_usage_sum(readings) -> Optional[dict]:
     """The sum of `codex_app_token_usage` readings (one per thread), or None
-    when there are none — a turn that reported no usage prints no token line."""
+    when there are none — a turn that reported no usage prints no token line.
+
+    Summing is right only while a child's ``total`` starts at zero. A child
+    forked with the parent's history (MultiAgentV2's default, ``fork_turns``
+    "all") is seeded with the parent's last ``TokenCount`` and counts on from
+    it — unless the thread is paginated, when the fork drops those events
+    (codex rust-v0.164.0: core/src/agent/control/spawn.rs
+    ``prepare_forked_history``; seeding in core/src/session/mod.rs, the
+    ``InitialHistory::Forked`` arm). ``thread/start`` without ``historyMode``
+    makes a non-ephemeral thread paginated (app-server
+    request_processors/thread_processor.rs), and `codex_app_thread_start`
+    passes neither; measured on a full-history fork: the child's first
+    ``total`` equals its own ``last``. Adding ``historyMode: "legacy"`` or
+    ``ephemeral`` there would bill the parent's tokens twice."""
     readings = [reading for reading in readings if reading]
     if not readings:
         return None
