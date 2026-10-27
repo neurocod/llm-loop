@@ -146,13 +146,6 @@ from .usage import CLAUDE_SESSION_DURATION
 # `limit_policy` attribute — see Driver and run_loop.
 
 
-# The Windows console is often cp1252 — switch output to UTF-8 so we can print Cyrillic.
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
-except (AttributeError, ValueError):
-    pass
-
 # The project root lives in `projectroot`, its own leaf module, and is reached
 # through it: `projectroot.project_dir()`. Not re-exported here on purpose —
 # this runner is a CONSUMER of the root, not its home, and a `from … import`

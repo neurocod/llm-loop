@@ -43,6 +43,24 @@ that choose between the two runners' parsers).
 """
 
 import importlib as _importlib
+import sys as _sys
+
+# A Windows console or a redirected stdout is often cp1252, and both runners
+# print paths and agent text that are not (a Cyrillic project root is the first
+# line of every run, `runlifecycle.begin_run`). Switched HERE because this is the
+# one code that runs before anything in the package, whichever runner or host
+# script imports it: it used to be a side effect of importing `cyclecore`, and
+# once the front door went lazy the parallel runner — which never imports
+# `cyclecore` — printed through cp1252 and died on that first line. A stream
+# that cannot be switched (None under pythonw, a replaced object without
+# `reconfigure`, one already written in another encoding) is left as it is.
+# Pinned by tests/test_utf8_output.py.
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+del _stream
 
 # The single source of truth for the version: pyproject.toml reads it back out
 # of here (`[tool.setuptools.dynamic] version = {attr = "llm_loop.__version__"}`),
