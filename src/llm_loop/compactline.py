@@ -46,16 +46,29 @@ __all__ = [
 ]
 
 
-try:  # optional, and the only reason rich is touched here
-    from rich.markup import escape as _rich_escape
-except ImportError:  # pragma: no cover - exercised only without rich installed
-    _rich_escape = None
+def _escape_with_rich_or_not(text: str) -> str:
+    """The escaper `esc` uses, resolved on its FIRST call rather than at import.
+
+    `wire` imports this module for `command_tool` alone, and a tool that reads
+    the wire without painting it (`tools/codex_agent`) must not load rich for
+    it: `rich.markup` is ~45 ms of import (2026-10-27). Pinned by
+    tests/test_lazy_front_door.py.
+    """
+    global _escape
+    try:  # optional, and the only reason rich is touched here
+        from rich.markup import escape as _escape
+    except ImportError:  # pragma: no cover - exercised only without rich installed
+        _escape = str
+    return _escape(text)
+
+
+_escape = _escape_with_rich_or_not
 
 
 def esc(text) -> str:
     """Escape Rich markup metacharacters in dynamic text (e.g. a Bash command or
     a file path containing '['). No-op when Rich is unavailable."""
-    return _rich_escape(str(text)) if _rich_escape is not None else str(text)
+    return _escape(str(text))
 
 
 def collapse(text) -> str:

@@ -30,11 +30,20 @@ __all__ = [
 ]
 
 
-try:  # optional, and the only reason rich is touched here
-    from rich.cells import cell_len as _cell_len
-except ImportError:  # pragma: no cover - exercised only without rich installed
-    def _cell_len(text: str) -> int:
-        return len(text)
+def _measure_with_rich_or_not(text: str) -> int:
+    """The measure `cell_width` uses, resolved on its FIRST call, not at import:
+    `wire` reaches this module through `compactline` without ever measuring, and
+    a reader of the wire must not load rich for it (see
+    `compactline._escape_with_rich_or_not`)."""
+    global _cell_len
+    try:  # optional, and the only reason rich is touched here
+        from rich.cells import cell_len as _cell_len
+    except ImportError:  # pragma: no cover - exercised only without rich installed
+        _cell_len = len
+    return _cell_len(text)
+
+
+_cell_len = _measure_with_rich_or_not
 
 
 def cell_width(text: str) -> int:

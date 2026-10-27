@@ -42,6 +42,8 @@ pausing policy, and modeswitch for a wrapper's own mode switches (the flags
 that choose between the two runners' parsers).
 """
 
+import importlib as _importlib
+
 # The single source of truth for the version: pyproject.toml reads it back out
 # of here (`[tool.setuptools.dynamic] version = {attr = "llm_loop.__version__"}`),
 # so bumping this line is the whole release step. Keep it a plain literal -
@@ -49,210 +51,113 @@ that choose between the two runners' parsers).
 # while the right-hand side stays a constant.
 __version__ = "0.1.0"
 
-from . import cmdline
-from . import exitlog
-from . import stopchannel
-from . import modeswitch
-from .modeswitch import ModeSwitch
-from .cyclecore import (
-    is_report,
-    parse_args,
-    run_loop,
-)
+# The front door is LAZY (PEP 562): a name below is imported from its home
+# module on first access, not when the package is. Every submodule import runs
+# this file first, so an eager front door made `import llm_loop.wire` — a leaf a
+# tool reads for one classifier — pay for the whole engine, rich's Markdown
+# renderer and markdown_it included: 0.64 s of import on 2026-10-27, which
+# `tools/codex_agent` paid on every command, `status` included. Pinned by
+# tests/test_lazy_front_door.py. Spellings are unchanged: `from llm_loop import
+# Driver`, `llm_loop.run_loop`, `from llm_loop import *` and `llm_loop.cyclecore`
+# (any submodule) all resolve on demand.
+#
+# name -> (home module, attribute there); attribute None = the module itself.
+_FRONT_DOOR = {}
+
+
+def _home(module, *names):
+    for name in names:
+        _FRONT_DOOR[name] = (module, name)
+
+
+for _module in ("cmdline", "exitlog", "modeswitch", "stopchannel"):
+    _FRONT_DOOR[_module] = (_module, None)
+_home("modeswitch", "ModeSwitch")
+_home("cyclecore", "is_report", "parse_args", "run_loop")
 # Same story as the moves below: parsing a --start-in value moved out of
 # cyclecore into `clispec`, beside the `type=` check that now runs it inside the
 # parser, and the front door is unchanged on purpose.
-from .clispec import parse_duration
+_home("clispec", "parse_duration")
 # Same story again: reading a run's cost back out of the mirror log moved from
 # cyclecore into `costlog`, with the two lines it reads, and the front door is
 # unchanged on purpose.
-from .costlog import report_costs
+_home("costlog", "report_costs")
 # Same story as every move below: rendering one provider stream — and the
 # single-stream latch that goes with it — left cyclecore for `streamrender`, and
 # the front door is unchanged on purpose. An embedder driving its own turn asks
 # the PACKAGE to run one, not whichever module currently prints it.
-from .streamrender import last_rate_limit_event, run_agent_streaming
+_home("streamrender", "last_rate_limit_event", "run_agent_streaming")
 # Same story as the four below: the vocabulary of WORK — what a unit of it is,
 # how it becomes an argv, and the Driver protocol a wrapper subclasses — moved
 # out of cyclecore into `agentwork`, and the front door is unchanged on purpose.
 # A wrapper names the PACKAGE's `Driver`, not the runner it happens to drive;
 # most wrappers here drive the parallel one and never call `run_loop` at all.
-from .agentwork import (
-    AgentCommand,
-    ClaudeCommand,
-    Driver,
-    LoopStop,
-    build_agent_argv,
-    build_claude_argv,
-)
+_home("agentwork", "AgentCommand", "ClaudeCommand", "Driver", "LoopStop",
+      "build_agent_argv", "build_claude_argv")
 # The project root moved out of cyclecore into `projectroot`, a leaf below both
 # runners and below the two modules that used to keep MIRRORS of it (see that
 # module's header). Same story as the three below: the front door is unchanged
 # on purpose — an embedder asks the PACKAGE where the project is, not whichever
 # module currently holds the global. `cyclecore.project_dir` deliberately no
 # longer resolves, so there is exactly one internal address for it too.
-from .projectroot import find_project_root, project_dir, set_project_root
+_home("projectroot", "find_project_root", "project_dir", "set_project_root")
 # Same story as the stop vocabulary below: the terminal front end and the mirror
 # log it writes moved out of cyclecore into `console`, and the front door is
 # unchanged on purpose — an embedder asks the PACKAGE where its log is.
-from .console import log_file_path
+_home("console", "log_file_path")
 # And again for the git-push policy, which moved out into `gitpush`: a wrapper
 # that names a policy names the PACKAGE's, not the runner it happens to drive.
-from .gitpush import GitPushPolicy
+_home("gitpush", "GitPushPolicy")
 # The stop/pause vocabulary moved out of cyclecore into its own module; the
 # front door is unchanged on purpose, since an embedder asks the PACKAGE for
 # `pending_stop`, not the module that used to hold it.
-from .stopchannel import (
-    REQUESTED_STOP_REASONS,
-    RunResult,
-    RunStopReason,
-    StopSource,
-    commit_stop,
-    confirm_stop_request,
-    latched_stop,
-    pause_requested,
-    pending_stop,
-    stop_file_for,
-    wait_while_paused,
-)
-from .providers import (
-    PROVIDER_NAMES,
-    PROVIDERS,
-    ProviderSpec,
-    provider_spec,
-    runtime_argv,
-    usage_source_for,
-)
-from .operator import Mailbox, MailboxSet
-from .codex_usage import CodexUsageSource, parse_rate_limits
+_home("stopchannel", "REQUESTED_STOP_REASONS", "RunResult", "RunStopReason",
+      "StopSource", "commit_stop", "confirm_stop_request", "latched_stop",
+      "pause_requested", "pending_stop", "stop_file_for", "wait_while_paused")
+_home("providers", "PROVIDER_NAMES", "PROVIDERS", "ProviderSpec", "provider_spec",
+      "runtime_argv", "usage_source_for")
+# `Mailbox` is the only valid argument to run_agent_streaming's and StatusApp's
+# `mailbox=`/`messages=`, so an embedder building its own front end needs it
+# from the front door rather than from llm_loop.operator.
+_home("operator", "Mailbox", "MailboxSet")
+_home("codex_usage", "CodexUsageSource", "parse_rate_limits")
 # `RateLimitEvent`/`rate_limit_event_from` are here and not with the renderer
 # that shows them: they say what a quota's wire verdict IS, which is a fact about
 # a quota. Only `last_rate_limit_event` above stays `streamrender`'s — it is that
 # renderer's single-stream latch, not vocabulary (see its block there).
-from .usage import (
-    RateLimitEvent,
-    Usage,
-    UsageReading,
-    UsageSource,
-    oauth_token,
-    parse_usage,
-    rate_limit_event_from,
-)
-from .limits import (
-    DayNightLimit,
-    LimitPolicy,
-    LimitRule,
-    SessionLimit,
-    WeeklyLimit,
-    default_policy,
-)
-from .statusline import (
-    Action,
-    InvocationProgress,
-    Job,
-    LoopStatus,
-    Mode,
-    NumberSetting,
-    PercentSetting,
-    QuotaRefresher,
-    Setting,
-    SettingsRegistry,
-    StatusApp,
-    push_quotas,
-    quota_rows,
-    render_rows,
-)
-from .drivers import ListFileDriver, StateFileDriver
-from .parallel import run_parallel
-from .parallel import parse_args as parse_parallel_args
-from .notifications import (
-    SettingsError,
-    completion_sound_enabled,
-    play_completion_sound,
-    settings_path,
-)
+_home("usage", "RateLimitEvent", "Usage", "UsageReading", "UsageSource",
+      "oauth_token", "parse_usage", "rate_limit_event_from")
+_home("limits", "DayNightLimit", "LimitPolicy", "LimitRule", "SessionLimit",
+      "WeeklyLimit", "default_policy")
+_home("statusline", "Action", "InvocationProgress", "Job", "LoopStatus", "Mode",
+      "NumberSetting", "PercentSetting", "QuotaRefresher", "Setting",
+      "SettingsRegistry", "StatusApp", "push_quotas", "quota_rows", "render_rows")
+_home("drivers", "ListFileDriver", "StateFileDriver")
+_home("parallel", "run_parallel")
+_FRONT_DOOR["parse_parallel_args"] = ("parallel", "parse_args")
+_home("notifications", "SettingsError", "completion_sound_enabled",
+      "play_completion_sound", "settings_path")
+del _module, _home
 
-__all__ = [
-    "Action",
-    "AgentCommand",
-    "ClaudeCommand",
-    "CodexUsageSource",
-    "DayNightLimit",
-    "Driver",
-    "GitPushPolicy",
-    "InvocationProgress",
-    "Job",
-    "LimitPolicy",
-    "LimitRule",
-    "ListFileDriver",
-    "LoopStatus",
-    # The only valid argument to run_agent_streaming's and StatusApp's
-    # `mailbox=`/`messages=`, so an embedder building its own front end needs it
-    # from the front door rather than from llm_loop.operator.
-    "Mailbox",
-    "MailboxSet",
-    "LoopStop",
-    "Mode",
-    "ModeSwitch",
-    "NumberSetting",
-    "PROVIDERS",
-    "PROVIDER_NAMES",
-    "PercentSetting",
-    "ProviderSpec",
-    "QuotaRefresher",
-    "REQUESTED_STOP_REASONS",
-    "RateLimitEvent",
-    "RunResult",
-    "RunStopReason",
-    "SessionLimit",
-    "Setting",
-    "SettingsError",
-    "SettingsRegistry",
-    "StateFileDriver",
-    "StatusApp",
-    "StopSource",
-    "Usage",
-    "UsageReading",
-    "UsageSource",
-    "WeeklyLimit",
-    "build_agent_argv",
-    "build_claude_argv",
-    "cmdline",
-    "commit_stop",
-    "completion_sound_enabled",
-    "confirm_stop_request",
-    "default_policy",
-    "exitlog",
-    "find_project_root",
-    "is_report",
-    "last_rate_limit_event",
-    "latched_stop",
-    "log_file_path",
-    "modeswitch",
-    "oauth_token",
-    "parse_args",
-    "parse_parallel_args",
-    "parse_duration",
-    "parse_rate_limits",
-    "parse_usage",
-    "pause_requested",
-    "pending_stop",
-    "play_completion_sound",
-    "project_dir",
-    "provider_spec",
-    "push_quotas",
-    "quota_rows",
-    "rate_limit_event_from",
-    "render_rows",
-    "report_costs",
-    "run_agent_streaming",
-    "run_loop",
-    "run_parallel",
-    "runtime_argv",
-    "set_project_root",
-    "settings_path",
-    "stop_file_for",
-    "stopchannel",
-    "usage_source_for",
-    "wait_while_paused",
-]
+__all__ = sorted(_FRONT_DOOR)
+
+
+def __getattr__(name):
+    home = _FRONT_DOOR.get(name)
+    if home is not None:
+        module = _importlib.import_module(f".{home[0]}", __name__)
+        value = module if home[1] is None else getattr(module, home[1])
+        globals()[name] = value      # resolved once; later reads skip this hook
+        return value
+    # Not a front-door name: `llm_loop.cyclecore` after a bare `import llm_loop`
+    # resolved while the front door was eager, so any submodule still does.
+    try:
+        return _importlib.import_module(f".{name}", __name__)
+    except ModuleNotFoundError as error:
+        if error.name != f"{__name__}.{name}":
+            raise                    # the submodule exists; ITS import failed
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
