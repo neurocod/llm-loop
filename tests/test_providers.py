@@ -266,7 +266,11 @@ def test_codex_process_starts_an_app_server_thread_and_turn(monkeypatch):
     assert raw_proc.stdin.closed
 
 
-def test_codex_process_ignores_nested_agent_events():
+def test_codex_process_bills_nested_agents_but_streams_only_the_root_turn():
+    """A sub-agent's answer, completion and error never reach the stream —
+    its `turn/completed` would end the job with the child's answer — but its
+    tokens are the job's cost: the turn's usage sums every thread's `total`.
+    Its `last` is not the root's window, so the context reading stays root's."""
     def notification(method, thread_id, turn_id, **params):
         return {
             "method": method,
@@ -275,9 +279,16 @@ def test_codex_process_ignores_nested_agent_events():
 
     messages = [
         notification("thread/tokenUsage/updated", "child-thread", "child-turn",
-                     tokenUsage={"last": {"inputTokens": 900,
-                                          "cachedInputTokens": 800,
-                                          "outputTokens": 70}}),
+                     tokenUsage={"total": {"inputTokens": 900,
+                                           "cachedInputTokens": 800,
+                                           "outputTokens": 70},
+                                 "last": {"inputTokens": 300}}),
+        # A thread's `total` is cumulative: its next reading replaces it.
+        notification("thread/tokenUsage/updated", "child-thread", "child-turn",
+                     tokenUsage={"total": {"inputTokens": 1000,
+                                           "cachedInputTokens": 850,
+                                           "outputTokens": 80},
+                                 "last": {"inputTokens": 100}}),
         notification("item/completed", "child-thread", "child-turn",
                      item={"id": "child-message", "type": "agentMessage",
                            "text": "child finished"}, completedAtMs=1),
@@ -300,9 +311,10 @@ def test_codex_process_ignores_nested_agent_events():
          "params": {"threadId": "root-thread",
                     "turn": {"items": [], "status": "completed"}}},
         notification("thread/tokenUsage/updated", "root-thread", "root-turn",
-                     tokenUsage={"last": {"inputTokens": 9,
-                                          "cachedInputTokens": 8,
-                                          "outputTokens": 7}}),
+                     tokenUsage={"total": {"inputTokens": 9,
+                                           "cachedInputTokens": 8,
+                                           "outputTokens": 7},
+                                 "last": {"inputTokens": 5}}),
         notification("item/completed", "root-thread", "root-turn",
                      item={"id": "root-message", "type": "agentMessage",
                            "text": "root finished"}, completedAtMs=2),
@@ -321,13 +333,13 @@ def test_codex_process_ignores_nested_agent_events():
     completed = next(proc.stdout)
 
     assert context["type"] == "thread.token_usage.updated"
-    assert context["tokenUsage"]["last"]["inputTokens"] == 9
+    assert context["tokenUsage"]["last"]["inputTokens"] == 5
     assert item["type"] == "item.completed"
     assert item["item"]["text"] == "root finished"
     assert completed == {
         "type": "turn.completed",
-        "usage": {"input_tokens": 9, "cached_input_tokens": 8,
-                  "output_tokens": 7},
+        "usage": {"input_tokens": 1009, "cached_input_tokens": 858,
+                  "output_tokens": 87},
     }
 
 

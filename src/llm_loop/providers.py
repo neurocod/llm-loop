@@ -161,7 +161,10 @@ class _CodexEventStream:
         self._owner = owner
         self._buffered = iter(buffered)
         self._source = iter(owner._proc.stdout)
-        self._latest_usage = None
+        # Each thread's latest cumulative reading (`wire.codex_app_token_usage`)
+        # — the main thread's and every sub-agent's: the turn's usage is their
+        # sum, so a review that delegated half its work bills that half too.
+        self._usage_by_thread = {}
 
     def __iter__(self):
         return self
@@ -185,15 +188,24 @@ class _CodexEventStream:
             if wire.codex_rpc_response_id(message) is not None:
                 self._owner.resolve_response(message)
                 continue
-            if not wire.codex_app_notification_belongs_to(
-                    message, self._owner.thread_id, self._owner.turn_id):
+            if wire.codex_app_from_sub_agent(message, self._owner.thread_id):
+                # A sub-agent's tokens are billed; nothing else of it reaches
+                # the stream — its answer, completion and errors are the main
+                # thread's to act on, and its window is not the main one.
+                self._observe_usage(message)
                 continue
-            usage = wire.codex_app_token_usage(message)
-            if usage is not None:
-                self._latest_usage = usage
-            event = wire.codex_app_event(message, self._latest_usage)
+            if not wire.codex_app_in_turn(message, self._owner.turn_id):
+                continue
+            self._observe_usage(message)
+            event = wire.codex_app_event(
+                message, wire.codex_app_usage_sum(self._usage_by_thread.values()))
             if event is not None:
                 return event
+
+    def _observe_usage(self, message: dict) -> None:
+        usage = wire.codex_app_token_usage(message)
+        if usage is not None:
+            self._usage_by_thread[wire.codex_app_event_thread(message)] = usage
 
     def close(self) -> None:
         try:

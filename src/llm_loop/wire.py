@@ -85,6 +85,7 @@ APP_INITIALIZED = "initialized"
 APP_THREAD_START = "thread/start"
 APP_THREAD_STARTED = "thread/started"
 APP_TURN_START = "turn/start"
+APP_TURN_STARTED = "turn/started"
 APP_TURN_STEER = "turn/steer"
 APP_ITEM_STARTED = "item/started"
 APP_ITEM_COMPLETED = "item/completed"
@@ -606,45 +607,124 @@ def codex_app_turn_id(result: dict) -> str:
     return str(turn.get("id") or "")
 
 
-def codex_app_notification_belongs_to(message: dict, thread_id: str,
-                                      turn_id: str) -> bool:
-    """Whether a notification belongs to the app-server turn we started.
+# --- Codex app-server: the main thread's events, and its sub-agents' -------
+#
+# One app-server connection reports the work of every sub-agent Codex spawns
+# inside a turn (`subAgentActivity` items naming `/root/<name>`), each on its
+# own thread, and a child's `turn/completed` is shaped exactly like the main
+# thread's. Read as the main thread's, it ends the caller's turn with the
+# CHILD's answer: a census of one host's logs on 2026-10-24 found 315
+# attempts ended at a child's completion. Every reader of this stream — the
+# provider adapter here, and hosts that drive the app-server themselves — tells
+# the two apart with these functions, so a new Codex format is fixed once.
 
-    One app-server connection also reports work done by collaboration agents.
-    Their item and completion notifications use different thread/turn IDs; if
-    those reach the provider-neutral stream, a child's ``turn/completed`` looks
-    exactly like completion of the root job.  Require every ID declared by the
-    notification to match.  ``thread/started`` has no turn scope; every other
-    notification consumed by this adapter must also declare the expected turn,
-    so malformed completion events cannot finish the job either.
+
+def codex_app_event_thread(message: dict) -> str:
+    """The thread a notification declares (``params.threadId``, else the
+    ``params.thread.id`` of a ``thread/started``), or "" when it names none."""
+    params = message.get("params") or {}
+    if not isinstance(params, dict):
+        return ""
+    thread = params.get("thread")
+    declared = params.get("threadId") or (
+        thread.get("id") if isinstance(thread, dict) else "")
+    return str(declared or "")
+
+
+def codex_app_from_sub_agent(message: dict, main_thread: str) -> bool:
+    """Whether a notification belongs to a sub-agent rather than to the MAIN
+    thread — the one ``thread/start`` or ``thread/resume`` answered with, or ""
+    for a reader of a log that has not learnt it yet
+    (`codex_app_learn_main_thread`).
+
+    A declared thread decides when the main one is known: equal to
+    ``main_thread`` it is the main thread's, whatever else the event says (a
+    ``rootTurnId`` mark overriding it would leave a main ``turn/completed``
+    unread and the turn running out its timeout; no main-thread turn carried a
+    foreign root in the logs of 2026-10-27, so this is the safe order, not a
+    seen case). Only an
+    event that declares no thread, or a reader that does not know the main one
+    yet, falls back to the two stateless marks: a turn whose ``rootTurnId`` is
+    not its own ``id`` (a child's turn names the main turn there; children of
+    older Codex versions carry no ``rootTurnId`` at all, and only the thread
+    tells them apart), and a ``thread/started`` with a ``parentThreadId``.
+
+    A notification that declares nothing and has neither mark is the main
+    thread's: the account-wide notifications (``account/rateLimits/updated``,
+    ``skills/changed``) have that shape, and so do stand-in servers of tests.
+    Whether it belongs to the caller's TURN is a separate question
+    (`codex_app_in_turn`).
     """
+    thread = codex_app_event_thread(message)
+    if thread and main_thread:
+        return thread != main_thread
     params = message.get("params") or {}
     if not isinstance(params, dict):
         return False
-    thread = params.get("thread") or {}
-    turn = params.get("turn") or {}
-    thread_ids = [params.get("threadId")]
-    turn_ids = [params.get("turnId")]
-    if isinstance(thread, dict):
-        thread_ids.append(thread.get("id"))
+    turn = params.get("turn")
     if isinstance(turn, dict):
-        turn_ids.append(turn.get("id"))
-    thread_ids = [str(value) for value in thread_ids if value]
-    turn_ids = [str(value) for value in turn_ids if value]
-    thread_matches = (bool(thread_ids)
-                      and all(value == thread_id for value in thread_ids))
+        root, own = turn.get("rootTurnId"), turn.get("id")
+        if root and own and root != own:
+            return True
+    started = params.get("thread")
+    return isinstance(started, dict) and bool(started.get("parentThreadId"))
+
+
+def codex_app_learn_main_thread(message: dict, main: str) -> str:
+    """``main`` once known; until then the thread of the first
+    ``thread/started`` or ``turn/started`` that is not a sub-agent's.
+
+    For readers of a LOG of notifications: it holds no responses, so a resumed
+    thread names itself only there — and the main turn always starts before
+    any sub-agent's, so the first unmarked start is the main thread's."""
+    if main or message.get("method") not in (APP_THREAD_STARTED,
+                                             APP_TURN_STARTED):
+        return main
+    if codex_app_from_sub_agent(message, main):
+        return main
+    return codex_app_event_thread(message)
+
+
+def codex_app_in_turn(message: dict, turn_id: str) -> bool:
+    """Whether a main-thread notification belongs to the turn ``turn_id``.
+
+    Asked only by a reader that owns exactly ONE turn and ends at its
+    completion (the provider stream, `providers._CodexEventStream`): every turn
+    id the notification declares must be ``turn_id``, and one must be declared,
+    so a ``turn/completed`` of another turn — or one naming none — cannot
+    finish the job. ``thread/started`` is the exception, having no turn.
+
+    A reader that follows the main thread across turns it did not start does
+    not ask it: Codex resumes the main thread by itself after a sub-agent
+    reports, and a host that waits for that continuation reads it as the main
+    thread's.
+    """
     if message.get("method") == APP_THREAD_STARTED:
-        return thread_matches
-    return (thread_matches and bool(turn_ids)
-            and all(value == turn_id for value in turn_ids))
+        return True
+    params = message.get("params") or {}
+    if not isinstance(params, dict):
+        return False
+    turn = params.get("turn")
+    declared = [params.get("turnId"),
+                turn.get("id") if isinstance(turn, dict) else None]
+    declared = [str(value) for value in declared if value]
+    return bool(declared) and all(value == turn_id for value in declared)
 
 
 def codex_app_token_usage(message: dict) -> Optional[dict]:
-    """The latest turn token counts, in the normalised ``exec --json`` shape."""
+    """One thread's cumulative token counts so far (``tokenUsage.total``), in
+    the normalised ``exec --json`` shape; None for another notification, {}
+    for one that carries no total.
+
+    ``total`` and not ``last``: ``last`` is the latest REQUEST alone — what the
+    thread occupies in the window (`codex_context_usage`) — while a turn's
+    usage, as ``exec --json`` reported it, is what the turn cost. The main
+    thread and each sub-agent report their own totals, so the turn's usage is
+    their sum (`codex_app_usage_sum`)."""
     if message.get("method") != APP_TOKEN_USAGE_UPDATED:
         return None
     params = message.get("params") or {}
-    usage = (params.get("tokenUsage") or {}).get("last") or {}
+    usage = (params.get("tokenUsage") or {}).get("total") or {}
     if not usage:
         return {}
     return {
@@ -652,6 +732,16 @@ def codex_app_token_usage(message: dict) -> Optional[dict]:
         CACHED_INPUT_TOKENS: usage.get("cachedInputTokens", 0),
         OUTPUT_TOKENS: usage.get("outputTokens", 0),
     }
+
+
+def codex_app_usage_sum(readings) -> Optional[dict]:
+    """The sum of `codex_app_token_usage` readings (one per thread), or None
+    when there are none — a turn that reported no usage prints no token line."""
+    readings = [reading for reading in readings if reading]
+    if not readings:
+        return None
+    return {key: sum(reading.get(key, 0) for reading in readings)
+            for key in (INPUT_TOKENS, CACHED_INPUT_TOKENS, OUTPUT_TOKENS)}
 
 
 def _codex_app_text(content: Any) -> str:
