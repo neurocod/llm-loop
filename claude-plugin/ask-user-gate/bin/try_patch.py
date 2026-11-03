@@ -72,7 +72,9 @@ Usage:
       --reject-exit 5 -- python selftest_run.py ped-delta
 
 Exit codes of its own: 2 bad edit, 3 restore failed, 4 refused by the journal,
-6 the command refused for a reason named by --reject-exit.
+6 the command refused for a reason named by --reject-exit; under --expect-fail
+a command's 75 (EX_TEMPFAIL, e.g. a probe that found the machine busy) is
+passed through as "judged nothing, rerun", never counted as the pin firing.
 """
 
 import argparse
@@ -116,6 +118,15 @@ SELFTEST_DIE_CODE = 86
 # SELFTEST_DIE_CODE (selftest only); without --expect-fail, the command's own
 # code, 130 if interrupted.
 EXIT_GATE_REFUSED = 6
+
+# `EX_TEMPFAIL` of BSD `sysexits.h`, "a temporary failure; the user is invited
+# to retry": a command that exits it ran nothing worth judging -- the case it is
+# here for is a probe that waited for a quiet machine, never got one and never
+# started -- so under --expect-fail it is never "the pin fired", with or without
+# --reject-exit, and the run ends with it unchanged: rerun later, as is. Not
+# opt-in like --reject-exit, because the word is the standard one and every
+# recipe that forgot to name it read a busy machine as a mutation caught.
+EXIT_TEMPFAIL = 75
 
 
 class Triple(argparse.Action):
@@ -439,6 +450,12 @@ def main() -> int:
             print("try_patch: the command PASSED without the fix -- the pin "
                   "does not pin anything", file=sys.stderr)
             return 1
+        if status == EXIT_TEMPFAIL:
+            print(f"try_patch: the command exited {EXIT_TEMPFAIL} (EX_TEMPFAIL: "
+                  "a temporary failure, e.g. a probe that found the machine "
+                  "busy), so it judged nothing and proves nothing about the "
+                  "pin -- rerun", file=sys.stderr)
+            return EXIT_TEMPFAIL
         if status in options.reject_exit:
             print(f"try_patch: the command refused for its own reason (exit "
                   f"{status}, named by --reject-exit), so it proves nothing "
@@ -759,6 +776,23 @@ def _case_reject_exit_voids_the_proof(work: Path) -> None:
     _expect(result.returncode == EXIT_GATE_REFUSED, f"not refused -- {shown}")
     _expect("failed as expected" not in result.stdout, f"counted -- {shown}")
     _expect("refused for its own reason (exit 7," in result.stderr,
+            f"the reason is not named -- {shown}")
+    _expect_bytes(victim, GUARDS, result)
+
+
+def _case_tempfail_judges_nothing_by_default(work: Path) -> None:
+    """EX_TEMPFAIL (a probe that waited out a busy machine and never started)
+    is not the mutation caught, though no --reject-exit names it: the run ends
+    EXIT_TEMPFAIL, saying "rerun", and "failed as expected" is never printed.
+    """
+    victim = _victim(work)
+    result = _run(work, "--expect-fail", "--reject-exit", "5", *_flip("guardA"),
+                  "--", sys.executable, "-c",
+                  f"raise SystemExit({EXIT_TEMPFAIL})")
+    shown = f"exit {result.returncode}\n{result.stdout}{result.stderr}"
+    _expect(result.returncode == EXIT_TEMPFAIL, f"not passed through -- {shown}")
+    _expect("failed as expected" not in result.stdout, f"counted -- {shown}")
+    _expect("judged nothing" in result.stderr and "rerun" in result.stderr,
             f"the reason is not named -- {shown}")
     _expect_bytes(victim, GUARDS, result)
 
@@ -1141,6 +1175,7 @@ SELFTEST_CASES = (
     _case_expect_fail_rejects_a_passing_command,
     _case_expect_fail_rejects_an_unrunnable_command,
     _case_reject_exit_voids_the_proof,
+    _case_tempfail_judges_nothing_by_default,
     _case_reject_exit_leaves_other_failures_counted,
     _case_pathext_shim_runs_by_its_bare_name,
     _case_command_rewriting_the_file_is_reported,
