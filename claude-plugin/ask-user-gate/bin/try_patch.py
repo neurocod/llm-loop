@@ -66,10 +66,13 @@ Usage:
   python try_patch.py --recover    # undo what a KILLED run left (see
                                    # JOURNAL_DIR_NAME in try_patch_journal.py)
 
-  # a gate with its own "could not judge" code: name it, or a typo'd suite
-  # reads as the mutation caught
+  # a gate with its own "could not judge" codes: name each, or a typo'd suite
+  # (5), a mutation that did not compile (65), a refusal (2) or a crash (70)
+  # reads as the mutation caught. None of these is a default: what a code
+  # means is the gate's word, not this script's
   python try_patch.py --file a.h --old X --new Y --expect-fail \\
-      --reject-exit 5 -- python selftest_run.py ped-delta
+      --reject-exit 2 --reject-exit 5 --reject-exit 65 --reject-exit 70 \\
+      -- python selftest_run.py ped-delta
 
 Exit codes of its own: 2 bad edit, 3 restore failed, 4 refused by the journal,
 6 the command refused for a reason named by --reject-exit; under --expect-fail
