@@ -43,7 +43,10 @@ record.write_text(json.dumps({'pid': os.getpid(),
                   encoding='utf-8')
 print('READY', flush=True)
 sys.stdin.readline()
-record.unlink()
+# Removed the way a real run removes it: a waiter polling the record holds it
+# open for a moment, and on Windows a bare unlink() then fails (WinError 32).
+# The record left behind names a dead pid, which frees the waiter just the same.
+exitlog._remove_quietly(record)
 """
 
 MODERN_CHILD = """\
@@ -129,7 +132,18 @@ class Child:
         self.proc.stdin.flush()
 
     def wait(self, code=0):
-        assert self.proc.wait(timeout=PROCESS_TIMEOUT) == code
+        actual = self.proc.wait(timeout=PROCESS_TIMEOUT)
+        if actual != code:
+            # The child's traceback is still in the queue: show it, or a red
+            # run says only "1 == 0".
+            self.reader.join(timeout=PROCESS_TIMEOUT)
+            output = []
+            while not self.lines.empty():
+                line = self.lines.get_nowait()
+                if line is not None:
+                    output.append(line)
+            pytest.fail(f"exit {actual}, expected {code}; "
+                        f"output: {''.join(output)!r}")
 
     def close(self):
         if self.proc.poll() is None:
