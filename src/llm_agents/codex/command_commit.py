@@ -1,13 +1,19 @@
-"""The commit.py policy for a worker in a linked pool slot."""
+"""The commit.py policy for a worker in a linked pool slot.
+
+The commit script is the git kit's (`llm_agents.git.commit`), run through the
+host's stand-in, which the host names (`HostPolicy.commit_script`); the slot
+rule and the option table are the kit's own, read here rather than copied.
+"""
 
 from __future__ import annotations
 
-import re
 import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
-from ..commit_identity import write_approval
+from ..git.commit import OPTION_FLAGS
+from ..git.commit_identity import write_approval
+from ..git.slots import git_admin as _git_admin, pool_slot
 from .command_arguments import (
     CommandContext,
     _Option,
@@ -23,35 +29,6 @@ from .command_paths import (
 )
 
 # --- committing from a pool slot -------------------------------------------
-
-
-def _git_admin(workspace: Path) -> Optional[Path]:
-    """The resolved admin directory named by a checkout's .git file."""
-    marker = workspace / ".git"
-    try:
-        first = marker.read_text(encoding="utf-8").strip().splitlines()[0]
-    except (OSError, ValueError, IndexError):
-        return None
-    key, _, value = first.partition(":")
-    if key.strip() != "gitdir" or not value.strip():
-        return None
-    return (workspace / value.strip()).resolve()
-
-
-def pool_slot(workspace: Path) -> bool:
-    """A linked `<main>-wtN` worktree, not the main tree or a submodule.
-
-    The worker identity stays the slot even when `-C` selects its submodule.
-    """
-    admin = _git_admin(workspace)
-    if admin is None:
-        return False
-    if (admin.parent.name.casefold() != "worktrees"
-            or admin.parent.parent.name.casefold() != ".git"):
-        return False
-    main = admin.parent.parent.parent.name
-    return re.fullmatch(rf"{re.escape(main)}-wt\d+", workspace.name,
-                        re.IGNORECASE) is not None
 
 
 def _own_root_refusal(value: str, cwd: Path, ctx: CommandContext,
@@ -125,18 +102,18 @@ def _message_file_refusal(value: str, cwd: Path, ctx: CommandContext) -> str:
     return ""
 
 
-# commit.py's own options (the `main` of the host's commit script, which
-# `HostPolicy.commit_briefing` names), spelled in full:
-# argparse also takes `--fi`/`--mess`/`--cw`, and a glued `-Fx` / `-F=x`
-# (argparse reads `=x`) is refused where an option is read
-# (`_parse_options`).
-_COMMIT_FILE = _Option(takes_value=True, check=_message_file_refusal)
-_COMMIT_CWD = _Option(takes_value=True, check=_own_root_refusal)
-_COMMIT_TEXT = _Option(takes_value=True, text=True)
-_COMMIT_OPTIONS = {
-    "-F": _COMMIT_FILE, "--file": _COMMIT_FILE,
-    "-m": _COMMIT_TEXT, "--message": _COMMIT_TEXT,
-    "-C": _COMMIT_CWD, "--cwd": _COMMIT_CWD}
+# commit.py's own options (the kit's `OPTION_FLAGS`, which its parser is built
+# from), spelled in full: argparse also takes `--fi`/`--mess`/`--cw`, and a
+# glued `-Fx` / `-F=x` (argparse reads `=x`) is refused where an option is
+# read (`_parse_options`). An option the kit adds without a judge here is a
+# KeyError at import, not a flag let through unjudged.
+_COMMIT_JUDGES = {
+    "file": _Option(takes_value=True, check=_message_file_refusal),
+    "message": _Option(takes_value=True, text=True),
+    "cwd": _Option(takes_value=True, check=_own_root_refusal)}
+_COMMIT_OPTIONS = {flag: _COMMIT_JUDGES[dest]
+                   for dest, flags in OPTION_FLAGS.items() for flag in flags}
+_CWD_FLAGS = OPTION_FLAGS["cwd"]
 
 
 def _nested_repo(run: Path, workspace: Path) -> Optional[Path]:
@@ -253,15 +230,16 @@ def _commit_path_refusal(raw: str, run: Path, ctx: CommandContext,
 
 
 def _commit(args: list[str], cwd: Path, ctx: CommandContext) -> str:
-    """The host's `tools/git/commit.py` from a worker: only in a pool slot
-    (`pool_slot`), run in the worker's own tree or with `-C` selecting a
-    directly declared submodule of that slot, options of
+    """The host's commit script (`HostPolicy.commit_script`) from a worker:
+    only in a pool slot (`pool_slot`), run in the worker's own tree or with
+    `-C` selecting a directly declared submodule of that slot, options of
     `_COMMIT_OPTIONS` before the paths, every path by
     `_commit_path_refusal`."""
     if not pool_slot(ctx.workspace):
-        return ("tools/git/commit.py: a worker commits only in a pool slot "
-                "(`<repo>-wtN`, tools/git/worktree.py); the main tree's master "
-                "is the orchestrator's")
+        policy = ctx.policy
+        return (f"{policy.commit_script}: a worker commits only in a pool slot "
+                f"(`<repo>-wtN`, {policy.pool_script}); the main tree's master "
+                f"is the orchestrator's")
     parsed, paths, why = _parse_options(
         args, _COMMIT_OPTIONS, "commit.py", "its own, spelled in full",
         cwd, ctx, remainder=True, reject_option_value=True)
@@ -274,8 +252,8 @@ def _commit(args: list[str], cwd: Path, ctx: CommandContext) -> str:
         return f"commit.py {stray}: options go before the paths"
     # Repeated uses of one spelling have argparse's last-value semantics.
     # Mixed spellings lose their order in _parse_options, so refuse them.
-    targets = [value for key, value in parsed.items() if key in {"-C", "--cwd"}]
-    if "-C" in parsed and "--cwd" in parsed:
+    targets = [value for key, value in parsed.items() if key in _CWD_FLAGS]
+    if all(flag in parsed for flag in _CWD_FLAGS):
         return "commit.py: use only one spelling of -C/--cwd"
     run = resolve_path(targets[-1], cwd)[1] if targets else cwd
     nested = _nested_repo(run, ctx.workspace)

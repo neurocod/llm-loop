@@ -28,7 +28,7 @@ from .paths import host_root, scratch_dir
 from .registry import AgentRecord
 from .roles import role_briefing
 from .command_commit import _git_admin
-from ..commit_identity import ENV as COMMIT_APPROVAL_ENV
+from ..git.commit_identity import ENV as COMMIT_APPROVAL_ENV
 from ..host_policy import EMPTY as EMPTY_POLICY
 from ..host_policy import active as host_policy
 from ..host_policy import explicit as explicit_grants
@@ -299,7 +299,7 @@ def _worktree_fact(workspace: Path,
     given when the agent may commit here — a worker that escalates by
     allowlist in a pool slot, on a host that names how (`commit_briefed`):
     it commits through the host's commit command outside the sandbox
-    (`command_commit._commit` judges tools/git/commit.py), with its message
+    (`command_commit._commit` judges the git kit's commit.py), with its message
     file in one of these roots, since commit.py deletes it; the words are
     the host's `HostPolicy.commit_briefing`.
 

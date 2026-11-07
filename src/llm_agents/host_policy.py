@@ -111,6 +111,10 @@ class HostPolicy:
     # How a worker in a pool slot is told to commit: (where the message file
     # goes, the worker's model) -> text. None: workers are not told to commit.
     commit_briefing: Optional[Callable[[str, str], str]] = None
+    # How a refusal of the commit judge names the host's stand-in of the git
+    # kit's commit script and its worktree pool (`codex.command_commit`).
+    commit_script: str = "commit.py"
+    pool_script: str = "llm_agents.git.worktree"
     # None: the review profile refuses to start (`llm_agents.claude.protocol`).
     review: Optional[ReviewProfile] = None
     # The on-screen counter's executable, relative to the root, most
