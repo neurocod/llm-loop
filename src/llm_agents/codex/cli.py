@@ -27,7 +27,7 @@ from .events import (
 )
 from .gates import GatesError, required_gates, summary as gate_summary
 from .protocol import APPROVAL_META, N_TURN_COMPLETED
-from .paths import agent_name, invocation_root, scratch_dir
+from .paths import agent_name, entered, invocation_root, scratch_dir
 from .registry import AgentRecord, Registry, RegistryError
 from .store import AgentStore, free_archive_stamp
 from .roles import ROLES, expected_answer
@@ -889,12 +889,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None, *,
          policy: Optional[host_policy.HostPolicy] = None,
-         root: Optional[Path] = None) -> int:
+         root: Optional[Path] = None, entry: Optional[Path] = None) -> int:
     """The command line. A host entry point passes its `policy` and `root`
-    (its own `__main__.py`); they hold for this call only
-    (`host_policy.installed`). Without them the call runs under `EMPTY`,
-    says so on stderr, and honours only what it was asked for itself
-    (`explicit_grants`)."""
+    (its own `__main__.py`), and as `entry` the path `python <entry>` runs
+    it by, which the hints naming the bridge print (`paths.bridge_command`;
+    default `python -m llm_agents.codex`); all three hold for this call only
+    (`host_policy.installed`, `paths.entered`). Without a policy the call
+    runs under `EMPTY`, says so on stderr, and honours only what it was
+    asked for itself (`explicit_grants`)."""
     if hasattr(sys.stdout, "reconfigure"):
         # Windows consoles default to a legacy code page, and an answer full of
         # box-drawing or non-ASCII text would die on a UnicodeEncodeError after
@@ -903,7 +905,7 @@ def main(argv: Optional[list[str]] = None, *,
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     if policy is not None and root is None:
         raise ValueError("a host policy comes with the host root it names")
-    with host_policy.installed(policy or host_policy.EMPTY, root):
+    with host_policy.installed(policy or host_policy.EMPTY, root), entered(entry):
         host_policy.announce_empty("codex_agent", EMPTY_STILL)
         args = build_parser().parse_args(argv)
         host_policy.grant(explicit_grants(args))

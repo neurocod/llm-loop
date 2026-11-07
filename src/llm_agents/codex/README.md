@@ -21,8 +21,9 @@ app-server answers on the wire (`tests/codex_agent/` of this repository).
 
 The core knows no project. A project's command tables, protected paths, gate
 directory, briefing lines and root arrive as a `llm_agents.host_policy.HostPolicy`
-that the project's own entry point hands to `cli.main(policy=..., root=...)`;
-the registry `.codex-agents` lives under that root. Run without one, the
+that the project's own entry point hands to `cli.main(policy=..., root=...,
+entry=...)`; the registry `.codex-agents` lives under that root, and `entry`
+is the path the bridge's printed hints run it by. Run without one, the
 bridge says so on stderr and runs with the empty policy: nothing leaves the
 sandbox unless that same call asked for it (`--escalate`,
 `--gates-from-prompt`).

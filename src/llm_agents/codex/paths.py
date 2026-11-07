@@ -10,9 +10,11 @@ import argparse
 import hashlib
 import os
 import tempfile
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from subprocess import SubprocessError
+from typing import Optional
 
 from .. import host_policy
 from ..gitlib import git
@@ -77,6 +79,41 @@ def host_root() -> Path:
     cwd is `invocation_root()` either way.
     """
     return host_policy.root() or invocation_root()
+
+
+# The path `python <entry>` runs the bridge by: None unless the host's entry
+# point named its own (`cli.main(entry=...)`), as `llm_agents.claude.worker`
+# keeps the claude bridge's.
+_entry: dict = {"path": None}
+
+
+@contextmanager
+def entered(path: Optional[Path]):
+    """`bridge_command()` names `path` (None: this package) for one block."""
+    before = _entry["path"]
+    _entry["path"] = Path(path).resolve() if path is not None else None
+    try:
+        yield
+    finally:
+        _entry["path"] = before
+
+
+def bridge_command() -> str:
+    """How a hint this bridge prints names the bridge itself, e.g. the
+    `logs --child` command a capped child quote points at
+    (`subagents.full_text_command`): `python <entry>`, relative to the host
+    root (forward slashes) when the entry lies under it, absolute otherwise;
+    without an entry, `python -m llm_agents.codex`."""
+    entry = _entry["path"]
+    if entry is None:
+        return "python -m llm_agents.codex"
+    root = host_policy.root()
+    if root is not None:
+        try:
+            return f"python {entry.relative_to(Path(root).resolve()).as_posix()}"
+        except ValueError:
+            pass
+    return f"python {entry}"
 
 
 def invocation_root() -> Path:

@@ -161,6 +161,28 @@ def test_a_host_holds_for_one_call_and_a_call_without_one_says_so(
         cli.main(["status"], policy=TEST_POLICY)
 
 
+def test_the_hints_name_the_bridge_by_the_entry_the_host_passed(
+        tmp_path, monkeypatch, empty):
+    """`main(entry=E)` names the bridge `python E` in its hints for that call
+    only: relative to the host root when E lies under it, absolute when not,
+    and `python -m llm_agents.codex` without an entry."""
+    from llm_agents.codex import subagents
+    monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
+    seen = []
+    monkeypatch.setattr(cli, "cmd_status", lambda args: seen.append(
+        subagents.full_text_command("w", "/root/c")) or 0)
+    inside = tmp_path / "host" / "bin" / "bridge"
+    outside = tmp_path / "elsewhere" / "bridge"
+    calls = ((inside, "python bin/bridge"),
+             (outside, f"python {outside.resolve()}"),
+             (None, "python -m llm_agents.codex"))
+    for entry, named in calls:
+        assert cli.main(["status"], policy=TEST_POLICY, root=tmp_path / "host",
+                        entry=entry) == 0
+        assert seen[-1] == f"`{named} logs w --child /root/c`"
+    assert paths.bridge_command() == "python -m llm_agents.codex"
+
+
 def test_only_spawn_s_own_flags_are_explicit_asks(tmp_path, monkeypatch, empty):
     """`spawn --escalate`/`--gates-from-prompt` grant for that call; a `send`
     replaying the record asks for nothing itself."""

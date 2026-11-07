@@ -1,7 +1,7 @@
 """Drive Codex CLI as a named worker, the way a subagent is driven.
 
 Run it as `python -m llm_agents.codex <command>`; a project with rules of its
-own calls `cli.main(policy=..., root=...)` from an entry point of its own
+own calls `cli.main(policy=..., root=..., entry=...)` from an entry point of its own
 (`llm_agents.host_policy` says what a host supplies).
 
 Why this exists: `codex -p "..."` prints its whole transcript to stdout, so a

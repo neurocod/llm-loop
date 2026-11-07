@@ -2,7 +2,8 @@
 
 Without a host this runs under the empty policy and says so on stderr
 (`host_policy.announce_empty`). A project with rules of its own does not run
-this file: its entry point calls `cli.main(policy=..., root=...)` itself.
+this file: its entry point calls `cli.main(policy=..., root=..., entry=...)`
+itself.
 
 Handed a directory, Python runs this file with THAT directory on `sys.path`
 rather than `src/`, so the package imports nothing; the one line below puts

@@ -116,10 +116,6 @@ class HostPolicy:
     # The on-screen counter's executable, relative to the root, most
     # preferred first; none for the empty policy.
     counter_exes: tuple[str, ...] = ()
-    # How a hint the codex bridge prints names the bridge itself, e.g. the
-    # `logs --child` command a capped child quote points at
-    # (`codex.subagents.full_text_command`): the host's own entry point.
-    codex_command: str = "python -m llm_agents.codex"
 
 
 EMPTY = HostPolicy()
