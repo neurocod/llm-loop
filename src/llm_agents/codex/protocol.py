@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from llm_loop.procend import REAP_GRACE_S, end_process_tree
+
 # --- protocol names -------------------------------------------------------
 # Spelled out rather than inlined because a typo in any of them shows up as a
 # turn that never completes (the server simply ignores an unknown method and we
@@ -68,7 +70,7 @@ NOISY_NOTIFICATIONS = [
 # looking like a slow model.
 STARTUP_TIMEOUT_S = 60.0
 
-REAP_GRACE_S = 2.0
+# `REAP_GRACE_S` (imported above) bounds each step of ending the server.
 
 
 # What to reply to each server-initiated request, per method. THREE DIFFERENT
@@ -175,34 +177,19 @@ def _reap(proc: subprocess.Popen) -> None:
 
     On Windows `codex` on PATH is `codex.cmd`, so the handle we hold is
     `cmd.exe` and the real CLI is a GRANDCHILD: `terminate()` would leave it
-    running, still holding the pipes. `taskkill /T` reaches the tree. (Measured
-    the hard way in `llm_loop.providers`.)
+    running, still holding the pipes. `taskkill /T` reaches the tree. The
+    escalation — ask, wait, kill, wait, each bounded by `REAP_GRACE_S` — is
+    `llm_loop.procend.end_process_tree`, the one copy every owner of a
+    provider child shares; this keeps only its own prologue: a child that has
+    already exited is left alone.
 
     Nothing here may raise: it runs from `finally` blocks, where an exception
-    would replace the one being unwound.
+    would replace the one being unwound (`end_process_tree` absorbs every
+    `OSError`; a `KeyboardInterrupt` still propagates, as it always did).
     """
     if proc.poll() is not None:
         return
-    if os.name == "nt":
-        try:
-            done = subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True, timeout=REAP_GRACE_S)
-            if done.returncode == 0:
-                return
-        except (OSError, subprocess.SubprocessError):
-            pass
-    try:
-        proc.terminate()
-    except OSError:
-        return
-    try:
-        proc.wait(timeout=REAP_GRACE_S)
-    except (OSError, subprocess.TimeoutExpired):
-        try:
-            proc.kill()
-        except OSError:
-            pass
+    end_process_tree(proc)
 
 
 class AppServer:
