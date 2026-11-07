@@ -53,8 +53,10 @@ std::optional<int> weekLeftFrom(const QJsonValue& value);
 // The pipe name, and the one rule about it: it is spelled a SECOND time in
 // `src/llm_agents/agent_counter.py`, and a disagreement fails silently — the
 // beacon finds no server, starts one, and still cannot reach it, so nothing is
-// ever counted and nothing ever says why. A cross-check test reads both files
-// and refuses a mismatch; that test is the only reason this may be a literal here.
+// ever counted and nothing ever says why. The cross-check
+// `test_the_pipe_prefix_is_spelled_the_same_in_both_halves` (tests/
+// test_agent_counter.py, needs no build) reads both files and refuses a
+// mismatch; that test is the only reason this may be a literal here.
 QString agentPipeName();
 
 class Registry : public QObject {

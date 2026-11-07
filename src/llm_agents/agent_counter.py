@@ -48,10 +48,11 @@ from . import host_policy
 # The pipe name, spelled a SECOND time in `extras/agent-counter/Registry.cpp`. A
 # disagreement is invisible at runtime — this side finds no server, starts one,
 # and still cannot reach it — so a cross-check test
-# (`test_the_pipe_prefix_is_spelled_the_same_in_both_halves`, run by the host
-# that builds the exe) reads both files and refuses a mismatch. Change one,
-# change the other; a running counter of the old name stops seeing new clients
-# until it is rebuilt and restarted, exactly as a version bump would.
+# (`test_the_pipe_prefix_is_spelled_the_same_in_both_halves`, tests/) reads both
+# files and refuses a mismatch. Change one, change the other; a running counter
+# of the old name stops seeing new clients until it is rebuilt and restarted,
+# exactly as a version bump would. An exe built before the change is caught
+# before it is started (`_listens_elsewhere`).
 PIPE_PREFIX = "llm-agents.v1."
 
 # Set to 0 to keep the counter out of the way (the test suite does exactly that:
@@ -71,6 +72,11 @@ EXE_ENV = "AGENT_COUNTER_EXE"
 # busy with the very agents being counted.
 SPAWN_WAIT_S = 3.0
 RETRY_STEP_S = 0.05
+
+# `exe --pipe-name` answers in 0.04-0.05 s (Release and Debug, measured
+# 2026-11-07); the rest is headroom for a loaded machine. Asked once per exe
+# per process, so even a timeout costs one turn this much, not every turn.
+PIPE_NAME_TIMEOUT_S = 5.0
 
 # ERROR_PIPE_BUSY is NOT "nobody is there": the pipe exists and every instance
 # is momentarily taken, and Windows prescribes waiting for one. Read as absence
@@ -96,6 +102,12 @@ _complained = False
 # runs turn after turn, and a field the provider dropped for good would
 # otherwise add the same line to its log once per turn.
 _week_complained: set[str] = set()
+# Guards both "once" flags above: `_complain` is reachable from a provider
+# stream's thread (`Beacon.report_week_used`) while the turn's own thread
+# announces, and an unlocked check-then-set can print the line twice.
+_once_lock = threading.Lock()
+# What each exe answered to `--pipe-name` in this process (None: no answer).
+_exe_pipe_names: dict[str, Optional[str]] = {}
 
 
 def _fold_user(raw: str) -> str:
@@ -135,9 +147,10 @@ def _complain(reason: str) -> None:
     module cannot detect any other way.
     """
     global _complained
-    if _complained:
-        return
-    _complained = True
+    with _once_lock:
+        if _complained:
+            return
+        _complained = True
     try:
         print(f"agent_counter: agent counter unavailable ({reason})", file=sys.stderr)
     except Exception:  # noqa: BLE001
@@ -151,9 +164,10 @@ def _complain_week(agent_type: str, why: str) -> None:
     """One line, once per provider per process, when a turn ended without a
     weekly figure: the badge then shows the count alone, and this line is
     what tells a missing figure apart from a counter that drew nothing."""
-    if agent_type in _week_complained:
-        return
-    _week_complained.add(agent_type)
+    with _once_lock:
+        if agent_type in _week_complained:
+            return
+        _week_complained.add(agent_type)
     try:
         print(f"agent_counter: no weekly-limit figure for {agent_type} ({why}); "
               f"the badge shows the count alone", file=sys.stderr)
@@ -281,15 +295,42 @@ def _spawn(exe: Path) -> None:
                      stderr=subprocess.DEVNULL)
 
 
+def _listens_elsewhere(exe: Path) -> Optional[str]:
+    """The pipe name `exe` listens on when it is NOT this client's, else None.
+
+    An exe built before a `PIPE_PREFIX` change would be started on every turn
+    and waited for `SPAWN_WAIT_S` in vain; asking it first turns that into one
+    line and no spawn. No answer (an exe older than `--pipe-name`, a crash, a
+    timeout) is not a mismatch: the spawn goes ahead as it always did.
+    """
+    key = str(exe)
+    if key not in _exe_pipe_names:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            done = subprocess.run([key, "--pipe-name"], capture_output=True, text=True,
+                                  timeout=PIPE_NAME_TIMEOUT_S, creationflags=flags)
+            _exe_pipe_names[key] = done.stdout.strip() if done.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            _exe_pipe_names[key] = None
+    named = _exe_pipe_names[key]
+    return named if named and pipe_path() != "\\\\.\\pipe\\" + named else None
+
+
 def _open_or_start() -> Optional[object]:
     handle = _connect()
     if handle is not None:
         return handle
     exe = counter_exe()
     if exe is None:
+        override = os.environ.get(EXE_ENV)
         named = host_policy.counter_paths()
-        _complain(f"{named[0].name} is not built" if named else
+        _complain(f"{EXE_ENV}={override} is not a file" if override else
+                  f"{named[0].name} is not built" if named else
                   "no counter executable (the host policy names none)")
+        return None
+    stale = _listens_elsewhere(exe)
+    if stale:
+        _complain(f"{exe} listens on {stale}, not {pipe_path()}; rebuild it")
         return None
     try:
         _spawn(exe)
