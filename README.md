@@ -219,6 +219,8 @@ examples/
   runCycle.py            state-machine wrapper
   runFileList.py         per-file work-queue wrapper
   runFileListParallel.py parallel work-queue wrapper
+agent-tools/             standalone stdlib scripts for agents (waits, line moves)
+                         — see agent-tools/README.md
 ideas/                   study material, never shipped — see ideas/README.md
 scripts/
   ci_local.py            the GitHub CI matrix run on this machine, one uv venv
