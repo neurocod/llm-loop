@@ -47,9 +47,12 @@ from . import host_policy
 
 # The pipe name, spelled a SECOND time in `extras/agent-counter/Registry.cpp`. A
 # disagreement is invisible at runtime — this side finds no server, starts one,
-# and still cannot reach it — so `test_beacon_pipe_name_matches_the_counter`
-# reads both files and refuses a mismatch. Change one, change the other.
-PIPE_PREFIX = "multiskill-agents.v1."
+# and still cannot reach it — so a cross-check test
+# (`test_the_pipe_prefix_is_spelled_the_same_in_both_halves`, run by the host
+# that builds the exe) reads both files and refuses a mismatch. Change one,
+# change the other; a running counter of the old name stops seeing new clients
+# until it is rebuilt and restarted, exactly as a version bump would.
+PIPE_PREFIX = "llm-agents.v1."
 
 # Set to 0 to keep the counter out of the way (the test suite does exactly that:
 # a gate run must not put a window on the operator's screen).

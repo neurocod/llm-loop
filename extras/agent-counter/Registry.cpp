@@ -98,7 +98,7 @@ QString agentPipeName() {
 	// The version is part of the NAME, and that is the whole upgrade story: a
 	// new client simply does not find an old running instance, starts its own,
 	// and two protocol versions never half-understand each other.
-	return QStringLiteral("multiskill-agents.v1.") + foldedUser();
+	return QStringLiteral("llm-agents.v1.") + foldedUser();
 }
 
 Registry::Registry(QObject* parent) : QObject(parent) {
