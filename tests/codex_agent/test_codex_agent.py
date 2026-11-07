@@ -4196,7 +4196,7 @@ def test_a_registry_failure_is_not_reported_as_a_failed_turn():
 
 # --- the on-screen counter ------------------------------------------------
 
-# The other half of these lives in `AgentCounter/`, and is pinned by
+# The other half of these lives in `extras/agent-counter/`, and is pinned by
 # `AgentCounter.exe --selftest`: the count, an abrupt client death, the start
 # race. Only a built exe can serve a named pipe (the stdlib can connect to one
 # but cannot create one), so the round trip below is the single place both

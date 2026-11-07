@@ -2,8 +2,9 @@
 
 A background agent is invisible: the turn takes minutes, the chat that launched
 it has moved on, and nothing on screen says work is still happening. `AgentCounter`
-(a badge with provider icons and counts at the top, `AgentCounter/`) answers that, and this
-module is the half that reports.
+(a badge with provider icons and counts at the top, `extras/agent-counter/`) answers
+that, and this module is the half that reports. The badge is OPTIONAL: without its
+executable this module shows nothing, fails nothing, and says so once (`_complain`).
 
 The report is the CONNECTION, not a message. This process opens the counter's
 named pipe when the turn starts and holds it until the turn ends; the count is
@@ -44,7 +45,7 @@ from typing import Iterator, Optional
 from . import host_policy
 
 
-# The pipe name, spelled a SECOND time in `AgentCounter/Registry.cpp`. A
+# The pipe name, spelled a SECOND time in `extras/agent-counter/Registry.cpp`. A
 # disagreement is invisible at runtime — this side finds no server, starts one,
 # and still cannot reach it — so `test_beacon_pipe_name_matches_the_counter`
 # reads both files and refuses a mismatch. Change one, change the other.
@@ -84,7 +85,7 @@ BUSY_WAIT_S = 1.0
 MAX_LABEL_CHARS = 120
 
 # The hello's optional weekly-limit REMAINDER (0..100, whole percent), read by
-# `Registry::handleLine` / `weekLeftFrom` in AgentCounter/Registry.cpp.
+# `Registry::handleLine` / `weekLeftFrom` in extras/agent-counter/Registry.cpp.
 WEEK_LEFT_FIELD = "week_left"
 
 _complained = False
