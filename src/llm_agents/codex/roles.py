@@ -80,7 +80,7 @@ def _reviewer_briefing(worktree_briefed: bool, scratch: Optional[Path],
     were written, not permissions. Accept the same environment inputs as the
     worker factory so the role table dispatches without a parallel if-chain.
     The text is shared with `claude_agent --profile review`
-    (`tools._shared.answer_contract`), so both reviews of one commit merge.
+    (`llm_agents.answer_contract`), so both reviews of one commit merge.
     """
     return REVIEWER_BRIEFING
 

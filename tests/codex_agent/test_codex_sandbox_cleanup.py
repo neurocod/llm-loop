@@ -4,9 +4,7 @@ from test_codex_agent import _no_badge  # noqa: F401 — see _no_badge docstring
 from pathlib import PurePath
 from llm_agents.codex import sandbox
 from llm_agents.codex.registry import AgentRecord
-from codex_wrap_support import (
-    _PS,
-)
+from llm_agents.codex.testing import PS as _PS
 
 
 def test_the_judge_lets_an_agent_delete_its_own_pytest_basetemp(tmp_path):

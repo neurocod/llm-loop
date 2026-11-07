@@ -20,7 +20,7 @@ from llm_agents.codex.command_arguments import _args_refusal
 from llm_agents.codex.command_dispatch import Shape, argv_refusal
 from llm_agents.codex.command_node import NpmScript, _npm
 from llm_agents.codex.registry import AgentRecord, Registry
-from codex_wrap_support import _PS
+from llm_agents.codex.testing import PS as _PS
 from llm_agents import agent_counter, host_policy
 from llm_agents.host_policy import (
     EMPTY, GIT_STORE, HostPolicy, Reserved, WorkerCommands)

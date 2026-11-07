@@ -3206,7 +3206,7 @@ def test_a_reviewer_prompt_with_numbered_questions_expects_every_number():
 
 def test_the_reviewer_briefing_is_the_one_claude_agent_reviews_with():
     """The orchestrator merges a Codex and a Claude review of one commit; the
-    two briefings are one text (`tools._shared.answer_contract`), so neither
+    two briefings are one text (`llm_agents.answer_contract`), so neither
     wrapper can drift the skeleton alone."""
     from llm_agents.codex.roles import role_briefing
     from llm_agents.answer_contract import REVIEWER_BRIEFING
