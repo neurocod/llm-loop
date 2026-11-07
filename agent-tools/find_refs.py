@@ -47,12 +47,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from typing import Sequence
 
 # Exit code of a search that could not run at all (no git, no repository):
-# not a finding's 1, and not git grep's own >1 either.
+# inside the docstring's ">1 = the search failed" range, never a finding's 1.
 NO_REPO_EXIT = 2
 
 
@@ -103,7 +104,12 @@ def repo_top(start: str | None) -> str | None:
     """The top level of the repository holding <start> (the cwd when None), or
     None after printing why there is none. A missing `git` is answered like a
     missing work tree, not with a traceback: whoever reads the output wants the
-    tool and the fix named, which `FileNotFoundError` from a subprocess is not."""
+    tool and the fix named, which `FileNotFoundError` from a subprocess is not.
+    A <start> that is no directory is named as such first: otherwise the same
+    OSError reads as a missing git."""
+    if start is not None and not os.path.isdir(start):
+        print(f"find_refs: --repo is not a directory: {start}", file=sys.stderr)
+        return None
     try:
         out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=start,
                              capture_output=True, text=True, encoding="utf-8",

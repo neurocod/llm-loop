@@ -70,6 +70,13 @@ def test_without_a_repository_the_gate_judges_nothing(tmp_path):
     assert "not inside a git work tree" in done.stderr
 
 
+def test_a_missing_repo_directory_is_named_as_such(tmp_path):
+    missing = tmp_path / "no-such-dir"
+    done = _gate("--repo", str(missing), "staleName", cwd=tmp_path)
+    assert done.returncode == find_refs.NO_REPO_EXIT, done.stdout + done.stderr
+    assert f"--repo is not a directory: {missing}" in done.stderr
+
+
 def test_a_malformed_aside_is_refused():
     with pytest.raises(SystemExit):
         find_refs.build_parser("x", with_glob=False).parse_args(["--aside", "notes/", "n"])
