@@ -48,7 +48,7 @@ class MoveError(Exception):
 
 
 def parse_ranges(specs: list[str], line_count: int) -> list[tuple[int, int]]:
-    """The ranges as 0-based half-open (start, end); raises {@link MoveError}."""
+    """The ranges as 0-based half-open (start, end); raises MoveError."""
     out: list[tuple[int, int]] = []
     for spec in specs:
         match = RANGE.match(spec)

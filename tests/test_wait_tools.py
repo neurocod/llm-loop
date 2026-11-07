@@ -1,7 +1,9 @@
 """agent-tools' waiters: they end by themselves, on the marker or the timeout."""
 
+import queue
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -34,6 +36,21 @@ def test_follow_file_takes_a_preset_the_caller_defines(tmp_path):
                 "=== summary ===", "--preset", "batch", "--poll", "0.05",
                 "--timeout", "30")
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_follow_file_define_preset_extends_a_built_in_one(tmp_path):
+    log = tmp_path / "task.out"
+    log.write_text("[exited with code 3]\n", encoding="utf-8")
+    done = _run("follow_file.py", str(log), "--define-preset", "task", "never",
+                "--preset", "task", "--poll", "0.05", "--timeout", "30")
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_follow_file_refuses_an_invalid_regex_when_it_is_defined(tmp_path):
+    done = _run("follow_file.py", str(tmp_path / "x"), "--define-preset", "bad",
+                "(", "--timeout", "30")
+    assert done.returncode == 2
+    assert "--define-preset bad: invalid regex" in done.stderr
 
 
 def test_follow_file_refuses_an_unknown_preset_by_name(tmp_path):
@@ -90,14 +107,25 @@ def test_wait_file_gone_waits_for_the_file_to_go(tmp_path):
     waiter = subprocess.Popen(
         [sys.executable, str(TOOLS / "wait_file_gone.py"), str(stop), "--poll", "0.05"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
+    lines: "queue.Queue[str]" = queue.Queue()
+    # A reader thread, so a waiter that stalls before its banner fails the test
+    # after CAP_S instead of hanging a bare readline() forever.
+    reader = threading.Thread(
+        target=lambda: [lines.put(line) for line in waiter.stdout], daemon=True)
+    reader.start()
     try:
         # The banner says the waiter saw the file, so the removal below is
         # what ends it rather than a race with its first check.
-        assert "waiting for" in waiter.stdout.readline()
+        banner = lines.get(timeout=CAP_S)
+        assert "waiting for" in banner
         stop.unlink()
-        out, _ = waiter.communicate(timeout=CAP_S)
+        waiter.wait(timeout=CAP_S)
+        reader.join(timeout=CAP_S)
     finally:
         if waiter.poll() is None:
             waiter.kill()
+        waiter.wait()
+        waiter.stdout.close()
+    out = "".join(lines.queue)
     assert waiter.returncode == 0, out
     assert "gone after" in out

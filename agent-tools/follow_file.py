@@ -76,8 +76,10 @@ def main() -> int:
                          + ", ".join(sorted(PRESETS)))
     ap.add_argument("--define-preset", nargs=2, action="append", default=[],
                     metavar=("NAME", "REGEX"),
-                    help="add REGEX to the preset NAME, creating it if new (repeatable); "
-                         "how a host project's wrapper supplies its own markers")
+                    help="add REGEX to the preset NAME, creating it if new; it extends "
+                         "a preset and never replaces one (repeatable). An invalid REGEX "
+                         "exits 2 at once. A REGEX starting with '-': write it as "
+                         "[-]... or \\-...")
     ap.add_argument("--settle", type=int, default=1,
                     help="polls the match must persist before exiting, so trailing lines "
                          "after the marker are printed too (default 1)")
@@ -92,6 +94,10 @@ def main() -> int:
 
     presets = {name: list(patterns) for name, patterns in PRESETS.items()}
     for name, pattern in args.define_preset:
+        try:
+            re.compile(pattern, re.MULTILINE)
+        except re.error as exc:
+            ap.error(f"--define-preset {name}: invalid regex {pattern!r}: {exc}")
         presets.setdefault(name, []).append(pattern)
     unknown = [name for name in args.preset if name not in presets]
     if unknown:
