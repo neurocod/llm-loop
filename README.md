@@ -222,6 +222,8 @@ examples/
 agent-tools/             standalone stdlib scripts for agents (waits, line moves)
                          — see agent-tools/README.md
 ideas/                   study material, never shipped — see ideas/README.md
+extras/                  optional native add-ons outside the pip package; today
+                         agent-counter/, the Qt badge for running agents
 scripts/
   ci_local.py            the GitHub CI matrix run on this machine, one uv venv
                          per Python: `python scripts/ci_local.py [3.10 ...]`
