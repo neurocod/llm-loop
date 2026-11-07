@@ -1,4 +1,9 @@
-"""Stale file renewal scenarios."""
+"""Stale file renewal scenarios.
+
+The owners are stubbed (`_renewing_judge`), so the copy, the concurrent-write
+checks and the stale-directory rule run on any platform; only the real owner
+reader and the hidden attribute need Windows, and say so where they do.
+"""
 
 from test_codex_agent import _no_badge  # noqa: F401 — see _no_badge docstring
 import os
@@ -7,11 +12,6 @@ from pathlib import Path
 import pytest
 from llm_agents.codex import file_renewal, sandbox
 from llm_agents.codex.registry import AgentRecord
-
-# What is renewed is a file the Windows sandbox account owns; off Windows
-# there is no such owner and `renew_file` never acts.
-pytestmark = pytest.mark.skipif(
-    os.name != "nt", reason="Windows-only: files owned by the Codex sandbox account")
 
 
 def _renewing_judge(tmp_path, monkeypatch, stale=True, stale_dir=False):
@@ -62,15 +62,18 @@ def test_a_file_the_user_owns_is_not_renewed(tmp_path, monkeypatch):
     verdict = judge([str(old)])
     assert verdict and "renewed" not in verdict.reason
     assert os.stat(old).st_ino == before
-    if os.name == "nt":
-        # The real reader: a file this process just wrote is its own, and a
-        # system file is not.
-        monkeypatch.undo()
-        fresh = tmp_path / "fresh.txt"
-        fresh.write_text("x")
-        assert file_renewal._owner_sid(fresh) == file_renewal._user_sid() is not None
-        system = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "notepad.exe"
-        assert file_renewal._owner_sid(system) not in (None, file_renewal._user_sid())
+
+
+@pytest.mark.skipif(os.name != "nt", reason=(
+    "Windows-only: the owner SIDs are read through advapi32; elsewhere "
+    "`_owner_sid` and `_user_sid` answer None by design"))
+def test_the_real_owner_reader_tells_the_user_from_the_system(tmp_path):
+    """A file this process just wrote is its own, and a system file is not."""
+    fresh = tmp_path / "fresh.txt"
+    fresh.write_text("x")
+    assert file_renewal._owner_sid(fresh) == file_renewal._user_sid() is not None
+    system = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "notepad.exe"
+    assert file_renewal._owner_sid(system) not in (None, file_renewal._user_sid())
 
 
 def test_a_write_during_the_renewal_is_kept_not_lost(tmp_path, monkeypatch):
