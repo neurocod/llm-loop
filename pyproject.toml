@@ -70,8 +70,10 @@ llm_loop = ["py.typed"]
 [tool.pytest.ini_options]
 # Replaces a hand-rolled sys.path.insert at the top of every test file. `ideas`
 # is here for test_continuous_claude.py alone: that directory is study
-# material, never shipped, and reachable only while testing.
-pythonpath = ["src", "ideas"]
+# material, never shipped, and reachable only while testing. `agent-tools` is
+# for the tests that import a standalone script as a module (test_cpu_load.py,
+# test_find_refs.py); the scripts themselves never import one another by name.
+pythonpath = ["src", "ideas", "agent-tools"]
 testpaths = ["tests"]
 # The `test` extra's floor, said where an older pytest reads it first.
 minversion = "8.0"
