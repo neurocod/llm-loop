@@ -66,6 +66,7 @@ where = ["src"]
 # consumer's type checker, however complete they are.
 [tool.setuptools.package-data]
 llm_loop = ["py.typed"]
+llm_agents = ["py.typed"]
 
 [tool.pytest.ini_options]
 # Replaces a hand-rolled sys.path.insert at the top of every test file. `ideas`

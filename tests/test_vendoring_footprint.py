@@ -11,15 +11,20 @@ handed an adopter four names - `llm_loop`, `tests`, `examples` and
 project has that package, ours won, and the host's suite would import modules
 it never wrote. The failure is silent and lands far from its cause.
 
-So the invariant is not "the package imports" but "src/ contains the package
-and nothing else". That is a property of the directory, which is why this test
-reads the filesystem instead of importing: under pytest `ideas/` is on the path
-too (test_continuous_claude.py needs it), so an import-based check would be
+So the invariant is not "the packages import" but "src/ contains the packages
+and nothing else": `llm_loop`, and `llm_agents` beside it (the agent bridges,
+a top-level package of their own so that `llm_loop`'s lazy front door stays
+as it is). That is a property of the directory, which is why this test reads
+the filesystem instead of importing: under pytest `ideas/` is on the path too
+(test_continuous_claude.py needs it), so an import-based check would be
 measuring the test environment rather than what an adopter gets.
 """
 from pathlib import Path
 
+import pytest
+
 SRC = Path(__file__).resolve().parents[1] / "src"
+PACKAGES = ["llm_agents", "llm_loop"]
 
 
 def _top_level_names():
@@ -40,14 +45,16 @@ def _top_level_names():
     return sorted(names)
 
 
-def test_src_supplies_only_the_package():
-    assert _top_level_names() == ["llm_loop"]
+def test_src_supplies_only_the_packages():
+    assert _top_level_names() == PACKAGES
 
 
-def test_the_package_is_importable_from_there():
-    assert (SRC / "llm_loop" / "__init__.py").is_file()
+@pytest.mark.parametrize("package", PACKAGES)
+def test_the_package_is_importable_from_there(package):
+    assert (SRC / package / "__init__.py").is_file()
 
 
-def test_the_type_marker_ships():
+@pytest.mark.parametrize("package", PACKAGES)
+def test_the_type_marker_ships(package):
     """PEP 561: without it a consumer's type checker ignores every annotation."""
-    assert (SRC / "llm_loop" / "py.typed").is_file()
+    assert (SRC / package / "py.typed").is_file()

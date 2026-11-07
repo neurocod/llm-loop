@@ -1,0 +1,21 @@
+{
+  "old": {
+    "threadId": "t-old",
+    "cwd": "C:\\work\\slot",
+    "model": "gpt-x",
+    "sandbox": "workspace-write",
+    "created": "2026-11-07 12:00:00",
+    "lastTurn": "2026-11-07 12:05:00",
+    "turns": 1,
+    "touched": "2026-11-07 12:05:00",
+    "escalate": "^tool\\b",
+    "writable": [
+      "C:\\work\\extra"
+    ],
+    "role": "worker",
+    "gates": [
+      "tool gate"
+    ],
+    "allowOnlineProbes": true
+  }
+}
