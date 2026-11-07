@@ -14,6 +14,7 @@ import enum
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ..host_policy import active as host_policy
 from .events import text_of, changed_paths
 
 # How long the wrapper keeps the app-server open after the MAIN thread's turn
@@ -248,8 +249,9 @@ class _Child:
 
 def full_text_command(agent: str, path: str) -> str:
     """The command that prints a child's messages whole (`cli.cmd_logs
-    --child`): where a capped quote sends its reader."""
-    return f"`python tools/codex_agent logs {agent} --child {path}`"
+    --child`): where a capped quote sends its reader, spelled the way the
+    host runs the bridge (`HostPolicy.codex_command`)."""
+    return f"`{host_policy().codex_command} logs {agent} --child {path}`"
 
 
 def _capped(text: str, limit: int, agent: str, path: str) -> str:

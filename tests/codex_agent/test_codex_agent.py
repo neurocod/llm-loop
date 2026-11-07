@@ -112,7 +112,7 @@ LOGGED_OVERLOAD = json.loads(
     "1788311174392}")
 DROPPED_TURN_MESSAGE = LOGGED_DROP["params"]["error"]["message"]
 
-# w2047/events.jsonl, 2026-11-07: the steady part of the network outage.
+# worker-c/events.jsonl, 2026-11-07: the steady part of the network outage.
 # Keep the wire shape and emittedAtMs cadence; the test clock replays minutes
 # instantly, without turning CPU scheduling delays into test failures.
 LOGGED_NETWORK_WAIT = json.loads(
@@ -250,7 +250,7 @@ def sub_agent_turn(main_answer, drop=False):
     """Codex splitting a review: the main thread spawns a child, the child
     finishes FIRST with its subtask's answer, and only then does the main
     thread answer and complete. Shapes (and the three ids' relations) from
-    `.codex-agents/r1544-review/events.jsonl`, lines 48-255 (2026-10-24):
+    `.codex-agents/review-a/events.jsonl`, lines 48-255 (2026-10-24):
     every notification declares its `threadId`, a child's turn carries the
     main turn as `rootTurnId`, and each thread reports its own cumulative
     token usage. `drop`: the service drops the main thread instead of letting
@@ -867,7 +867,7 @@ def run_turn():
                  "command": wrap.format(words)})
         item({"type": "agentMessage", "text": "commit handled"})
     elif SCENARIO == "rate-limits":
-        # The account's weekly figure, the shape of `.codex-agents/f1942`
+        # The account's weekly figure, the shape of `.codex-agents/fix-a`
         # line 31: repeated unchanged, then changed, then a report with only
         # a five-hour window (no weekly figure at all).
         for window, used in ((10080, 82.5), (10080, 82.5), (10080, 90), (300, 5)):
@@ -1638,7 +1638,7 @@ def test_a_sub_agents_tokens_outlive_the_attempt_that_spawned_it(
     """Every attempt of one caller turn starts a fresh `TurnRunner`, and the
     main thread's cumulative total carries the earlier attempts' spend by
     itself — a child's does not: its thread is over, and the next attempt
-    hears nothing of it. r1544-review spent 433k on its child in attempt 1;
+    hears nothing of it. review-a spent 433k on its child in attempt 1;
     after the `--expect` follow-up the summary showed the main thread's
     total alone. The bill is the main thread's newest total plus every
     child's last, whichever attempt it ran in."""
@@ -2069,7 +2069,7 @@ def test_a_long_child_answer_is_capped_in_the_turn_about_it():
     kind, text, finished, cut = tracker.turn_prompt("", "w")
     assert kind == subagents.DONE_TURN and len(finished) == 15
     assert len(text) < subagents.PROMPT_CHARS + 20_000
-    assert ("more characters: `python tools/codex_agent logs w --child "
+    assert ("more characters: `python -m llm_agents.codex logs w --child "
             "/root/c0` prints them") in text
     assert "(omitted: the quoted messages reached" in text
 
@@ -2406,7 +2406,7 @@ def test_logs_label_a_grandchild_and_show_an_interrupted_child(
     so labels learnt from the main thread's records alone printed the
     grandchild's lines as a bare "[sub-agent]". And the main thread
     interrupting a child (`kind: interrupted`, seven times in the logs up to
-    2026-10-24, e.g. `.codex-agents/rev1163` line 204) is as much the child's
+    2026-10-24, e.g. `.codex-agents/rev-f` line 204) is as much the child's
     fate as its completion, and printed nothing."""
     monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
     main = {"threadId": "th-main", "turnId": "t-main"}

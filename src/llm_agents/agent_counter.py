@@ -174,7 +174,7 @@ class Beacon:
     from a thread-pool callback with no buffer cap (qwindowspipereader.cpp,
     `waitCallback`), so even a counter whose GUI thread is busy keeps draining.
     And only a CHANGED figure is written: Codex repeats its report every
-    10–20 s (26 times in one turn of `.codex-agents/f1942`), and a turn should
+    10–20 s (26 times in one turn of `.codex-agents/fix-a`), and a turn should
     write a few lines, not one per provider notification.
 
     A disabled or unreachable counter yields a Beacon with no handle, on which

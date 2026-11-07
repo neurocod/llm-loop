@@ -222,7 +222,7 @@ class TurnRunner:
     activity — its commands and edits count, its tokens are billed — but its
     completion, answer and errors are the main thread's to act on, not ours
     (read as ours, a child's `turn/completed` ended the caller's turn with the
-    CHILD's answer: `.codex-agents/r1544-review`, line 255).
+    CHILD's answer: `.codex-agents/review-a`, line 255).
     Its lifetime is the exception (`subs`): a child still running when the
     main thread completes keeps the server open
     (`subagent_wait.await_main_and_sub_agents`).
@@ -245,7 +245,7 @@ class TurnRunner:
         self._week_used = week_used or (earlier._week_used if earlier else None)
         # Each thread's own cumulative `tokenUsage.total` (in, cached, out):
         # the main thread and every sub-agent report theirs separately
-        # (measured on `.codex-agents/r1544-review`: the child's first reading
+        # (measured on `.codex-agents/review-a`: the child's first reading
         # was 36k against the main thread's 115k), so the bill is their sum.
         # That holds only while a forked child's total starts at zero, i.e.
         # while threads stay paginated — the condition and its Codex source
@@ -256,7 +256,7 @@ class TurnRunner:
         # across attempts by itself (`_carry_over`) and its next reading
         # replaces the entry, but a child's thread is over with the attempt
         # that spawned it and never reports again — started empty, the
-        # follow-up of r1544-review dropped the child's 433k from the bill.
+        # follow-up of review-a dropped the child's 433k from the bill.
         self._totals: dict[str, tuple[int, int, int]] = (
             dict(earlier._totals) if earlier is not None else {})
         self._sum_totals()

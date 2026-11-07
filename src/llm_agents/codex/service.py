@@ -122,7 +122,7 @@ def is_network_wait(params: dict) -> bool:
 
     `Reconnecting... 5/5` alone is also emitted for service faults; a 429 is
     another retry the CLI owns. Neither suspends the attempt's work budget.
-    Shape measured in w2047/events.jsonl, 2026-11-07.
+    Shape measured in worker-c/events.jsonl, 2026-11-07.
     """
     error = params.get("error") or {}
     return (bool(params.get("willRetry"))
@@ -131,10 +131,10 @@ def is_network_wait(params: dict) -> bool:
 
 
 # All seven .codex-agents/*/events.jsonl with actual network waits, scanned
-# 2026-11-07 (218 notifications): rev1105, rev-d, w0460, w1_2022_fix2,
-# w2047, w2050, w2_2031. Largest heartbeat gap: rev-d, 182.785 s;
-# last heartbeat to progress: rev-d 77.717 s, w2_2031 75.573 s,
-# w1_2022_fix2 68.559 s. Round UP twice the largest of both measurements.
+# 2026-11-07 (218 notifications): rev-e, rev-d, worker-a, worker-b,
+# worker-c, worker-d, worker-f. Largest heartbeat gap: rev-d, 182.785 s;
+# last heartbeat to progress: rev-d 77.717 s, worker-f 75.573 s,
+# worker-b 68.559 s. Round UP twice the largest of both measurements.
 # This bounds credited silence, never the lifetime of the attempt itself.
 NETWORK_WAIT_GAP_S = 366.0
 # A separate caller-wide wall-clock allowance, not a work timeout. Two hours
