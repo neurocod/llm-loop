@@ -11,11 +11,14 @@ import os
 import re
 import subprocess
 import threading
+import uuid
 from pathlib import Path
 
 import pytest
 
 from llm_agents import agent_counter, host_policy
+from llm_agents.claude import follow_up, worker
+from llm_agents.claude.state import Store
 from llm_agents.host_policy import HostPolicy
 
 REGISTRY_CPP = Path(__file__).resolve().parents[1] / "extras" / "agent-counter" / "Registry.cpp"
@@ -65,6 +68,37 @@ def recorded(monkeypatch):
     monkeypatch.setattr(agent_counter, "_open_or_start", lambda: _Recorder(messages))
     monkeypatch.setattr(agent_counter, "_week_complained", set())
     return messages
+
+
+@windows_only
+@pytest.mark.parametrize("agent_type, expected", [
+    ("claude", "claude"), ("codex", "codex"), ("unknown", "unknown"), ("other", "unknown"),
+])
+def test_shared_client_transmits_type_independently_of_label(recorded, agent_type, expected):
+    with agent_counter.announce("claude:misleading-label", agent_type=agent_type):
+        pass
+    assert recorded == [{"op": "hello", "label": "claude:misleading-label", "agent_type": expected}]
+
+
+@windows_only
+def test_a_worker_turn_feeds_its_streams_weekly_figure_to_its_counter(recorded, tmp_path, monkeypatch):
+    """The PLACE of the wiring: worker -> answer_turn -> run_turn's callback."""
+    name = f"week-{uuid.uuid4().hex}"
+    store = Store(tmp_path / "state")
+    store.create(name, tmp_path, {}, "No model runs in this test")
+
+    def fake_turn(*args, on_week_used=None, **kwargs):
+        on_week_used(40.0, "")
+        return {"status": "completed", "answer": "Offline weekly-figure probe"}
+
+    def unexpected_launch(*args, **kwargs):
+        raise AssertionError("An offline counter test must never launch a provider worker")
+
+    monkeypatch.setattr(follow_up, "run_turn", fake_turn)
+    monkeypatch.setattr(worker, "launch", unexpected_launch)
+    worker.work(store, name)
+    assert store.get(name)["status"] == "completed", store.get(name)
+    assert [(m["agent_type"], m.get("week_left")) for m in recorded] == [("claude", None), ("claude", 60)]
 
 
 @windows_only

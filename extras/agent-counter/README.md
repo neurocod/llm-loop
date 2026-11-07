@@ -2,9 +2,7 @@
 
 An optional on-screen badge that shows how many background agents (Claude,
 Codex) are running right now, with the provider's weekly-limit remainder when
-the provider reports one. The client half is `src/llm_agents/agent_counter.py`:
-each running agent holds one named-pipe connection for the length of its turn,
-and the badge counts the connections.
+the provider reports one. The client half is `src/llm_agents/agent_counter.py`.
 
 - **Windows only.** It speaks a Windows named pipe; `main.cpp` has never been
   built or run on another OS.
