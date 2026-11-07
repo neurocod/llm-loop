@@ -21,6 +21,8 @@ import uuid
 
 from functools import partial
 
+from llm_loop.procend import end_process_tree
+
 from .. import host_policy
 from ..answer_contract import REVIEWER_BRIEFING
 from ..child_job import ChildJob
@@ -227,22 +229,23 @@ def child_environment(*, review: bool = False) -> dict[str, str]:
     return env
 
 
-def terminate_tree(proc: subprocess.Popen) -> None:
-    """Terminate only the child owned by this live Popen, never a persisted PID."""
-    if os.name == "nt":
-        if proc.poll() is not None:
-            return
-        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       creationflags=subprocess.CREATE_NO_WINDOW, check=False)
-    else:
+def _end_child(proc: subprocess.Popen) -> None:
+    """End the CLI child owned by this live Popen, never a persisted PID:
+    bounded and never raising (`finally` blocks call it). The escalation is
+    `llm_loop.procend.end_process_tree`, as in `codex.protocol._reap`; this
+    keeps only its own prologue. On POSIX the child leads its own session
+    (`start_new_session`), and a tool holding stdout can outlive a leader
+    that already exited: `killpg` reaches the group either way. On Windows
+    the job object (`ChildJob`) ends the descendants. A child that has
+    exited is then left alone."""
+    if os.name != "nt":
         try:
             os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    if proc.poll() is None:
-        proc.kill()
-    proc.wait()
+        except OSError:
+            pass  # the group is gone, or was never ours to signal
+    if proc.poll() is not None:
+        return
+    end_process_tree(proc)
 
 
 RATE_LIMIT_EVENT = "rate_limit_event"
@@ -350,7 +353,7 @@ def run_turn(agent: dict, turn: dict, directory: Path,
                     # A finished CLI can leave a tool holding stdout open.
                     # Release descendants before waiting for the reader's EOF,
                     # otherwise the default unlimited turn never completes.
-                    terminate_tree(proc)
+                    _end_child(proc)
                     job.close()
                     reaped_descendants = True
                 if cancelled():
@@ -401,7 +404,7 @@ def run_turn(agent: dict, turn: dict, directory: Path,
             failure = f"{type(exc).__name__}: {exc}"
         finally:
             if proc is not None:
-                terminate_tree(proc)
+                _end_child(proc)
                 if job:
                     job.close()
                 if writer:
