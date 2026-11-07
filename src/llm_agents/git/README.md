@@ -49,6 +49,7 @@ raise SystemExit(worktree.main(POOL))
 ## Platforms
 
 Shared directories are directory junctions on Windows (no administrator
-rights needed) and symlinks elsewhere; `drop` removes the link before git
-removes the slot, because Git for Windows follows a junction while removing.
+rights needed) and symlinks elsewhere. Before git removes a slot, `drop`
+detaches every link in it that points outside -- the host's or anybody
+else's -- because Git for Windows follows a junction while removing.
 The index-lock wait recognises both POSIX and Windows wording.

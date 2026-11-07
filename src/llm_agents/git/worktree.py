@@ -513,21 +513,74 @@ def share_dirs(path: Path, *, keep_local: bool = False) -> None:
         share_dir(shared, path, keep_local=keep_local)
 
 
-def detach_shared_dirs(path: Path) -> None:
-    """Remove only the links before Git removes the slot.
+def is_link(path: Path) -> bool:
+    return path.is_symlink() or is_directory_junction(path)
+
+
+def is_inside(path: str | Path, root: str | Path) -> bool:
+    target, top = norm(path), norm(root)
+    return target == top or target.startswith(top.rstrip("\\/") + os.sep)
+
+
+def outside_links(root: Path) -> list[tuple[Path, str]]:
+    """Every symlink or junction under `root` whose target lies outside it, as
+    (link, target).
+
+    Walked without following any link, so what a link points at is never
+    listed, let alone entered. A directory that cannot be read may hide a link,
+    so it is a refusal, not a skip.
+    """
+    found: list[tuple[Path, str]] = []
+    folders = [root]
+    while folders:
+        folder = folders.pop()
+        try:
+            entries = list(os.scandir(folder))
+        except OSError as error:
+            raise Fail(f"cannot look for links in {folder} ({error}); removing the slot could follow "
+                       f"one out of it, so remove {root} by hand")
+        for entry in entries:
+            path = Path(entry.path)
+            if is_link(path):
+                target = os.path.realpath(path)
+                if not is_inside(target, root):
+                    found.append((path, target))
+            elif entry.is_dir(follow_symlinks=False):
+                folders.append(path)
+    return found
+
+
+def _remove_link(link: Path) -> None:
+    """The link itself, never its target: unlink a symlink (a POSIX one, or a
+    Windows file symlink), rmdir a junction or a Windows directory symlink."""
+    try:
+        link.unlink()
+    except OSError:
+        os.rmdir(link)
+
+
+def detach_outside_links(path: Path) -> None:
+    """Remove every link that leads out of the slot before anything removes it recursively.
 
     Git for Windows follows directory junctions during `worktree remove
-    --force` (measured 2026-10-05, test_removing_a_worktree_keeps_shared_files).
-    rmdir on the junction itself leaves the main checkout's files intact;
-    never recursively remove this path. Ordinary local directories belong to
-    the slot and are left for Git to remove.
+    --force` and `submodule deinit -f` (measured 2026-10-05,
+    test_removing_a_worktree_keeps_shared_files): left in place, a junction
+    to the main checkout's directory takes that directory's files with the
+    slot. Every link is detached, not only the host's `shared` ones: a link
+    the host does not list -- one made by hand, by a dependency installer, or
+    by a run that knew another host -- costs the same, and the empty host
+    lists none at all. One that cannot be detached is a refusal naming it.
+    Links pointing inside the slot go with the slot, so they are left to Git.
     """
-    for shared in HOST.shared:
-        target = path / Path(shared.path)
-        if target.is_symlink():
-            target.unlink()
-        elif is_directory_junction(target):
-            target.rmdir()
+    listed = {norm(path / Path(shared.path)) for shared in HOST.shared}
+    for link, target in outside_links(path):
+        try:
+            _remove_link(link)
+        except OSError as error:
+            raise Fail(f"cannot detach {link} -> {target} ({error}); removing the slot would follow "
+                       f"it and delete files of {target}. Remove the link by hand, then drop again")
+        if norm(link) not in listed:
+            print(f"detached {link} -> {target} (a link out of the slot)")
 
 
 # ------------------------------------------------------------- submodules
@@ -543,20 +596,32 @@ def has_commit(repo: Path, sha: str) -> bool:
     return git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo, check=False).returncode == 0
 
 
-def fetch_commit(repo: Path, sha: str, sources: list[str]) -> bool:
+def one_line(text: str) -> str:
+    """Git's multi-line output folded into one line of a warning."""
+    return " ".join(text.split())
+
+
+def fetch_commit(repo: Path, sha: str, sources: list[str],
+                 failures: Optional[list[str]] = None) -> bool:
     """Bring `sha` into `repo` from the first source that has it; True when present.
 
     The slot's own clone goes first: a gitlink bumped in a slot points at a
     commit that may exist nowhere else yet (the submodule push is a separate
     step). A failing or timed-out fetch is only a miss -- the land already
-    happened, so nothing here may abort it.
+    happened, so nothing here may abort it -- but not a silent one: each is
+    appended to `failures` as "<source>: <why>" for the caller's warning.
     """
     for source in sources:
         if has_commit(repo, sha):
             return True
-        with contextlib.suppress(Fail):
-            git(["fetch", "--quiet", "--no-tags", source, sha], cwd=repo, check=False,
-                timeout=PUSH_TIMEOUT_S)
+        try:
+            proc = git(["fetch", "--quiet", "--no-tags", source, sha], cwd=repo, check=False,
+                       timeout=PUSH_TIMEOUT_S)
+            why = (one_line(proc.stderr) or f"exit {proc.returncode}") if proc.returncode else ""
+        except Fail as error:      # the timeout
+            why = one_line(str(error))
+        if why and failures is not None:
+            failures.append(f"{source}: {why}")
     return has_commit(repo, sha)
 
 
@@ -570,8 +635,11 @@ def fetch_unpushed_gitlinks(path: Path, subs: list[str]) -> None:
     `equalize` (or a rebase onto such a master) `git submodule update` failed
     with "not our ref" and left the slot showing `M <sub>` (measured
     2026-11-07; the fix by hand was a fetch from the main clone, then the
-    update). A commit the clone already has, or one the main clone lacks too,
-    is left to `submodule update` and its own error.
+    update). A commit the clone already has is left alone, and one the main
+    clone lacks too is left to the clone's own origin, which `submodule
+    update` and `follow_gitlinks` fetch from. A fetch that fails although the
+    main clone has the commit is one warning line naming the submodule, the
+    commit and the commands that fix it by hand.
     """
     for sub in subs:
         repo = path / sub
@@ -579,10 +647,16 @@ def fetch_unpushed_gitlinks(path: Path, subs: list[str]) -> None:
         if norm(path) == norm(main_dir()) or not (repo / ".git").exists():
             continue
         sha = gitlink("HEAD", sub, repo=path)
-        if not sha or has_commit(repo, sha) or not (source / ".git").exists():
+        if not sha or has_commit(repo, sha) or not (source / ".git").exists() or not has_commit(source, sha):
             continue
-        if fetch_commit(repo, sha, [str(source)]):
+        failures: list[str] = []
+        if fetch_commit(repo, sha, [str(source)], failures):
             print(f"{sub}: fetched {sha[:9]} from the main checkout's clone (not on its origin yet)")
+            continue
+        why = "; ".join(failures) or "the fetch reported success, yet the commit is missing"
+        print(f"warning: {sub}: cannot fetch {sha[:9]} from the main checkout's clone ({why}). "
+              f'Fix: git -C "{repo}" fetch "{source}" {sha}, then '
+              f'git -C "{path}" submodule update -- "{sub}"', file=sys.stderr)
 
 
 def follow_gitlinks(slot: Slot) -> None:
@@ -593,6 +667,12 @@ def follow_gitlinks(slot: Slot) -> None:
     stands on the old commit. Only a clean clone whose HEAD is an ancestor of
     the recorded gitlink moves, so commits made in the slot's clone and not
     yet recorded are never left behind; anything else is named and kept.
+
+    Never fatal: `next` has recorded its assignment by now, and the create
+    hook has claimed the slot -- an abort there consumed the assignment, kept
+    the claim and never started the agent. Every miss (a commit nowhere to be
+    fetched, a move git refuses, e.g. over an untracked file the gitlink's
+    commit adds) is a warning naming the submodule and the command.
     """
     initialized = [sub for sub in all_submodules() if (slot.path / sub / ".git").exists()]
     fetch_unpushed_gitlinks(slot.path, initialized)
@@ -600,26 +680,48 @@ def follow_gitlinks(slot: Slot) -> None:
         repo = slot.path / sub
         wanted = gitlink("HEAD", sub, repo=slot.path)
         head = git(["rev-parse", "HEAD"], cwd=repo, check=False).stdout.strip()
-        if not wanted or head == wanted or not has_commit(repo, wanted):
+        if not wanted or head == wanted:
+            continue
+
+        def warn(why: str) -> None:
+            print(f"warning: {slot.name}'s {sub} stays at {head[:9]} although its HEAD records "
+                  f"{wanted[:9]}: {why}. When that is resolved: "
+                  f'git -C "{slot.path}" submodule update -- "{sub}"', file=sys.stderr)
+
+        # Still missing after the main clone's turn: the clone's own origin may
+        # have it, which is where `submodule update` would have looked.
+        failures: list[str] = []
+        if not fetch_commit(repo, wanted, ["origin"], failures):
+            warn(f"{wanted[:9]} is not in its clone, and origin does not give it either "
+                 f"({'; '.join(failures) or 'no error'})")
             continue
         dirty = git(["status", "--porcelain", "--untracked-files=no"], cwd=repo, check=False).stdout.strip()
         forward = git(["merge-base", "--is-ancestor", head, wanted], cwd=repo, check=False).returncode == 0
         if dirty or not forward:
-            why = "it has uncommitted changes" if dirty else "its HEAD is not an ancestor of the gitlink"
-            print(f"warning: {slot.name}'s {sub} stays at {head[:9]} although its HEAD records "
-                  f"{wanted[:9]}: {why}", file=sys.stderr)
+            warn("it has uncommitted changes" if dirty else "its HEAD is not an ancestor of the gitlink")
             continue
-        git(["submodule", "update", "--", sub], cwd=slot.path)
+        moved = git(["submodule", "update", "--", sub], cwd=slot.path, check=False)
+        if moved.returncode != 0:
+            warn(f"submodule update failed: {one_line(moved.stdout + moved.stderr)}")
+            continue
         print(f"{slot.name}'s {sub}: {head[:9]} -> {wanted[:9]} (follows the slot's gitlink)")
 
 
-def reset_to_master(slot: Slot, install: bool) -> None:
-    """The slot's branch := master, dependencies refreshed. Caller has checked it is safe."""
+def reset_to_master(slot: Slot, install: bool, *, strict: bool = True) -> None:
+    """The slot's branch := master, dependencies refreshed. Caller has checked it is safe.
+
+    `strict=False` (the hooks): a failed submodule update is a warning, not an
+    abort, for the reason `follow_gitlinks` gives.
+    """
     git(["reset", "--hard", "master"], cwd=slot.path)
     initialized = [sub for sub in all_submodules() if (slot.path / sub / ".git").exists()]
     if initialized:
         fetch_unpushed_gitlinks(slot.path, initialized)
-        git(["submodule", "update", "--", *initialized], cwd=slot.path)
+        updated = git(["submodule", "update", "--", *initialized], cwd=slot.path, check=strict)
+        if updated.returncode != 0:
+            print(f"warning: {slot.name}'s submodules were not updated: "
+                  f"{one_line(updated.stdout + updated.stderr)}. When that is resolved: "
+                  f'git -C "{slot.path}" submodule update', file=sys.stderr)
     # Keep legacy slots with their own local copies. Missing directories and
     # existing shared links use the main checkout, even with --no-install.
     share_dirs(slot.path, keep_local=True)
@@ -679,8 +781,10 @@ def sync_main_submodules(old_master: str, slot: Slot) -> None:
             warn("it has uncommitted changes")
             continue
         sources = [str(slot.path / sub)] if (slot.path / sub / ".git").exists() else []
-        if not fetch_commit(repo, new, [*sources, "origin"]):
-            warn(f"{new[:9]} is neither in its clone nor fetchable from {slot.name} or origin")
+        failures: list[str] = []
+        if not fetch_commit(repo, new, [*sources, "origin"], failures):
+            warn(f"{new[:9]} is neither in its clone nor fetchable from {slot.name} or origin"
+                 + (f" ({'; '.join(failures)})" if failures else ""))
             continue
         ff_ok = git(["merge-base", "--is-ancestor", head, new], cwd=repo, check=False).returncode == 0
         if not ff_ok:
@@ -863,12 +967,13 @@ def cmd_drop(args: argparse.Namespace) -> int:
     slot = find_slot(slot_named(args))
     if slot.path.is_dir():
         refuse_unless_idle(slot)
+        # Before deinit too: it empties a submodule's tree the same way.
+        detach_outside_links(slot.path)
         for sub in all_submodules():
             if (slot.path / sub / ".git").exists():
                 git(["submodule", "deinit", "-f", "--", sub], cwd=slot.path)
         # --force: git refuses a worktree whose index holds a gitlink even after
         # deinit (measured 2026-09-06); the checks above are what make it safe.
-        detach_shared_dirs(slot.path)
         git(["worktree", "remove", "--force", str(slot.path)], cwd=main_dir())
     else:
         git(["worktree", "prune"], cwd=main_dir())
@@ -956,7 +1061,7 @@ def cmd_hook_create(args: argparse.Namespace) -> int:
         slot, needs_reset, how = choose_slot(name, f"{name or 'unnamed'} session {session or '?'}")
         if needs_reset:
             # A free slot may still lag behind master; bring it up before the agent starts.
-            reset_to_master(slot, install=True)
+            reset_to_master(slot, install=True, strict=False)
         else:
             follow_gitlinks(slot)
             share_dirs(slot.path, keep_local=True)
@@ -982,7 +1087,7 @@ def cmd_hook_remove(args: argparse.Namespace) -> int:
             print(f"worktree hook remove: {slot.name} is {state.describe()}; keeping it as is")
             return 0
         unclaim(slot)
-        reset_to_master(slot, install=False)
+        reset_to_master(slot, install=False, strict=False)
         print(f"worktree hook remove: {slot.name} returned to the pool")
     return 0
 

@@ -249,6 +249,8 @@ def test_removing_a_worktree_keeps_shared_files(tmp_path, monkeypatch, hosted):
     model.write_bytes(b"shared chair")
     worktree.share_dirs(slot)
     # Exercise the real drop command: Git alone follows a Windows junction.
+    # Only ever on a slot under this test's own directory.
+    assert slot.resolve().is_relative_to(tmp_path.resolve())
     pool_slot = worktree.Slot(2, slot, "wt2", "head", False)
     monkeypatch.setattr(worktree, "find_slot", lambda spec: pool_slot)
     monkeypatch.setattr(worktree, "refuse_unless_idle", lambda slot: None)
@@ -256,3 +258,63 @@ def test_removing_a_worktree_keeps_shared_files(tmp_path, monkeypatch, hosted):
     assert worktree.cmd_drop(_parse(["drop", "wt2"])) == 0
     assert not slot.exists()
     assert model.read_bytes() == b"shared chair"
+
+
+def _link(link, target):
+    """A directory junction on Windows (what a host's share makes there), a symlink elsewhere."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if worktree.os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(str(target.resolve()), str(link.absolute()))
+    else:
+        link.symlink_to(target.resolve(), target_is_directory=True)
+
+
+@pytest.fixture
+def slot_with_an_unlisted_link(tmp_path, monkeypatch):
+    """A real slot holding a link the host never listed (the EMPTY host lists
+    none), ignored by git so the slot counts as clean, to a directory OUTSIDE
+    the slot."""
+    main, slot, outside = tmp_path / "main", tmp_path / "main-wt2", tmp_path / "outside"
+    main.mkdir()
+    (outside / "keep").mkdir(parents=True)
+    precious = outside / "keep" / "precious.bin"
+    precious.write_bytes(b"not the slot's")
+    monkeypatch.setattr(worktree, "HOST", worktree.EMPTY)
+    monkeypatch.setattr(worktree, "main_dir", lambda: main)
+    git(main, "init", "-q", "-b", "master")
+    (main / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    git(main, "add", ".gitignore")
+    git(main, "commit", "-q", "-m", "Initial")
+    git(main, "worktree", "add", "-q", "-b", "wt2", str(slot))
+    link = slot / "cache" / "deep" / "outside"
+    _link(link, outside)
+    assert worktree.is_link(link) and (link / "keep" / "precious.bin").is_file()
+    # Only ever on a slot under this test's own directory.
+    assert slot.resolve().is_relative_to(tmp_path.resolve())
+    pool_slot = worktree.Slot(2, slot, "wt2", "", False)
+    monkeypatch.setattr(worktree, "find_slot", lambda spec: pool_slot)
+    return slot, link, precious
+
+
+def test_drop_with_the_empty_host_keeps_what_an_unlisted_link_points_at(slot_with_an_unlisted_link, capsys):
+    """Git for Windows follows a junction while removing a worktree, and the
+    empty host lists no shared directory: the kit itself must detach it."""
+    slot, link, precious = slot_with_an_unlisted_link
+    assert worktree.cmd_drop(_parse(["drop", "wt2"])) == 0
+    assert not slot.exists()
+    assert precious.read_bytes() == b"not the slot's"
+    assert f"detached {link}" in capsys.readouterr().out
+
+
+def test_a_link_that_cannot_be_detached_stops_the_drop_naming_it(slot_with_an_unlisted_link, monkeypatch):
+    slot, link, precious = slot_with_an_unlisted_link
+
+    def stuck(path):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(worktree, "_remove_link", stuck)
+    with pytest.raises(worktree.Fail, match="cannot detach") as refused:
+        worktree.cmd_drop(_parse(["drop", "wt2"]))
+    assert str(link) in str(refused.value)
+    assert slot.is_dir() and precious.is_file()

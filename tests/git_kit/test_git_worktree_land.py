@@ -7,6 +7,7 @@ whose own submodule clone makes the bumped commit (never pushed upstream, the
 way a slot's submodule commit sits before its push).
 """
 
+import io
 import subprocess
 
 import pytest
@@ -265,3 +266,75 @@ def test_next_keeps_a_slot_s_unrecorded_submodule_work(repos, capsys):
     assert command("next", "wt2") == 0
     assert run(slot / "sub", "rev-parse", "HEAD") == mine
     assert "not an ancestor of the gitlink" in capsys.readouterr().err
+
+
+def test_a_failed_fetch_from_the_main_clone_is_one_warning_naming_the_fix(repos, monkeypatch, capsys):
+    """A fetch that failed printed nothing, and the slot silently stayed on the
+    old commit showing `M sub`."""
+    main, slot, base = repos
+    landed = bump_in_main(main)
+    run(slot, "rebase", "-q", "master")
+    real = worktree.git
+
+    def no_fetch(args, **kwargs):
+        if args[0] == "fetch":
+            return subprocess.CompletedProcess(args, 128, "", "fatal: simulated refusal\n")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(worktree, "git", no_fetch)
+    assert command("next", "wt2") == 0
+    assert run(slot / "sub", "rev-parse", "HEAD") == base
+    err = capsys.readouterr().err
+    fetch_line = next(line for line in err.splitlines() if "cannot fetch" in line)
+    assert fetch_line.startswith(f"warning: sub: cannot fetch {landed[:9]} from the main checkout's clone")
+    assert "fatal: simulated refusal" in fetch_line
+    assert f'git -C "{slot / "sub"}" fetch "{main / "sub"}" {landed}' in fetch_line
+    # And the follow step names the commit it could not reach.
+    assert f"{landed[:9]} is not in its clone, and origin does not give it either" in err
+
+
+def test_a_gitlink_only_origin_has_is_fetched_from_origin(repos, tmp_path, capsys):
+    """Skipping a commit the slot's clone lacks also kept `submodule update`
+    from fetching one that is on the submodule's origin."""
+    main, slot, base = repos
+    upstream = tmp_path / "upstream"
+    pushed = commit_file(upstream, "a.txt", "pushed")
+    run(main, "update-index", "--cacheinfo", f"160000,{pushed},sub")
+    run(main, "commit", "-q", "-m", "record a pushed commit the main clone never fetched")
+    commit_file(slot, "work.txt", "task")
+    run(slot, "rebase", "-q", "master")
+    assert command("next", "wt2") == 0
+    assert run(slot / "sub", "rev-parse", "HEAD") == pushed
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_a_follow_git_refuses_warns_and_the_hook_still_starts_the_agent(repos, monkeypatch, capsys):
+    """`next` records its assignment and the create hook claims the slot
+    before the submodule follow: an abort there stranded both and the agent
+    never started. Here the gitlink's commit adds a file the slot's clone has
+    untracked, so `submodule update` refuses to overwrite it."""
+    main, slot, base = repos
+    landed = commit_file(main / "sub", "new.txt", "landed")
+    run(main, "add", "sub")
+    run(main, "commit", "-q", "-m", "bump sub with a new file")
+    commit_file(slot, "work.txt", "task")
+    run(slot, "rebase", "-q", "master")
+    (slot / "sub" / "new.txt").write_text("mine, untracked\n", encoding="utf-8")
+
+    assert command("next", "wt2") == 0
+    err = capsys.readouterr().err
+    assert "submodule update failed" in err and landed[:9] in err
+    assert (main / ".git" / worktree.NEXT_FILE).read_text() == "wt2"
+
+    pool_slot = worktree.Slot(2, slot, "wt2", "", False)
+    monkeypatch.setattr(worktree, "list_slots", lambda: [pool_slot])
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    monkeypatch.setattr(worktree, "push_master", lambda: True)
+    monkeypatch.setattr(worktree.sys, "stdin", io.StringIO('{"name": "agent", "session_id": "s"}'))
+    printed = io.StringIO()
+    monkeypatch.setattr(worktree.sys, "__stdout__", printed)
+    assert command("hook-create") == 0
+    assert printed.getvalue().strip() == str(slot)
+    assert "submodule update failed" in capsys.readouterr().err
+    assert (slot / "sub" / "new.txt").read_text(encoding="utf-8") == "mine, untracked\n"
+    run(main, "worktree", "unlock", str(slot))

@@ -12,10 +12,8 @@ which needs a human rather than a union.
 Why a tool and not an editor: two branches that both APPEND to a journal or a
 backlog produce one conflict per shared insertion point, and the right answer
 is almost always "keep both". Deleting the markers by hand over a thousand-line
-hunk is where a paragraph goes missing silently (precedent: the refactoring
-backlog on 2026-08-22, back when it was one file; it is a directory now, and a
-journal still appends the way that one did). Exit code 1 on any refusal; 0 after
-writing (or on --dry-run).
+hunk is where a paragraph goes missing silently. Exit code 1 on any refusal; 0
+after writing (or on --dry-run).
 """
 from __future__ import annotations
 
@@ -23,10 +21,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
-
-# How the usage line above spells this command; a host's stand-in passes its
-# own spelling to `main`, which substitutes it in the help text.
-COMMAND = "python -m llm_agents.git.union_conflicts"
+from typing import Optional
 
 OURS = "<<<<<<< "
 SEP = "=======\n"
@@ -71,8 +66,10 @@ def resolve(text: str, specs: dict[int, str], default: str) -> tuple[str, int]:
     return "".join(out), hunk
 
 
-def main(command: str = COMMAND) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.replace(COMMAND, command),
+def main(description: Optional[str] = None) -> int:
+    """`description`: a host's own help text (its spelling of the command, its
+    precedents) in place of this module's docstring."""
+    ap = argparse.ArgumentParser(description=description or __doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("file")
     ap.add_argument("--hunk", action="append", default=[], metavar="N=SPEC")
