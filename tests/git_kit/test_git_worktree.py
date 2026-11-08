@@ -282,7 +282,7 @@ def slot_with_an_unlisted_link(tmp_path, monkeypatch):
     precious.write_bytes(b"not the slot's")
     monkeypatch.setattr(worktree, "HOST", worktree.EMPTY)
     monkeypatch.setattr(worktree, "main_dir", lambda: main)
-    git(main, "init", "-q", "-b", "master")
+    git(main, "init", "-q", "-b", worktree.EMPTY.main_branch)
     (main / ".gitignore").write_text("cache/\n", encoding="utf-8")
     git(main, "add", ".gitignore")
     git(main, "commit", "-q", "-m", "Initial")

@@ -36,7 +36,9 @@ A project hands its rules to `main` from a small entry point of its own:
   `-C`;
 - `worktree.PoolHost`: how the project spells the command, the submodules a
   new slot gets, directories only the main checkout fills (`SharedDir`,
-  linked into every slot), the dependency install step, notes and help texts.
+  linked into every slot), the dependency install step, notes and help texts,
+  the main branch and remote (`main`, `origin`) and whether commands push on
+  their own (off: `--push` asks for it).
 
 ```python
 from llm_agents.git import worktree

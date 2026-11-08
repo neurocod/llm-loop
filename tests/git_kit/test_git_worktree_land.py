@@ -19,7 +19,8 @@ _CONFIG = {
     "user.name": "Land test",
     "user.email": "test@example.com",
     "commit.gpgsign": "false",
-    "init.defaultBranch": "master",
+    # The empty host's main branch (`PoolHost.main_branch`).
+    "init.defaultBranch": "main",
 }
 
 
@@ -165,7 +166,7 @@ def test_a_moved_nested_gitlink_is_named(repos, tmp_path, capsys):
     run(main / "sub", "checkout", "-q", "--detach", with_inner)
     run(main / "sub", "submodule", "update", "-q", "--init", "--", "inner")
     commit_file(inner, "i.txt", "two")
-    run(slot / "sub" / "inner", "pull", "-q", "origin", "master")
+    run(slot / "sub" / "inner", "pull", "-q", "origin", "main")
     run(slot / "sub", "add", "inner")
     run(slot / "sub", "commit", "-q", "-m", "bump inner")
     new = run(slot / "sub", "rev-parse", "HEAD")
@@ -181,6 +182,7 @@ def test_a_failing_sync_still_releases_the_slot_and_pushes(repos, monkeypatch, c
     bump_in_slot(slot)
     run(main, "worktree", "lock", "--reason", "claimed", str(slot))
     pushed = []
+    monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(push_by_default=True))
     monkeypatch.setattr(worktree, "push_master", lambda: pushed.append(True) or True)
 
     def broken(old_master, pool_slot):
@@ -191,6 +193,64 @@ def test_a_failing_sync_still_releases_the_slot_and_pushes(repos, monkeypatch, c
     assert pushed == [True]
     assert "locked" not in run(main, "worktree", "list", "--porcelain")
     assert "sync exploded" in capsys.readouterr().err
+
+
+def test_the_empty_host_lands_into_main_and_pushes_only_when_asked(repos, monkeypatch, capsys):
+    """A stranger's first `land` must not publish anything: the empty host
+    lands into `main` and pushes only on `--push`, to `origin`."""
+    main, slot, base = repos
+    assert (worktree.EMPTY.main_branch, worktree.EMPTY.remote) == ("main", "origin")
+    pushed = []
+    monkeypatch.setattr(worktree, "push_master", lambda: pushed.append(True) or True)
+    commit_file(slot, "one.txt", "first")
+    assert command("land", "wt2") == 0
+    assert pushed == []
+    assert run(main, "rev-parse", "main") == run(slot, "rev-parse", "HEAD")
+    out = capsys.readouterr().out
+    assert "main -> " in out
+    assert "push skipped (this pool does not push by default; --push pushes main to origin)" in out
+    commit_file(slot, "two.txt", "second")
+    assert command("land", "wt2", "--push") == 0
+    assert pushed == [True]
+    with pytest.raises(worktree.Fail, match="both --push and --no-push"):
+        command("land", "wt2", "--push", "--no-push")
+
+
+def test_a_pushing_host_pushes_its_branch_to_its_remote(repos, monkeypatch, capsys):
+    main, slot, base = repos
+    calls = []
+    real = worktree.git
+
+    def recording(args, **kwargs):
+        if args[0] == "push":
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(worktree, "git", recording)
+    monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(
+        main_branch="main", remote="upstream", push_by_default=True))
+    commit_file(slot, "one.txt", "first")
+    assert command("land", "wt2") == 0
+    assert calls == [["push", "upstream", "main"]]
+    assert "pushed main to upstream" in capsys.readouterr().out
+    commit_file(slot, "two.txt", "second")
+    assert command("land", "wt2", "--no-push") == 0
+    assert len(calls) == 1
+    assert "push skipped (--no-push)" in capsys.readouterr().out
+
+
+def test_the_help_lists_the_push_flag_that_changes_something(monkeypatch):
+    def land_help():
+        choices = worktree.build_parser()._subparsers._group_actions[0].choices
+        return " ".join(choices["land"].format_help().split())
+
+    monkeypatch.setattr(worktree, "HOST", worktree.EMPTY)
+    assert "--push push main to origin afterwards" in land_help()
+    assert "--no-push" not in land_help()
+    monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(main_branch="trunk", push_by_default=True))
+    assert "--no-push do not push trunk afterwards" in land_help()
+    assert "--push " not in land_help()
 
 
 def test_all_submodules_keeps_a_path_with_spaces_whole(repos, tmp_path):
@@ -251,7 +311,7 @@ def test_next_moves_a_rebased_slot_s_clean_submodule_forward(repos, capsys):
     main, slot, base = repos
     landed = bump_in_main(main)
     commit_file(slot, "work.txt", "task")
-    run(slot, "rebase", "-q", "master")
+    run(slot, "rebase", "-q", "main")
     assert command("next", "wt2") == 0
     assert run(slot / "sub", "rev-parse", "HEAD") == landed
     assert run(slot, "status", "--porcelain") == ""
@@ -261,7 +321,7 @@ def test_next_moves_a_rebased_slot_s_clean_submodule_forward(repos, capsys):
 def test_next_keeps_a_slot_s_unrecorded_submodule_work(repos, capsys):
     main, slot, base = repos
     bump_in_main(main)
-    run(slot, "rebase", "-q", "master")
+    run(slot, "rebase", "-q", "main")
     mine = commit_file(slot / "sub", "mine.txt", "unrecorded")
     assert command("next", "wt2") == 0
     assert run(slot / "sub", "rev-parse", "HEAD") == mine
@@ -273,7 +333,7 @@ def test_a_failed_fetch_from_the_main_clone_is_one_warning_naming_the_fix(repos,
     old commit showing `M sub`."""
     main, slot, base = repos
     landed = bump_in_main(main)
-    run(slot, "rebase", "-q", "master")
+    run(slot, "rebase", "-q", "main")
     real = worktree.git
 
     def no_fetch(args, **kwargs):
@@ -302,7 +362,7 @@ def test_a_gitlink_only_origin_has_is_fetched_from_origin(repos, tmp_path, capsy
     run(main, "update-index", "--cacheinfo", f"160000,{pushed},sub")
     run(main, "commit", "-q", "-m", "record a pushed commit the main clone never fetched")
     commit_file(slot, "work.txt", "task")
-    run(slot, "rebase", "-q", "master")
+    run(slot, "rebase", "-q", "main")
     assert command("next", "wt2") == 0
     assert run(slot / "sub", "rev-parse", "HEAD") == pushed
     assert "warning" not in capsys.readouterr().err
@@ -318,7 +378,7 @@ def test_a_follow_git_refuses_warns_and_the_hook_still_starts_the_agent(repos, m
     run(main, "add", "sub")
     run(main, "commit", "-q", "-m", "bump sub with a new file")
     commit_file(slot, "work.txt", "task")
-    run(slot, "rebase", "-q", "master")
+    run(slot, "rebase", "-q", "main")
     (slot / "sub" / "new.txt").write_text("mine, untracked\n", encoding="utf-8")
 
     assert command("next", "wt2") == 0

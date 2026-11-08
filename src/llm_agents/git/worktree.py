@@ -3,7 +3,7 @@
 
 The unit of occupancy is a TASK, not an agent: the slot hosts the whole pipeline
 of one task (implement -> review -> fixes -> refactor pass) and is handed back
-once the task's commits are on master. Slots are siblings of the main checkout
+once the task's commits are on the main branch. Slots are siblings of the main checkout
 (`<repo>-wt1`, ...) on branches `wt1`, ... (`slots.py` holds the naming rule);
 created ONCE and kept, because a dependency install and a build configure cost
 minutes.
@@ -32,7 +32,8 @@ did not object to the slot being locked before it received the path.
 
 What a project adds -- how its users spell this command, the submodules a new
 slot gets, directories only the main checkout fills, its dependency install,
-its notes and help texts -- is a `PoolHost` handed to `main` by the project's
+its notes and help texts, its main branch and remote and whether it pushes
+on its own -- is a `PoolHost` handed to `main` by the project's
 own entry point. Run directly, the script uses `EMPTY` and says so on stderr.
 """
 from __future__ import annotations
@@ -96,6 +97,21 @@ class PoolHost:
     new_notes: tuple = ()
     # Help texts that replace the defaults below, by key.
     help: Mapping[str, str] = field(default_factory=dict)
+    # The branch slots are cut from and land into, and the remote it is pushed
+    # to. A fixed name rather than the remote's default branch read from
+    # `refs/remotes/<remote>/HEAD`: that ref exists only in a clone (not after
+    # `git init` + `remote add`) and goes stale when the remote renames its
+    # branch, so a detected name would differ between two checkouts of one
+    # project. `main` is the name the hosting services start a repository on;
+    # a project on another name says so here, and a wrong one fails on the
+    # first git call that names it rather than landing somewhere else.
+    main_branch: str = "main"
+    remote: str = "origin"
+    # Whether the commands that move the main branch (`new`, `equalize`,
+    # `land`, the create hook) push it afterwards; `--push`/`--no-push`
+    # override it per call. Off unless the host opts in: a first `land` in
+    # somebody else's repository must not publish anything.
+    push_by_default: bool = False
 
 
 EMPTY = PoolHost()
@@ -255,7 +271,8 @@ def find_slot(spec: str) -> Slot:
         if norm(s.path) == norm(top):
             return s
     if norm(top) == norm(main_dir()):
-        raise Fail(f"{top} is the main checkout (master), not a pool slot.\n" + slots_hint(slots))
+        raise Fail(f"{top} is the main checkout ({HOST.main_branch}), not a pool slot.\n"
+                   + slots_hint(slots))
     raise Fail(f"{top} is a worktree but not a pool slot ({main_dir().name}-wtN)")
 
 
@@ -273,19 +290,20 @@ def slots_hint(slots: list[Slot]) -> str:
 
 def is_clean(path: Path) -> bool:
     # Edits or stray files INSIDE a submodule are that submodule's business, not
-    # the slot's work; a gitlink pointing elsewhere than master's is still reported.
+    # the slot's work; a gitlink pointing elsewhere than the main branch's is still reported.
     out = git(["status", "--porcelain", "--ignore-submodules=dirty"], cwd=path).stdout
     return out.strip() == ""
 
 
 def unlanded_branch(branch: str) -> list[str]:
-    """`git cherry -v master <branch>` '+' lines: commits whose PATCH is not on master.
+    """`git cherry -v <main> <branch>` '+' lines: commits whose PATCH is not on
+    the main branch.
 
-    Patch identity, not ancestry: a branch that reached master through a rebase
-    or squash has different SHAs but no '+' lines, and may be reset; an
-    ancestry check would refuse it forever.
+    Patch identity, not ancestry: a branch that reached the main branch through
+    a rebase or squash has different SHAs but no '+' lines, and may be reset;
+    an ancestry check would refuse it forever.
     """
-    out = git(["cherry", "-v", "master", branch], cwd=main_dir()).stdout
+    out = git(["cherry", "-v", HOST.main_branch, branch], cwd=main_dir()).stdout
     return [line[2:] for line in out.splitlines() if line.startswith("+ ")]
 
 
@@ -317,7 +335,7 @@ class SlotState:
         if self.unlanded:
             parts.append(f"{len(self.unlanded)} unlanded commit(s)")
         if self.behind:
-            parts.append(f"{self.behind} behind master")
+            parts.append(f"{self.behind} behind {HOST.main_branch}")
         return ", ".join(parts) if parts else "free"
 
 
@@ -326,7 +344,8 @@ def slot_state(slot: Slot) -> SlotState:
     usable = exists and not slot.detached
     behind = 0
     if usable:
-        behind = int(git(["rev-list", "--count", f"{slot.branch}..master"], cwd=main_dir()).stdout.strip() or 0)
+        behind = int(git(["rev-list", "--count", f"{slot.branch}..{HOST.main_branch}"],
+                         cwd=main_dir()).stdout.strip() or 0)
     return SlotState(
         exists=exists, detached=slot.detached, locked=slot.locked, lock_reason=slot.lock_reason,
         clean=is_clean(slot.path) if exists else True,
@@ -355,10 +374,11 @@ def refuse_unless_idle(slot: Slot, state: SlotState | None = None) -> None:
 
 def unlanded_refusal(name: str, pending: list[str], path: Path) -> Fail:
     listing = "\n".join(pending)
+    main = HOST.main_branch
     return Fail(
-        f"{name} has {len(pending)} commit(s) whose patch is not on master:\n{listing}\n"
-        f"Land them first ({HOST.command} land {name}), or if master already carries their "
-        f"content in another form, reset by hand: git -C {path} reset --hard master")
+        f"{name} has {len(pending)} commit(s) whose patch is not on {main}:\n{listing}\n"
+        f"Land them first ({HOST.command} land {name}), or if {main} already carries their "
+        f"content in another form, reset by hand: git -C {path} reset --hard {main}")
 
 
 # ------------------------------------------------------------------ claims
@@ -418,36 +438,51 @@ def all_submodules() -> list[str]:
     return [entry.partition("\n")[2] for entry in proc.stdout.split("\0") if entry]
 
 
-# ------------------------------------------------------------------- master
+# ------------------------------------------------------------ main branch
 
 def push_master() -> bool:
-    """Push master to origin; a failure is reported and the local result stands.
+    """Push the main branch to the host's remote; a failure is reported and
+    the local result stands.
 
-    Pushing is automatic, not a manual step (the decision this pool was built
-    under, 2026-09-06), so every command that touches master pushes unless
-    told `--no-push`.
+    Whether a command calls this on its own is the host's choice
+    (`PoolHost.push_by_default`): a pool that pushes automatically keeps the
+    remote current without a manual step, and every such command takes
+    `--no-push`.
     """
+    main, remote = HOST.main_branch, HOST.remote
     try:
-        proc = git(["push", "origin", "master"], cwd=main_dir(), check=False, timeout=PUSH_TIMEOUT_S)
+        proc = git(["push", remote, main], cwd=main_dir(), check=False, timeout=PUSH_TIMEOUT_S)
     except Fail:
-        print(f"warning: push of master timed out after {PUSH_TIMEOUT_S} s (the local result stands)",
+        print(f"warning: push of {main} timed out after {PUSH_TIMEOUT_S} s (the local result stands)",
               file=sys.stderr)
         return False
     text = (proc.stdout + proc.stderr).strip()
     if proc.returncode != 0:
-        print(f"warning: push of master failed (the local result stands):\n{text}", file=sys.stderr)
+        print(f"warning: push of {main} failed (the local result stands):\n{text}", file=sys.stderr)
         return False
     last = text.splitlines()[-1] if text else ""
-    print(f"pushed master to origin: {last}" if last else "pushed master to origin")
+    print(f"pushed {main} to {remote}: {last}" if last else f"pushed {main} to {remote}")
     return True
 
 
-def finish(no_push: bool) -> int:
+def wants_push(args: argparse.Namespace) -> bool:
+    """`--push` or `--no-push` if the call gave one, else the host's default."""
+    asked, refused = getattr(args, "push", False), getattr(args, "no_push", False)
+    if asked and refused:
+        raise Fail("both --push and --no-push given")
+    return asked or (HOST.push_by_default and not refused)
+
+
+def finish(args: argparse.Namespace) -> int:
     """Exit code of a command whose last step is the push: 2 when the push failed."""
-    if no_push:
+    if wants_push(args):
+        return 0 if push_master() else 2
+    if getattr(args, "no_push", False):
         print("push skipped (--no-push)")
-        return 0
-    return 0 if push_master() else 2
+    else:
+        print(f"push skipped (this pool does not push by default; --push pushes "
+              f"{HOST.main_branch} to {HOST.remote})")
+    return 0
 
 
 def main_branch() -> str:
@@ -630,7 +665,7 @@ def fetch_unpushed_gitlinks(path: Path, subs: list[str]) -> None:
     A landed submodule commit stays local until somebody pushes it, and the
     main checkout's clone is where `land` put it (`sync_main_submodules`). A
     slot's clone fetches from the submodule's origin only, so after
-    `equalize` (or a rebase onto such a master) `git submodule update` failed
+    `equalize` (or a rebase onto such a main branch) `git submodule update` failed
     with "not our ref" and left the slot showing `M <sub>` (measured
     2026-11-07; the fix by hand was a fetch from the main clone, then the
     update). A commit the clone already has is left alone, and one the main
@@ -661,7 +696,7 @@ def follow_gitlinks(slot: Slot) -> None:
     """Move a slot's clean submodules FORWARD to the gitlinks its HEAD records.
 
     For a slot that keeps its work (`next`, an assigned create hook): after a
-    rebase onto a master that bumped a submodule, the slot's clone still
+    rebase onto a main branch that bumped a submodule, the slot's clone still
     stands on the old commit. Only a clean clone whose HEAD is an ancestor of
     the recorded gitlink moves, so commits made in the slot's clone and not
     yet recorded are never left behind; anything else is named and kept.
@@ -706,12 +741,13 @@ def follow_gitlinks(slot: Slot) -> None:
 
 
 def reset_to_master(slot: Slot, install: bool, *, strict: bool = True) -> None:
-    """The slot's branch := master, dependencies refreshed. Caller has checked it is safe.
+    """The slot's branch := the main branch, dependencies refreshed. Caller has
+    checked it is safe.
 
     `strict=False` (the hooks): a failed submodule update is a warning, not an
     abort, for the reason `follow_gitlinks` gives.
     """
-    git(["reset", "--hard", "master"], cwd=slot.path)
+    git(["reset", "--hard", HOST.main_branch], cwd=slot.path)
     initialized = [sub for sub in all_submodules() if (slot.path / sub / ".git").exists()]
     if initialized:
         fetch_unpushed_gitlinks(slot.path, initialized)
@@ -723,13 +759,15 @@ def reset_to_master(slot: Slot, install: bool, *, strict: bool = True) -> None:
     # Keep legacy slots with their own local copies. Missing directories and
     # existing shared links use the main checkout, even with --no-install.
     share_dirs(slot.path, keep_local=True)
-    print(f"{slot.name} is at {git(['rev-parse', '--short', 'HEAD'], cwd=slot.path).stdout.strip()} (= master)")
+    print(f"{slot.name} is at {git(['rev-parse', '--short', 'HEAD'], cwd=slot.path).stdout.strip()} "
+          f"(= {HOST.main_branch})")
     if install:
         HOST.install(slot.path, slot.admin_dir())
 
 
 def sync_main_submodules(old_master: str, slot: Slot) -> None:
-    """After a land, move the main checkout's submodules to the gitlinks master now records.
+    """After a land, move the main checkout's submodules to the gitlinks the
+    main branch now records.
 
     A plain `merge --ff-only` leaves them where they were, so the main
     checkout -- where most commits happen -- went on running the new commit
@@ -755,7 +793,7 @@ def sync_main_submodules(old_master: str, slot: Slot) -> None:
     warning names it -- one `diff-tree` per moved submodule, and only on a
     bump, so the check is cheaper than finding out from a stale nested tree.
     """
-    new_master = git(["rev-parse", "master"], cwd=main_dir()).stdout.strip()
+    new_master = git(["rev-parse", HOST.main_branch], cwd=main_dir()).stdout.strip()
     for sub in all_submodules():
         repo = main_dir() / sub
         if not (repo / ".git").exists():
@@ -771,8 +809,9 @@ def sync_main_submodules(old_master: str, slot: Slot) -> None:
         command = f'git -C "{repo}" {" ".join(move)}'
 
         def warn(reason: str) -> None:
-            print(f"warning: {sub} in the main checkout stays at {head[:9]} although master now "
-                  f"records {new[:9]}: {reason}.\nWhen that is resolved: {command}", file=sys.stderr)
+            print(f"warning: {sub} in the main checkout stays at {head[:9]} although "
+                  f"{HOST.main_branch} now records {new[:9]}: {reason}.\n"
+                  f"When that is resolved: {command}", file=sys.stderr)
 
         dirty = git(["status", "--porcelain", "--untracked-files=no"], cwd=repo, check=False).stdout.strip()
         if dirty:
@@ -798,7 +837,7 @@ def sync_main_submodules(old_master: str, slot: Slot) -> None:
         if moved.returncode != 0:
             warn(f"{move[0]} failed:\n{moved.stdout}{moved.stderr}".rstrip())
             continue
-        print(f"{sub}: {head[:9]} -> {new[:9]} (main checkout follows master's gitlink)")
+        print(f"{sub}: {head[:9]} -> {new[:9]} (main checkout follows {HOST.main_branch}'s gitlink)")
         warn_nested_gitlinks(sub, repo, head, new)
 
 
@@ -819,10 +858,12 @@ def warn_nested_gitlinks(sub: str, repo: Path, before: str, after: str) -> None:
 
 def cmd_status(args: argparse.Namespace) -> int:
     slots = list_slots()
-    unpushed = git(["rev-list", "--count", "origin/master..master"], cwd=main_dir(), check=False).stdout.strip()
+    main = HOST.main_branch
+    unpushed = git(["rev-list", "--count", f"{HOST.remote}/{main}..{main}"], cwd=main_dir(),
+                   check=False).stdout.strip()
     head = main_branch() or "DETACHED"
     print(f"main: {main_dir()}  {head} {git(['rev-parse', '--short', 'HEAD'], cwd=main_dir()).stdout.strip()}"
-          f"  unpushed master: {unpushed or '?'}")
+          f"  unpushed {main}: {unpushed or '?'}")
     if not slots:
         print(f"no slot ({HOST.command} new)")
     for s in slots:
@@ -847,18 +888,18 @@ def cmd_new(args: argparse.Namespace) -> int:
         pending = unlanded_branch(branch)
         if pending:
             raise unlanded_refusal(branch, pending, main_dir())
-        print(f"branch {branch} exists with nothing unlanded; reusing it at master")
-        git(["branch", "-f", branch, "master"], cwd=main_dir())
+        print(f"branch {branch} exists with nothing unlanded; reusing it at {HOST.main_branch}")
+        git(["branch", "-f", branch, HOST.main_branch], cwd=main_dir())
         git(["worktree", "add", str(path), branch], cwd=main_dir())
     else:
-        git(["worktree", "add", "-b", branch, str(path), "master"], cwd=main_dir())
+        git(["worktree", "add", "-b", branch, str(path), HOST.main_branch], cwd=main_dir())
     slot = Slot(number, path, branch, "", False)
     print(f"created {slot.name} at {path}")
     share_dirs(path)
     init_submodules(slot, all_submodules() if args.submodules == "all" else list(HOST.default_submodules))
     if not args.no_install:
         HOST.install(path, slot.admin_dir())
-    code = finish(args.no_push)
+    code = finish(args)
     for note in HOST.new_notes:
         print(note)
     if not is_permitted(path):
@@ -891,7 +932,7 @@ def cmd_equalize(args: argparse.Namespace) -> int:
     slot = find_slot(slot_named(args, default="."))
     refuse_unless_idle(slot)
     reset_to_master(slot, install=not args.no_install)
-    return finish(args.no_push)
+    return finish(args)
 
 
 def cmd_share(args: argparse.Namespace) -> int:
@@ -911,36 +952,38 @@ def cmd_land(args: argparse.Namespace) -> int:
     if not state.unlanded:
         print(f"{slot.name} has nothing to land")
         unclaim(slot)
-        return finish(args.no_push)
+        return finish(args)
+    main = HOST.main_branch
     current = main_branch()
-    if current != "master":
-        raise Fail(f"the main checkout has {current or 'a detached HEAD'} checked out, not master; "
+    if current != main:
+        raise Fail(f"the main checkout has {current or 'a detached HEAD'} checked out, not {main}; "
                    f"`land` fast-forwards the checked-out branch and would land into the wrong one")
-    old_master = git(["rev-parse", "master"], cwd=main_dir()).stdout.strip()
+    old_master = git(["rev-parse", main], cwd=main_dir()).stdout.strip()
     merge = git(["merge", "--ff-only", slot.branch], cwd=main_dir(), check=False)
     if merge.returncode != 0:
         detail = f"{merge.stdout}{merge.stderr}".rstrip()
         if not is_clean(main_dir()):
-            raise Fail(f"master cannot fast-forward to {slot.branch}:\n{detail}\n"
+            raise Fail(f"{main} cannot fast-forward to {slot.branch}:\n{detail}\n"
                        f"The main checkout has uncommitted changes that this land would overwrite; "
                        f"commit or stash them there first, then land again.")
-        raise Fail(f"master cannot fast-forward to {slot.branch}:\n{detail}\n"
-                   f"master moved on. Rebase the slot first: git -C {slot.path} rebase master "
+        raise Fail(f"{main} cannot fast-forward to {slot.branch}:\n{detail}\n"
+                   f"{main} moved on. Rebase the slot first: git -C {slot.path} rebase {main} "
                    f"(then re-run the gates there), and land again.")
-    print(f"master -> {git(['rev-parse', '--short', 'master'], cwd=main_dir()).stdout.strip()} "
+    print(f"{main} -> {git(['rev-parse', '--short', main], cwd=main_dir()).stdout.strip()} "
           f"({len(state.unlanded)} commit(s) from {slot.name})")
     try:
         sync_main_submodules(old_master, slot)
     except (Fail, OSError, subprocess.SubprocessError) as error:
-        # Master has landed: a sync failure must not keep the slot claimed or skip the push.
+        # The main branch has landed: a sync failure must not keep the slot
+        # claimed or skip the push.
         print(f"warning: the main checkout's submodules were not synced after the land: {error}",
               file=sys.stderr)
     unclaim(slot)
-    return finish(args.no_push)
+    return finish(args)
 
 
 def cmd_push(args: argparse.Namespace) -> int:
-    return finish(no_push=False)
+    return 0 if push_master() else 2
 
 
 def cmd_next(args: argparse.Namespace) -> int:
@@ -1058,13 +1101,15 @@ def cmd_hook_create(args: argparse.Namespace) -> int:
     with contextlib.redirect_stdout(sys.stderr):
         slot, needs_reset, how = choose_slot(name, f"{name or 'unnamed'} session {session or '?'}")
         if needs_reset:
-            # A free slot may still lag behind master; bring it up before the agent starts.
+            # A free slot may still lag behind the main branch; bring it up
+            # before the agent starts.
             reset_to_master(slot, install=True, strict=False)
         else:
             follow_gitlinks(slot)
             share_dirs(slot.path, keep_local=True)
         print(f"worktree hook: {name or '(unnamed)'} -> {slot.name} ({how})")
-        push_master()
+        if HOST.push_by_default:
+            push_master()
     print(str(slot.path), file=sys.__stdout__)
     return 0
 
@@ -1093,8 +1138,17 @@ def cmd_hook_remove(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
+    main, remote = HOST.main_branch, HOST.remote
+    # Both flags are always accepted (`wants_push`), so a script written for
+    # one host runs on another; only the one that changes something here is
+    # listed in the help.
     pushing = argparse.ArgumentParser(add_help=False)
-    pushing.add_argument("--no-push", action="store_true", help="do not push master afterwards")
+    pushing.add_argument("--no-push", action="store_true",
+                         help=f"do not push {main} afterwards" if HOST.push_by_default
+                         else argparse.SUPPRESS)
+    pushing.add_argument("--push", action="store_true",
+                         help=argparse.SUPPRESS if HOST.push_by_default
+                         else f"push {main} to {remote} afterwards")
     installing = argparse.ArgumentParser(add_help=False)
     installing.add_argument("--no-install", action="store_true", help=help_text("--no-install"))
     # Every command that names a slot takes it both ways — see `slot_named`.
@@ -1102,7 +1156,7 @@ def build_parser() -> argparse.ArgumentParser:
     naming.add_argument("slot", nargs="?", help="wtN, N, or a slot directory")
     naming.add_argument("--dir", help="the same slot, as an option (either spelling works)")
 
-    sub.add_parser("status", help="slot state and unpushed master").set_defaults(func=cmd_status)
+    sub.add_parser("status", help=f"slot state and unpushed {main}").set_defaults(func=cmd_status)
 
     p = sub.add_parser("new", parents=[pushing, installing], help=help_text("new"))
     p.add_argument("number", nargs="?", type=int)
@@ -1111,7 +1165,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_new)
 
     p = sub.add_parser("equalize", parents=[pushing, installing, naming],
-                       help="slot branch := master (refuses dirty, unlanded or locked slots); "
+                       help=f"slot branch := {main} (refuses dirty, unlanded or locked slots); "
                             "default slot: the current worktree")
     p.set_defaults(func=cmd_equalize)
 
@@ -1120,10 +1174,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(func=cmd_share)
 
     p = sub.add_parser("land", parents=[pushing, naming],
-                       help="master := slot branch (ff-only), unlock the slot, push")
+                       help=f"{main} := slot branch (ff-only), unlock the slot"
+                            + (", push" if HOST.push_by_default else ""))
     p.set_defaults(func=cmd_land)
 
-    sub.add_parser("push", help="push master to origin").set_defaults(func=cmd_push)
+    sub.add_parser("push", help=f"push {main} to {remote}").set_defaults(func=cmd_push)
 
     p = sub.add_parser("next", parents=[naming], help="which slot the next WorktreeCreate hook hands out")
     p.set_defaults(func=cmd_next)
@@ -1152,6 +1207,7 @@ def main(host: Optional[PoolHost] = None) -> int:
         HOST = host
     _utf8_streams()
     args = build_parser().parse_args()
+    wants_push(args)  # both flags: refused before anything moves
     return args.func(args)
 
 
