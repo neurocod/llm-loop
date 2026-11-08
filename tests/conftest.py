@@ -4,9 +4,11 @@ stream, an open console route — outliving the test that left it."""
 
 import atexit
 import sys
+from pathlib import Path
 
 import pytest
 
+from llm_agents import host_policy
 from llm_loop import console, exitlog, limits, projectroot, scriptlock
 
 from _runfixtures import finish_record
@@ -108,6 +110,33 @@ def _put_back(item) -> list:
 def _leak_message(item, leaks) -> str:
     return (f"{item.nodeid} left {'; '.join(leaks)} — run it inside "
             f"`_runfixtures.isolated_run`")
+
+
+_CORE_TESTS = Path(__file__).parent / "codex_agent"
+
+
+@pytest.fixture(autouse=True)
+def _core_host(request):
+    """Every core test (`codex_agent/`) runs under the core's own test host
+    (`core_policy`); a test about the empty policy installs `EMPTY` itself.
+
+    Here, scoped by path, and not as an autouse fixture in
+    `codex_agent/conftest.py`: pytest 9.1 binds a subdirectory conftest's
+    fixtures to the FIRST `Dir` node of that directory, and command-line
+    paths that leave a directory and come back (`codex_agent/a.py
+    test_b.py codex_agent/c.py`) collect it a second time as another node
+    that gets none of them. Measured 2026-11-08: under that order every
+    test of the second node ran under `EMPTY`, and the one that needed the
+    host's gates (`..._survives_a_failed_gate_follow_up`) read
+    `gate_follow_ups == 0` with "gates not run: no host policy". `tests/`
+    itself is collected once, since every path given lies under it.
+    """
+    if not request.path.is_relative_to(_CORE_TESTS):
+        yield
+        return
+    from core_policy import CORE_POLICY  # codex_agent/'s own module
+    with host_policy.installed(CORE_POLICY):
+        yield
 
 
 @pytest.fixture(autouse=True)

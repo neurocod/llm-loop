@@ -1,6 +1,6 @@
 """The core tests' own host: generic judges bound to generic tables.
 
-Every core test runs under `CORE_POLICY` (conftest.py) unless it asks for
+Every core test runs under `CORE_POLICY` (`_core_host` in tests/conftest.py) unless it asks for
 `EMPTY`; nothing here names a project. The tables are small on purpose: one
 entry per generic judge the core ships (pytest, try_patch, an editing script,
 the slot commit, npm/npx/node), so a judge's own rules are pinned here and
