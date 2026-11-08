@@ -63,8 +63,17 @@ def seconds(value: str) -> float:
     return value
 
 
+class _ExactParser(argparse.ArgumentParser):
+    """A parser, and subparsers (built with the parent's class), that refuse
+    abbreviated long options: `spawn w --turn 5` was read as `--turn-timeout
+    5`, `--turn` being a flag of `wait`/`result`/`logs` only."""
+
+    def __init__(self, *args, allow_abbrev: bool = False, **kwargs) -> None:
+        super().__init__(*args, allow_abbrev=allow_abbrev, **kwargs)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+    parser = _ExactParser(description=__doc__, epilog=(
         "spawn returns immediately. send queues a followup in the same Claude "
         "session. wait returns only the final answer; an expired wait leaves "
         "the worker running and exits successfully with pending status. "

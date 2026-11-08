@@ -2427,7 +2427,7 @@ _PROMPT_COMMAND_LINES = [
     ("spawn --quiet w a", ["a"]),
     ("spawn w a --quiet b", ["a", "b"]),
     ("spawn w a --quiet b --effort high c", ["a", "b", "c"]),
-    ("spawn w a b --tim 5 c", ["a", "b", "c"]),
+    ("spawn w a b --timeout 5 c", ["a", "b", "c"]),
     ("spawn w --sandbox read-only a --keep b", ["a", "b"]),
     ("spawn w --cwd X hello", ["hello"]),
     ("send w --timeout 5 -", ["-"]),
@@ -2440,7 +2440,12 @@ _PROMPT_COMMAND_LINES = [
     ("spawn w a --bogus b", "unrecognized arguments: --bogus b"),
     ("send w a --bogus b -- c", "unrecognized arguments: --bogus b"),
     ("spawn w a --qiet b", "unrecognized arguments: --qiet b"),
-    ("spawn w --e high a", "ambiguous option: --e"),
+    # No abbreviations (`cli._PromptParser.__init__`): `--prompt` was read as
+    # `--prompt-file`, and the text as the name of a file to read.
+    ("spawn w --prompt x", "unrecognized arguments: --prompt x"),
+    ("send w --prompt x", "unrecognized arguments: --prompt x"),
+    ("spawn w a --tim 5 b", "unrecognized arguments: --tim 5 b"),
+    ("spawn w --e high a", "unrecognized arguments: --e high a"),
 ]
 
 
@@ -2468,10 +2473,11 @@ def test_prompt_command_lines_parse_alike(line, expected, capsys):
 
 
 def test_prompt_option_values_still_parse():
-    """The options themselves are argparse's: values, abbreviations."""
+    """The options themselves are argparse's: values, `--opt=value`."""
     args = cli.build_parser().parse_args(
-        "spawn w a --tim 5 --effort high --sandbox read-only b".split())
+        "spawn w a --timeout=5 --effort high --sandbox read-only b".split())
     assert (args.timeout, args.effort, args.sandbox) == (5.0, "high", "read-only")
+    assert cli.build_parser().parse_args(["send", "w", "--expect="]).expect == ""
 
 
 def test_a_mistyped_cwd_is_refused_instead_of_created(tmp_path, monkeypatch):

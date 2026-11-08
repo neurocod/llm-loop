@@ -252,6 +252,23 @@ class CliWorkerTests(unittest.TestCase):
             parser.parse_args(["wait", "review", "--timeout", "0", "--until-done"])
         self.assertEqual(error.exception.code, 2)
 
+    def test_abbreviated_options_are_refused(self):
+        """`spawn r --turn 5` was read as `--turn-timeout 5`: `--turn` is a
+        flag of wait/result/logs, not of spawn. Full spellings still parse."""
+        parser = cli.build_parser()
+        for argv in (["spawn", "r", "--message", "x", "--turn", "5"],
+                     ["send", "r", "--message", "x", "--wa", "5"],
+                     ["wait", "r", "--time", "5"]):
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+                parser.parse_args(argv)
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("unrecognized arguments", stderr.getvalue())
+        args = parser.parse_args(["spawn", "r", "--prompt", "x",
+                                  "--turn-timeout", "5", "--expect="])
+        self.assertEqual((args.message, args.turn_timeout, args.expect),
+                         ("x", 5.0, ""))
+
     def test_spawn_runs_on_opus_unless_a_model_is_named(self):
         parser = cli.build_parser()
         self.assertEqual(parser.parse_args(["spawn", "r", "--message", "x"]).model, "opus")

@@ -759,6 +759,13 @@ class _PromptParser(argparse.ArgumentParser):
 
     _collects_prompt = False
 
+    def __init__(self, *args, allow_abbrev: bool = False, **kwargs) -> None:
+        # No abbreviated long options, on the subparsers too (they are built
+        # by this class with no `allow_abbrev` of their own): `spawn w
+        # --prompt "fix it"` used to be taken as `--prompt-file "fix it"` and
+        # fail on a missing file — or read one that happened to exist.
+        super().__init__(*args, allow_abbrev=allow_abbrev, **kwargs)
+
     def collect_prompt(self, help_text: str) -> None:
         """Mark this parser as one whose leftover words are the prompt."""
         self._collects_prompt = True
