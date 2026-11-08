@@ -1,6 +1,7 @@
 """Sandbox cleanup scenarios."""
 
 from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401 — see no_badge's docstring
+import os
 from pathlib import PurePath
 from llm_agents.codex import sandbox
 from llm_agents.codex.registry import AgentRecord
@@ -93,7 +94,8 @@ def test_the_judge_lets_an_agent_delete_its_own_pytest_basetemp(tmp_path):
     # neither a cleanup dir nor inside the workspace.
     (work / "my dir").mkdir()
     assert ask(ps.format("Remove-Item -Recurse -Force './my dir/.pytest-tmp'"))
-    assert ask(ps.format('Remove-Item -Recurse -Force ".\\my dir\\.pytest-tmp"'))
+    if os.name == "nt":  # a backslash separates path parts only on Windows
+        assert ask(ps.format('Remove-Item -Recurse -Force ".\\my dir\\.pytest-tmp"'))
     assert not ask(ps.format("Remove-Item -Recurse -Force './my dir/src'"))
     assert not ask(ps.format("Remove-Item -Recurse -Force './my dir/.pytest-tmp"))
     # A workspace that is itself named like a cleanup dir is never a target.

@@ -100,9 +100,7 @@ def test_a_workspace_write_agent_gets_a_second_root_outside_the_tree(
     read_only = wire.run_fake_turn(tmp_path, monkeypatch, "plain", name="r",
                                sandbox="read-only")
     assert read_only.status == "completed"
-    starts = [message["params"] for message in wire.received(tmp_path)
-              if message.get("method") == "turn/start"]
-    assert "sandboxPolicy" not in starts[-1]
+    assert "sandboxPolicy" not in wire.turn_starts(tmp_path)[-1]["params"]
     opened_ro = [message["params"] for message in wire.received(tmp_path)
                  if message.get("method") == "thread/start"][-1]
     assert str(paths.scratch_dir("r")) not in opened_ro["developerInstructions"]

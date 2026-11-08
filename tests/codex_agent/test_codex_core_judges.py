@@ -113,6 +113,10 @@ def test_try_patch_and_the_entries_judge_what_they_run(tmp_path, monkeypatch,
 ])
 def test_try_patch_and_the_entries_grant_their_shapes(tmp_path, monkeypatch, command, where):
     work, ask = worker_tree(tmp_path, monkeypatch)
+    if "BIN/" in command and not (work / "BIN").exists():
+        # The row pins that a case alias of the entry is the entry; on a
+        # case-sensitive filesystem the alias names no file at all.
+        pytest.skip("case-sensitive filesystem: BIN/Try_Patch.py is not the entry here")
     _granted(ask, command, cwd=work / where)
 
 

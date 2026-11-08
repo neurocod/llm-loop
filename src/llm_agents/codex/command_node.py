@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
 from typing import Mapping, Optional
-from urllib.parse import unquote
 from urllib.parse import urlparse
+from urllib.request import url2pathname
 from .command_arguments import (
     CommandContext,
     _ArgvJudge,
@@ -357,7 +357,9 @@ def _loader_refusal(value: str, cwd: Path, ctx: CommandContext) -> str:
         return ""
     raw = value
     if value.lower().startswith("file:"):
-        raw = unquote(urlparse(value).path).lstrip("/")
+        # url2pathname, not `.path.lstrip("/")`: stripping the slash made
+        # Windows' `/C:/x` a path but POSIX's `/tmp/x` a relative `tmp/x`.
+        raw = url2pathname(urlparse(value).path)
     loader, why = _existing_file(raw, cwd, ctx, "--import")
     if why:
         return why
