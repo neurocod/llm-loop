@@ -77,9 +77,9 @@ def test_opening_falls_back_to_the_providers_default_policy(monkeypatch):
 def test_a_later_run_keeps_the_accounts_policy_and_its_edit(monkeypatch, capsys):
     """One policy per account per process, whatever driver the next run has.
 
-    runGenerateModels chains a kit-promotion run (no policy of its own) and a
-    product batch (its own): a weekly ceiling edited with `w` in one was gone
-    in the other, which opened a policy of its own.
+    A batching wrapper chains a pass with no policy of its own and a batch
+    with one: a weekly ceiling edited with `w` in the first was gone in the
+    second, which opened a policy of its own.
     """
     monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: object())
     first = limits.LimitPolicy([limits.WeeklyLimit(96)])

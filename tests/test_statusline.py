@@ -1761,8 +1761,8 @@ def test_a_driver_with_no_total_gets_no_invented_denominator(monkeypatch, tmp_pa
 
 def test_a_driver_with_a_queue_of_its_own_gets_a_denominator(monkeypatch,
                                                               tmp_path):
-    """A queue does not have to be a list file to be countable: the kit-promotion
-    pass drains a folder of requests, and its row used to read a bare `iter 1`
+    """A queue does not have to be a list file to be countable: a driver that
+    drains a folder of requests had a row reading a bare `iter 1`
     however much was left in it — the one number a watcher wants.
     """
     from llm_loop import cyclecore

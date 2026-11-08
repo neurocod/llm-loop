@@ -1,6 +1,8 @@
-"""Pin what a leading underscore means inside this package: module-private.
+"""Pin two kinds of privacy: what a leading underscore means inside this
+package (module-private), and that the public tree keeps its host project's
+names to itself (the last test).
 
-It used to mean nothing checkable. Twelve underscored symbols owned by `console`
+The underscore used to mean nothing checkable. Twelve underscored symbols owned by `console`
 and `usage` were read from six other modules through 21 code sites — `_fmt_left`
 by three importers, `_TeeToLog` by both runners — and the newest of those sites
 had been added weeks after the rest without anybody reading it as a signal.
@@ -21,6 +23,7 @@ the package to import cleanly to run.
 """
 
 import ast
+import os
 from pathlib import Path
 
 import pytest
@@ -104,3 +107,59 @@ def test_the_gate_can_see_both_spellings(tmp_path):
 
     assert sorted(found) == ["console._real_stream",
                              "from .console import _fmt_left"]
+
+
+# --- the other privacy: the host project's, kept out of the public tree --------
+
+REPO = PACKAGE.parents[1]
+
+# Names of the project this engine was extracted from, and spellings that
+# belong to its machines. Each was found in a comment, a docstring or a test
+# fixture AFTER the tree went public (2026-11-08: a wrapper's file name in six
+# modules and four tests, a drive path in a docstring, a backlog number in a
+# test): a reader of this repository has none of them, so a sentence built on
+# one explains nothing to them. Case-insensitive, matched as plain text.
+HOST_PROJECT_NAMES = ("runGenerateModels", "kit-promotion", "webgame",
+                      "MultiSkill", "C:\\g\\")
+
+# What a host name could be written in: the tracked text kinds. Binaries and
+# the generated trees are skipped by not being named.
+TEXT_SUFFIXES = {".py", ".md", ".toml", ".yml", ".yaml", ".json", ".txt",
+                 ".cpp", ".h", ".hpp", ".inc", ".cmd", ".ps1", ".sh", ".cfg",
+                 ".ini", ".gitignore", ".typed"}
+SKIPPED_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules",
+                "build", "dist", ".venv", "venv"}
+
+
+def _text_files(root: Path):
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames
+                             if name not in SKIPPED_DIRS
+                             and not name.endswith(".egg-info"))
+        for filename in sorted(filenames):
+            path = Path(directory) / filename
+            if path.suffix in TEXT_SUFFIXES or filename == "LICENSE":
+                yield path
+
+
+def test_no_tracked_text_names_the_host_project():
+    """The sweep `git grep -i -E 'runGenerateModels|…'` as a test, so the next
+    comment that reaches for a host name fails here rather than in a reader's
+    eyes. This file is the one place the names are allowed to appear."""
+    this = Path(__file__).resolve()
+    lowered = tuple(name.lower() for name in HOST_PROJECT_NAMES)
+    hits = []
+    for path in _text_files(REPO):
+        if path == this:
+            continue
+        for number, line in enumerate(
+                path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            low = line.lower()
+            hits += [f"{path.relative_to(REPO).as_posix()}:{number}: {name}"
+                     for name, needle in zip(HOST_PROJECT_NAMES, lowered)
+                     if needle in low]
+
+    assert hits == [], (
+        "the public tree names its host project: " + ", ".join(hits)
+        + ". Say the thing itself (a batching wrapper, a drive path such as "
+          "C:\\work) instead of the host's name for it.")

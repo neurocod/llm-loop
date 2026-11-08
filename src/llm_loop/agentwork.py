@@ -218,8 +218,8 @@ class Driver:
 
         Report it in the unit an ITERATION works through, where you can: the row
         clamps the total against `--max-runs`, which counts iterations, so a
-        driver whose one iteration clears several items (the kit-promotion pass
-        empties its whole requests folder in one) reads `iter 3/3` under
+        driver whose one iteration clears several items (a pass that empties a
+        whole folder of requests in one) reads `iter 3/3` under
         `--max-runs 3` while a dozen items are still waiting. Only the display
         is affected — no cap, gate or queue decision reads this — and only when
         such a driver is given a cap, which is why the honest count of what is

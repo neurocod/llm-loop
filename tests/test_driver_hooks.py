@@ -459,8 +459,8 @@ def test_hooks_that_ask_for_nothing_leave_the_run_exactly_as_it_was(
 ):
     """The default hooks return None, so an unaware driver cannot be paused.
 
-    An empty reason asks nothing either, as it already did in the fleet
-    (`note_driver_handback`); the sequential runner paused on it before 1370.
+    An empty reason asks nothing either, as it already did in the parallel
+    runner (`note_driver_handback`); the sequential runner used to pause on it.
     """
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda *args, **kwargs: 0)

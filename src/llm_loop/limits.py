@@ -441,7 +441,7 @@ def process_policy(provider: str,
     """The ONE policy `provider`'s account is gated on in this process.
 
     A wrapper may chain several runs with different drivers in one process
-    (runGenerateModels alternates a kit-promotion run and a product batch), and
+    (a batching wrapper alternating two kinds of pass, a driver each), and
     the operator's `w` edit mutates the policy of the run on screen. Resolved
     per driver, that edit was gone when the next run opened a policy of its own,
     and each phase gated on different ceilings. So the first run to open the

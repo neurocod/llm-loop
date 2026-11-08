@@ -63,7 +63,7 @@ def split_shell(command: str) -> tuple[str, str]:
     by `shlex.split` into exactly `[powershell.exe, -Command, <script>]`). A
     script holding a `'` arrives double-quoted with its backslashes doubled
     and every `!` cut out into single quotes (`--old 'if ("'!x) y;'"'`), so a
-    reader that only stripped the outer quotes judged `C:\\\\g\\\\...` paths
+    reader that only stripped the outer quotes judged `C:\\\\work\\\\...` paths
     and quote debris rather than what PowerShell runs. A command that does
     not split that way (no Codex wrapper, unbalanced quotes, an unquoted
     backslashed path to the shell) is read by `_SHELL_WRAPPER` instead: one

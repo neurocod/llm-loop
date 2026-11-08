@@ -216,12 +216,12 @@ def test_the_table_still_answers_at_this_module_s_address():
 # --- render: one line, for the shell it is pasted into -------------------------
 
 @pytest.mark.parametrize("shell, expected", [
-    (POWERSHELL, "& python runGenerateModels.py --max-runs 2"),
-    (POSIX, "python runGenerateModels.py --max-runs 2"),
+    (POWERSHELL, "& python runBatches.py --max-runs 2"),
+    (POSIX, "python runBatches.py --max-runs 2"),
 ])
 def test_render_prefixes_interpreter_and_script(shell, expected):
     line = render(["-m", "5"], {"--max-runs": 2}, executable="python",
-                  script="runGenerateModels.py", shell=shell)
+                  script="runBatches.py", shell=shell)
     assert line == expected
 
 

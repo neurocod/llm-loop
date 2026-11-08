@@ -61,7 +61,7 @@ def test_a_record_whose_owner_is_gone_is_reported_and_cleared(
     dead = exitlog.record_path(logs, "pytest-exit", "proj", 424242)
     dead.write_text(json.dumps({
         "pid": 424242, "app": "pytest-exit", "project": "proj",
-        "argv": "runGenerateModels.py --codex --random",
+        "argv": "runBatches.py --codex --random",
         "started": 1000.0, "alive_at": 2000.0,
         "phase": "iteration 10 — electric-guitar-hollow-body.md",
     }), encoding="utf-8")
@@ -124,7 +124,7 @@ def test_the_report_of_a_vanished_run_lands_in_the_log(
     dead = exitlog.record_path(logs, app_name, project, 424242)
     dead.write_text(json.dumps({
         "pid": 424242, "app": app_name, "project": project,
-        "argv": "runGenerateModels.py --codex --random",
+        "argv": "runBatches.py --codex --random",
         "started": 1000.0, "alive_at": 2000.0,
         "phase": "iteration 10 — electric-guitar-hollow-body.md",
     }), encoding="utf-8")

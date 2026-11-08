@@ -357,8 +357,8 @@ def render(argv: List[str], overrides: Dict[str, Any], *,
            shell: Optional[str] = None) -> str:
     """The full copy-pasteable command line reproducing this run.
 
-    `script` defaults to `sys.argv[0]` - the wrapper actually launched
-    (runGenerateModels.py), not this module - so the line can be pasted as-is.
+    `script` defaults to `sys.argv[0]` - the wrapper actually launched (your
+    runBatches.py), not this module - so the line can be pasted as-is.
 
     The line is written for ONE shell, the one it will be pasted into: a line
     is only reproducible in the shell that parses it, and the two candidates

@@ -163,15 +163,13 @@ STOP_RECHECK_SECONDS = 0.25
 # What settles it is measured, not argued — the producer and the consumer of the
 # latch are BOTH outside every run, and no run object exists between them:
 #
-#   * `runGenerateModels._detect_phase_stop` calls `mark_stop_file_detected`
-#     from the host wrapper, BETWEEN two runner calls, with no runner on the
-#     stack at all;
+#   * a batching wrapper's phase check calls `mark_stop_file_detected` BETWEEN
+#     two runner calls, with no runner on the stack at all;
 #   * the removal happens when the wrapper's own `main()` leaves the lifecycle
 #     it entered around its whole invocation.
 #
-#   Pinned end to end by `test_phase_boundary_keeps_stop_file_until_outer_exit`
-#   in the host suite, which enters the lifecycle and marks a detection without
-#   ever building a run.
+#   Such a wrapper's suite pins it end to end by entering the lifecycle and
+#   marking a detection without ever building a run.
 #
 # Hanging the latch on a run object would therefore need a channel to hand it UP
 # to something that outlives the run — and that channel, for a single-process
@@ -281,8 +279,8 @@ def latched_stop(app=None) -> Optional[StopSource]:
 # The half of a stop-file announcement that does not depend on what found the
 # sentinel: the run ends, the FILE stays. A constant rather than a literal in
 # each sentence, because that promise is made in three places — both runners'
-# stop tail (`commit_stop`) and the wrapper that looks between two phases
-# (runGenerateModels._detect_phase_stop) — and the copies had already drifted
+# stop tail (`commit_stop`) and a batching wrapper's check between two phases
+# — and the copies had already drifted
 # into different spellings of it.
 STOP_FILE_KEPT_CLAUSE = ("stopping; it remains in place until "
                          "the application exits.")

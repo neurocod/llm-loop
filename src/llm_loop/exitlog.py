@@ -2,7 +2,7 @@
 
 A loop that dies leaves the mirror log ending mid-line, and nothing in it says
 whether that was a crash, a stop request, or a kill from outside. Measured, not
-theorised: two runGenerateModels runs (2026-08-20 13:02, 2026-08-21 02:44) ended
+theorised: two overnight runs of one wrapper (2026-08-20 13:02, 2026-08-21 02:44) ended
 exactly like that, and the cause turned out to be the run's OWN agent, which
 mistook the long-lived `python.exe` parent for a hung `commit.py` helper and
 issued `Stop-Process` on it. Nothing in the 11 MB log named that; the log simply
