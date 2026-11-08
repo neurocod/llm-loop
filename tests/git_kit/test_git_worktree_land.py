@@ -9,6 +9,8 @@ way a slot's submodule commit sits before its push).
 
 import io
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -238,6 +240,60 @@ def test_a_pushing_host_pushes_its_branch_to_its_remote(repos, monkeypatch, caps
     assert command("land", "wt2", "--no-push") == 0
     assert len(calls) == 1
     assert "push skipped (--no-push)" in capsys.readouterr().out
+
+
+def test_main_refuses_both_push_flags_before_landing(repos):
+    main, slot, _ = repos
+    before = run(main, "rev-parse", "main")
+    pending = commit_file(slot, "pending.txt", "unlanded")
+    assert pending != before
+    run(main, "worktree", "lock", "--reason", "claimed", str(slot))
+    shown = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+         "from llm_agents.git import worktree; root = Path(sys.argv[2]); "
+         "worktree.main_dir = lambda: root; "
+         "sys.argv = ['worktree', 'land', 'wt2', '--push', '--no-push']; "
+         "sys.exit(worktree.main())",
+         str(Path(worktree.__file__).resolve().parents[2]), str(main)],
+        cwd=main, capture_output=True, text=True)
+    assert shown.returncode == 1, shown.stderr
+    assert "both --push and --no-push" in shown.stderr
+    assert run(main, "rev-parse", "main") == before
+    assert run(slot, "rev-parse", "HEAD") == pending
+    assert "locked claimed" in run(main, "worktree", "list", "--porcelain")
+
+
+@pytest.mark.parametrize("push_by_default", [False, True])
+@pytest.mark.parametrize("flag", [None, "--push", "--no-push"])
+@pytest.mark.parametrize("operation", ["equalize", "new"])
+def test_slot_preparation_obeys_the_push_policy(repos, monkeypatch, push_by_default, flag, operation):
+    main, slot, _ = repos
+    monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(push_by_default=push_by_default))
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    pushed = []
+    monkeypatch.setattr(worktree, "push_master", lambda: pushed.append(True) or True)
+    argv = [operation, "wt2" if operation == "equalize" else "3", "--no-install"]
+    if flag:
+        argv.append(flag)
+    assert command(*argv) == 0
+    expected = flag == "--push" or (push_by_default and flag != "--no-push")
+    assert pushed == ([True] if expected else [])
+
+
+@pytest.mark.parametrize("push_by_default", [False, True])
+def test_create_hook_obeys_the_host_push_default(repos, monkeypatch, push_by_default):
+    main, slot, _ = repos
+    monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(push_by_default=push_by_default))
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    monkeypatch.setattr(worktree.sys, "stdin", io.StringIO('{"name": "wt2"}'))
+    printed = io.StringIO()
+    monkeypatch.setattr(worktree.sys, "__stdout__", printed)
+    pushed = []
+    monkeypatch.setattr(worktree, "push_master", lambda: pushed.append(True) or True)
+    assert command("hook-create") == 0
+    assert printed.getvalue().strip() == str(slot)
+    assert pushed == ([True] if push_by_default else [])
 
 
 def test_the_help_lists_the_push_flag_that_changes_something(monkeypatch):
