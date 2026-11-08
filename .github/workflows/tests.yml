@@ -18,6 +18,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # macos-latest is arm64. actions/python-versions has no arm64 build of
+        # 3.9 after 3.9.13 or of 3.10 after 3.10.11, so there "3.9" and "3.10"
+        # resolve to those older patch releases rather than failing (manifest
+        # checked 2026-11-08). No x86 macos-13 fallback: that runner image is
+        # being retired, and the floor is still tested on an old patch.
         os: [ubuntu-latest, windows-latest, macos-latest]
         # The floor declared in pyproject (requires-python = ">=3.9"). Listing
         # it here is what turns that declaration into a tested claim rather

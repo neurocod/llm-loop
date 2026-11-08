@@ -44,10 +44,10 @@ directory. There is no one true directory to name: this file ships as a plugin
 knows how they spelled it; argparse says the same by printing `%(prog)s`.
 
 Usage:
-  python try_patch.py --file webgame/src/sim/player.ts \\
-      --old 'const RISING_SPEED = 1e-4;' --new 'const RISING_SPEED = 0;' \\
-      --cwd webgame --expect-fail \\
-      -- npx vitest run test/player.rising.test.ts
+  python try_patch.py --file app/src/main.py \\
+      --old 'MAX_RETRIES = 3' --new 'MAX_RETRIES = 0' \\
+      --cwd app --expect-fail \\
+      -- python -m pytest tests/test_main.py
 
   # several edits in one go: repeat --file/--old/--new as a triple
   python try_patch.py --file a.ts --old X --new Y \\
@@ -232,10 +232,10 @@ def main() -> int:
             "journal at\n"
             f"the tree root: {JOURNAL_DIR_NAME}/"),
         epilog="examples:\n"
-               "  python %(prog)s --file src/player.ts \\\n"
-               "      --old 'const SPEED = 1e-4;' --new 'const SPEED = 0;' \\\n"
-               "      --cwd webgame --expect-fail -- npx vitest run "
-               "test/player.test.ts\n"
+               "  python %(prog)s --file app/src/main.py \\\n"
+               "      --old 'MAX_RETRIES = 3' --new 'MAX_RETRIES = 0' \\\n"
+               "      --cwd app --expect-fail -- python -m pytest "
+               "tests/test_main.py\n"
                "  python %(prog)s --file a.ts --old X --new Y \\\n"
                "                      --file b.ts --old P --new Q -- npm test\n"
                "  python %(prog)s --file a.ts --remove 'guard();' "

@@ -138,9 +138,10 @@ def test_gates_share_one_budget(tmp_path):
     logged = []
     results = gates.run_gates(["npm test", "npm run typecheck"], tmp_path, 0.1,
                               slow, logged.append)
-    # `deadline - now` with no tick between them is the budget plus rounding:
-    # `(t + 0.1) - t` read 0.10000000000582 on Windows 3.9/3.10, whose
-    # monotonic clock advances in 15.6 ms steps.
+    # `deadline - now` with no tick between them is the budget plus float
+    # rounding: `(t + 0.1) - t` read 0.10000000000582 on Windows 3.9/3.10,
+    # where `t` is a large monotonic value and its last bits are coarse. The
+    # 1e-6 slack covers that rounding only, not a clock step between reads.
     assert len(seen) == 1 and seen[0] <= 0.1 + 1e-6
     assert results[0].passed
     assert results[1].exit_code is None and "budget" in results[1].output

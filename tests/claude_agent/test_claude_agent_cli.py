@@ -34,7 +34,9 @@ class CliWorkerTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.enter(patch.dict("os.environ", {agent_counter.DISABLE_ENV: "0"}))
         self.addCleanup(self.tmp.cleanup)
-        self.cwd = Path(self.tmp.name)
+        # Resolved: the CLI prints resolved paths, and on macOS the temp
+        # directory under /var is /private/var once resolved.
+        self.cwd = Path(self.tmp.name).resolve()
         self.root = self.cwd / "state"
         self.store = Store(self.root)
         self.launch = self.enter(patch.object(cli, "launch"))

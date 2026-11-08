@@ -94,8 +94,10 @@ def test_the_judge_lets_an_agent_delete_its_own_pytest_basetemp(tmp_path):
     # neither a cleanup dir nor inside the workspace.
     (work / "my dir").mkdir()
     assert ask(ps.format("Remove-Item -Recurse -Force './my dir/.pytest-tmp'"))
-    if os.name == "nt":  # a backslash separates path parts only on Windows
-        assert ask(ps.format('Remove-Item -Recurse -Force ".\\my dir\\.pytest-tmp"'))
+    # A backslash separates path parts only on Windows; on POSIX the whole
+    # token is one name in the cwd, which is not a cleanup dir.
+    assert ask(ps.format('Remove-Item -Recurse -Force ".\\my dir\\.pytest-tmp"')
+               ).granted == (os.name == "nt")
     assert not ask(ps.format("Remove-Item -Recurse -Force './my dir/src'"))
     assert not ask(ps.format("Remove-Item -Recurse -Force './my dir/.pytest-tmp"))
     # A workspace that is itself named like a cleanup dir is never a target.

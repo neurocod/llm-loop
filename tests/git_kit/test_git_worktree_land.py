@@ -187,7 +187,7 @@ def test_a_failing_sync_still_releases_the_slot_and_pushes(repos, monkeypatch, c
     monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(push_by_default=True))
     monkeypatch.setattr(worktree, "push_main_branch", lambda: pushed.append(True) or True)
 
-    def broken(old_master, pool_slot):
+    def broken(old_main, pool_slot):
         raise worktree.Fail("sync exploded")
 
     monkeypatch.setattr(worktree, "sync_main_submodules", broken)

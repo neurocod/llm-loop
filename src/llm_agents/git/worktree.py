@@ -765,7 +765,7 @@ def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True) -> N
         HOST.install(slot.path, slot.admin_dir())
 
 
-def sync_main_submodules(old_master: str, slot: Slot) -> None:
+def sync_main_submodules(old_main: str, slot: Slot) -> None:
     """After a land, move the main checkout's submodules to the gitlinks the
     main branch now records.
 
@@ -793,12 +793,12 @@ def sync_main_submodules(old_master: str, slot: Slot) -> None:
     warning names it -- one `diff-tree` per moved submodule, and only on a
     bump, so the check is cheaper than finding out from a stale nested tree.
     """
-    new_master = git(["rev-parse", HOST.main_branch], cwd=main_dir()).stdout.strip()
+    new_main = git(["rev-parse", HOST.main_branch], cwd=main_dir()).stdout.strip()
     for sub in all_submodules():
         repo = main_dir() / sub
         if not (repo / ".git").exists():
             continue
-        old, new = gitlink(old_master, sub), gitlink(new_master, sub)
+        old, new = gitlink(old_main, sub), gitlink(new_main, sub)
         if not new or old == new:
             continue
         head = git(["rev-parse", "HEAD"], cwd=repo, check=False).stdout.strip()
@@ -958,7 +958,7 @@ def cmd_land(args: argparse.Namespace) -> int:
     if current != main:
         raise Fail(f"the main checkout has {current or 'a detached HEAD'} checked out, not {main}; "
                    f"`land` fast-forwards the checked-out branch and would land into the wrong one")
-    old_master = git(["rev-parse", main], cwd=main_dir()).stdout.strip()
+    old_main = git(["rev-parse", main], cwd=main_dir()).stdout.strip()
     merge = git(["merge", "--ff-only", slot.branch], cwd=main_dir(), check=False)
     if merge.returncode != 0:
         detail = f"{merge.stdout}{merge.stderr}".rstrip()
@@ -972,7 +972,7 @@ def cmd_land(args: argparse.Namespace) -> int:
     print(f"{main} -> {git(['rev-parse', '--short', main], cwd=main_dir()).stdout.strip()} "
           f"({len(state.unlanded)} commit(s) from {slot.name})")
     try:
-        sync_main_submodules(old_master, slot)
+        sync_main_submodules(old_main, slot)
     except (Fail, OSError, subprocess.SubprocessError) as error:
         # The main branch has landed: a sync failure must not keep the slot
         # claimed or skip the push.
