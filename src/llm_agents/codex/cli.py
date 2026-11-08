@@ -808,6 +808,10 @@ def build_parser() -> argparse.ArgumentParser:
         # assigns heavy tasks to Opus instead of raising Codex's default.
         # Effort is per turn, not persisted in AgentRecord: send without the
         # flag uses the current default, even after an explicit high turn.
+        # (`--model`, by contrast, is spawn-only: the thread keeps it for the
+        # agent's life.) Changing the effort between turns does not drop the
+        # prompt cache: measured 2026-11-08, a medium->high turn read 36224
+        # of 36365 input tokens (99.6 %) from cache.
         sub.add_argument("--effort", default="medium",
                          help="reasoning effort override for this turn "
                               "(default: %(default)s)")
@@ -880,13 +884,17 @@ def build_parser() -> argparse.ArgumentParser:
     # may escape it: the agent asks, and only a match is granted. A whole-turn
     # `danger-full-access` is the alternative, and it drops the sandbox for
     # everything; see `sandbox.escalation_judge`.
+    # A worker's allowlist is the host's `HostPolicy.commands.shapes`
+    # (`sandbox.opens_commands`), named in the help by the host's own word for
+    # it (`shapes_name`) so the help and the judge's refusals agree.
     spawn.add_argument("--escalate", default="", metavar="REGEX",
                        help="commands matching this regex may run OUTSIDE the "
                             "sandbox when the agent asks (e.g. "
                             r"'^npm (test|run typecheck)\b'); everything else "
-                            "is still declined. A --role worker escalates the "
-                            f"command shapes of {policy.commands.shapes_name} "
-                            "without it; given, the regex adds to them")
+                            "is still declined. A --role worker needs no regex "
+                            "for its host's allowlist "
+                            f"({policy.commands.shapes_name}); given, the "
+                            "regex adds to it")
     spawn.add_argument("--allow-online-probes", action="store_true",
                        help=policy.commands.reserved.online_help)
     # One more directory, by name: the protocol's `workspaceWrite` policy takes
