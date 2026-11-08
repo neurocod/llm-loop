@@ -45,6 +45,11 @@ that choose between the two runners' parsers).
 import importlib as _importlib
 import sys as _sys
 
+# The module map — one line per module, saying what it owns — is the Layout
+# section of README.md beside this file. A new module gets its line there: the
+# map is worth its upkeep only while it is complete, since a module missing from
+# it is one nobody browsing the package knows to open.
+
 # A Windows console or a redirected stdout is often cp1252, and both runners
 # print paths and agent text that are not (a Cyrillic project root is the first
 # line of every run, `runlifecycle.begin_run`). Switched HERE because this is the

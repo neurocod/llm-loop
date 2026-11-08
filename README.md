@@ -1,8 +1,8 @@
 # llm-loop
 
 **Tools for running coding agents unattended — for hours, several at once, in
-one repository.** Python 3.9+, standard library only; one code path on
-Windows, Linux and macOS, and CI runs all three.
+one repository.** Python 3.9+, no required third-party package (`rich` is
+optional); one code path on Windows, Linux and macOS, and CI runs all three.
 
 An agent CLI left alone fails in predictable places: it fills its context window
 and forgets the plan; it runs out of quota mid-task; two of them stage each
@@ -20,6 +20,22 @@ repository and use the part you need.
 | **ask-user-gate** | a Claude Code hook that refuses the shell shapes that stop a session on a prompt | [`claude-plugin/ask-user-gate`](claude-plugin/ask-user-gate/README.md) |
 | **agent-tools** | the small waits and edits an agent harness keeps asking permission for | [`agent-tools`](agent-tools/README.md) |
 | **agent-counter** | optional: an on-screen count of running agents (Windows, Qt) | [`extras/agent-counter`](extras/agent-counter/README.md) |
+
+A few words the sections below lean on:
+
+- **host** — the project that uses this repository's tools; what it adds to
+  them (`PoolHost`, `CommitHost`, `HostPolicy`) are its *host rules*. A tool
+  run without any runs on the **empty host policy**: neutral defaults, nothing
+  project-specific, said once on stderr.
+- **vendor** — take the repository as a git submodule and put its `src/` on
+  `sys.path`, instead of pip-installing it; the route the examples assume.
+- **worker** — a Codex or Claude CLI process a bridge starts for one task,
+  inside a sandbox; a **judge** is the function that decides whether one of
+  its commands may run outside that sandbox.
+- **gate** — a check that has to pass before a step goes on: a test suite, or
+  a hook that refuses a command before it runs.
+- **slot** — one standing worktree of the pool (`<repo>-wt1` on branch `wt1`),
+  used by one agent at a time.
 
 ## The loop — `llm_loop`
 
@@ -196,9 +212,11 @@ nothing and never fail a turn. Build and wiring:
 
 ## Requirements and CI
 
-Python 3.9 or newer and nothing else: every import across `src/` is from the
-standard library (`pyproject.toml` says why the floor is 3.9). The loop and the
-bridges need the CLI they drive — `claude` or `codex` — installed and signed in;
+Python 3.9 or newer and no required third-party package: every import across
+`src/` is from the standard library, except `rich`, which the loop uses for live
+Markdown rendering when it is installed and does without when it is not
+(`pyproject.toml` says why the floor is 3.9). The loop and the bridges need the
+CLI they drive — `claude` or `codex` — installed and signed in;
 the tests need neither (the Codex tests run against the stand-in wire, the Claude
 tests against patched launches).
 

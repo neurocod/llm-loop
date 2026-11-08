@@ -21,7 +21,9 @@ Two deliveries, and the difference is only WHEN the agent sees the note:
     messages on stdin (`AgentChannel`). The note reaches the model at its next
     turn boundary, mid-iteration. Measured against `claude` 2.1.238: a note sent
     while a tool call was running was picked up ~1.8 s later, after that call
-    finished, and the turn continued rather than restarting.
+    finished, and the turn continued rather than restarting. One that arrives
+    as the turn ends may instead be answered as a continuation of the same
+    session.
   * queued - no such channel right now (between iterations, a provider without
     the transport, `--no-live-messages`). The note waits and is appended to the
     NEXT iteration's prompt by `append_notes`.

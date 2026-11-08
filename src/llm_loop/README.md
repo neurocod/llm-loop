@@ -21,7 +21,7 @@ overnight.
 
 | | Ralph (the canonical loop) | llm-loop |
 |---|---|---|
-| Implementation | a bash one-liner; forks exist in bash/PowerShell | a Python package (3.9+, **stdlib only**), one code path on Windows/Linux/macOS |
+| Implementation | a bash one-liner; forks exist in bash/PowerShell | a Python package (3.9+, **no required third-party package**), one code path on Windows/Linux/macOS |
 | Iteration body | the same prompt file, every time | a pluggable `Driver`: state machine, work queue, or your own |
 | Multi-step work | one undifferentiated "do the next thing" step | explicit phases; **the state is read back by the script**, not only by the agent |
 | Prompt | fixed file | `prompt()` is computed per iteration from the current state / work item |
@@ -148,10 +148,11 @@ project-specific thinking goes. The shipped
 
 ## Requirements
 
-**Python 3.9+ and nothing else.** The engine has zero third-party
-dependencies — every import across its modules comes from the standard
-library — so vendoring it adds no transitive dependency to your project and
-cannot conflict with the versions you already pin.
+**Python 3.9+ and no required third-party package.** Every import across the
+engine's modules comes from the standard library, except `rich`: installed, it
+renders the assistant's Markdown live; absent, the output is plainer and
+nothing fails. So vendoring the engine adds no transitive dependency to your
+project and cannot conflict with the versions you already pin.
 
 **Plus the CLI you intend to drive, already signed in.** The loop authenticates
 nothing itself: it shells out to `claude` or `codex`, and reads the quota
@@ -227,9 +228,6 @@ scripts/
   collect_codex_thread.py one Codex rollout JSONL as a chronological view
 ```
 
-One line per module, and every module has one: the map is worth its upkeep only
-while it is complete — a module missing from it is a module nobody browsing the
-package knows to open. A new module gets its line here, saying what it owns.
 The rest of the repository (the agent bridges, the git kit, the shell gate,
 `agent-tools/`, `extras/`) is mapped in the top-level [README](../../README.md).
 
@@ -276,7 +274,9 @@ class FileListDriver(ListFileDriver):
     pick_order    = "random"   # or "list" to walk the list top to bottom
 
     def model(self):
-        return "sonnet"   # or "" to use the CLI's own configured model
+        # Codex: "" lets the CLI use its own configured model; a Claude run
+        # names one. The same test as in examples/runFileList.py.
+        return "" if self.provider == "codex" else "sonnet"
 
     def prompt(self, source, target):
         return (f"Read {source} and write a Markdown summary to {target}. "
@@ -524,194 +524,87 @@ alive and the item it was working on. `llm_loop.exitlog` is the whole of it.
 
 ## Ctrl+C
 
-Inside a runner (`run_loop`, `run_parallel`) Ctrl+C raises no
-`KeyboardInterrupt`. The first press ends the turn in flight, its CLI included,
-and every wait; the run then leaves with exit code 130 after the same exit
-push, closing usage snapshot and report of undelivered notes as any other
-ending. A further press gives up what that ending still waits for — the exit
-push, the workers' turns — and nothing else.
-
-A runner that has heard a press never returns a result: it exits 130. An
-ending that exits with its own code (a driver's exit 3) keeps it; a wrapper
-that must still hear the press opens `ctrlc.captured()` around the runner call
-and asks that Interrupt after it.
-
-For an embedder this changes three public calls while a run is open:
-`run_agent_streaming` returns `ctrlc.EXIT_CODE` (130) for a turn the press cut
-short, and `LimitPolicy.check_and_wait` and `stopchannel.sleep_unless` return
-early as they do for a stop request; ask `llm_loop.ctrlc.current().requested`
-which it was. Outside a run they raise `KeyboardInterrupt` as before.
-`llm_loop.ctrlc` is the whole of it.
+Inside a runner Ctrl+C is an event the run polls, not a `KeyboardInterrupt`:
+the first press ends the turn in flight and every wait, and the run leaves with
+exit code 130 after its usual ending — exit push, usage snapshot, the report of
+undelivered notes; a further press gives up what that ending still waits for.
+Which public calls return early for an embedder, and how a wrapper hears the
+press once the runner has left, is `llm_loop.ctrlc` (the module docstring and
+`ctrlc.captured`).
 
 ## Interactive status line
 
-On a terminal, a run pins a few rows at the bottom — iteration, provider/model,
-elapsed time, the provider's live quota figures and the script's own limits, one
-row per job, and a legend of the keys it answers to. Piped output, CI and
-`--no-statusline` get the plain scrolling output of before.
+On a terminal a run pins a few rows at the bottom — iteration, provider/model,
+elapsed time, the provider's live quota figures and the policy's ceilings, one
+row per job, and a legend of the keys — and names the window after the row's
+first field (`statusline.title_text`). Piped output, CI and `--no-statusline`
+get the plain scrolling output of before, and no title.
 
-The same run also names the window (and the tab, and the taskbar button):
-`⟳ iter 12/40 · bmx-bike.md` — the row's first field, then what each still-busy
-job is on, so a run left in the background stays readable with the terminal
-itself out of sight. It shares the rows' kill switch — piped output, CI and
-`--no-statusline` get no title either — and the name is handed back when the run
-ends, whichever way it ends.
-
-The iteration counter carries the whole of "how much work is this run": its
-denominator is `--max-runs`, whatever the driver reports from
-`Driver.pending_total()`, or the smaller of the two. `--max-runs` therefore
-gets no field of its own — a knob
-whose value is already on the row registers with `show_in_status=False` and
-stays editable and reproducible without spending row width twice.
-
-**The quota fields have two halves**, split by ` / `:
+The iteration counter's denominator is `--max-runs`, `Driver.pending_total()`,
+or the smaller of the two. A quota field has two halves split by ` / `: the
+account's own report (how much of the window is spent, how long it has to run)
+and what the `LimitPolicy` rule for that window makes of it — every window the
+provider meters is shown, the policy half only where a rule watches
+(`statusline.quota_rows`, `LimitRule.status` for a custom rule):
 
 ```
  session 43% (2h11m) / ceil 95% | week 63% (17h27m)
  └── the provider ──┘└─ policy ─┘└─ the provider ─┘
 ```
 
-Left of the slash is the account's own report — how much of the window is spent
-and how long it still has to run. Every window the provider meters gets a field,
-whether or not the run is gated on it, so the reader sees the whole budget and
-not just the slice that happens to be watched: the 5-hour session and the week
-are always there (`n/a` when the provider reports no figure), and a window a plan
-does not have is dropped unless a rule watches it. Right of the slash is what the
-`LimitPolicy` rule for that window makes of it — its live ceiling by default,
-absent entirely when no rule watches it. A custom rule can say something else by
-overriding `LimitRule.status(reading, now)`.
+The keys (`h` or `?` lists them), each with the symbol that holds its rule:
 
-Keys: `s` requests a graceful stop of **this** run (pressing `s` again during
-the countdown cancels it), `p` holds it at the next iteration boundary and `p`
-again lets it go (see below), `m` sends the agent a note (see below), and in a
-parallel run `+` starts one more worker immediately. An increased worker count
-also carries into later batches of the same invocation. `h` or `?` shows the
-full key list. State-driven loops also expose `b`: `BreakpointAction`.
+| Key | Does | Rule |
+|---|---|---|
+| `s` | stops **this** run; `s` again during the 5 s countdown cancels | `statusline.StopAction`, `stopchannel.confirm_stop_request` |
+| `p` | holds the run at the next iteration boundary; `p` again lets it go | `statusline.PauseAction`, `stopchannel.wait_while_paused` |
+| `m` | a note to the running agent (in a fleet, to one job of it) | `statusline.MessageAction`, `llm_loop.operator` |
+| `+` / `-` | one more / one fewer worker in a parallel run, for the rest of the invocation | `parallel.ResizeWorkerPoolAction` |
+| `w` | edits the weekly ceiling of the live policy | `statusline.WeeklyLimitAction` |
+| `b` | a state breakpoint, in state-driven loops | `statusline.BreakpointAction` |
 
-`s` sets an in-process flag and writes nothing to disk, so several loops
-launched in one project root are stopped one at a time — the terminal you type
-it into is the run that halts. The `stop` file below is the other channel: it
-stops every run watching the root, survives the process, and is therefore what
-scripts and run-chaining use. A stop file this run merely obeys is not the key's
-to withdraw, so `s` neither writes nor removes it.
+## Stopping: the `s` key and the `stop` file
 
-Where the two meet, the file wins: a run that stops while a sentinel is on disk
-consumes it, whether or not `s` was also pressed. Otherwise the file would
-outlive the loop it was written for and the launch queued behind it would wait
-forever.
+Two channels, not interchangeable (`stopchannel.StopSource`). `s` is
+in-process: it stops the run whose terminal it was typed into and writes
+nothing to disk. A file named `stop` in the project root halts **every** run
+rooted there at its next iteration boundary, survives the process, and is
+therefore what scripts and run-chaining use: the run that obeys it removes it
+on exit, and a launch that finds one already there waits until it is gone
+(`stopchannel.wait_for_stop_file_clear`; `--dry-run` only reports it). When
+both are up the file wins — `stopchannel.latched_stop` says why.
 
 ## Holding the run (`p`)
 
-`p` pauses the loop and `p` again resumes it. The iteration in flight is never
-interrupted — it finishes its one state transition, and the next one does not
-begin. That gap is the point: nothing the loop reads (a state file, a task list,
-the tree itself) is being written while it holds, so it can be edited, and the
-next iteration is what reads the edit. In a parallel run the same key stops new
-files being claimed, and whatever is already running finishes.
-
-**Read the row, not the keypress**, because the two are not the same moment:
-
-```
- ⟳ iter 12/40 | … | PAUSING — the iteration in flight finishes first
- ⏸ iter 12/40 | … | PAUSED — press p to resume
-```
-
-Only the second line means the run is standing still and the files are yours.
-(`pause_state` in `statusline.py` is the whole rule.)
-
-Held, a run still answers everything else: `s` ends the hold and stops the run
-(with its usual cancel countdown), the `stop` file does the same, and `m` still
-accepts notes (see below). Like `s`, `p` is in-process and
-writes nothing to disk — it holds the run whose terminal it was typed into, and
-the ones next door work on.
-
-Create a file named `stop` in the project root to halt **every** loop rooted
-there at its next iteration boundary; it is removed on stop so the next launch
-starts clean. This is useful when a parallel agent needs to stop or unlock a running
-script by creating or removing this file. If the file exists before startup, the
-script waits until it is deleted.
-
-A `--dry-run` never removes it — previewing commands while a real
-run has a stop pending must not cancel that stop — it only reports that the file
-is there. To stop just one of several concurrent loops, press `s` in its
-terminal instead (see above): that request is in-process and leaves no file.
-
-A launch that finds the sentinel already in place does not start and does not
-consume it: it waits (sequential and parallel alike, before `--start-in`) until
-the file goes away — cleared by the run it was meant for, or removed by hand —
-and only then begins. So queueing the next run behind a stop you just requested
-works, and a leftover `stop` never costs a run its first iteration.
-
-What a hold does **not** do is keep a finished run alive: a sequential run that
-has reached `--max-runs`, and a parallel one whose queue drained or hit its item
-cap, end instead of waiting for a boundary that will never come.
+The iteration in flight finishes and the next does not begin, so the files the
+loop reads are yours to edit until `p` again. Read the row, not the keypress:
+`PAUSING` means an iteration is still running, `PAUSED` that the run stands
+still (`statusline.pause_state`). A held run still answers `s`, the stop file
+and `m`; one with nothing left to do ends instead of holding.
 
 ## Talking to the running agent (`m`)
 
-The loop is autonomous, not unattended. `m` opens a one-line editor in the
-pinned area: Enter sends and leaves the editor open for the next note, Esc
-clears a half-typed line, and Esc on an empty line leaves. (Both are two-step on
-purpose — keys arrive one at a time from a single burst, so an editor that
-closed on Enter would hand the rest of a pasted line to the normal keys, `s`
-included.) While the editor is open the legend shows its keys and not the run's,
-because in there `s` is a letter.
-
-The line is properly editable, not append-only: ←/→ move the cursor and typing
-lands where it points, Ctrl+←/→ move by word, Home/End (Ctrl+A / Ctrl+E) jump to
-either end, Delete cuts forward, and Ctrl+W / Ctrl+U / Ctrl+K erase the word
-before the cursor / everything before it / everything after it. The view scrolls
-to keep the caret visible when the note outgrows the row. Both spellings of
-every key are decoded, so the same bindings work on Windows and POSIX.
-
-What you type reaches the agent one of two ways:
-
-* **into the current iteration**, if one is running. The agent receives the
-  note at the model's next turn boundary — for example, after a tool call
-  returns — and continues the same iteration with that guidance. A tool call
-  already in progress is allowed to finish. The note may also be answered as a
-  continuation of the same session if it arrives as the active turn ends.
-* **queued for the next iteration** otherwise (between iterations, including
-  a fully `PAUSED` run, or with `--no-live-messages`), appended to that prompt as
-  a named section. The legend
-  counts what is waiting: `m message (2 queued)`.
-
-Notes are framed before the agent sees them: who is speaking, and that a note is
-guidance rather than a replacement for the task. That matters — a bare imperative
-arriving mid-turn reads like a prompt injection, and is treated as one. It also
-means an emphatic note ("stop reading files, do X instead") is obeyed literally:
-say what you mean.
-
-Every note is printed into the scrolling output — and therefore into the mirror
-log — at the point where the agent received it, so an iteration that changed
-course mid-flight is explainable afterwards. The receipt is the CLI's own replay
-of the message, not this end assuming the pipe was read.
-
-With one agent, `m` opens the editor directly. With several workers, `m` first
-asks for a job number; Enter selects it and opens an editor labelled with that
-job. Each job has its own queue, so a note typed between that worker's iterations
-rides its next prompt rather than being picked up by whichever worker starts
-next.
-
-A note still queued when the run ends is reported, with its text, rather than
-dropped in silence: "the next iteration" is a promise the last iteration cannot
-keep. A live send still lacking the provider's replay receipt at shutdown is
-reported separately as unconfirmed, so an interrupted write cannot disappear.
-
-`m` works with both providers. Claude receives a streaming-input user message;
-Codex receives an app-server `turn/steer` request for the active turn. With
-`--no-live-messages`, either provider queues the note for the next iteration
-instead. It is not a paste target — every newline in a paste sends what
-precedes it as its own note.
+`m` opens a one-line editor in the pinned area (with several workers, a job
+number first): Enter sends and stays in the editor, Esc clears the line, Esc on
+an empty line leaves; the cursor and erase keys are `statusline.LineEditor.ACTIONS`.
+A note reaches the agent mid-turn while a turn is running (Claude over
+streaming input, Codex over `turn/steer`) and rides the next prompt otherwise,
+`--no-live-messages` included. Either way it is framed as a human's guidance
+rather than a replacement for the task — an emphatic note is obeyed literally,
+so say what you mean — and printed into the scrolling output, hence the mirror
+log, where the agent received it. Notes the run ends still holding are
+reported, not dropped (`operator.report_undelivered_notes`). Not a paste
+target: every newline sends.
 
 ### When the status line freezes
 
 Its quiet failure branches (a key reader that died, a frame that raised, keys
 dropped behind a stuck write) are written to `<app>-<project>.diag.log` beside
-the mirror log; the run's banner prints the path. `LLM_LOOP_KEYTRACE=1` adds a
-line per key per stage (read, posted, applied, painted). To reproduce without a
-paid turn, `python scripts/fake_claude/fake_cycle.py` runs a real sequential
-runner against a fake `claude`, and `py-spy dump --pid <pid> --native` shows
-where each thread is.
+the mirror log; the run's banner prints the path, and `llm_loop.diaglog` has
+the `LLM_LOOP_KEYTRACE=1` trace. To reproduce without a paid turn,
+`python scripts/fake_claude/fake_cycle.py` runs a real sequential runner
+against a fake `claude`, and `py-spy dump --pid <pid> --native` shows where
+each thread is.
 
 ## Per-user settings
 
