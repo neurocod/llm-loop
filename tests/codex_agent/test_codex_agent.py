@@ -2416,19 +2416,61 @@ def test_registry_round_trips_roles_and_status_keeps_old_records_unchanged(
     ]
 
 
-def test_prompt_words_after_options_parse_alike_on_every_python(capsys):
-    """Older argparse left a prompt word after an option unrecognized
-    (`cli._PromptParser`); the words keep their order wherever they sit, and
-    an unknown option is still refused."""
+# (command line, prompt it parses to — or the error text it must print).
+# Every row holds on 3.9-3.13 alike; the rules are `cli._PromptParser`'s.
+_PROMPT_COMMAND_LINES = [
+    ("spawn w a b", ["a", "b"]),
+    ("send w a b", ["a", "b"]),
+    ("send w", []),
+    ("spawn w --quiet a b", ["a", "b"]),
+    ("spawn --quiet w a", ["a"]),
+    ("spawn w a --quiet b", ["a", "b"]),
+    ("spawn w a --quiet b --effort high c", ["a", "b", "c"]),
+    ("spawn w a b --tim 5 c", ["a", "b", "c"]),
+    ("spawn w --sandbox read-only a --keep b", ["a", "b"]),
+    ("spawn w --cwd X hello", ["hello"]),
+    ("send w --timeout 5 -", ["-"]),
+    ("spawn w a --quiet -", ["a", "-"]),
+    ("spawn w --quiet -- -x", ["-x"]),
+    ("spawn w a -- --quiet -- b", ["a", "--quiet", "--", "b"]),
+    ("send w -- -", ["-"]),
+    ("spawn w --quiet a -5", "unrecognized arguments: -5"),
+    ("spawn w --quiet -x", "unrecognized arguments: -x"),
+    ("spawn w a --bogus b", "unrecognized arguments: --bogus b"),
+    ("send w a --bogus b -- c", "unrecognized arguments: --bogus b"),
+    ("spawn w a --qiet b", "unrecognized arguments: --qiet b"),
+    ("spawn w --e high a", "ambiguous option: --e"),
+]
+
+
+@pytest.mark.parametrize("line,expected", _PROMPT_COMMAND_LINES,
+                         ids=[line for line, _ in _PROMPT_COMMAND_LINES])
+def test_prompt_command_lines_parse_alike(line, expected, capsys):
+    """`spawn` and `send` read their prompt words by `cli._PromptParser`'s
+    rules, not argparse's, which changed between versions: options anywhere
+    before `--`, everything after it prompt text, and an unknown option an
+    error naming it and the words after it rather than prompt text."""
+    argv = line.split()
     parse = cli.build_parser().parse_args
-    assert parse(["spawn", "w", "--quiet", "a", "b"]).prompt == ["a", "b"]
-    assert parse(["spawn", "w", "a", "--quiet", "b", "--effort", "high", "c"]
-                 ).prompt == ["a", "b", "c"]
-    assert parse(["send", "w", "--timeout", "5", "-"]).prompt == ["-"]
-    assert parse(["send", "w", "a", "b"]).prompt == ["a", "b"]
+    if isinstance(expected, list):
+        args = parse(argv)
+        assert args.prompt == expected
+        assert args.name == "w"
+        return
     with pytest.raises(SystemExit):
-        parse(["spawn", "w", "a", "--bogus", "b"])
-    assert "unrecognized arguments: --bogus" in capsys.readouterr().err
+        parse(argv)
+    err = capsys.readouterr().err
+    assert expected in err
+    # The error names the words from the first unknown one on, and nothing else.
+    if expected.startswith("unrecognized"):
+        assert err.rstrip().endswith(expected)
+
+
+def test_prompt_option_values_still_parse():
+    """The options themselves are argparse's: values, abbreviations."""
+    args = cli.build_parser().parse_args(
+        "spawn w a --tim 5 --effort high --sandbox read-only b".split())
+    assert (args.timeout, args.effort, args.sandbox) == (5.0, "high", "read-only")
 
 
 def test_a_mistyped_cwd_is_refused_instead_of_created(tmp_path, monkeypatch):

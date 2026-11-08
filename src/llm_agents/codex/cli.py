@@ -726,29 +726,61 @@ def cmd_drop(args: argparse.Namespace) -> int:
 
 
 class _PromptParser(argparse.ArgumentParser):
-    """Prompt words after an option reach `prompt` on every Python.
+    """The prompt words of `spawn` and `send`, collected by this class rather
+    than by argparse, so that a command line means the same on every Python.
 
-    In `spawn rev --cwd X hello`, older argparse fills `name` and the
-    `nargs="*"` `prompt` from the first run of positionals, `rev` alone, so
-    `prompt` is `[]` and `hello` is left over: "unrecognized arguments:
-    hello" (measured on 3.9.x, 3.10.x, 3.11.9, 3.12.2 and 3.12.3; 3.13.7
-    defers the empty match and parses it). Here the leftover words that are not options are appended to
-    `prompt` in order, which is what the newer argparse gives; a leftover
-    option still fails as unrecognized. The subparsers are of this class too
-    (`add_subparsers` builds them with the parent's class), and it is theirs
-    that see the leftovers.
+    The rules, for a parser marked by `collect_prompt()`:
+    - options may stand anywhere before the first `--`, between prompt words
+      too; an option's value is taken by argparse as usual;
+    - the first word that is not an option or an option's value is `name`;
+      every later one joins `prompt`, in order;
+    - every word after the first `--` is prompt text, even one starting with
+      `-`; the `--` itself is dropped;
+    - before `--`, a word starting with `-` is an option, `-5` included: an
+      unknown one is an error naming it and every word after it, as stock
+      argparse names its leftovers, so a mistyped option never becomes
+      prompt text. Prompt text that starts with `-` goes after `--`;
+    - a lone `-` is a prompt word; a prompt that is exactly `-` is read from
+      stdin (`_read_prompt`).
+
+    Why not argparse's own `nargs="*"` positional: which words it gives the
+    prompt changed between versions. Before 3.13, in `spawn rev --cwd X
+    hello`, `name` and `prompt` were matched on the first run of positionals,
+    `rev` alone, so `prompt` was `[]` and `hello` was left over
+    ("unrecognized arguments: hello"; measured on 3.9.x, 3.10.x, 3.11.9,
+    3.12.2 and 3.12.3); 3.13.7 defers the empty match and parses it, yet still
+    refuses `spawn w a --quiet b`, and it took `-5` as a prompt word where
+    3.11 left it over. Here argparse only parses the options and `name`, which
+    it does alike on 3.9-3.13 (`test_prompt_command_lines_parse_alike`), and
+    the words it leaves over are sorted by the rules above. The subparsers
+    are of this class too (`add_subparsers` builds them with the parent's
+    class); only the ones `collect_prompt()` marked change behaviour.
     """
 
+    _collects_prompt = False
+
+    def collect_prompt(self, help_text: str) -> None:
+        """Mark this parser as one whose leftover words are the prompt."""
+        self._collects_prompt = True
+        self.set_defaults(prompt=[])
+        self.usage = "%(prog)s [options] name [prompt ...] [-- prompt ...]"
+        self.epilog = f"prompt: {help_text}"
+
     def parse_known_args(self, args=None, namespace=None):
-        namespace, extras = super().parse_known_args(args, namespace)
-        prompt = getattr(namespace, "prompt", None)
-        if isinstance(prompt, list) and extras:
-            words, options = [], []
-            for word in extras:
-                (words if word == "-" or not word.startswith("-") else options).append(word)
-            namespace.prompt = prompt + words
-            extras = options
-        return namespace, extras
+        if not self._collects_prompt:
+            return super().parse_known_args(args, namespace)
+        words = list(sys.argv[1:] if args is None else args)
+        tail: list[str] = []
+        if "--" in words:
+            cut = words.index("--")
+            words, tail = words[:cut], words[cut + 1:]
+        namespace, extras = super().parse_known_args(words, namespace)
+        unknown = next((i for i, word in enumerate(extras)
+                        if word.startswith("-") and word != "-"), None)
+        if unknown is not None:
+            return namespace, extras[unknown:]
+        namespace.prompt = extras + tail
+        return namespace, []
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -758,8 +790,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run Codex CLI as a named worker; print only its answer.")
     subs = parser.add_subparsers(dest="command", required=True)
 
-    def add_turn_flags(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("prompt", nargs="*", help="prompt text, or `-` for stdin")
+    def add_turn_flags(sub: _PromptParser) -> None:
+        sub.collect_prompt("the words after the name, and every word after "
+                           "`--`; `-` alone reads it from stdin")
         sub.add_argument("--prompt-file", help="read the prompt from this file")
         sub.add_argument("--timeout", type=float, default=DEFAULT_TURN_TIMEOUT_S,
                          help="seconds before an ATTEMPT is abandoned; a turn "
