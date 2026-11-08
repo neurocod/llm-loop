@@ -304,8 +304,9 @@ def test_review_command_ignores_ambient_grants_without_disabling_oauth(
     grants = argv[argv.index("--allowedTools") + 1:argv.index("--setting-sources")]
     assert grants == ["Read", "Glob", "Grep",
                       *(f"Bash(git -C {SUBMODULE} {rule} *)" for rule in protocol.REVIEW_RULES)]
-    for rule in grants[3:]:
-        assert rule.count("*") == 1 and rule.endswith(" --end-of-options *)"), rule
+    for rule in grants[3:]:  # The wildcard follows the option terminator.
+        terminator = " -- *)" if " grep " in rule else " --end-of-options *)"
+        assert rule.count("*") == 1 and rule.endswith(terminator), rule
     instructions = argv[argv.index("--append-system-prompt") + 1]
     for rule in grants[3:]:  # The briefing spells out every template it may type.
         template = rule[len("Bash("):-len(" *)")].removeprefix("git ")
@@ -362,15 +363,9 @@ def test_review_git_templates_read_committed_objects(review_git_repo, rule):
     operands = (["needle", "HEAD", "--", "sample.txt"] if args[0] == "grep"
                 else ["HEAD", "--", "sample.txt"])
     result = git(*args, *operands)
-    if (args[0] == "grep" and result.returncode
-            and "unable to resolve revision: needle" in result.stderr):
-        # Measured 2026-11-08: git 2.43.0 (Ubuntu 24.04) takes
-        # `--end-of-options` as grep's PATTERN and the pattern as a revision;
-        # 2.53.0 parses it. The template is safe there (nothing after it is an
-        # option) but cannot search: a git limit, not this rule's.
-        pytest.skip(f"{git('--version').stdout.strip()} reads --end-of-options "
-                    f"as grep's pattern")
-    assert result.returncode == 0, result.stderr
+    # Red on git 2.43.0 if grep's terminator were `--end-of-options`
+    # (`protocol.REVIEW_RULES`): "unable to resolve revision: needle".
+    assert result.returncode == 0, (git("--version").stdout, result.stderr)
     expected = {"show": "review needle", "log": "review fixture", "grep": "HEAD:sample.txt:1"}
     assert ("sample.txt |" if "--stat" in args else expected[args[0]]) in result.stdout
     assert not marker.exists()
@@ -381,8 +376,9 @@ def test_review_git_templates_read_committed_objects(review_git_repo, rule):
 @pytest.mark.parametrize(("rule", "operands"), [
     *((rule, ["--output=written", "HEAD"]) for rule in REVIEW_BASH
       if review_template(rule)[0] in ("show", "log")),
-    *((rule, ["-O./helper.sh", "needle"]) for rule in REVIEW_BASH
-      if review_template(rule)[0] == "grep"),
+    *((rule, operands) for rule in REVIEW_BASH if review_template(rule)[0] == "grep"
+      # As the pattern, and after it: where `-e PATTERN` would let it through.
+      for operands in (["-O./helper.sh", "needle"], ["needle", "-O./helper.sh"])),
 ])
 def test_review_git_wildcard_cannot_reenable_options(review_git_repo, rule, operands):
     root, marker, git = review_git_repo
@@ -391,7 +387,8 @@ def test_review_git_wildcard_cannot_reenable_options(review_git_repo, rule, oper
     result = git(*review_template(rule), *operands)
     assert not (root / "written").exists()
     assert not marker.exists()
-    assert result.returncode != 0, result.stdout  # The option became a bad revision.
+    # The option became a bad revision, or an option after a non-option.
+    assert result.returncode != 0, result.stdout
 
 
 def test_review_refuses_to_start_without_compiled_gate(monkeypatch, review_host):

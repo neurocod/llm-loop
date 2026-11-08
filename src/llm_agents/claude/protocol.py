@@ -60,22 +60,29 @@ REVIEW_TOOLS = "Read,Glob,Grep,Bash"
 # So rules exist only for the host's submodule (`ReviewProfile.submodule`), as
 # templates the briefing spells out.
 # A rule matches the literal command text and '*' spans options as well, so
-# every template ends option parsing BEFORE the wildcard. Trust model: a
+# every template ends option parsing BEFORE the wildcard: `--end-of-options`
+# for show and log, a leading `--` for grep. Grep cannot take the marker:
+# git 2.43.0 (Ubuntu 24.04's) keeps it in argv and reads it as the PATTERN,
+# so the real pattern becomes a revision and no search runs (2.53.0 parses
+# it). A leading `--` ends grep's options on both, and the first word after
+# it is the pattern (measured 2026-11-08). `-e PATTERN` would not do: option
+# parsing resumes after its value, so `-e x -O./prog` runs prog. Trust model: a
 # cooperative reviewer, guarded against accidents, not an attacker; still the
 # classifier refuses --output=FILE (the one way to write a file), --ext-diff /
 # --textconv (run configured programs) and worktree grep -O (runs a program)
 # in the main tree, and the submodule must not be the weaker door, so the old
 # `show *` is not restored. Cost: no option after the hash (2 of the 27 used
 # --stat, hence its own form; `HASH -- path` still works after the marker),
-# and log is limited by a range (HASH~10..HASH), not -N.
+# and log is limited by a range (HASH~10..HASH), not -N. Show and log keep
+# `--end-of-options` because there a `--` would make the hash a path.
 # Slot commits share the main tree's object store: no slot -C paths.
 # https://code.claude.com/docs/en/permissions#wildcard-patterns
 REVIEW_RULES = (
     "show --end-of-options",
     "show --stat --end-of-options",
     "log --end-of-options",
-    "grep -n -E --end-of-options",
-    "grep -n -E -C 30 --end-of-options",
+    "grep -n -E --",
+    "grep -n -E -C 30 --",
 )
 
 
@@ -118,12 +125,12 @@ def review_instructions() -> str:
     prefix = f"git -C {submodule}"
     templates = (
         f"The {submodule} submodule "
-        "takes only these templates, typed as shown up to the marker, with no option "
-        "after `--end-of-options` (a path after `--` is fine): "
-        f"`{prefix} show --end-of-options HASH` (`show --stat --end-of-options HASH` "
+        "takes only these templates, typed as shown up to the marker (`--end-of-options`, "
+        "or grep's first `--`), with no option after it (a path after a later `--` is "
+        f"fine): `{prefix} show --end-of-options HASH` (`show --stat --end-of-options HASH` "
         f"for the file list), `{prefix} log --end-of-options HASH~10..HASH`, "
-        f"`{prefix} grep -n -E --end-of-options PATTERN HASH -- PATH`, "
-        f"`{prefix} grep -n -E -C 30 --end-of-options PATTERN HASH -- PATH`. "
+        f"`{prefix} grep -n -E -- PATTERN HASH -- PATH`, "
+        f"`{prefix} grep -n -E -C 30 -- PATTERN HASH -- PATH`. "
     ) if submodule else ""
     return (
         "You are a delegated code reviewer. Read the exact hashes the caller gives. "
