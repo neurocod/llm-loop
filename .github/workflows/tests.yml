@@ -8,15 +8,17 @@ on:
 
 jobs:
   pytest:
-    # Both operating systems earn their place: the engine drives a terminal
-    # status line, spawns provider CLIs and locks files, and every one of those
-    # differs on Windows. A Linux-only matrix would pass while the tool the
-    # author actually runs is broken.
+    # Every operating system the README promises earns its place: the engine
+    # drives a terminal status line, spawns provider CLIs and locks files, and
+    # every one of those differs on Windows. A Linux-only matrix would pass while
+    # the tool the author actually runs is broken. macOS is here because no
+    # machine of the author's can run it: CI is its only test. Qt and `extras/`
+    # stay out of this job: they are opt-in builds, not part of the package.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         # The floor declared in pyproject (requires-python = ">=3.9"). Listing
         # it here is what turns that declaration into a tested claim rather
         # than a hopeful one.
