@@ -59,8 +59,19 @@ def _owner_sid(path: Path) -> Optional[str]:
         kernel.LocalFree(descriptor)
 
 
-def _user_sid() -> Optional[str]:
-    """This process's user as a SID string; None off Windows or on failure."""
+def _own_sids() -> frozenset[str]:
+    """The owners a file of this process's own can have: its user
+    (TokenUser = 1) and the default owner a NEW file gets (TokenOwner = 4).
+    They differ in an elevated administrator's process, whose new files are
+    owned by BUILTIN\\Administrators, S-1-5-32-544 (windows-latest CI, run as
+    runneradmin, 2026-11-08); counting only the user made every file of an
+    elevated run look stale. Empty off Windows or on failure."""
+    return frozenset(sid for sid in (_token_sid(1), _token_sid(4)) if sid)
+
+
+def _token_sid(info_class: int) -> Optional[str]:
+    """The SID of a TOKEN_USER / TOKEN_OWNER of this process (both start
+    with the SID pointer); None off Windows or on failure."""
     if os.name != "nt":
         return None
     import ctypes
@@ -79,10 +90,9 @@ def _user_sid() -> Optional[str]:
         return None
     try:
         size = ctypes.c_uint32()
-        advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+        advapi.GetTokenInformation(token, info_class, None, 0, ctypes.byref(size))
         buffer = ctypes.create_string_buffer(size.value)
-        # TokenUser = 1: a TOKEN_USER, whose first field is the SID pointer.
-        if not advapi.GetTokenInformation(token, 1, buffer, size,
+        if not advapi.GetTokenInformation(token, info_class, buffer, size,
                                           ctypes.byref(size)):
             return None
         return _sid_string(ctypes.c_void_p.from_buffer(buffer).value)
@@ -132,8 +142,8 @@ def renew_file(path: Path) -> tuple[bool, str]:
     elevated token. Replacing needs only DELETE, which Modify includes.
 
     Only files that are actually stale are renewed: owned by someone other
-    than this process's user (`_owner_sid`, a `CodexSandbox*` account). A
-    file the user owns gets the new capability SIDs pushed down like the
+    than this process (`_owner_sid` outside `_own_sids`: a `CodexSandbox*`
+    account). A file the user owns gets the new capability SIDs pushed down like the
     rest of the tree. Not renewed either: a hard link (the copy would split
     it), a read-only file (the replace fails on it), a file in a directory
     the sandbox account owns (the copy would inherit that stale list; the
@@ -151,8 +161,8 @@ def renew_file(path: Path) -> tuple[bool, str]:
     every failure. Best effort: the grant stands either way."""
     if not path.is_file() or path.is_symlink():
         return False, ""
-    owner, user = _owner_sid(path), _user_sid()
-    if owner is None or user is None or owner == user:
+    owner, own = _owner_sid(path), _own_sids()
+    if owner is None or not own or owner in own:
         return False, ""
     if _owner_sid(path.parent) == owner:
         # A directory the sandbox account created is stale the same way, and
