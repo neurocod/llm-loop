@@ -103,7 +103,8 @@ def _message_file_refusal(value: str, cwd: Path, ctx: CommandContext) -> str:
 
 
 # commit.py's own options (the kit's `OPTION_FLAGS`, which its parser is built
-# from), spelled in full: argparse also takes `--fi`/`--mess`/`--cw`, and a
+# from), spelled in full: the kit's parser refuses `--fi`/`--mess`/`--cw`
+# (`allow_abbrev=False`), so the judge does too, and a
 # glued `-Fx` / `-F=x` (argparse reads `=x`) is refused where an option is
 # read (`_parse_options`). An option the kit adds without a judge here is a
 # KeyError at import, not a flag let through unjudged.

@@ -668,10 +668,15 @@ def tail(path: Path, count: int = 25) -> str:
     return "\n".join("    " + line for line in lines[-count:])
 
 
-def print_tail(path: Path) -> None:
-    """Keep a failed step report printable on legacy consoles and stream doubles."""
+def print_safe(text: str) -> None:
+    """Print text that may hold characters the console cannot encode (a log
+    tail, a path under a non-ASCII home) on legacy consoles and stream doubles."""
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    print(tail(path).encode(encoding, errors="replace").decode(encoding))
+    print(text.encode(encoding, errors="replace").decode(encoding))
+
+
+def print_tail(path: Path) -> None:
+    print_safe(tail(path))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -720,10 +725,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         took = f"{time.monotonic() - started:.0f} s"
         if failed:
             failures.append(version)
-            print(f"   FAIL in {took} at {failed}\n   log: {log_path}")
+            print_safe(f"   FAIL in {took} at {failed}\n   log: {log_path}")
             print_tail(log_path)
         else:
-            print(f"   ok in {took}  (log: {log_path})")
+            print_safe(f"   ok in {took}  (log: {log_path})")
     print("all passed" if not failures else f"FAILED: {' '.join(failures)}")
     return 1 if failures else 0
 
