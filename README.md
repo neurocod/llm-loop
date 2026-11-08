@@ -1,742 +1,239 @@
 # llm-loop
 
-**Run a coding agent unattended for hours.** `llm-loop` calls a headless LLM CLI
-(Claude Code or Codex) over and over, each time with a *fresh* context window,
-while the actual progress lives where it survives a context reset: in your files
-and in git. The loop stops itself when the account's quota runs low, when the
-agent reports a dead end, or when you ask it to — and it is a Python package
-with zero third-party dependencies, so it behaves identically on Windows, Linux
-and macOS.
+**Tools for running coding agents unattended — for hours, several at once, in
+one repository.** Python 3.9+, standard library only; one code path on
+Windows, Linux and macOS, and CI runs all three.
 
-## llm-loop vs. the Ralph loop
+An agent CLI left alone fails in predictable places: it fills its context window
+and forgets the plan; it runs out of quota mid-task; two of them stage each
+other's files; one of them stops on a permission prompt nobody is watching. Each
+part here closes one of those gaps, and each stands on its own — vendor the
+repository and use the part you need.
 
-The technique this builds on is Geoffrey Huntley's
-[Ralph](https://ghuntley.com/ralph/) — *"Ralph is a bash loop"*:
-
-```bash
-while :; do cat PROMPT.md | claude-code ; done
-```
-
-That one line is the whole idea, and it is a good one. Everything below is the
-scaffolding you end up writing yourself the moment you leave such a loop running
-overnight.
-
-| | Ralph (the canonical loop) | llm-loop |
+| Part | Closes | Where |
 |---|---|---|
-| Implementation | a bash one-liner; forks exist in bash/PowerShell | a Python package (3.9+, **stdlib only**), one code path on Windows/Linux/macOS |
-| Iteration body | the same prompt file, every time | a pluggable `Driver`: state machine, work queue, or your own |
-| Multi-step work | one undifferentiated "do the next thing" step | explicit phases; **the state is read back by the script**, not only by the agent |
-| Prompt | fixed file | `prompt()` is computed per iteration from the current state / work item |
-| Model choice | one model for the whole run | `model()` per iteration — a cheap model for `cleanup`, a smart one for `implementation` |
-| Quota / rate limits | run until the CLI dies | the account's real figures are read over the provider's API **before** each iteration, and the loop waits under configurable ceilings (session / day-night / weekly), with a reactive `rate_limit_event` backstop |
-| Parallelism | sequential (fan-out only *inside* one agent) | `-j N` concurrent CLI workers draining a work-queue file, one item per job |
-| Stopping | Ctrl+C | `s` key (this run only), `stop` sentinel file (every run in the root), `--max-runs`, an `error` state that halts for a human, and a `done` / `complete` state that ends the run cleanly |
-| Steering | stop it, edit the prompt, start again | `m` sends a note into the current iteration at the model's next turn boundary (or queues it for the next iteration when none is running); `p` holds the loop at an iteration boundary so the files it reads can be edited, `p` again lets it go |
-| Providers | whatever the pipe points at | Claude and Codex adapters (argv vs. stdin prompt transport, both stream-json rendered) |
-| Observability | terminal scrollback | pinned status line (iteration, model, elapsed, live quota, per-job rows), rotating mirror log, optional Markdown rendering |
-| git | your problem | `--git-push none\|after_new_commits\|each_hour` |
-| Setup cost | none | one submodule + a ~15-line wrapper |
+| **The loop** | one long task, fresh context per step, quota-aware | [`llm_loop`](src/llm_loop/README.md) |
+| **Agent bridges** | a Codex or Claude worker driven like a subagent; a review by the *other* model | [`llm_agents.codex`](src/llm_agents/codex/README.md), [`llm_agents.claude`](src/llm_agents/claude/README.md) |
+| **Git kit** | several agents committing in one repository: a worktree pool, an exact commit | [`llm_agents.git`](src/llm_agents/git/README.md) |
+| **Host rules** | what a project adds to the kit and the bridges, in one small module | [`examples/host_rules.py`](examples/host_rules.py) |
+| **Test support** | pinning a host's rules against the same fake Codex wire the core is pinned on | [`llm_agents.codex.testing`](src/llm_agents/codex/testing/__init__.py) |
+| **ask-user-gate** | a Claude Code hook that refuses the shell shapes that stop a session on a prompt | [`claude-plugin/ask-user-gate`](claude-plugin/ask-user-gate/README.md) |
+| **agent-tools** | the small waits and edits an agent harness keeps asking permission for | [`agent-tools`](agent-tools/README.md) |
+| **agent-counter** | optional: an on-screen count of running agents (Windows, Qt) | [`extras/agent-counter`](extras/agent-counter/README.md) |
 
-Nothing here replaces the idea; it makes the idea survivable unattended.
+## The loop — `llm_loop`
 
-## Why the extra machinery pays off
-
-You write only *what work to do each iteration* — a `Driver` subclass, usually
-some fifteen lines. Two are ready-made, and the shape decides the rest.
-
-**A state machine (`StateFileDriver`) gives each step a clean context.** The
-loop is, in pseudocode:
-
-```
-while not error and not limits_reached:
-    claude|codex -p "Follow the instructions in currentState.md"
-    state = first_line_of("currentState.md")
-```
-
-and `currentState.md` is a playbook whose first line names the current step:
-
-```
-Current state: plan mode
-
-If the state is "plan mode": read TODO.md, choose ONE task, write it to
-currentTask.md, set the state to "implementation", exit.
-
-If the state is "implementation": implement currentTask.md,
-set the state to "cleanup", exit.
-
-If the state is "cleanup": review the changes, commit, delete currentTask.md,
-set the state to "plan mode", exit.
-```
-
-That sketch is boiled down to the mechanism. A playbook that survives real
-unattended nights is considerably more detailed — where the task comes from when
-the TODO list runs dry, when a test is written, what `cleanup` is allowed to
-revert, what counts as a dead end — see
-[`examples/currentState.md`](examples/currentState.md), the file this project's
-own loop runs on.
-
-Because every step is its own process, the implementation step is not reading a
-context window already half-full of the *analysis* that chose the task —
-planning can be as heavy as it likes and still costs the implementation nothing.
-Add as many steps as your project deserves: human review, refactor pass,
-benchmark, docs.
-
-**The script sees the step, so it can specialise it.** The state line comes back
-to the Python side, which is what makes per-step model selection, per-step
-prompts and per-step limits possible at all — `cleanup` on a cheap model,
-`implementation` on the expensive one.
-
-**The other shape is a work queue (`ListFileDriver`)** — a list file that the
-loop drains, striking each item out once its command succeeds:
-
-```
-while not error and not limits_reached:
-    line = read_line_from(list_file)
-    run("claude|codex", f"Translate {line} to Portuguese into Port-{line}, "
-                        f"then strike {line} out of {list_file}")
-```
-
-Idempotent by construction: kill it any time, relaunch, it picks up the
-remainder. And since the items are independent, they can run **N at a time**:
-
-```
-[job 3] 💻 pdfinfo 'D:\g\3d-research\musical-instruments\acoustic-upright-piano\kawai-k-series-…
-[job 3] 📤 exit 0
-[job 4] 💻 curl.exe -L --fail --output 'D:\g\3d-research\food-and-beverages\eggs-dozen\thirty-…
-
-──────────────────────────────
- ⟳ iter 4/12 | codex | 4 jobs | 1m37s | session n/a | week 26% (6d8h) / ceil 95%
- job 1 ▶ gpt-5.6-terra | iter 1    | 1m37s  | calculator-desktop.md
- job 2 ▶ gpt-5.6-terra | iter 1    | 1m36s  | terminal-block-connector.md
- job 3 ▶ gpt-5.6-terra | iter 1    | 1m36s  | acoustic-upright-piano.md
- job 4 ▶ gpt-5.6-terra | iter 1    | 1m36s  | eggs-dozen.md
- keys: s stop | p pause | m message | +/- add/remove workers | h help
-```
-
-## A playbook worth stealing
-
-The state machine is the headline shape, and a playbook for it is where the
-project-specific thinking goes. The shipped
-[`examples/currentState.md`](examples/currentState.md) cycles like this:
-
-```
-         ┌──────────────────────────────────────────────┐
-         ▼  (loop back once the task is wrapped up)     │
-  ┌─────────────┐                                       │
-  │  plan mode  │  look around, pick a task,            │
-  │             │  fill currentTask.md                  │
-  └──────┬──────┘                                       │
-         ▼ task ready                                   │
-  ┌─────────────┐                                       │
-  │  implement  │ build it, write a self-test,          │
-  │             │  commit intermediate work             │
-  └──────┬──────┘                                       │
-         ▼ code written                                 │
-  ┌─────────────┐                                       │
-  │   cleanup   │  commit or revert, tidy comments,     │
-  │             │  update TODO / README                 │
-  └──────┬──────┘                                       │
-         │ task done                                    │
-         └──────────────────────────────────────────────┘
-
-  · · · from ANY state, on an unrecoverable problem · · ·
-                          │
-                          ▼
-                  ┌─────────────┐
-                  │    error    │  loop halts until a human
-                  │   (halt)    │  resets the state line
-                  └─────────────┘
-```
-
-## Requirements
-
-**Python 3.9+ and nothing else.** The engine has zero third-party
-dependencies — every import across its modules comes from the standard
-library — so vendoring it adds no transitive dependency to your project and
-cannot conflict with the versions you already pin.
-
-**Plus the CLI you intend to drive, already signed in.** The loop authenticates
-nothing itself: it shells out to `claude` or `codex`, and reads the quota
-figures through that CLI's own login (see *Usage limits*). So an unauthenticated
-CLI fails twice over — every iteration exits without doing any work, and the
-limit gate, having no figures, cannot tell that it should have paused. Check
-before a long run:
-
-```bash
-claude auth status     # JSON; "loggedIn": true is the field that matters
-codex login status     # e.g. "Logged in using ChatGPT"
-```
-
-Sign in with `claude auth login` / `codex login`. Both keep the session on disk,
-so this is a one-off per machine, not per run. For Claude the loop also accepts
-`CLAUDE_CODE_OAUTH_TOKEN`, and honours `CLAUDE_CONFIG_DIR` when looking for the
-credentials — useful on a CI box with no interactive login.
-
-## Layout
-
-```
-src/
-  llm_loop/
-    cyclecore.py     engine: parse_args and the sequential run_loop
-    streamrender.py  one provider run rendered live, and the single-stream state
-                     that only a runner with one in flight can hold
-    wire.py          the words the provider stream is made of, so both renderers
-                     read the same event by the same name
-    runlifecycle.py  the prologue and epilogue every run has, and the live
-                     knobs (RunSettings) both runners read
-    scriptlock.py    ScriptLock / ensure_script_lock
-    agentwork.py     what one unit of work is, and the Driver protocol a
-                     wrapper subclasses to produce them
-    console.py       what a run prints, and the rotating mirror log that is the
-                     second copy of every line of it
-    costlog.py       --cost: the two logged lines a run's spend is read back from
-    stopchannel.py   how a run is asked to stop or hold, and what it reports
-    breakpoints.py   run-local state breakpoint names and matching
-    projectroot.py   where the project being driven is, and the one place that
-                     answers it
-    gitpush.py       when a run pushes what it has committed, and where
-    providers.py     Claude/Codex executable flags, argv construction, and the
-                     ending owed to a provider child
-    procend.py       ending a child process tree: ask, wait, kill, wait
-    drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)
-    parallel.py      run_parallel: N concurrent LLM workers over a list file
-    ownership.py     one thread owns a shared resource, the rest post to it
-    operator.py      notes typed at the console, on their way to the running agent
-    usage.py         what is known about a quota: the queried figures
-                     (UsageSource) and the verdict the wire streams back
-    codex_usage.py   the same figures for Codex, over its own app-server protocol
-    limits.py        LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
-    statusline.py    the status area pinned under a run: its rows, and the keys
-    termio.py        the terminal underneath: reserved region, window title, keys
-    textwidth.py     how wide terminal text is, and how much a line may hold
-    compactline.py   the one-event-one-line shapes both runners print
-    clispec.py       every option the family's command lines carry, declared
-                     once: both parsers and cmdline's alias table come from it
-    cmdline.py       the command line that would reproduce this run
-    notifications.py opt-in settings and completion sounds for unattended runs
-    exitlog.py       why a run ended — including the endings it cannot report itself
-examples/
-  runCycle.py            state-machine wrapper
-  runFileList.py         per-file work-queue wrapper
-  runFileListParallel.py parallel work-queue wrapper
-agent-tools/             standalone stdlib scripts for agents (waits, line moves)
-                         — see agent-tools/README.md
-ideas/                   study material, never shipped — see ideas/README.md
-extras/                  optional native add-ons outside the pip package; today
-                         agent-counter/, the Qt badge for running agents
-scripts/
-  ci_local.py            the GitHub CI matrix run on this machine, one uv venv
-                         per Python: `python scripts/ci_local.py [3.10 ...]`
-  collect_codex_thread.py one Codex rollout JSONL as a chronological view
-```
-
-One line per module, and every module has one: the map is worth its upkeep only
-while it is complete — a module missing from it is a module nobody browsing the
-package knows to open. A new module gets its line here, saying what it owns.
-
-The package sits under `src/` for one reason, and it is the reason to keep it
-there: a host project puts that directory on `sys.path`, so whatever sits
-directly inside it becomes a top-level importable name for them — at position
-0, outranking their own modules. With `src/` holding nothing but the package,
-vendoring costs an adopter exactly one name. Flat at the repository root it
-would also hand them `tests`, which nearly every project already has.
-`tests/test_vendoring_footprint.py` keeps that honest.
-
-## Use it from a host project
-
-Add it as a submodule, then copy one of the [`examples/`](examples/) wrappers
-into your project root and adjust the paths, prompt and model:
+Geoffrey Huntley's [Ralph](https://ghuntley.com/ralph/) is `while :; do cat
+PROMPT.md | claude ; done`; this is that loop made survivable overnight. Each
+iteration starts a headless CLI (`claude` or `codex`) with a fresh context
+window, progress lives in files and git, and before every iteration the loop
+reads the account's real quota and waits under a ceiling you set. A `Driver`
+subclass of some fifteen lines says what one iteration does: a state machine
+(`StateFileDriver`) or a work queue drained one item — or `-j N` items — at a
+time (`ListFileDriver`).
 
 ```bash
 git submodule add https://github.com/neurocod/llm-loop.git tools/llm-loop
 cp tools/llm-loop/examples/runFileList.py .   # then edit the constants
+python runFileList.py --dry-run               # the commands it would run
+python runFileList.py --codex --max-runs 5
 ```
 
-Vendoring is the intended route: it pins the engine to a commit your project
-controls, and a wrapper needs no install step. Where the code sits and where
-your project sits are kept separate — the engine anchors every project-relative
-operation (git/agent cwd, the stop file, the relative paths a Driver is handed)
-to the project root: the current working directory by default, or
-`--project-dir`/`-C`. If you would rather have it on
-the import path proper, it is a normal PEP 621 project:
+Per-iteration model choice, the pinned status line and its keys (`s` stop, `p`
+hold, `m` a note to the running agent), the stop file, push policy, Ctrl+C and
+the usage-limit rules are the loop's own manual:
+[`src/llm_loop/README.md`](src/llm_loop/README.md). The playbook this
+repository's own loop runs on is
+[`examples/currentState.md`](examples/currentState.md).
+
+## Agent bridges — `llm_agents.codex`, `llm_agents.claude`
+
+Run Codex CLI or Claude Code as a **named worker** from a script or from another
+agent: `spawn` an agent with a task, `send` a follow-up on the same thread,
+read its `result`, `logs` and `status`. The turn itself stays in the agent's own
+log; only the answer reaches the caller's context. Both bridges speak the CLI's
+own protocol (Codex's app-server, Claude Code's stream-json), sandbox the worker,
+and let a command out of the sandbox only when a judge says so.
+
+The reason to have both: **a review by the other model finds what yours
+missed.** One commit reviewed by Codex and by a Claude subagent gave 8 and 11
+findings with 4 in common (measured 2026-08-24) — half of each list was visible
+to one model alone. So Claude's commits get a Codex review and Codex's a Claude
+review, with the same two commands:
 
 ```bash
-pip install git+https://github.com/neurocod/llm-loop.git
+python -m llm_agents.codex spawn review-1 --role reviewer --sandbox read-only --prompt-file review.txt
+python -m llm_agents.codex result review-1
+python -m llm_agents.claude spawn review-2 --message-file review.txt
+python -m llm_agents.claude wait review-2 --until-done
 ```
 
-then drop the `sys.path.insert` line from the wrapper. Note that `pip install
-llm-loop` does **not** get you this project — that name on PyPI belongs to an
-unrelated 2023 package.
+Run bare like this they use the **empty host policy** and say so on stderr:
+nothing leaves the sandbox unless the call itself asks (`--escalate`,
+`--gates-from-prompt`), and Claude's `review` profile refuses to start without
+a host's gate hook. A project hands its rules to `cli.main(policy=..., root=...,
+entry=...)` from an entry point of its own — see *Host rules* below. The
+reasoning behind the sandboxes, how to cut a task so the worker returns one
+result, and the Windows sandbox's traps are in the package READMEs.
 
-A wrapper is tiny — subclass a Driver, set the project-specific bits as class
-attributes / an overridden `prompt()`, and call `.main()`:
+## Git kit — `llm_agents.git`
+
+Several agents writing one repository trip over git in a few predictable ways:
+a commit sweeps up hunks another agent staged, two commits collide on
+`index.lock`, two writers share one working tree. The kit is the set of scripts
+that keeps that from happening:
+
+- `worktree` — a pool of standing worktree **slots** beside the main checkout
+  (`<repo>-wt1`, `-wt2`, … on branches `wt1`, …), with `new`, `equalize`,
+  `land`, `drop`, and Claude Code's `WorktreeCreate`/`WorktreeRemove` hooks
+  that hand each `isolation: "worktree"` agent a free slot;
+- `commit` — commits exactly the named paths whatever else is staged, waits out
+  a held index lock, and reads its message from a file so no shell re-quotes it.
+
+```bash
+python -m llm_agents.git.worktree status
+python -m llm_agents.git.worktree new            # creates <repo>-wt1 on branch wt1
+python -m llm_agents.git.commit -F msg.txt src/a.py docs/b.md
+python -m llm_agents.git.commit -C ../repo-wt1 -m "Subject" -m "Body" src/a.py
+```
+
+The defaults are neutral: the main branch is `main`, the remote `origin`, and
+**nothing pushes unless asked** (`--push` on the command, or a host that opts in
+with `PoolHost.push_by_default`). The fields a project sets — its submodules,
+shared directories, install step, branch names — are `worktree.PoolHost` and
+`commit.CommitHost`; the kit's [README](src/llm_agents/git/README.md) lists the
+other modules.
+
+## Host rules — `examples/host_rules.py`
+
+The kit and the bridges know no project. What one adds — the file never
+committed, the submodules a slot gets, the paths no agent writes, the commit
+command a worker is told — is a `PoolHost`, a `CommitHost` and a `HostPolicy`
+(`llm_agents.host_policy`) in one module of the project's own, which its entry
+points hand to each `main`:
 
 ```python
-# runFileList.py  (in your project root)
-import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tools", "llm-loop", "src"))
+from llm_agents.git import worktree
+from host_rules import POOL          # your copy of examples/host_rules.py
 
-from llm_loop import ListFileDriver
-
-class FileListDriver(ListFileDriver):
-    list_file     = "files.md"
-    target_suffix = ".summary.md"
-    pick_order    = "random"   # or "list" to walk the list top to bottom
-
-    def model(self):
-        return "sonnet"   # or "" to use the CLI's own configured model
-
-    def prompt(self, source, target):
-        return (f"Read {source} and write a Markdown summary to {target}. "
-                f"Do not modify {source}.")
-
-if __name__ == "__main__":
-    FileListDriver.main()
+raise SystemExit(worktree.main(POOL))
 ```
 
-Run it from the project root so the working directory is the project root (or
-pass `--project-dir <path>` from anywhere):
+[`examples/host_rules.py`](examples/host_rules.py) is a complete, neutral
+example with every field a downstream project usually sets;
+`tests/test_examples_host_rules.py` keeps it importing.
 
-```
-python runFileList.py               # drain the list, one file per iteration
-python runFileList.py --codex
-python runFileList.py --max-runs 5  # at most 5 iterations
-python runFileList.py --dry-run     # print the commands, run nothing
-```
+## Test support for a host — `llm_agents.codex.testing`
 
-Items go out in random order by default, which keeps an interrupted run from
-draining one section of a grouped list before touching the rest. Set
-`pick_order = "list"` (or override `pick(pending)`) to hand them out top to
-bottom instead — the setting governs the parallel runner too.
+A host's judge tables deserve pins of their own, against a tree of their own;
+what a host should not rewrite is how a judge is asked, how a fixture
+repository and a pool slot are laid out, and the stand-in `codex app-server`
+the core's own tests run against. The package exports exactly that:
+`worker_judge`, `pool_slot`, `commit_judge` and the rest of
+[`__init__.py`](src/llm_agents/codex/testing/__init__.py); `wire` is the
+offline app-server (a real child process on real pipes, no network, no
+`codex`); `fixtures` the pytest fixtures a turn test registers by importing
+them. The core's own test host, `tests/codex_agent/core_policy.py`, is a small
+`HostPolicy` built the way a project's is.
 
-Claude remains the default for compatibility. Select Codex per invocation with
-`--codex`, or set `provider = "codex"` on the Driver subclass. Codex normally runs
-through its app-server protocol, so `m` can steer the active turn; the same sequential and
-parallel renderers show agent messages, commands, file changes, failures, and
-final token counts. `--no-live-messages` falls back to `codex exec --json` and
-sends the prompt through a closed stdin stream (`codex exec ... -`) instead of
-argv. Both transports avoid Windows command-line length limits without entering
-the interactive UI. Claude keeps its existing provider-specific transport.
-The adapter grants writes only to the workspace and routes any approval through
-Codex's automatic reviewer; it does not bypass the sandbox.
+## ask-user-gate — a Claude Code plugin
 
-### State-machine driver
+A `PreToolUse` hook that refuses the shell commands which would park the
+session on a permission dialog — a `cd … && …` chain, a backgrounded `&`, a
+heredoc, `sed -i`, a `sleep` loop, a command over the analyser's length limit —
+and names the replacement for each. It ships `replace_in_file.py` (a checked
+`sed -i`) and `try_patch.py` (mutate, run, restore from a `finally`; with
+`--expect-fail` the way to prove a test can fail), plus a C++ twin for machines
+that call the hook a hundred thousand times a month.
 
-Drives the state machine shown in the diagram above — the state file's first
-line names the current mode, `prompt()` supplies the required project playbook,
-and an overridden `model()` picks the model per mode (drop `model()` to let the
-CLI use its own configured model):
-
-```python
-from llm_loop import StateFileDriver
-
-class CycleDriver(StateFileDriver):
-    state_file = "currentState.md"
-
-    def prompt(self):
-        return f"Follow the instructions in {self.state_file}"
-
-    def model(self):
-        if self.state_name() == "implementation":
-            return "claude/opus"
-        return "codex"
-
-if __name__ == "__main__":
-    CycleDriver.main()
+```text
+/plugin marketplace add neurocod/llm-loop
+/plugin install ask-user-gate@neurocod
 ```
 
-Two states end the run. `error` (anywhere in the line) halts with exit code 1 for
-a human. A state that **begins with** `done` or `complete` — `Current state: done`,
-`Current state: done — nothing before Phase 5 is left` — is a clean stop with exit
-code 0 and the final push, for a playbook that has a finish line. The word has to
-be the state itself: `review complete` or `done-list` are ordinary steps and keep
-the loop going. Both words are the `done_tokens` class attribute if your playbook
-wants a different one.
-
-### Parallel work queue
-
-Any `ListFileDriver` subclass also runs concurrently via `.main_parallel()` — no
-extra code, just a different entry point. Put it in its own wrapper file and the
-derived `app_name` / `prog` give it a separate log file and `--help` name for
-free:
-
-```python
-class FileListParallelDriver(FileListDriver):
-    pass
-
-if __name__ == "__main__":
-    FileListParallelDriver.main_parallel()
+```bash
+python claude-plugin/ask-user-gate/hooks/ask_user_gate.py --self-test
+python claude-plugin/ask-user-gate/bin/try_patch.py --selftest
 ```
 
-### Wrapper options in `--help`
+Why each shape is refused, how to update an installed copy, and the C++ port:
+[`claude-plugin/ask-user-gate/README.md`](claude-plugin/ask-user-gate/README.md).
 
-A wrapper that offers a mode of its own has to scan `argv` for it — the two
-parsers have disjoint option sets, so the flag choosing between them decides
-which parser runs. Declare such flags once, as a
-[`modeswitch`](src/llm_loop/modeswitch.py) table: `register` (called from each
-driver's `add_cli_options`) puts the switches into that driver's parser, and
-`modeswitch.parse` is the dispatch — the scan, your choice of driver and parser,
-the parse, and exit 2 when an abbreviation made the scan and the parser read a
-switch differently. `Driver.main()` never acts on a switch, so it refuses a
-line that gives one:
+## agent-tools
 
-```python
-SWITCHES = (ModeSwitch(("-p", "--parallel"), "parallel", False,
-                       "run N workers", listed_in=frozenset({"sequential"})),)
+Standalone scripts (no import of the packages) for the one-liners an agent
+harness keeps stopping on: wait for a file to appear or vanish, follow a growing
+log until a pattern shows, move line ranges between files byte-exactly, read the
+machine's CPU load, search a whole repository for a name after a rename.
 
-class FileListDriver(ListFileDriver):
-    @classmethod
-    def add_cli_options(cls, parser):
-        modeswitch.register(parser, SWITCHES, "sequential")
-
-class FileListParallelDriver(FileListDriver):
-    @classmethod
-    def add_cli_options(cls, parser):      # parsed, not listed, in its --help
-        modeswitch.register(parser, SWITCHES, "parallel")
-
-def choose(scanned):
-    if scanned.parallel:
-        return modeswitch.Choice(FileListParallelDriver, parse_parallel_args)
-    return modeswitch.Choice(FileListDriver, parse_args)
-
-def main(argv=None):
-    choice, scanned, args = modeswitch.parse(argv, SWITCHES, choose)
-    run = run_parallel if scanned.parallel else run_loop
-    run(choice.driver(), args, app_name=choice.driver.resolved_app_name())
+```bash
+python agent-tools/follow_file.py --help
+python agent-tools/rename_gate.py old_name     # exit 1 while any hit is left
 ```
 
-The switches stay in `argv`: the chosen parser reads the whole line, so a value
-flag followed by a switch is a usage error instead of the switch's neighbour
-quietly becoming the value.
+[`agent-tools/README.md`](agent-tools/README.md) has the table.
 
-Hold the hook to [`clispec.unstrippable_flags`](src/llm_loop/clispec.py) in a
-test of your own, over every parser your entry points build. `register` tells
-the status line's argv rewriter about your switches; a value-taking option of
-your own that is not a switch needs the same, through `clispec.record_flags`:
+## agent-counter — optional, Windows, Qt
 
-```python
-parser.add_argument("--size", type=int)
-clispec.record_flags(parser, {"size": clispec.Flag(("--size",), True)})
+An on-screen badge with the number of running agents and the provider's
+weekly-limit remainder. Not part of the pip package (Qt is no dependency of
+this project), never built on another OS, and absent it the bridges show
+nothing and never fail a turn. Build and wiring:
+[`extras/agent-counter/README.md`](extras/agent-counter/README.md).
+
+## Requirements and CI
+
+Python 3.9 or newer and nothing else: every import across `src/` is from the
+standard library (`pyproject.toml` says why the floor is 3.9). The loop and the
+bridges need the CLI they drive — `claude` or `codex` — installed and signed in;
+the tests need neither (the Codex tests run against the stand-in wire, the Claude
+tests against patched launches).
+
+CI (`.github/workflows/tests.yml`) runs the suite and the gate's self-tests on
+Linux, Windows and macOS for Python 3.9 through 3.13. The same matrix on your
+machine, one uv venv per Python:
+
+```bash
+python -m pip install -e ".[test]"
+python -m pytest -q
+python scripts/ci_local.py 3.9 3.13     # a subset; no argument runs them all
 ```
 
-### Reacting to the world around a run
-
-`Driver.item_started(command)` and `Driver.item_finished(command, returncode)`
-are called at the two boundaries of one unit of work, in both runners (the
-parallel one calls them from its worker threads, so keep them thread-safe).
-Override the one you need to watch something the run does not own — a folder the
-agents themselves write into, a lock, a budget.
-
-Return a short reason from either and the runner stops handing out new work and
-returns `RunStopReason.DRIVER_PAUSE` once everything in flight has finished: no
-turn is cancelled and nothing is lost from the queue. It is the same close
-`--max-runs` uses (new claims refused, work in flight untouched) rather than the
-`s` key's — a pause cannot be taken back, so unlike `s` a claim that has not
-started yet goes back to the queue instead of being held. A run whose LAST item
-asks for the pause may report either `DRIVER_PAUSE` or `NO_WORK`, depending on
-which worker got there first; a caller has to treat both as "come back and ask
-again". It is the ending for a wrapper that alternates two kinds of run — "this runner call is over, ask me again" — as opposed to
-`next_command() -> None` (the queue is empty) and `LoopStop` (abort, a human is
-wanted). A host wrapper that slices its work into fixed-size batches to get an
-inter-batch boundary usually wants this instead: the run then ends when the
-condition actually appears rather than N items later.
-
-## Usage limits
-
-Before each iteration (and after any failed one) the loop reads the account's
-quota figures and pauses if a watched one is at/over its ceiling. Which
-quota, and at what ceiling, is a *specialisation* you pick by setting the
-`limit_policy` class attribute on your Driver — a `LimitPolicy` holding one or
-more rules; the loop pauses while **any** of them is exceeded:
-
-```python
-from llm_loop import (LimitPolicy, SessionLimit, DayNightLimit, WeeklyLimit)
-
-class MyDriver(StateFileDriver):
-    # pick ONE of these:
-    limit_policy = LimitPolicy([SessionLimit(80)])                  # flat session cap
-    limit_policy = LimitPolicy([DayNightLimit()])                   # smart session (default)
-    limit_policy = LimitPolicy([WeeklyLimit(90)])                   # weekly cap
-    limit_policy = LimitPolicy([DayNightLimit(), WeeklyLimit(90)])  # composite
-```
-
-| Rule | Watches | Ceiling behaviour |
-|---|---|---|
-| `SessionLimit(limit)` | the ~5-hour session | flat `limit`%, wait out the window |
-| `DayNightLimit(day=, night=, deadline_hour=)` | the session | day/night base + a climb toward 100% as the window nears its reset |
-| `WeeklyLimit(limit, sonnet_only=)` | the weekly quota | flat `limit`%, wait out the week |
-
-Leaving `limit_policy` unset keeps Claude's historical
-`LimitPolicy([DayNightLimit()])`. Codex defaults to the composite session and
-weekly policy because plans may expose both windows or only a weekly window.
-The bookend usage snapshots and the per-check log lines report exactly the quotas
-the active policy watches — those are records of the gate. The pinned status line
-is not: it lists every window the provider meters (see below). When `--max-runs N`
-is given (a short bounded run) the limit gate is skipped entirely.
-
-The hold itself watches both stop channels, so a run parked on the wall — which
-in a parallel run means every worker at once, with nothing else left to notice a
-keypress — still answers `s` and the `stop` file within a quarter-second instead
-of only when the window resets.
-
-**Where the figures come from.** For Claude, `usage.py` reads them over HTTP from the same
-endpoint the CLI's own `/usage` panel and status line are built from,
-authenticated with the OAuth token the CLI keeps in `~/.claude/.credentials.json`
-(`CLAUDE_CONFIG_DIR` / `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_BASE_URL` are
-honoured). No tokens, no model turn — the earlier `claude -p "/usage"` round-trip
-that this replaced cost $0.33 and 17 s per check, i.e. it spent a slice of the
-very budget it was measuring.
-
-For Codex, `codex_usage.py` starts `codex app-server` and calls the official
-`account/rateLimits/read` JSONL/JSON-RPC method using the CLI's existing login.
-It does not start a thread or model turn. The returned window durations decide
-whether a reading is the short session quota or the long weekly quota, including
-weekly-only plans where Codex reports the seven-day window as `primary`.
-
-The Claude endpoint is undocumented, and either provider query can fail because
-of a temporary network, CLI, or authentication problem. A failure is therefore
-treated as "no figures" rather than a fatal error. Claude also has a reactive
-backstop: every run streams its own `rate_limit_event` verdict, and a `rejected`
-makes the loop wait out exactly the quota that refused it
-(`usage.RateLimitEvent`). A failed Codex turn forces a fresh app-server
-reading before the bounded retry path continues.
-
-## Command-line options
-
-The option list is your wrapper's `--help`. Both runners build their parsers
-from one table, [`llm_loop.clispec.OPTIONS`](src/llm_loop/clispec.py), and the two accept different
-subsets of it (`clispec.OPTION_ORDER`), so ask the entry point you run:
+## Layout
 
 ```
-python runFileList.py --help           # .main(): the sequential runner
-python runFileListParallel.py --help   # .main_parallel(): the parallel one
-python runCycle.py --stat              # time spent per state in the mirror log
+src/llm_loop/        the loop engine                        — src/llm_loop/README.md
+src/llm_agents/      the bridges and what they share:
+  codex/             Codex CLI as a named worker              — codex/README.md
+  codex/testing/     the fake app-server wire, for a host's tests
+  claude/            Claude Code as a named worker            — claude/README.md
+  git/               the worktree pool and the commit helper  — git/README.md
+  host_policy.py     what a project adds, handed over explicitly
+  answer_contract.py the `## Coverage` contract and its follow-up
+  child_job.py       a Windows Job Object that ends a child's tree with its owner
+  agent_counter.py   the client of the optional counter
+  gitlib.py          the git runner the kit and the bridges share
+examples/            the loop wrappers, the playbook, host_rules.py
+claude-plugin/       ask-user-gate: the hook, its bin/ tools, the C++ port
+agent-tools/         standalone scripts for agents
+extras/              optional native add-ons outside the pip package
+scripts/             ci_local.py; fake_claude/; collect_codex_thread.py
+ideas/               study material, never shipped
 ```
 
-## Why the run ended
+`src/` holds the two packages and nothing else, so a host that puts it on
+`sys.path` inherits exactly two names (`tests/test_vendoring_footprint.py`).
 
-Every run closes the mirror log with one line naming its ending:
+## Install
 
-```
-=== run ended: no more work in the queue · 21 iteration(s), 21 completed · 4h12m ===
-```
+Vendoring is the intended route — it pins the engine to a commit your project
+controls, and a wrapper needs no install step:
 
-A stop file, the `s` key, `--max-runs`, a driver stop, five provider errors in a row, an
-unhandled exception, Ctrl+C, a signal — each gets its own phrase there. What
-cannot get one is a kill from outside (`Stop-Process`, `taskkill /F`, an OOM
-kill, a power cut): the process is gone, so it writes nothing at all. For those,
-each run keeps a small `<app>-<project>.<pid>.run.json` record beside its log
-and removes it on the way out — a record still on disk whose owner is gone is
-the report, and the next run prints it, naming the pid, the moment it was last
-alive and the item it was working on. `llm_loop.exitlog` is the whole of it.
-
-## Ctrl+C
-
-Inside a runner (`run_loop`, `run_parallel`) Ctrl+C raises no
-`KeyboardInterrupt`. The first press ends the turn in flight, its CLI included,
-and every wait; the run then leaves with exit code 130 after the same exit
-push, closing usage snapshot and report of undelivered notes as any other
-ending. A further press gives up what that ending still waits for — the exit
-push, the workers' turns — and nothing else.
-
-A runner that has heard a press never returns a result: it exits 130. An
-ending that exits with its own code (a driver's exit 3) keeps it; a wrapper
-that must still hear the press opens `ctrlc.captured()` around the runner call
-and asks that Interrupt after it.
-
-For an embedder this changes three public calls while a run is open:
-`run_agent_streaming` returns `ctrlc.EXIT_CODE` (130) for a turn the press cut
-short, and `LimitPolicy.check_and_wait` and `stopchannel.sleep_unless` return
-early as they do for a stop request; ask `llm_loop.ctrlc.current().requested`
-which it was. Outside a run they raise `KeyboardInterrupt` as before.
-`llm_loop.ctrlc` is the whole of it.
-
-## Interactive status line
-
-On a terminal, a run pins a few rows at the bottom — iteration, provider/model,
-elapsed time, the provider's live quota figures and the script's own limits, one
-row per job, and a legend of the keys it answers to. Piped output, CI and
-`--no-statusline` get the plain scrolling output of before.
-
-The same run also names the window (and the tab, and the taskbar button):
-`⟳ iter 12/40 · bmx-bike.md` — the row's first field, then what each still-busy
-job is on, so a run left in the background stays readable with the terminal
-itself out of sight. It shares the rows' kill switch — piped output, CI and
-`--no-statusline` get no title either — and the name is handed back when the run
-ends, whichever way it ends.
-
-The iteration counter carries the whole of "how much work is this run": its
-denominator is `--max-runs`, whatever the driver reports from
-`Driver.pending_total()`, or the smaller of the two. `--max-runs` therefore
-gets no field of its own — a knob
-whose value is already on the row registers with `show_in_status=False` and
-stays editable and reproducible without spending row width twice.
-
-**The quota fields have two halves**, split by ` / `:
-
-```
- session 43% (2h11m) / ceil 95% | week 63% (17h27m)
- └── the provider ──┘└─ policy ─┘└─ the provider ─┘
+```bash
+git submodule add https://github.com/neurocod/llm-loop.git tools/llm-loop
 ```
 
-Left of the slash is the account's own report — how much of the window is spent
-and how long it still has to run. Every window the provider meters gets a field,
-whether or not the run is gated on it, so the reader sees the whole budget and
-not just the slice that happens to be watched: the 5-hour session and the week
-are always there (`n/a` when the provider reports no figure), and a window a plan
-does not have is dropped unless a rule watches it. Right of the slash is what the
-`LimitPolicy` rule for that window makes of it — its live ceiling by default,
-absent entirely when no rule watches it. A custom rule can say something else by
-overriding `LimitRule.status(reading, now)`.
-
-Keys: `s` requests a graceful stop of **this** run (pressing `s` again during
-the countdown cancels it), `p` holds it at the next iteration boundary and `p`
-again lets it go (see below), `m` sends the agent a note (see below), and in a
-parallel run `+` starts one more worker immediately. An increased worker count
-also carries into later batches of the same invocation. `h` or `?` shows the
-full key list. State-driven loops also expose `b`: `BreakpointAction`.
-
-`s` sets an in-process flag and writes nothing to disk, so several loops
-launched in one project root are stopped one at a time — the terminal you type
-it into is the run that halts. The `stop` file below is the other channel: it
-stops every run watching the root, survives the process, and is therefore what
-scripts and run-chaining use. A stop file this run merely obeys is not the key's
-to withdraw, so `s` neither writes nor removes it.
-
-Where the two meet, the file wins: a run that stops while a sentinel is on disk
-consumes it, whether or not `s` was also pressed. Otherwise the file would
-outlive the loop it was written for and the launch queued behind it would wait
-forever.
-
-## Holding the run (`p`)
-
-`p` pauses the loop and `p` again resumes it. The iteration in flight is never
-interrupted — it finishes its one state transition, and the next one does not
-begin. That gap is the point: nothing the loop reads (a state file, a task list,
-the tree itself) is being written while it holds, so it can be edited, and the
-next iteration is what reads the edit. In a parallel run the same key stops new
-files being claimed, and whatever is already running finishes.
-
-**Read the row, not the keypress**, because the two are not the same moment:
-
-```
- ⟳ iter 12/40 | … | PAUSING — the iteration in flight finishes first
- ⏸ iter 12/40 | … | PAUSED — press p to resume
-```
-
-Only the second line means the run is standing still and the files are yours.
-(`pause_state` in `statusline.py` is the whole rule.)
-
-Held, a run still answers everything else: `s` ends the hold and stops the run
-(with its usual cancel countdown), the `stop` file does the same, and `m` still
-accepts notes (see below). Like `s`, `p` is in-process and
-writes nothing to disk — it holds the run whose terminal it was typed into, and
-the ones next door work on.
-
-Create a file named `stop` in the project root to halt **every** loop rooted
-there at its next iteration boundary; it is removed on stop so the next launch
-starts clean. This is useful when a parallel agent needs to stop or unlock a running
-script by creating or removing this file. If the file exists before startup, the
-script waits until it is deleted.
-
-A `--dry-run` never removes it — previewing commands while a real
-run has a stop pending must not cancel that stop — it only reports that the file
-is there. To stop just one of several concurrent loops, press `s` in its
-terminal instead (see above): that request is in-process and leaves no file.
-
-A launch that finds the sentinel already in place does not start and does not
-consume it: it waits (sequential and parallel alike, before `--start-in`) until
-the file goes away — cleared by the run it was meant for, or removed by hand —
-and only then begins. So queueing the next run behind a stop you just requested
-works, and a leftover `stop` never costs a run its first iteration.
-
-What a hold does **not** do is keep a finished run alive: a sequential run that
-has reached `--max-runs`, and a parallel one whose queue drained or hit its item
-cap, end instead of waiting for a boundary that will never come.
-
-## Talking to the running agent (`m`)
-
-The loop is autonomous, not unattended. `m` opens a one-line editor in the
-pinned area: Enter sends and leaves the editor open for the next note, Esc
-clears a half-typed line, and Esc on an empty line leaves. (Both are two-step on
-purpose — keys arrive one at a time from a single burst, so an editor that
-closed on Enter would hand the rest of a pasted line to the normal keys, `s`
-included.) While the editor is open the legend shows its keys and not the run's,
-because in there `s` is a letter.
-
-The line is properly editable, not append-only: ←/→ move the cursor and typing
-lands where it points, Ctrl+←/→ move by word, Home/End (Ctrl+A / Ctrl+E) jump to
-either end, Delete cuts forward, and Ctrl+W / Ctrl+U / Ctrl+K erase the word
-before the cursor / everything before it / everything after it. The view scrolls
-to keep the caret visible when the note outgrows the row. Both spellings of
-every key are decoded, so the same bindings work on Windows and POSIX.
-
-What you type reaches the agent one of two ways:
-
-* **into the current iteration**, if one is running. The agent receives the
-  note at the model's next turn boundary — for example, after a tool call
-  returns — and continues the same iteration with that guidance. A tool call
-  already in progress is allowed to finish. The note may also be answered as a
-  continuation of the same session if it arrives as the active turn ends.
-* **queued for the next iteration** otherwise (between iterations, including
-  a fully `PAUSED` run, or with `--no-live-messages`), appended to that prompt as
-  a named section. The legend
-  counts what is waiting: `m message (2 queued)`.
-
-Notes are framed before the agent sees them: who is speaking, and that a note is
-guidance rather than a replacement for the task. That matters — a bare imperative
-arriving mid-turn reads like a prompt injection, and is treated as one. It also
-means an emphatic note ("stop reading files, do X instead") is obeyed literally:
-say what you mean.
-
-Every note is printed into the scrolling output — and therefore into the mirror
-log — at the point where the agent received it, so an iteration that changed
-course mid-flight is explainable afterwards. The receipt is the CLI's own replay
-of the message, not this end assuming the pipe was read.
-
-With one agent, `m` opens the editor directly. With several workers, `m` first
-asks for a job number; Enter selects it and opens an editor labelled with that
-job. Each job has its own queue, so a note typed between that worker's iterations
-rides its next prompt rather than being picked up by whichever worker starts
-next.
-
-A note still queued when the run ends is reported, with its text, rather than
-dropped in silence: "the next iteration" is a promise the last iteration cannot
-keep. A live send still lacking the provider's replay receipt at shutdown is
-reported separately as unconfirmed, so an interrupted write cannot disappear.
-
-`m` works with both providers. Claude receives a streaming-input user message;
-Codex receives an app-server `turn/steer` request for the active turn. With
-`--no-live-messages`, either provider queues the note for the next iteration
-instead. It is not a paste target — every newline in a paste sends what
-precedes it as its own note.
-
-### When the status line freezes
-
-Its quiet failure branches (a key reader that died, a frame that raised, keys
-dropped behind a stuck write) are written to `<app>-<project>.diag.log` beside
-the mirror log; the run's banner prints the path. `LLM_LOOP_KEYTRACE=1` adds a
-line per key per stage (read, posted, applied, painted). To reproduce without a
-paid turn, `python scripts/fake_claude/fake_cycle.py` runs a real sequential
-runner against a fake `claude`, and `py-spy dump --pid <pid> --native` shows
-where each thread is.
-
-## Per-user settings
-
-Wrappers can opt into a completion sound through the per-user JSON settings
-file. It is disabled when the file or key is absent:
-
-```json
-{
-  "completion_sound": true
-}
-```
-
-On Windows the file is `%APPDATA%\llm-loop\settings.json`. On Linux and
-macOS it is `${XDG_CONFIG_HOME:-~/.config}/llm-loop/settings.json`. Set
-`LLM_LOOP_SETTINGS` to use a different absolute path. Windows wrappers use
-the native system notification sound; other platforms emit a terminal bell.
-
-`pip install rich` enables live Markdown rendering of the assistant's output
-(the loop works without it, just plainer).
+It is also a normal PEP 621 project: `pip install
+git+https://github.com/neurocod/llm-loop.git`. Note that `pip install llm-loop`
+does **not** get you this project — that name on PyPI belongs to an unrelated
+2023 package. MIT license.
