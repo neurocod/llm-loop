@@ -815,7 +815,7 @@ def main():
                 json.dump({root: os.path.isdir(root) for root in roots}, handle)
             out({"jsonrpc": "2.0", "id": request_id,
                  "result": {"turn": {"id": "t1", "status": "inProgress"}}})
-            TURN_TEXT =" ".join(str(part.get("text") or "") for part in
+            TURN_TEXT = " ".join(str(part.get("text") or "") for part in
                                  (msg.get("params") or {}).get("input") or [])
             run_turn()
         elif method == "turn/interrupt":
