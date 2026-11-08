@@ -9,7 +9,8 @@ Modes: `ok` answers everything; `exit-after-read` exits right after its first
 read reply (the next read on it sees EOF); `exit-on-read` exits on its first
 read without replying; `hang` never answers a read;
 `hang-ignore-eof` never answers a read and outlives stdin EOF by a minute, so
-only a kill ends it.
+only a kill ends it; `id-clash` asks a question of its own, numbered with the
+id of the read it is about to answer, before each read reply.
 """
 
 import json
@@ -34,6 +35,10 @@ def main() -> None:
             if mode == "exit-on-read":
                 return
             reads += 1
+            if mode == "id-clash":
+                print(json.dumps({"id": request_id, "method":
+                                  "item/tool/requestUserInput", "params": {}}),
+                      flush=True)
             reply = {"id": request_id, "result": {"rateLimits": {
                 "primary": {"usedPercent": reads, "windowDurationMins": 10080},
             }}}

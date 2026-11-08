@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from llm_loop import codex_usage, runlifecycle
+from llm_loop import appserver, codex_usage, runlifecycle
 
 FAKE = os.path.join(os.path.dirname(__file__), "_fake_codex_app_server.py")
 
@@ -23,13 +23,13 @@ def pid_log(tmp_path):
 def sent(monkeypatch):
     """Every message written to any quota server, in order."""
     messages = []
-    real_write = codex_usage._QuotaServer.write
+    real_send = appserver.Connection.send
 
-    def recording_write(self, message):
+    def recording_send(self, message):
         messages.append(message)
-        real_write(self, message)
+        real_send(self, message)
 
-    monkeypatch.setattr(codex_usage._QuotaServer, "write", recording_write)
+    monkeypatch.setattr(appserver.Connection, "send", recording_send)
     return messages
 
 
@@ -53,6 +53,18 @@ def test_cache_misses_reuse_one_server_with_growing_ids(pid_log):
         assert _starts(pid_log) == 1
         # initialize took id 0, the three reads 1..3
         assert source._next_id == 4
+    finally:
+        source.close()
+
+
+def test_a_server_request_carrying_the_read_s_id_is_not_its_reply(pid_log, capsys):
+    """The server numbers its own requests; one that happens to carry the id
+    of the pending read used to be taken for the reply, and its empty result
+    came back as no figures at all, with nothing said."""
+    source = _source(pid_log, mode="id-clash")
+    try:
+        assert [_percent(source) for _ in range(2)] == [1, 2]
+        assert "no Codex usage figures" not in capsys.readouterr().out
     finally:
         source.close()
 

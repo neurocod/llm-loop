@@ -635,12 +635,16 @@ def test_codex_context_reaches_status_before_turn_ends(monkeypatch, runner):
     holder = []
 
     def check(asked, label, actual, expected):
-        holder[0].until_asked(asked)
+        if not holder[0].until_asked(asked):
+            failures.append(f"{label}: the renderer never asked for item "
+                            f"{asked} (asked {holder[0].asked})")
+            return
         if actual() != expected:
             failures.append(f"{label}: {actual()!r} != {expected!r}")
 
     def source():
-        started.wait(10)
+        if not started.wait(_LOCKSTEP_WAIT_S):
+            failures.append("the source was never released (holder unset)")
         yield usage(88_764)
         check(2, "root reading", lambda: job.snapshot().context_label(),
               "ctx 88k/258k (34%)")
@@ -672,6 +676,13 @@ def test_codex_context_reaches_status_before_turn_ends(monkeypatch, runner):
     assert holder[0].asked >= 5, "the source was not read to its end"
 
 
+# The bound on each lockstep wait. The renderer handles an item in
+# milliseconds; this only bounds a loaded machine, and a miss is recorded as a
+# failure, never hung on. 20 s: the repo's fallback max(T + 10 s, 2T) over the
+# former unmeasured 10 s.
+_LOCKSTEP_WAIT_S = 20.0
+
+
 class _Lockstep(appserver.Connection):
     """A connection that counts the reader's requests for an item."""
 
@@ -686,11 +697,11 @@ class _Lockstep(appserver.Connection):
             self._asked.notify_all()
         return super().take(deadline, what)
 
-    def until_asked(self, count):
+    def until_asked(self, count) -> bool:
+        """Whether the reader asked for `count` items within the bound."""
         with self._asked:
-            # 10 s: the renderer handles an item in milliseconds; this bounds
-            # a loaded machine, and a miss is reported, never hung on.
-            self._asked.wait_for(lambda: self.asked >= count, timeout=10)
+            return self._asked.wait_for(lambda: self.asked >= count,
+                                        timeout=_LOCKSTEP_WAIT_S)
 
 
 @pytest.mark.parametrize("tokens,window,expected", [

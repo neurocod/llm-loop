@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from llm_loop import appserver
-from llm_loop.appserver import STARTUP_TIMEOUT_S
+from llm_loop.appserver import STARTUP_TIMEOUT_S, THREAD_OPEN_TIMEOUT_S
 from llm_loop.procend import REAP_GRACE_S
 
 # --- protocol names -------------------------------------------------------
@@ -67,8 +67,9 @@ NOISY_NOTIFICATIONS = [
     "process/outputDelta",
 ]
 
-# `STARTUP_TIMEOUT_S` (imported above) bounds each handshake and opener
-# request; `REAP_GRACE_S` bounds each step of ending the server.
+# `STARTUP_TIMEOUT_S` (imported above) bounds the handshake and each opener
+# request, `THREAD_OPEN_TIMEOUT_S` the thread's start or resume;
+# `REAP_GRACE_S` bounds each step of ending the server.
 
 
 # What to reply to each server-initiated request, per method. THREE DIFFERENT

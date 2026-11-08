@@ -273,8 +273,9 @@ def _console_isolation() -> dict:
 def _start_codex_app_server(argv: list, prompt: str, project_dir: str):
     """Open the app-server's thread and turn; return the process streaming it.
 
-    Every startup reply is awaited within `appserver.STARTUP_TIMEOUT_S`, and
-    whatever the server says meanwhile is kept, in order, for the renderer."""
+    Every startup reply is awaited within `appserver.STARTUP_TIMEOUT_S`
+    (`thread/start`: `appserver.THREAD_OPEN_TIMEOUT_S`), and whatever the
+    server says meanwhile is kept, in order, for the renderer."""
     options = argv if isinstance(argv, _CodexArgv) else None
     app_argv = [argv[0], "app-server", "--stdio"]
     proc = appserver.spawn(runtime_argv(app_argv, "codex"), cwd=project_dir,
@@ -282,9 +283,10 @@ def _start_codex_app_server(argv: list, prompt: str, project_dir: str):
     connection = None
     buffered = []
 
-    def opener(body: dict) -> dict:
-        return connection.request(body, appserver.STARTUP_TIMEOUT_S,
-                                  on_other=buffered.append)
+    def opener(body: dict, timeout: Optional[float] = None) -> dict:
+        return connection.request(
+            body, appserver.STARTUP_TIMEOUT_S if timeout is None else timeout,
+            on_other=buffered.append)
 
     try:
         connection = appserver.Connection(proc)
@@ -294,7 +296,7 @@ def _start_codex_app_server(argv: list, prompt: str, project_dir: str):
             None, project_dir,
             options.model if options is not None else "",
             options.sandbox_mode if options is not None else "",
-        ))
+        ), appserver.THREAD_OPEN_TIMEOUT_S)
         thread_id = wire.codex_app_thread_id(thread)
         if not thread_id:
             raise RuntimeError("codex app-server returned no thread id")

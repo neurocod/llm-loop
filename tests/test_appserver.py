@@ -253,12 +253,17 @@ def test_the_loop_s_startup_is_bounded(loop_server, monkeypatch):
 
     with pytest.raises(TimeoutError, match="did not answer initialize"):
         loop_server("mute-initialize")
-    # 0.5 s wait + procend's bounded ending; 20 s bounds a loaded machine.
-    assert time.monotonic() - started < 20
+    # 0.5 s wait + procend's bounded ending (3 * REAP_GRACE_S at worst); 40 s
+    # is the repo's fallback max(T + 10 s, 2T) over the former unmeasured 20 s.
+    assert time.monotonic() - started < 40
 
 
-def test_the_worker_runs_a_turn_on_the_same_transport(tmp_path, monkeypatch):
-    outcome = fake.run_fake_turn(tmp_path, monkeypatch, "plain")
+@pytest.mark.parametrize("scenario", ["plain", "id-clash"])
+def test_the_worker_runs_a_turn_on_the_same_transport(tmp_path, monkeypatch,
+                                                      scenario):
+    """"id-clash" as for the loop: taken for the reply, the server's question
+    opened no thread."""
+    outcome = fake.run_fake_turn(tmp_path, monkeypatch, scenario)
 
     assert outcome.status == "completed"
     assert outcome.text == "fake answer"

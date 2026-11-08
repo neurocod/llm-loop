@@ -40,7 +40,7 @@ from .protocol import (
     AppServer, M_INITIALIZE, M_INITIALIZED, M_THREAD_NAME_SET, M_THREAD_RESUME,
     M_THREAD_START, M_TURN_START, N_ERROR, N_RATE_LIMITS, N_THREAD_STARTED,
     N_TOKEN_USAGE, N_TURN_COMPLETED, N_TURN_STARTED, NOISY_NOTIFICATIONS,
-    STARTUP_TIMEOUT_S,
+    STARTUP_TIMEOUT_S, THREAD_OPEN_TIMEOUT_S,
 )
 from .registry import AgentRecord
 from .store import AgentStore
@@ -78,7 +78,8 @@ DEFAULT_TURN_TIMEOUT_S = 1800.0
 # `run_turn` writes its opening log line first of all, and the turn's deadline
 # is armed only after `turn/start` is accepted; the four openers in between
 # (initialize, thread/start-or-resume, thread/name/set, turn/start) are each
-# bounded separately by `protocol.STARTUP_TIMEOUT_S`, and their RESPONSES are
+# bounded separately — the thread's by `protocol.THREAD_OPEN_TIMEOUT_S`, the
+# other three by `protocol.STARTUP_TIMEOUT_S` — and their RESPONSES are
 # returned to the caller rather than dispatched (`AppServer.request`), so none
 # of them writes anything to the event log. A live-but-slow-starting turn can
 # therefore leave the log untouched for this long, which is why
@@ -87,7 +88,7 @@ DEFAULT_TURN_TIMEOUT_S = 1800.0
 # `--timeout 60` turn read as "killed?" while its server was still starting
 # (review 2026-09-13). Erring long only delays that verdict; erring short
 # reports a working agent as dead.
-TURN_STARTUP_GRACE_S = 4 * STARTUP_TIMEOUT_S
+TURN_STARTUP_GRACE_S = 3 * STARTUP_TIMEOUT_S + THREAD_OPEN_TIMEOUT_S
 
 # How long to wait before each resend of a turn the SERVICE dropped, one entry
 # per attempt — so the list's length IS the retry limit (user decision
@@ -108,7 +109,7 @@ TURN_STARTUP_GRACE_S = 4 * STARTUP_TIMEOUT_S
 #
 # One ceiling to respect when raising these: a pause is a stretch in which the
 # log is silent BY DESIGN, and `cli._turn_in_progress` calls a log silent for
-# longer than the turn's timeout plus `TURN_STARTUP_GRACE_S` (240 s) the work
+# longer than the turn's timeout plus `TURN_STARTUP_GRACE_S` (780 s) the work
 # of a killed process. The longest pause here stays under that grace, so the
 # verdict holds even for a turn started with a one-second timeout — and the
 # assert below is that sentence made mechanical, because the two constants are
@@ -980,9 +981,10 @@ def _run_turn_logged(record: AgentRecord, prompt: str, resume_thread: str,
             thread = server.request(
                 M_THREAD_RESUME,
                 {"threadId": resume_thread, **sandbox.thread_params(record)},
-                on_event=runner.on_event)
+                timeout=THREAD_OPEN_TIMEOUT_S, on_event=runner.on_event)
         else:
             thread = server.request(M_THREAD_START, sandbox.thread_params(record),
+                                    timeout=THREAD_OPEN_TIMEOUT_S,
                                     on_event=runner.on_event)
         thread_id = str((thread.get("thread") or {}).get("id") or "")
         if not thread_id:

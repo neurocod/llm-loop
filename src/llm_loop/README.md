@@ -198,7 +198,7 @@ src/
                      ending owed to a provider child
     procend.py       ending a child process tree: ask, wait, kill, wait
     appserver.py     JSON-RPC over a `codex app-server` child's stdio, for
-                     both the provider process and `llm_agents.codex`
+                     the provider process, `codex_usage` and `llm_agents.codex`
     drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)
     parallel.py      run_parallel: N concurrent LLM workers over a list file
     ownership.py     one thread owns a shared resource, the rest post to it

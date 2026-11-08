@@ -11,15 +11,13 @@ an empty snapshot so a temporary CLI/auth problem does not make the loop crash.
 """
 
 import atexit
-import json
-import queue
 import shutil
 import subprocess
 import threading
 import time
 from typing import Callable, List, Optional
 
-from . import wire
+from . import appserver, wire
 from .console import print_line
 from .procend import REAP_GRACE_S, end_process_tree
 from .usage import EMPTY_READING, EMPTY_USAGE, Usage, UsageReading, summary_line
@@ -131,95 +129,58 @@ class _ServerError(RuntimeError):
     """The quota server answered with an error: it is alive and kept."""
 
 
-_EOF = object()
-
-
 class _QuotaServer:
-    """One live `codex app-server` and the thread pumping its stdout.
+    """One live `codex app-server`, read through `appserver.Connection`.
 
-    The pump turns the blocking `readline` into a queue the caller can wait on
-    with a deadline — the only way to bound a read from a pipe that is
-    portable to Windows. stderr is merged into stdout; lines that are not JSON
-    are skipped.
+    stderr is merged into stdout; whatever is not the awaited response — a
+    line that is not JSON, a notification, a request of the server's own,
+    even one carrying the awaited id — is skipped. The transport's failures
+    are translated into the ones `CodexUsageSource` acts on, with the words
+    the status line has always printed.
     """
 
-    def __init__(self, argv: List[str]):
-        self.proc = subprocess.Popen(
-            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", bufsize=1,
-        )
+    def __init__(self, argv: List[str], first_id: int):
+        self.connection = appserver.Connection(
+            appserver.spawn(argv, merge_stderr=True), first_id=first_id)
+        self.proc = self.connection.proc
         self.started = time.monotonic()
-        self._lines: "queue.Queue[object]" = queue.Queue()
-        self._pump = threading.Thread(target=self._read_stdout,
-                                      name="codex-quota-stdout", daemon=True)
-        self._pump.start()
 
-    def _read_stdout(self) -> None:
+    @property
+    def next_id(self) -> int:
+        return self.connection.next_id
+
+    def send(self, message: dict) -> None:
+        self.connection.send(message)
+
+    def request(self, body: dict, deadline: float) -> dict:
+        """Send `body` (numbered by the connection) and return its result."""
         try:
-            for line in self.proc.stdout:
-                self._lines.put(line)
-        except (OSError, ValueError):
-            pass                    # stdout closed under us by `stop`
-        finally:
-            self._lines.put(_EOF)
-
-    def write(self, message: dict) -> None:
-        self.proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-        self.proc.stdin.flush()
-
-    def read_response(self, request_id: int, deadline: float) -> dict:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("codex app-server request timed out")
-            try:
-                line = self._lines.get(timeout=remaining)
-            except queue.Empty:
-                raise TimeoutError("codex app-server request timed out") from None
-            if line is _EOF:
-                self._lines.put(_EOF)   # every later read sees it too
-                raise _ServerClosed("codex app-server closed before replying")
-            try:
-                message = json.loads(line)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(message, dict) or message.get("id") != request_id:
-                continue
-            if "error" in message:
-                error = message.get("error") or {}
-                detail = error.get("message") if isinstance(error, dict) else error
-                raise _ServerError(str(detail or "unknown app-server error"))
-            return message.get("result") or {}
+            return self.connection.request(body, deadline - time.monotonic())
+        except TimeoutError:
+            raise TimeoutError("codex app-server request timed out") from None
+        except appserver.Closed:
+            raise _ServerClosed("codex app-server closed before replying") from None
+        except appserver.RpcError as exc:
+            raise _ServerError(exc.detail or "unknown app-server error") from None
 
     def stop(self) -> None:
-        """Close stdin and reap; escalate to ending the tree, then kill.
+        """Close stdin and give the server `REAP_GRACE_S` to exit on it; then
+        end the tree.
 
         On Windows `proc` is usually the npm shim's `cmd.exe` and the CLI a
         grandchild, so the escalation goes through the shared tree-aware
         `procend.end_process_tree` (`taskkill /T`), not the shim-only
-        `terminate`. A grandchild that survives anyway keeps the stdout write
-        end: the pump then stays in `readline`, and closing stdout would block
-        on the lock that read holds (19.0 s measured 2026-10-02 against a 20 s
-        grandchild) — so the stream is left to the daemon pump instead.
+        `terminate`. stdout is the connection's pump's to close
+        (`appserver.Connection._pump_stdout`).
         """
         proc = self.proc
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
+        self.connection.close_input()
         try:
             proc.wait(timeout=REAP_GRACE_S)
         except subprocess.TimeoutExpired:
             end_process_tree(proc)
         except OSError:
             pass
-        self._pump.join(timeout=REAP_GRACE_S)
-        if not self._pump.is_alive():
-            try:
-                proc.stdout.close()
-            except OSError:
-                pass
 
 
 # Every source that may own a live server, so the endings that never reach
@@ -278,10 +239,12 @@ class CodexUsageSource:
         self._closed = False
         _open_sources.add(self)
 
-    def _request_id(self) -> int:
-        request_id = self._next_id
-        self._next_id += 1
-        return request_id
+    def _request(self, server: _QuotaServer, body: dict, deadline: float) -> dict:
+        """`server.request`, the source's id counter kept in step with it."""
+        try:
+            return server.request(body, deadline)
+        finally:
+            self._next_id = server.next_id
 
     def _drop_server(self) -> None:
         server, self._server = self._server, None
@@ -296,13 +259,11 @@ class CodexUsageSource:
             self._drop_server()
             server = None
         if server is None:
-            server = _QuotaServer(self._argv())
+            server = _QuotaServer(self._argv(), first_id=self._next_id)
             self._server = server
             try:
-                request_id = self._request_id()
-                server.write(wire.codex_app_initialize(request_id))
-                server.read_response(request_id, deadline)
-                server.write(wire.codex_app_initialized())
+                self._request(server, wire.codex_app_initialize(None), deadline)
+                server.send(wire.codex_app_initialized())
             except BaseException:
                 self._drop_server()
                 raise
@@ -322,9 +283,8 @@ class CodexUsageSource:
             except (OSError, RuntimeError, ValueError) as exc:
                 return _no_figures(exc)
             try:
-                request_id = self._request_id()
-                server.write(wire.codex_app_rate_limits_read(request_id))
-                return server.read_response(request_id, deadline)
+                return self._request(
+                    server, wire.codex_app_rate_limits_read(None), deadline)
             except (BrokenPipeError, _ServerClosed) as exc:
                 self._drop_server()
                 if fresh or attempt == 2:

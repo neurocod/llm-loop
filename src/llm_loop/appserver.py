@@ -1,15 +1,16 @@
 """Line-delimited JSON-RPC over a child's stdio: the one transport every
-`codex app-server --stdio` client here is built on.
+`codex app-server` client here is built on.
 
-Two clients speak this wire for different reasons — the loop's provider
-process (`providers`), whose stdout a renderer streams, and the named Codex
-worker (`llm_agents.codex.protocol`), which answers approvals and waits on
-sub-agents — and each used to carry its own spawn, line parser, response wait
-and shutdown. A fix in one never reached the other: the loop's startup waited
-with no bound at all, and took any message carrying the awaited id for the
-reply, a server-initiated request included. What is common lives here; what a
-client needs on top (approvals and threads, steering and event conversion)
-stays with the client.
+Three clients speak this wire for different reasons — the loop's provider
+process (`providers`), whose stdout a renderer streams, the named Codex worker
+(`llm_agents.codex.protocol`), which answers approvals and waits on
+sub-agents, and the loop's quota reader (`codex_usage`), which keeps a private
+server for rate-limit reads — and each used to carry its own spawn, line
+parser, response wait and shutdown. A fix in one never reached the others: the
+loop's startup waited with no bound at all, and two of them took any message
+carrying the awaited id for the reply, a server-initiated request included.
+What is common lives here; what a client needs on top (approvals and threads,
+steering and event conversion, restarts and caching) stays with the client.
 
 Reading happens on a pump thread feeding a queue, so every wait can carry a
 deadline: a blocking `readline()` cannot, and a server that dies mid-turn or a
@@ -30,10 +31,31 @@ from typing import Callable, Optional, Union
 from . import wire
 from .procend import end_unless_exited
 
-# The handshake and the thread/turn openers are answered in well under a second
-# by a healthy server; a separate, short bound keeps a misconfigured CLI from
-# looking like a slow model.
+# The bound on each startup request that starts nothing of its own: the
+# handshake (`initialize`, timed from the spawn, so the CLI's own start through
+# the npm shim is in it), `thread/name/set` and `turn/start` (answered once the
+# turn is accepted, before the model says anything). A separate, short bound
+# keeps a misconfigured CLI from looking like a slow model.
+#
+# Measured on codex-cli 0.167.0, 2026-11-08, 5 live runs from this repo's
+# root: spawn + initialize 0.406-0.458 s, turn/start 0.027-0.047 s; codex-cli
+# 0.159.2 took up to 1.463 s cold for spawn + handshake (2026-10-01,
+# `codex_usage.APP_SERVER_MAX_AGE`). 60 s is 40x the slowest of those: a
+# loaded machine or a slow disk fits, a CLI that never answers is still told
+# apart from a turn's own 30-minute budget.
 STARTUP_TIMEOUT_S = 60.0
+
+# The bound on `thread/start` and `thread/resume`, kept OUT of
+# `STARTUP_TIMEOUT_S` because opening a thread waits for the MCP servers the
+# user's config marks `required = true`, each up to its own
+# `startup_timeout_sec` (default 30 s, rust-v0.164.0
+# `rmcp_client::DEFAULT_STARTUP_TIMEOUT`; the user may raise it — Codex's own
+# test of this wait sets 120 s). Servers that are not required start in the
+# background: with one enabled (`node_repl`), thread/start took 0.203-0.436 s
+# (same 5 runs, 2026-11-08). The bound is what a hung server costs, so it errs
+# long: 600 s is 20x the default and 5x that test's 120 s, and a user who
+# needs more than that has an MCP server to fix, not a client to wait.
+THREAD_OPEN_TIMEOUT_S = 600.0
 
 # How often a wait without a deadline wakes: a blocking `Queue.get()` on
 # Windows does not return to the interpreter for a Ctrl+C until it is fed.
@@ -252,6 +274,13 @@ class Connection:
                 raise InputClosed("the server's input is closed")
             self.proc.stdin.write(encode(body))
             self.proc.stdin.flush()
+
+    @property
+    def next_id(self) -> int:
+        """The id the next request will carry: an owner that outlives this
+        connection continues its numbering from here (`codex_usage`)."""
+        with self._pending_lock:
+            return self._next_id
 
     def _number(self, body: dict) -> dict:
         with self._pending_lock:

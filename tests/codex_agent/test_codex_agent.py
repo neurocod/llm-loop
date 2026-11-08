@@ -2840,10 +2840,10 @@ def test_status_shows_a_turn_that_is_still_running(tmp_path, monkeypatch, capsys
     # log nothing, so this may be a live turn whose server is still starting.
     #
     # Measured against the four openers themselves rather than against the
-    # constant: `4 * protocol.STARTUP_TIMEOUT_S` is the whole point of the
-    # grace, and reading the grace back out of `turn` pinned a turn that had
-    # waited out one opener just as well as a turn that had waited out four.
-    four_openers = 4 * protocol.STARTUP_TIMEOUT_S
+    # constant: their four bounds are the whole point of the grace, and
+    # reading the grace back out of `turn` pinned a turn that had waited out
+    # one opener just as well as a turn that had waited out four.
+    four_openers = 3 * protocol.STARTUP_TIMEOUT_S + protocol.THREAD_OPEN_TIMEOUT_S
     for silent_s in (601, 601 + four_openers - 5):
         starting = time.time() - silent_s
         os.utime(log, (starting, starting))

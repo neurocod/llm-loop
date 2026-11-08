@@ -106,18 +106,16 @@ CACHED_INPUT_TOKENS = "cached_input_tokens"
 OUTPUT_TOKENS = "output_tokens"
 
 
-# Three of the words above are ordinary English, and three modules that have
-# nothing to do with this stream spell them for their own reasons: `codex_usage`
-# parses the app-server's JSON-RPC envelope, whose keys are `result` and `error`;
+# Two of the words above are ordinary English, and two modules that have
+# nothing to do with this stream spell them for their own reasons:
 # `drivers.StateFileDriver.error_token` is a word looked for in a state FILE; and
 # `providers` passes `text=True` to `subprocess.Popen`, which is about decoding a
-# pipe. Naming those sites here rather than dropping the three words from the
-# guarded set is what keeps a THIRD copy of `et == "result"` a violation. The
+# pipe. Naming those sites here rather than dropping the two words from the
+# guarded set is what keeps another copy of `et == "result"` a violation. The
 # gate also fails on an entry that has gone stale, so this cannot quietly turn
 # into an amnesty list: an exemption survives only while its module still says
 # the word.
 SPELLED_ELSEWHERE = {
-    "codex_usage": frozenset({RESULT, ERROR}),
     "drivers": frozenset({ERROR}),
     "providers": frozenset({BLOCK_TEXT}),
 }
