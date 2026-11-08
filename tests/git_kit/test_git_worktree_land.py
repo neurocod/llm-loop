@@ -185,7 +185,7 @@ def test_a_failing_sync_still_releases_the_slot_and_pushes(repos, monkeypatch, c
     run(main, "worktree", "lock", "--reason", "claimed", str(slot))
     pushed = []
     monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(push_by_default=True))
-    monkeypatch.setattr(worktree, "push_master", lambda: pushed.append(True) or True)
+    monkeypatch.setattr(worktree, "push_main_branch", lambda: pushed.append(True) or True)
 
     def broken(old_master, pool_slot):
         raise worktree.Fail("sync exploded")
@@ -203,7 +203,7 @@ def test_the_empty_host_lands_into_main_and_pushes_only_when_asked(repos, monkey
     main, slot, base = repos
     assert (worktree.EMPTY.main_branch, worktree.EMPTY.remote) == ("main", "origin")
     pushed = []
-    monkeypatch.setattr(worktree, "push_master", lambda: pushed.append(True) or True)
+    monkeypatch.setattr(worktree, "push_main_branch", lambda: pushed.append(True) or True)
     commit_file(slot, "one.txt", "first")
     assert command("land", "wt2") == 0
     assert pushed == []
@@ -272,7 +272,7 @@ def test_slot_preparation_obeys_the_push_policy(repos, monkeypatch, push_by_defa
     monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(push_by_default=push_by_default))
     monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
     pushed = []
-    monkeypatch.setattr(worktree, "push_master", lambda: pushed.append(True) or True)
+    monkeypatch.setattr(worktree, "push_main_branch", lambda: pushed.append(True) or True)
     argv = [operation, "wt2" if operation == "equalize" else "3", "--no-install"]
     if flag:
         argv.append(flag)
@@ -290,7 +290,7 @@ def test_create_hook_obeys_the_host_push_default(repos, monkeypatch, push_by_def
     printed = io.StringIO()
     monkeypatch.setattr(worktree.sys, "__stdout__", printed)
     pushed = []
-    monkeypatch.setattr(worktree, "push_master", lambda: pushed.append(True) or True)
+    monkeypatch.setattr(worktree, "push_main_branch", lambda: pushed.append(True) or True)
     assert command("hook-create") == 0
     assert printed.getvalue().strip() == str(slot)
     assert pushed == ([True] if push_by_default else [])
@@ -445,7 +445,7 @@ def test_a_follow_git_refuses_warns_and_the_hook_still_starts_the_agent(repos, m
     pool_slot = worktree.Slot(2, slot, "wt2", "", False)
     monkeypatch.setattr(worktree, "list_slots", lambda: [pool_slot])
     monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
-    monkeypatch.setattr(worktree, "push_master", lambda: True)
+    monkeypatch.setattr(worktree, "push_main_branch", lambda: True)
     monkeypatch.setattr(worktree.sys, "stdin", io.StringIO('{"name": "agent", "session_id": "s"}'))
     printed = io.StringIO()
     monkeypatch.setattr(worktree.sys, "__stdout__", printed)

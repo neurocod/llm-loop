@@ -55,7 +55,7 @@ from .slots import SLOT_NAME_RE, slot_dir_name, slot_name, slot_number
 
 # `terminal_prompt=False`: every command here may run from a hook with nobody at
 # the keyboard, so git must never ask for credentials (the automatic push in
-# `push_master`); `failure="exit"` turns a failed or timed-out command into a
+# `push_main_branch`); `failure="exit"` turns a failed or timed-out command into a
 # one-line `error:` instead of a traceback. Both knobs are explained on
 # `gitlib.git`.
 git = functools.partial(git, errors="replace", terminal_prompt=False, failure="exit")
@@ -440,7 +440,7 @@ def all_submodules() -> list[str]:
 
 # ------------------------------------------------------------ main branch
 
-def push_master() -> bool:
+def push_main_branch() -> bool:
     """Push the main branch to the host's remote; a failure is reported and
     the local result stands.
 
@@ -476,7 +476,7 @@ def wants_push(args: argparse.Namespace) -> bool:
 def finish(args: argparse.Namespace) -> int:
     """Exit code of a command whose last step is the push: 2 when the push failed."""
     if wants_push(args):
-        return 0 if push_master() else 2
+        return 0 if push_main_branch() else 2
     if getattr(args, "no_push", False):
         print("push skipped (--no-push)")
     else:
@@ -740,7 +740,7 @@ def follow_gitlinks(slot: Slot) -> None:
         print(f"{slot.name}'s {sub}: {head[:9]} -> {wanted[:9]} (follows the slot's gitlink)")
 
 
-def reset_to_master(slot: Slot, install: bool, *, strict: bool = True) -> None:
+def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True) -> None:
     """The slot's branch := the main branch, dependencies refreshed. Caller has
     checked it is safe.
 
@@ -788,7 +788,7 @@ def sync_main_submodules(old_master: str, slot: Slot) -> None:
     warning naming the reason and the command. Submodules whose gitlink the
     land did not move are not looked at at all.
 
-    Nested submodules are not synced (one level, like `reset_to_master`):
+    Nested submodules are not synced (one level, like `reset_to_main_branch`):
     when the move shifts the gitlink of an initialized nested submodule, a
     warning names it -- one `diff-tree` per moved submodule, and only on a
     bump, so the check is cheaper than finding out from a stale nested tree.
@@ -931,7 +931,7 @@ def slot_named(args: argparse.Namespace, *, default: str | None = None) -> str:
 def cmd_equalize(args: argparse.Namespace) -> int:
     slot = find_slot(slot_named(args, default="."))
     refuse_unless_idle(slot)
-    reset_to_master(slot, install=not args.no_install)
+    reset_to_main_branch(slot, install=not args.no_install)
     return finish(args)
 
 
@@ -983,7 +983,7 @@ def cmd_land(args: argparse.Namespace) -> int:
 
 
 def cmd_push(args: argparse.Namespace) -> int:
-    return 0 if push_master() else 2
+    return 0 if push_main_branch() else 2
 
 
 def cmd_next(args: argparse.Namespace) -> int:
@@ -1103,13 +1103,13 @@ def cmd_hook_create(args: argparse.Namespace) -> int:
         if needs_reset:
             # A free slot may still lag behind the main branch; bring it up
             # before the agent starts.
-            reset_to_master(slot, install=True, strict=False)
+            reset_to_main_branch(slot, install=True, strict=False)
         else:
             follow_gitlinks(slot)
             share_dirs(slot.path, keep_local=True)
         print(f"worktree hook: {name or '(unnamed)'} -> {slot.name} ({how})")
         if HOST.push_by_default:
-            push_master()
+            push_main_branch()
     print(str(slot.path), file=sys.__stdout__)
     return 0
 
@@ -1130,7 +1130,7 @@ def cmd_hook_remove(args: argparse.Namespace) -> int:
             print(f"worktree hook remove: {slot.name} is {state.describe()}; keeping it as is")
             return 0
         unclaim(slot)
-        reset_to_master(slot, install=False, strict=False)
+        reset_to_main_branch(slot, install=False, strict=False)
         print(f"worktree hook remove: {slot.name} returned to the pool")
     return 0
 
