@@ -145,9 +145,9 @@ MONITOR_TOOLS = {"Monitor"}
 # "ask the human". Only used to explain the chain finding better.
 #
 # re.ASCII on this pattern and the three below, because `\s`, `\d` and `\b` are
-# Unicode-aware by default on a str and a SHELL is not. Without it `cd\xa0webgame
+# Unicode-aware by default on a str and a SHELL is not. Without it `cd\xa0app
 # && ls` matched CD_COMMAND -- but a non-breaking space is not a word separator
-# to bash, so that text is one word `cd\xa0webgame` and no directory change at
+# to bash, so that text is one word `cd\xa0app` and no directory change at
 # all, and the same held for `sleep ٣٠` with Arabic-Indic digits. The
 # port's matchers are ASCII (see cpp/ask_user_gate.cpp); this is the half that
 # was wrong, so this is the half that moved.
@@ -679,7 +679,7 @@ def shell_for_tool(tool_name: str) -> "str | None":
 SELF_TEST_CASES = [
     # (command, shell, should_be_denied[, tool])
     ("git status", "bash", False),
-    ("npm run build --prefix webgame", "bash", False),
+    ("npm run build --prefix app", "bash", False),
     ("git log --oneline -20 | head -5", "bash", False),
     ("python -c 'print(1); print(2)'", "bash", False),
     ("grep -rn 'a && b' src", "bash", False),
@@ -688,12 +688,12 @@ SELF_TEST_CASES = [
     ("git add -A && git commit -m x", "bash", False),
     ("ls; pwd", "bash", False),
     ("rg --version; rg --files | head -2", "bash", False),
-    ("cd webgame && npx vitest run", "bash", True),
-    ("cd webgame; npx vitest run", "bash", True),
-    ("pushd webgame && npm run build", "bash", True),
-    ("echo 'cd webgame && x'", "bash", False),
+    ("cd app && npx vitest run", "bash", True),
+    ("cd app; npx vitest run", "bash", True),
+    ("pushd app && npm run build", "bash", True),
+    ("echo 'cd app && x'", "bash", False),
     ("git log --format=%cd; git status", "bash", False),
-    ("Set-Location webgame; npx vitest run", "powershell", True),
+    ("Set-Location app; npx vitest run", "powershell", True),
     ("npm run dev &", "bash", True),
     ("cat > f.txt <<'EOF'\nbody\nEOF", "bash", True),
     ("ls a <<< 'x'", "bash", False),
@@ -707,19 +707,19 @@ SELF_TEST_CASES = [
     ("sleep 30", "bash", True),
     ("i=0; while [ $i -lt 55 ]; do sleep 30; i=$((i+1)); done", "bash", True),
     ("while true; do sleep $DELAY; done", "bash", True),
-    ("npm run dev --prefix webgame; sleep 2", "bash", True),
+    ("npm run dev --prefix app; sleep 2", "bash", True),
     ("Start-Sleep -Seconds 30", "powershell", True),
     ("sleep 5", "powershell", True),
     # ... and the words that only look like it.
     ("ls sleep.txt", "bash", False),
-    ("npm run probe --prefix webgame -- --sleep 5", "bash", False),
+    ("npm run probe --prefix app -- --sleep 5", "bash", False),
     ("grep -n 'sleep 30' scripts/probe.sh", "bash", False),
     ("python -c \"import time; time.sleep(1)\"", "bash", False),
     ("awk '{print \"x\"}' file", "bash", False),
     ("find . -name '*.tmp' -exec rm {} +", "bash", False),
     ("echo ${VAR:-\"x\"}", "bash", True),
     ("git add -A && git commit -m x  # allowAskUser", "bash", False),
-    ("Get-ChildItem C:\\game\\1339", "powershell", False),
+    ("Get-ChildItem C:\\data\\run1", "powershell", False),
     ("Get-Item a; Get-Item b", "powershell", False),
     ("git commit -F @'\nmsg\n'@", "powershell", True),
     # Monitor carries a shell command under a tool name of its own. The first
@@ -727,7 +727,7 @@ SELF_TEST_CASES = [
     ("while true; do if ! tasklist //FI \"IMAGENAME eq node.exe\" | grep -qi "
      "node.exe; then echo done; break; fi; sleep 10; done", "bash", True,
      "Monitor"),
-    ("tail -f webgame/.devlogs/latest.log | grep --line-buffered ERROR",
+    ("tail -f app/logs/latest.log | grep --line-buffered ERROR",
      "bash", False, "Monitor"),
     # ... but following a background TASK's output outlives the task. The first
     # case is the one that parked a runCycle.py loop (2026-09-23).
@@ -738,7 +738,7 @@ SELF_TEST_CASES = [
      "| grep -E --line-buffered PASS", "bash", True, "Monitor"),
     ("tail -F /tmp/claude/s/tasks/br3nn9dju.output", "bash", True),
     ("tail -n 40 /tmp/claude/s/tasks/br3nn9dju.output", "bash", False),
-    ("tail -f webgame/tasks/notes.md", "bash", False, "Monitor"),
+    ("tail -f app/tasks/notes.md", "bash", False, "Monitor"),
     ("echo 'tail -f /tmp/s/tasks/x.output'", "bash", False),
     ("tail -f /tmp/s/tasks/x.output # allowAskUser", "bash", False, "Monitor"),
 ]

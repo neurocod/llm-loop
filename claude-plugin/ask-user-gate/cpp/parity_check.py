@@ -86,9 +86,9 @@ EXTRA_CASES = [
     ("echo \"a; b\"", "bash", "Bash"),
     ("echo \\\"a; b", "bash", "Bash"),
     ("echo 'unterminated; b", "bash", "Bash"),
-    ("Get-Item 'C:\\game\\'; Get-Item b", "powershell", "PowerShell"),
-    ("Get-Item \"C:\\game\\\"; Get-Item b", "powershell", "PowerShell"),
-    ("echo \"C:\\game\\\"; cd x", "bash", "Bash"),
+    ("Get-Item 'C:\\data\\'; Get-Item b", "powershell", "PowerShell"),
+    ("Get-Item \"C:\\data\\\"; Get-Item b", "powershell", "PowerShell"),
+    ("echo \"C:\\data\\\"; cd x", "bash", "Bash"),
     ("echo hi # cd x && ls", "bash", "Bash"),
     ("echo hi # cd x\ncd y && ls", "bash", "Bash"),
     ("cd x&&ls", "bash", "Bash"),
@@ -138,8 +138,8 @@ EXTRA_CASES = [
     ("npm run dev & echo started", "bash", "Bash"),
     ("cmd |& tee log", "bash", "Bash"),
     # The escape hatch, in the spellings it will actually be typed in.
-    ("cd webgame && npx vitest run # allowAskUser", "bash", "Bash"),
-    ("cd webgame && npx vitest run # ALLOWASKUSER", "bash", "Bash"),
+    ("cd app && npx vitest run # allowAskUser", "bash", "Bash"),
+    ("cd app && npx vitest run # ALLOWASKUSER", "bash", "Bash"),
     # Length: on the limit, over it, and over it in multi-byte characters, where
     # a byte count and a code-point count disagree.
     ("x" * reference.MAX_COMMAND_LENGTH, "bash", "Bash"),
@@ -162,8 +162,8 @@ EXTRA_CASES = [
     ("cd x; & app.exe", "powershell", "PowerShell"),
     # Unicode where a shell sees none: NBSP is not a word separator, Arabic-Indic
     # digits are not a duration, and the escape hatch is an ASCII token.
-    ("x; cd\u00a0webgame && ls", "bash", "Bash"),
-    ("x;\u001ccd webgame && ls", "bash", "Bash"),
+    ("x; cd\u00a0app && ls", "bash", "Bash"),
+    ("x;\u001ccd app && ls", "bash", "Bash"),
     ("sleep \u0663\u0660", "bash", "Bash"),
     ("sleep\u00a05", "bash", "Bash"),
     ("cd x && ls # allowas\u212Auser", "bash", "Bash"),

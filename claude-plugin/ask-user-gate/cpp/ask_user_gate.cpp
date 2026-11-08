@@ -1206,7 +1206,7 @@ struct SelfTestCase {
 std::vector<SelfTestCase> selfTestCases() {
 	return {
 		{"git status", "bash", false},
-		{"npm run build --prefix webgame", "bash", false},
+		{"npm run build --prefix app", "bash", false},
 		{"git log --oneline -20 | head -5", "bash", false},
 		{"python -c 'print(1); print(2)'", "bash", false},
 		{"grep -rn 'a && b' src", "bash", false},
@@ -1215,12 +1215,12 @@ std::vector<SelfTestCase> selfTestCases() {
 		{"git add -A && git commit -m x", "bash", false},
 		{"ls; pwd", "bash", false},
 		{"rg --version; rg --files | head -2", "bash", false},
-		{"cd webgame && npx vitest run", "bash", true},
-		{"cd webgame; npx vitest run", "bash", true},
-		{"pushd webgame && npm run build", "bash", true},
-		{"echo 'cd webgame && x'", "bash", false},
+		{"cd app && npx vitest run", "bash", true},
+		{"cd app; npx vitest run", "bash", true},
+		{"pushd app && npm run build", "bash", true},
+		{"echo 'cd app && x'", "bash", false},
 		{"git log --format=%cd; git status", "bash", false},
-		{"Set-Location webgame; npx vitest run", "powershell", true},
+		{"Set-Location app; npx vitest run", "powershell", true},
 		{"npm run dev &", "bash", true},
 		{"cat > f.txt <<'EOF'\nbody\nEOF", "bash", true},
 		{"ls a <<< 'x'", "bash", false},
@@ -1234,26 +1234,26 @@ std::vector<SelfTestCase> selfTestCases() {
 		{"sleep 30", "bash", true},
 		{"i=0; while [ $i -lt 55 ]; do sleep 30; i=$((i+1)); done", "bash", true},
 		{"while true; do sleep $DELAY; done", "bash", true},
-		{"npm run dev --prefix webgame; sleep 2", "bash", true},
+		{"npm run dev --prefix app; sleep 2", "bash", true},
 		{"Start-Sleep -Seconds 30", "powershell", true},
 		{"sleep 5", "powershell", true},
 		// ... and the words that only look like it.
 		{"ls sleep.txt", "bash", false},
-		{"npm run probe --prefix webgame -- --sleep 5", "bash", false},
+		{"npm run probe --prefix app -- --sleep 5", "bash", false},
 		{"grep -n 'sleep 30' scripts/probe.sh", "bash", false},
 		{"python -c \"import time; time.sleep(1)\"", "bash", false},
 		{"awk '{print \"x\"}' file", "bash", false},
 		{"find . -name '*.tmp' -exec rm {} +", "bash", false},
 		{"echo ${VAR:-\"x\"}", "bash", true},
 		{"git add -A && git commit -m x  # allowAskUser", "bash", false},
-		{"Get-ChildItem C:\\game\\1339", "powershell", false},
+		{"Get-ChildItem C:\\data\\run1", "powershell", false},
 		{"Get-Item a; Get-Item b", "powershell", false},
 		{"git commit -F @'\nmsg\n'@", "powershell", true},
 		// Monitor carries a shell command under a tool name of its own. The
 		// first case is the one that walked past this gate into a dialog.
 		{"while true; do if ! tasklist //FI \"IMAGENAME eq node.exe\" | grep -qi node.exe; then "
 			"echo done; break; fi; sleep 10; done", "bash", true, "Monitor"},
-		{"tail -f webgame/.devlogs/latest.log | grep --line-buffered ERROR", "bash", false, "Monitor"},
+		{"tail -f app/logs/latest.log | grep --line-buffered ERROR", "bash", false, "Monitor"},
 		// ... but following a background TASK's output outlives the task.
 		{"tail -n +1 -f \"C:/Users/u/AppData/Local/Temp/claude/p/s/tasks/b4w56u3jv.output\" | grep "
 			"--line-buffered -E \"^=== |FAIL|Error\"", "bash", true, "Monitor"},
@@ -1261,7 +1261,7 @@ std::vector<SelfTestCase> selfTestCases() {
 			"--line-buffered PASS", "bash", true, "Monitor"},
 		{"tail -F /tmp/claude/s/tasks/br3nn9dju.output", "bash", true},
 		{"tail -n 40 /tmp/claude/s/tasks/br3nn9dju.output", "bash", false},
-		{"tail -f webgame/tasks/notes.md", "bash", false, "Monitor"},
+		{"tail -f app/tasks/notes.md", "bash", false, "Monitor"},
 		{"echo 'tail -f /tmp/s/tasks/x.output'", "bash", false},
 		{"tail -f /tmp/s/tasks/x.output # allowAskUser", "bash", false, "Monitor"},
 	};
