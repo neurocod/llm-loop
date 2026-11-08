@@ -601,6 +601,22 @@ def test_a_full_turn_returns_the_final_message_and_its_counters(tmp_path, monkey
     assert started["input"] == [{"type": "text", "text": "do the thing"}]
 
 
+def test_the_thread_opener_is_bracketed_in_the_log(tmp_path, monkeypatch):
+    """`status` grants the thread opener's long bound only between its two
+    lines (`test_status_allows_a_pending_thread_open_its_own_bound`), so the
+    writer must close the bracket before the turn runs."""
+    wire.run_fake_turn(tmp_path, monkeypatch, "plain", timeout=10.0)
+    log = list(AgentStore("w").events())
+    openers = [i for i, m in enumerate(log) if m.get("_meta") == events.OPENER_META]
+    assert [log[i]["phase"] for i in openers] == [events.OPENER_THREAD_OPEN,
+                                                  events.OPENER_DONE]
+    assert log[openers[0]]["grace_s"] == turn.THREAD_OPEN_GRACE_S
+    first_item = next(i for i, m in enumerate(log)
+                      if m.get("method") == protocol.N_ITEM_COMPLETED)
+    assert openers[1] < first_item
+    assert events.last_turn_trace(AgentStore("w").events_path).opener_grace_s == 0
+
+
 def test_an_answer_lacking_the_expected_section_is_followed_up_once(
         tmp_path, monkeypatch, capsys):
     """Codex answers one question of five and stops; the operator's fix was
@@ -2813,6 +2829,43 @@ def test_status_running_lists_only_turns_in_progress(tmp_path, monkeypatch, caps
     assert "idle agent(s) not listed" not in printed
 
 
+def test_status_allows_a_pending_thread_open_its_own_bound(
+        tmp_path, monkeypatch, capsys):
+    """`thread/start` and `thread/resume` may wait for required MCP servers up
+    to `protocol.THREAD_OPEN_TIMEOUT_S`, far past the other openers' bound.
+    Only while that request is pending — between its two `OPENER_META`
+    lines — is the log entitled to the longer silence; once it is done, a
+    silent log is judged by the short grace again, so a worker that dies
+    mid-turn is not reported ten minutes late."""
+    monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
+    Registry().put(AgentRecord(name="open", thread_id="t1", sandbox="read-only"))
+    store = AgentStore("open")
+    store.append_events([
+        {"_meta": events.TURN_META, "name": "open", "prompt": "p",
+         "at": "2026-11-08 10:00:00", "timeout": 60.0},
+        {"_meta": events.OPENER_META, "phase": events.OPENER_THREAD_OPEN,
+         "grace_s": turn.THREAD_OPEN_GRACE_S}])
+    short = 60 + 4 * protocol.STARTUP_TIMEOUT_S
+
+    def judged(silent_s):
+        stamp = time.time() - silent_s
+        os.utime(store.events_path, (stamp, stamp))
+        printed = _cli(capsys, "status", "open")
+        assert ("killed" in printed) is not ("RUNNING since" in printed), printed
+        return "RUNNING since" in printed
+
+    # Pending: past the short grace, still inside the thread's own bound.
+    assert judged(short + 30)
+    assert judged(short + protocol.THREAD_OPEN_TIMEOUT_S - 5)
+    assert not judged(short + protocol.THREAD_OPEN_TIMEOUT_S + 30)
+
+    # Done: the short grace again, as before the longer bound existed.
+    store.append_events([{"_meta": events.OPENER_META,
+                          "phase": events.OPENER_DONE}])
+    assert judged(short - 5)
+    assert not judged(short + 30)
+
+
 def test_status_shows_a_turn_that_is_still_running(tmp_path, monkeypatch, capsys):
     """Three first-turn workers printed `0 turns · last -`, the line of an
     agent that never started (2026-09-13). The log's opening line without its
@@ -2842,8 +2895,10 @@ def test_status_shows_a_turn_that_is_still_running(tmp_path, monkeypatch, capsys
     # Measured against the four openers themselves rather than against the
     # constant: their four bounds are the whole point of the grace, and
     # reading the grace back out of `turn` pinned a turn that had waited out
-    # one opener just as well as a turn that had waited out four.
-    four_openers = 3 * protocol.STARTUP_TIMEOUT_S + protocol.THREAD_OPEN_TIMEOUT_S
+    # one opener just as well as a turn that had waited out four. No thread
+    # opener is pending on this log, so its longer bound is not among them
+    # (`test_status_allows_a_pending_thread_open_its_own_bound`).
+    four_openers = 4 * protocol.STARTUP_TIMEOUT_S
     for silent_s in (601, 601 + four_openers - 5):
         starting = time.time() - silent_s
         os.utime(log, (starting, starting))

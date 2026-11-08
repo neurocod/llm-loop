@@ -60,6 +60,15 @@ SUB_AGENTS_WAITING = "waiting"
 SUB_AGENTS_CUT = "cut"
 SUB_AGENTS_FOLLOW_UP = "follow_up"
 SUB_AGENTS_END = "end"
+# The attempt's thread opener (`turn._run_turn_logged`): `OPENER_THREAD_OPEN`
+# is written just before `thread/start` or `thread/resume` and carries the
+# extra silence that request may take (`grace_s`); `OPENER_DONE` follows it on
+# every exit. Only between the two is the log entitled to that extra silence
+# (`cli._turn_in_progress`) — a grace granted to every phase reported a worker
+# that died mid-turn ten minutes late.
+OPENER_META = "opener"
+OPENER_THREAD_OPEN = "thread_open"
+OPENER_DONE = "done"
 
 
 def follow_up_kind(message: dict) -> str:
@@ -184,6 +193,9 @@ class TurnTrace:
     sub_agent_grace_s: float = 0.0
     # Paths of the sub-agents this turn interrupted (`SubAgentAccount.cut`).
     cut_sub_agents: tuple[str, ...] = ()
+    # The extra silence the pending thread opener may take (`OPENER_META`);
+    # 0 outside it.
+    opener_grace_s: float = 0.0
 
 
 def iter_log(path: Path, *, start: int = 0):
@@ -312,7 +324,15 @@ def last_turn_trace(path: Path) -> Optional[TurnTrace]:
             trace.ended = True
             trace.status = str(message.get("status") or "")
             continue
+        if meta == OPENER_META:
+            trace.opener_grace_s = (float(message.get("grace_s") or 0)
+                                    if message.get("phase") == OPENER_THREAD_OPEN
+                                    else 0.0)
+            continue
         if meta == RETRY_META:
+            # Each attempt opens its own thread: nothing of the last
+            # attempt's opener carries over into the pause before the next.
+            trace.opener_grace_s = 0.0
             # A retry REOPENS the turn: the dropped attempt already wrote its
             # own `turn/completed`, and leaving that verdict standing would let
             # `status` report a turn as failed while its next attempt is

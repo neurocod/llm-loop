@@ -609,7 +609,8 @@ def _turn_in_progress(store: AgentStore, trace: Optional[TurnTrace]) -> str:
     event, so one silent for longer than the turn's own timeout belongs to a
     process that is gone, since a live one would have timed out and closed it
     — plus `turn.TURN_STARTUP_GRACE_S`, the silence a turn is entitled to
-    before that timeout is even armed — and the sub-agent grace it announced
+    before that timeout is even armed, and while a thread opener is pending
+    the extra it announced (`events.OPENER_META`) — and the sub-agent grace it announced
     (`subagents.SUB_AGENT_GRACE_S`), plus the heartbeat allowance of an
     announced network wait (`service.NETWORK_WAIT_GAP_S`).
     """
@@ -632,7 +633,8 @@ def _turn_in_progress(store: AgentStore, trace: Optional[TurnTrace]) -> str:
     silent_s = store.events_silent_s()
     network_grace = NETWORK_WAIT_GAP_S if trace.reconnecting_since else 0.0
     if silent_s > ((trace.timeout_s or DEFAULT_TURN_TIMEOUT_S)
-                   + TURN_STARTUP_GRACE_S + trace.sub_agent_grace_s + network_grace):
+                   + TURN_STARTUP_GRACE_S + trace.opener_grace_s
+                   + trace.sub_agent_grace_s + network_grace):
         return (f" · turn started {trace.started} never ended ({work}; the "
                 f"process was killed?)")
     return f" · RUNNING since {trace.started} ({work})"

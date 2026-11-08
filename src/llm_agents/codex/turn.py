@@ -32,8 +32,8 @@ from .subagent_wait import (
 from .subagents import SubAgentAccount, SubAgentTracker
 from .beacon import announce
 from .events import (
-    END_META, FOLLOWUP_EXPECT, FOLLOWUP_GATES, FOLLOWUP_META, REPORT_META,
-    RETRY_META, TURN_META, NETWORK_WAIT_META, completed_item, item_work, text_of,
+    END_META, FOLLOWUP_EXPECT, FOLLOWUP_GATES, FOLLOWUP_META, OPENER_DONE,
+    OPENER_META, OPENER_THREAD_OPEN, REPORT_META, RETRY_META, TURN_META, NETWORK_WAIT_META, completed_item, item_work, text_of,
 )
 from .paths import host_root
 from .protocol import (
@@ -78,17 +78,27 @@ DEFAULT_TURN_TIMEOUT_S = 1800.0
 # `run_turn` writes its opening log line first of all, and the turn's deadline
 # is armed only after `turn/start` is accepted; the four openers in between
 # (initialize, thread/start-or-resume, thread/name/set, turn/start) are each
-# bounded separately — the thread's by `protocol.THREAD_OPEN_TIMEOUT_S`, the
-# other three by `protocol.STARTUP_TIMEOUT_S` — and their RESPONSES are
-# returned to the caller rather than dispatched (`AppServer.request`), so none
-# of them writes anything to the event log. A live-but-slow-starting turn can
-# therefore leave the log untouched for this long, which is why
+# bounded separately and their RESPONSES are returned to the caller rather
+# than dispatched (`AppServer.request`), so none of them writes anything to the
+# event log. Four `protocol.STARTUP_TIMEOUT_S` cover them all but the thread's,
+# which may wait for required MCP servers up to
+# `protocol.THREAD_OPEN_TIMEOUT_S`: that one is bracketed by
+# `events.OPENER_META` lines, and only between them is the log entitled to the
+# extra silence (`THREAD_OPEN_GRACE_S`) — granted to every phase, it delayed
+# the verdict on a worker that died mid-turn by ten minutes. A
+# live-but-slow-starting turn can therefore leave the log untouched for this
+# long, which is why
 # `cli._turn_in_progress` adds it to the turn's timeout before calling a silent
 # log the work of a killed process: judged by the turn timeout alone, a
 # `--timeout 60` turn read as "killed?" while its server was still starting
 # (review 2026-09-13). Erring long only delays that verdict; erring short
 # reports a working agent as dead.
-TURN_STARTUP_GRACE_S = 3 * STARTUP_TIMEOUT_S + THREAD_OPEN_TIMEOUT_S
+TURN_STARTUP_GRACE_S = 4 * STARTUP_TIMEOUT_S
+
+# What the thread-open line adds to `TURN_STARTUP_GRACE_S` while its request
+# is pending — so a new thread is allowed 840 s of silence from that line, more
+# than the 780 s the rest of its openers can take from the turn's start.
+THREAD_OPEN_GRACE_S = THREAD_OPEN_TIMEOUT_S
 
 # How long to wait before each resend of a turn the SERVICE dropped, one entry
 # per attempt — so the list's length IS the retry limit (user decision
@@ -109,7 +119,7 @@ TURN_STARTUP_GRACE_S = 3 * STARTUP_TIMEOUT_S + THREAD_OPEN_TIMEOUT_S
 #
 # One ceiling to respect when raising these: a pause is a stretch in which the
 # log is silent BY DESIGN, and `cli._turn_in_progress` calls a log silent for
-# longer than the turn's timeout plus `TURN_STARTUP_GRACE_S` (780 s) the work
+# longer than the turn's timeout plus `TURN_STARTUP_GRACE_S` (240 s) the work
 # of a killed process. The longest pause here stays under that grace, so the
 # verdict holds even for a turn started with a one-second timeout — and the
 # assert below is that sentence made mechanical, because the two constants are
@@ -977,15 +987,25 @@ def _run_turn_logged(record: AgentRecord, prompt: str, resume_thread: str,
         })
         server.notify(M_INITIALIZED, {})
 
-        if resume_thread:
-            thread = server.request(
-                M_THREAD_RESUME,
-                {"threadId": resume_thread, **sandbox.thread_params(record)},
-                timeout=THREAD_OPEN_TIMEOUT_S, on_event=runner.on_event)
-        else:
-            thread = server.request(M_THREAD_START, sandbox.thread_params(record),
-                                    timeout=THREAD_OPEN_TIMEOUT_S,
-                                    on_event=runner.on_event)
+        # Bracketed for `status` (`events.OPENER_META`): the done line is in
+        # the `finally`, so a failed open does not leave the grace standing.
+        log({"_meta": OPENER_META, "phase": OPENER_THREAD_OPEN,
+             "grace_s": THREAD_OPEN_GRACE_S,
+             "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+        try:
+            if resume_thread:
+                thread = server.request(
+                    M_THREAD_RESUME,
+                    {"threadId": resume_thread, **sandbox.thread_params(record)},
+                    timeout=THREAD_OPEN_TIMEOUT_S, on_event=runner.on_event)
+            else:
+                thread = server.request(M_THREAD_START,
+                                        sandbox.thread_params(record),
+                                        timeout=THREAD_OPEN_TIMEOUT_S,
+                                        on_event=runner.on_event)
+        finally:
+            log({"_meta": OPENER_META, "phase": OPENER_DONE,
+                 "at": time.strftime("%Y-%m-%d %H:%M:%S")})
         thread_id = str((thread.get("thread") or {}).get("id") or "")
         if not thread_id:
             raise RuntimeError(f"{M_THREAD_START} returned no thread id")
