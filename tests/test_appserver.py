@@ -7,13 +7,12 @@ The wire tests drive BOTH clients against the same stand-in server
 transport is pinned once for the two of them.
 """
 
-import io
-import json
 import subprocess
 import sys
 import time
 
 import pytest
+from _fakeproc import JsonLinesProcess
 
 from llm_loop import appserver, procend, providers
 from llm_loop.agentwork import AgentCommand
@@ -22,25 +21,14 @@ from llm_agents.codex.testing import wire as fake
 from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401
 
 
-class _Lines:
-    """A stand-in process: stdout replays `items`, stdin is recorded."""
+class _Lines(JsonLinesProcess):
+    """A stand-in process that has already exited: the transport reads its
+    stdout to the end."""
 
-    class _Input(io.StringIO):
-        def close(self):
-            self.was_closed = True
-
-    def __init__(self, *items):
-        self.stdin = self._Input()
-        self.stdout = io.StringIO("".join(
-            item if isinstance(item, str) else json.dumps(item) + "\n"
-            for item in items))
-        self.returncode = 0
+    returncode = 0
 
     def poll(self):
         return self.returncode
-
-    def sent(self):
-        return [json.loads(line) for line in self.stdin.getvalue().splitlines()]
 
 
 # --- the transport on its own ------------------------------------------------

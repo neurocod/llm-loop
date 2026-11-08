@@ -15,6 +15,7 @@ from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
                                    usage_source_for)
 
+from _fakeproc import JsonLinesProcess
 from _runfixtures import isolated_run
 
 
@@ -132,15 +133,10 @@ def test_codex_default_policy_watches_session_and_week():
         "Current session", "Current week (all models)"]
 
 
-class _FakeAppServer:
-    class _Input(io.StringIO):
-        def close(self):
-            pass
+class _FakeAppServer(JsonLinesProcess):
+    """A stand-in that runs until the client ends it."""
 
-    def __init__(self, lines):
-        self.stdin = self._Input()
-        self.stdout = io.StringIO("".join(json.dumps(line) + "\n" for line in lines))
-        self.returncode = None
+    returncode = None
 
     def poll(self):
         return self.returncode
@@ -161,7 +157,7 @@ def test_codex_usage_source_uses_app_server_and_caches(monkeypatch):
     created = []
 
     def fake_popen(argv, **kwargs):
-        proc = _FakeAppServer([
+        proc = _FakeAppServer(
             {"id": 0, "result": {"userAgent": "test"}},
             {"id": 1, "result": {"rateLimits": {
                 "primary": {"usedPercent": 16,
@@ -169,7 +165,7 @@ def test_codex_usage_source_uses_app_server_and_caches(monkeypatch):
                             "resetsAt": 1787231258},
                 "secondary": None,
             }}},
-        ])
+        )
         created.append((argv, proc))
         return proc
 
@@ -181,8 +177,7 @@ def test_codex_usage_source_uses_app_server_and_caches(monkeypatch):
     assert len(created) == 1
     argv, proc = created[0]
     assert argv == ["codex.CMD", "app-server"]
-    methods = [json.loads(line)["method"]
-               for line in proc.stdin.getvalue().splitlines()]
+    methods = [message["method"] for message in proc.sent()]
     assert methods == ["initialize", "initialized", "account/rateLimits/read"]
 
 
