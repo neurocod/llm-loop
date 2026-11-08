@@ -149,7 +149,7 @@ def test_network_wait_timeout_resends_same_thread(
         reachable=lambda: checks.append(True) or True, sleep=pauses.append)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.service_retries == 1
-    assert outcome.network_wait_s == 366
+    assert outcome.network_wait_s == pytest.approx(366)
     assert checks == [True] and pauses == [turn.SERVICE_RETRY_PAUSES_S[0]]
     resumed = [m for m in wire.received(tmp_path) if m.get("method") == "thread/resume"]
     assert len(resumed) == 1 and resumed[0]["params"]["threadId"] == "th-fake"
@@ -182,7 +182,7 @@ def test_network_wait_ceiling_is_shared_by_resends(
         reachable=lambda: True, sleep=lambda _: None)
     assert outcome.status == "failed" and outcome.service_retries == 1
     assert "no network for 10.0 min (wait limit reached)" in outcome.error
-    assert outcome.network_wait_s == 600
+    assert outcome.network_wait_s == pytest.approx(600)
 
 
 def test_network_wait_recovery_keeps_only_elapsed_credit():
@@ -213,7 +213,9 @@ def test_network_wait_completion_at_ceiling_keeps_answer(
         reachable=lambda: checks.append(True), sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.text == "complete answer"
-    assert outcome.network_wait_s == 100 and not checks
+    # Credit is summed piecewise on a clock based at the real monotonic()
+    # value, so the total may land an ULP short of the clamp.
+    assert outcome.network_wait_s == pytest.approx(100) and not checks
 
 
 @pytest.mark.parametrize("gap", [366.0, 128.0])
