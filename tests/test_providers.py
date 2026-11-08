@@ -1139,8 +1139,8 @@ def test_a_worker_keeps_an_empty_slot_for_a_command_that_reported_no_code(
 
 def test_a_doubled_windows_path_is_halved_for_display():
     assert compactline.undouble_backslashes(
-        r"powershell.exe -Command 'D:\\g\\3d-research\\x'"
-    ) == r"powershell.exe -Command 'D:\g\3d-research\x'"
+        r"powershell.exe -Command 'D:\\work\\research\\x'"
+    ) == r"powershell.exe -Command 'D:\work\research\x'"
 
 
 def test_a_doubled_unc_path_keeps_its_leading_pair():
@@ -1158,7 +1158,7 @@ def test_a_string_without_backslashes_is_untouched():
 
 
 def test_both_renderers_use_the_helper_on_command_execution(monkeypatch, capsys):
-    item = {"type": "command_execution", "command": r"cd D:\\g\\loop && ls",
+    item = {"type": "command_execution", "command": r"cd D:\\work\\loop && ls",
             "exit_code": 0}
     streamrender._render_codex_event({"type": "item.completed", "item": item})
     _codex_job(monkeypatch,
@@ -1166,8 +1166,8 @@ def test_both_renderers_use_the_helper_on_command_execution(monkeypatch, capsys)
                returncode=0)
 
     out = capsys.readouterr().out
-    assert out.count(r"cd D:\g\loop && ls") == 2
-    assert r"D:\\g" not in out
+    assert out.count(r"cd D:\work\loop && ls") == 2
+    assert r"D:\\work" not in out
 
 
 def test_the_claude_bash_tool_line_uses_the_helper():

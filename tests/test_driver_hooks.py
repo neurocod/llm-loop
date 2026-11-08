@@ -395,7 +395,7 @@ def test_the_sequential_loop_announces_the_first_reason_it_was_given(
     rename it. `item_finished` is still CALLED after a start-hook hand-back: the
     Driver contract promises it for every outcome and the fleet already calls it
     unconditionally, so a driver counting attempts there counts the same under
-    `--jobs 1` and `--jobs N` (the sequential runner skipped it before 1370).
+    `--jobs 1` and `--jobs N` (the sequential runner used to skip it).
     """
     monkeypatch.setattr(cyclecore, "run_claude_streaming",
                         lambda *args, **kwargs: 0)

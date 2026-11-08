@@ -99,8 +99,8 @@ be reverted. Lower value given push-forward workflow, but cheap insurance.
 Each runner call builds its own `StatusApp`, so `_paused` dies with it — the
 same trap `s` has (and works around by returning a `RunResult.reason` the
 wrapper acts on, see `REQUESTED_STOP_REASONS`). A wrapper that slices one
-invocation into several runner calls — the host project's
-`runGenerateModels.py -p`, which calls `run_parallel` once per batch — therefore
+invocation into several runner calls — a host wrapper that calls `run_parallel`
+once per batch — therefore
 starts the next batch unpaused, silently, after the user held the run. Nothing
 carries the flag across: `InvocationProgress` is the seam for invocation-wide
 state, but it holds figures, not requests. Not reachable from `runCycle.py`

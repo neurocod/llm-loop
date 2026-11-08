@@ -1,13 +1,13 @@
 """try_patch's journal: what a run mutated, until it is verifiably restored.
 
 A module of its own, standard library only, because it is read from outside:
-`unrestored_mutations` in `tools/git/commit.py` (the repository this grew up
-in) refuses to commit a file a try_patch run still holds, and imports THIS file
-from whatever commit its submodule sits at -- not try_patch.py, whose CLI,
-`replace_in_file` import and path setup it has no use for. So
-`JOURNAL_DIR_NAME`, `scan_journal(folder, recover=False)` and the `Finding`
-fields it reads (`who` among them) are an interface: change them together with
-commit.py, in the landing that bumps the submodule.
+a host's commit helper (a `CommitHost.checks` entry of `llm_agents.git.commit`
+in the repository this grew up in) refuses to commit a file a try_patch run
+still holds, and imports THIS file from whatever commit its submodule sits at
+-- not try_patch.py, whose CLI, `replace_in_file` import and path setup it has
+no use for. So `JOURNAL_DIR_NAME`, `scan_journal(folder, recover=False)` and
+the `Finding` fields it reads (`who` among them) are an interface: change them
+together with that check, in the landing that bumps the submodule.
 
 The selftest stays in try_patch.py.
 """

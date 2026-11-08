@@ -628,7 +628,7 @@ void whitespaceSplit(const std::string& command, std::vector<std::string>& token
 	}
 }
 
-// `sed -i` -- banned by CLAUDE.md and not on any allow-list here.
+// `sed -i` -- a file rewritten by the command body, and on no allow-list.
 std::vector<Finding> scanSedInPlace(const std::string& command) {
 	std::vector<std::string> tokens;
 	if (!shlexSplit(command, tokens))

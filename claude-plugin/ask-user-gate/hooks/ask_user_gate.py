@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse gate: refuse shell commands that would stop for a human prompt.
 
-CLAUDE.md lists the shapes that make the permission analyser give up and ask a
+A few command shapes make Claude Code's permission analyser give up and ask a
 human no matter what the allow-rules say -- a command longer than the parser's
 limit, a file written by the command body, `sed -i`, and chains, of which this
 refuses the ones that also move the working directory (see CD_COMMAND for why
@@ -123,7 +123,7 @@ MARKER = "allowaskuser"
 ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 # Hard limit of the command analyser inside Claude Code (MAX_COMMAND_LENGTH,
-# measured -- see CLAUDE.md). Above it the parse aborts, nothing can be scanned,
+# measured on a refused command). Above it the parse aborts, nothing can be scanned,
 # and the decision is forced down to "ask the human" whatever the allow-rules say.
 MAX_COMMAND_LENGTH = 10000
 
@@ -161,8 +161,8 @@ RELATIVE_REDIRECT = re.compile(r">>?\s*(?!/|[A-Za-z]:[\\/]|&)([^\s|;&<>()]+)",
 #
 # A chain WITHOUT one of these is currently let through, on the user's reading
 # (2026-08-15) that the dialogs they saw were all cd-compounds rather than
-# chains as such. That is a relaxation of the CLAUDE.md rule as ENFORCEMENT
-# only -- the rule itself stands, since one command per call also stays
+# chains as such. That is a relaxation of the one-command-per-call rule as
+# ENFORCEMENT only -- the rule itself stands, since one command per call also stays
 # retryable and lets the harness attribute a failure. If the prompts come back
 # for a plain `a; b`, widen this to any separator again: the change is the
 # `cwd_changing` guard at the end of scan_shell_syntax, nothing else.
@@ -490,7 +490,7 @@ def scan_shell_syntax(command: str, shell: str, windows: bool,
 
 
 def scan_sed_in_place(command: str) -> list[Finding]:
-    """`sed -i` -- banned by CLAUDE.md and not on any allow-list here."""
+    """`sed -i` -- a file rewritten by the command body, and on no allow-list."""
     try:
         tokens = shlex.split(command, posix=True)
     except ValueError:

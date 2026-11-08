@@ -72,7 +72,7 @@ Usage:
   # means is the gate's word, not this script's
   python try_patch.py --file a.h --old X --new Y --expect-fail \\
       --reject-exit 2 --reject-exit 5 --reject-exit 65 --reject-exit 70 \\
-      -- python selftest_run.py ped-delta
+      -- python run_suites.py physics
 
 Exit codes of its own: 2 bad edit, 3 restore failed, 4 refused by the journal,
 6 the command refused for a reason named by --reject-exit; under --expect-fail
@@ -111,7 +111,7 @@ SELFTEST_DIE_ENV = "TRY_PATCH_SELFTEST_DIE_AFTER_MUTATION"
 SELFTEST_DIE_CODE = 86
 
 # --expect-fail met an exit named by --reject-exit: the gate refused for its own
-# reason (selftest_run.py's 5 for an unknown suite name), so the run proved
+# reason (a suite runner's 5 for an unknown suite name, say), so the run proved
 # nothing about the pin. Not 1: 1 is "the pin pins nothing", a verdict about the
 # TEST that sends the caller to rewrite it; this one is about the RUN and sends
 # them to fix the command. Not the gate's own code passed through either: a
