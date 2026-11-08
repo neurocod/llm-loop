@@ -4,13 +4,13 @@ submodule rules, junction paths, the worker briefing skeleton and the fake
 wire. A host's own tables are pinned in the host's repository; these hold
 for any host binding the same judges."""
 
-from test_codex_agent import _no_badge  # noqa: F401 — see _no_badge docstring
+from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401 — see no_badge's docstring
 import json
 import os
 
 import pytest
 
-from test_codex_agent import _answers, _first_request, _run_fake_turn
+from llm_agents.codex.testing import wire
 from llm_agents.codex import roles, sandbox
 from llm_agents.codex.registry import AgentRecord
 from llm_agents.codex.store import AgentStore
@@ -293,10 +293,10 @@ def test_edits_retried_outside_are_judged_on_the_wire(tmp_path, monkeypatch):
     scratch = tmp_path / "scratch"
     monkeypatch.setattr(sandbox, "scratch_dir", lambda name: scratch)
     monkeypatch.setenv("FAKE_SCRATCH", str(scratch))
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "file-approvals",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "file-approvals",
                              sandbox="workspace-write", timeout=15.0)
     assert outcome.text == "file approvals handled"
-    decision = {request: _answers(tmp_path)[request]["result"]["decision"]
+    decision = {request: wire.answers(tmp_path)[request]["result"]["decision"]
                 for request in (9201, 9202, 9203, 9206, 9209, 9210)}
     assert decision == {9201: "accept", 9202: "decline", 9203: "decline",
                         9206: "decline", 9209: "decline", 9210: "decline"}
@@ -313,10 +313,10 @@ def test_commands_are_judged_on_the_wire(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox, "scratch_dir", lambda name: tmp_path / "scratch")
     (tmp_path / "package.json").write_text(json.dumps({"scripts": {
         "test": "vitest run", "typecheck": "tool a"}}))
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "escalate", timeout=15.0,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "escalate", timeout=15.0,
                              sandbox="workspace-write", role="worker", expect="")
     assert outcome.text.startswith("escalation handled")
-    answers = _answers(tmp_path)
+    answers = wire.answers(tmp_path)
     assert {request: answers[request]["result"]["decision"]
             for request in range(9101, 9107)} == {
         9101: "accept", 9102: "decline", 9103: "decline", 9104: "decline",
@@ -333,12 +333,12 @@ def test_a_commit_is_judged_on_the_wire(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox, "scratch_dir", lambda name: tmp_path / "scratch")
     monkeypatch.setenv("FAKE_SLOT", str(slot))
     monkeypatch.setenv("FAKE_SCRATCH", str(tmp_path / "scratch"))
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "commit", timeout=15.0,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "commit", timeout=15.0,
                              sandbox="workspace-write", role="worker", expect="", cwd=slot)
     assert outcome.text.startswith("commit handled")
-    answers = _answers(tmp_path)
+    answers = wire.answers(tmp_path)
     assert {request: answers[request]["result"]["decision"]
             for request in range(9301, 9305)} == {
         9301: "accept", 9302: "decline", 9303: "decline", 9304: "decline"}
-    briefing = _first_request(tmp_path, "thread/start")["params"]["developerInstructions"]
+    briefing = wire.first_request(tmp_path, "thread/start")["params"]["developerInstructions"]
     assert "commit with tools/git/commit.py, the message file in your scratch" in briefing

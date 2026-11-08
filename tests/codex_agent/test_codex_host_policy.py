@@ -5,7 +5,8 @@ What a host supplies is pinned by policies of this suite's own
 no project; a real host pins its own policy in its own repository.
 """
 
-from test_codex_agent import _install_fake_server, _no_badge  # noqa: F401
+from llm_agents.codex.testing import wire
+from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401
 import json
 import subprocess
 import sys
@@ -125,7 +126,7 @@ def test_without_a_host_recorded_gates_run_only_when_this_call_passed_them(
         return gates.GateRun(command, str(cwd), 0, "ok", 0.1)
 
     monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
-    _install_fake_server(monkeypatch, tmp_path, "plain")
+    wire.install_fake_server(monkeypatch, tmp_path, "plain")
     record = AgentRecord(name="w", cwd=str(tmp_path), sandbox="read-only",
                          gates=["tool gate"])
     outcome = turn.run_turn(record=record, prompt="p", resume=False,

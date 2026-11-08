@@ -1,9 +1,9 @@
 """Regression tests for the delegated Codex worker (`llm_agents.codex`).
 
 Everything here runs offline: the real `codex` CLI is never started. What talks
-to the client instead is a stand-in app-server (FAKE_APP_SERVER below) launched
-as a REAL child process, so the wire tests exercise the actual pipes, encoding
-and line buffering rather than a mock's idea of them.
+to the client instead is a stand-in app-server (`llm_agents.codex.testing.wire`)
+launched as a REAL child process, so the wire tests exercise the actual pipes,
+encoding and line buffering rather than a mock's idea of them.
 
 What is pinned is the part that fails SILENTLY in production — the registry
 shared by parallel agents, and the request/approval shapes, where a wrong field
@@ -19,10 +19,6 @@ spending a real Codex turn per run.
 Where a name's definer and its only consumer are the same module
 (`protocol.subprocess`, `registry.LOCK_WAIT_S`), both readings coincide; that is
 a coincidence, not the rule.
-
-The fake-wire helpers (`_run_fake_turn`, `_answers`, `_first_request`,
-`_received`) and the autouse `_no_badge` fixture are shared across the
-sibling test modules; their signatures are no longer this file's own.
 """
 
 import dataclasses
@@ -54,952 +50,15 @@ from llm_agents.codex.paths import agent_name
 from llm_agents.codex.registry import AgentRecord, Registry, RegistryError
 from llm_agents.codex.store import AgentStore
 from llm_agents.codex.turn import TurnOutcome, TurnRunner
+from llm_agents.codex.testing import wire
+from llm_agents.codex.testing.fixtures import no_badge, worker_report  # noqa: F401
+from llm_agents.codex.testing.wire import (
+    LOGGED_DROP, LOGGED_NETWORK_WAIT, LOGGED_OVERLOAD, LOGGED_RECONNECT,
+    NETWORK_WAIT_TIMES,
+)
 from core_policy import core_main
 
 WRITERS = 6
-
-
-@pytest.fixture(autouse=True)
-def _no_badge(monkeypatch):
-    """Keep the on-screen counter out of every test that runs a turn.
-
-    `run_turn` announces itself to `AgentCounter`, which would start a window on
-    the operator's screen once per turn test. Autouse rather than per-test: the
-    announcement is inside `run_turn`, so every future test that runs a turn
-    inherits it without having to know the badge exists. The two tests that are
-    ABOUT the beacon undo it deliberately.
-
-    Sibling modules must import this fixture to register it with pytest.
-    The import LOOKS unused (2026-09-13), but removing it allows turn
-    tests to open real badge windows. Keep registration explicit rather
-    than widening its scope to every test through conftest.py.
-    """
-    monkeypatch.setenv(beacon.DISABLE_ENV, "0")
-    monkeypatch.delenv("CODEX_AGENTS_COUNTER", raising=False)
-
-
-# --- fake app-server ------------------------------------------------------
-
-# The outage the retry rule was written for, copied verbatim out of
-# worker-e's `events.jsonl` (2026-09-13) rather than written
-# from memory — a shape invented here would pin nothing but itself. Three lines
-# of one failure: the server reconnecting (`willRetry`, and the kind in its
-# object spelling), the error that ends the turn (the kind degraded to the
-# catch-all `"other"`, the sentence kept), and, from an earlier day, the other
-# service failure these logs have seen. The stand-in below is handed the drop's
-# message on its command line, so both halves of the pin are this one string.
-LOGGED_DROP = json.loads(
-    '{"method": "error", "params": {"error": {"message": "stream disconnected '
-    'before completion: Unable to verify model access right now. Please '
-    'retry.", "codexErrorInfo": "other", "additionalDetails": null, '
-    '"misalignment": null}, "willRetry": false, "threadId": '
-    '"01a09779-2ded-7041-aaef-b795471eb850", "turnId": '
-    '"01a09779-30f7-7850-850c-5c4f54018dd8"}, "emittedAtMs": 1789247876163}')
-LOGGED_RECONNECT = json.loads(
-    '{"method": "error", "params": {"error": {"message": "Reconnecting... 5/5",'
-    ' "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": '
-    'null}}, "additionalDetails": "stream disconnected before completion: '
-    'Unable to verify model access right now. Please retry.", "misalignment": '
-    'null}, "willRetry": true, "threadId": '
-    '"01a09779-2ded-7041-aaef-b795471eb850", "turnId": '
-    '"01a09779-30f7-7850-850c-5c4f54018dd8"}, "emittedAtMs": 1789247871949}')
-LOGGED_OVERLOAD = json.loads(
-    '{"method": "error", "params": {"error": {"message": "Selected model is at '
-    'capacity. Please try a different model.", "codexErrorInfo": '
-    '"serverOverloaded", "additionalDetails": null, "misalignment": null}, '
-    '"willRetry": false, "threadId": "01a05fa3-c011-7a50-8a1f-e4ff435224da", '
-    '"turnId": "01a05fa3-c273-7d51-9731-b4433f5629bd"}, "emittedAtMs": '
-    "1788311174392}")
-DROPPED_TURN_MESSAGE = LOGGED_DROP["params"]["error"]["message"]
-
-# worker-c/events.jsonl, 2026-11-07: the steady part of the network outage.
-# Keep the wire shape and emittedAtMs cadence; the test clock replays minutes
-# instantly, without turning CPU scheduling delays into test failures.
-LOGGED_NETWORK_WAIT = json.loads(
-    '{"method": "error", "params": {"error": {"message": "Reconnecting... '
-    'waiting for network", "codexErrorInfo": {"responseStreamDisconnected": '
-    '{"httpStatusCode": null}}, "additionalDetails": "Connection failed: error '
-    'sending request", "misalignment": null}, "willRetry": true, "threadId": '
-    '"01a1b4cc-9df0-7261-9030-864b6d84b697", "turnId": '
-    '"01a1b4cc-a550-79f2-a90f-acb4d804d0c5"}, "emittedAtMs": 1794038271329}')
-NETWORK_WAIT_TIMES = [1794038271329, 1794038334670, 1794038398202,
-                      1794038461795, 1794038525197]
-
-# A minimal `codex app-server --stdio` stand-in. It is written to tmp_path and
-# run by the interpreter under test; the client's argv is rewritten by
-# `_install_fake_server`. Every message it reads is appended to
-# `received.jsonl`, which is how the tests see what the CLIENT actually put on
-# the wire (the client discards most responses, so asserting on its return
-# values alone would miss the request side entirely).
-FAKE_APP_SERVER = r'''"""Stand-in codex app-server for the offline wire tests."""
-import json
-import os
-import sys
-import time
-
-SCENARIO = sys.argv[1]
-WORK = sys.argv[2]
-# The sentence a real drop carried, handed over rather than spelled again here:
-# one string, so rewording the pin cannot leave the stand-in replaying a shape
-# OpenAI never sent.
-DROP_MESSAGE = sys.argv[3]
-NETWORK_FIXTURE, NETWORK_TIMES = json.loads(sys.argv[4])
-
-sys.stdin.reconfigure(encoding="utf-8")
-sys.stdout.reconfigure(encoding="utf-8")
-
-RECEIVED = os.path.join(WORK, "received.jsonl")
-
-
-def out(msg):
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
-
-
-def read():
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            return None
-        line = line.strip()
-        if not line:
-            continue
-        msg = json.loads(line)
-        with open(RECEIVED, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(msg) + "\n")
-        return msg
-
-
-def note(method, params=None):
-    out({"jsonrpc": "2.0", "method": method, "params": params or {}})
-
-
-def item(payload):
-    note("item/completed", {"item": payload})
-
-
-def ask(request_id, method, params=None):
-    """Server-initiated request; blocks until the client answers it."""
-    out({"jsonrpc": "2.0", "id": request_id, "method": method,
-         "params": params or {}})
-    while True:
-        msg = read()
-        if msg is None:
-            sys.exit(0)
-        if msg.get("id") == request_id and "method" not in msg:
-            return msg
-
-
-def wait_for(path, limit=10.0):
-    deadline = time.monotonic() + limit
-    while time.monotonic() < deadline:
-        if os.path.exists(path):
-            return True
-        time.sleep(0.02)
-    return False
-
-
-def attempt_number():
-    """Which attempt at this turn is running, counted on disk.
-
-    A service-drop retry starts a FRESH server process, so an in-memory
-    counter would say "1" every time.
-    """
-    path = os.path.join(WORK, "attempts.txt")
-    seen = 0
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as handle:
-            seen = int(handle.read() or 0)
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(str(seen + 1))
-    return seen + 1
-
-
-def usage(total_in, cached, out, occupied):
-    """Report token usage the way the server does — CUMULATIVELY OVER THE
-    THREAD, so a resumed turn carries on from the dropped one's numbers rather
-    than restarting at zero. The pairs the callers pass are the real ones,
-    lifted from the outage log either side of its resume."""
-    note("thread/tokenUsage/updated", {"tokenUsage": {
-        "total": {"inputTokens": total_in, "cachedInputTokens": cached,
-                  "outputTokens": out},
-        "last": {"totalTokens": occupied}, "modelContextWindow": 258400}})
-
-
-def fail(message, info, reconnect=False):
-    """Fail the turn the way the 2026-09-13 outage did: five reconnects with
-    `willRetry` and the kind in its object spelling, then the terminal error
-    with the kind degraded to `"other"`, then the failed `turn/completed`."""
-    if reconnect:
-        note("error", {"error": {
-            "message": "Reconnecting... 5/5",
-            "codexErrorInfo": {"responseStreamDisconnected":
-                               {"httpStatusCode": None}},
-            "additionalDetails": message, "misalignment": None},
-            "willRetry": True, "threadId": "th-fake", "turnId": "t1"})
-    error = {"message": message, "codexErrorInfo": info,
-             "additionalDetails": None, "misalignment": None}
-    note("error", {"error": error, "willRetry": False,
-                   "threadId": "th-fake", "turnId": "t1"})
-    note("turn/completed", {"threadId": "th-fake", "turn": {
-        "id": "t1", "items": [], "itemsView": "notLoaded", "status": "failed",
-        "error": error, "durationMs": 179014}})
-
-
-def sub_agent_turn(main_answer, drop=False):
-    """Codex splitting a review: the main thread spawns a child, the child
-    finishes FIRST with its subtask's answer, and only then does the main
-    thread answer and complete. Shapes (and the three ids' relations) from
-    `.codex-agents/review-a/events.jsonl`, lines 48-255 (2026-10-24):
-    every notification declares its `threadId`, a child's turn carries the
-    main turn as `rootTurnId`, and each thread reports its own cumulative
-    token usage. `drop`: the service drops the main thread instead of letting
-    it answer, after the children are done."""
-    main = {"threadId": "th-fake", "turnId": "t-main"}
-    child = {"threadId": "th-child", "turnId": "t-child"}
-    late = {"threadId": "th-late", "turnId": "t-late"}
-    note("turn/started", {"threadId": "th-fake", "turn": {
-        "id": "t-main", "rootTurnId": "t-main", "status": "inProgress"}})
-    note("item/completed", {**main, "item": {
-        "type": "subAgentActivity", "kind": "started",
-        "agentThreadId": "th-child", "agentPath": "/root/client_review"}})
-    note("turn/started", {"threadId": "th-child", "turn": {
-        "id": "t-child", "rootTurnId": "t-main", "status": "inProgress"}})
-    # A second child, whose message arrives only AFTER the main thread's
-    # final answer: routed as a main-thread item it would replace that answer
-    # (a child that speaks first is overwritten by the main answer either way).
-    note("item/completed", {**main, "item": {
-        "type": "subAgentActivity", "kind": "started",
-        "agentThreadId": "th-late", "agentPath": "/root/late_check"}})
-    note("turn/started", {"threadId": "th-late", "turn": {
-        "id": "t-late", "rootTurnId": "t-main", "status": "inProgress"}})
-    note("item/completed", {**child, "item": {
-        "type": "commandExecution", "command": "git show a", "exitCode": 0}})
-    note("item/completed", {**child, "item": {
-        "type": "agentMessage", "phase": "final_answer",
-        "text": "## Findings\nnone in the client portion"}})
-    # Not in that log: a child's terminal error, in the shape of
-    # LOGGED_DROP — the main thread then completes the turn regardless.
-    note("error", {**child, "error": {"message": "child stream broke",
-                                      "codexErrorInfo": "other"},
-                   "willRetry": False})
-    # The main thread's last reading comes BEFORE the child's (lines 248
-    # and 251), so a child reading taken as occupancy would be the last.
-    note("thread/tokenUsage/updated", {**main, "tokenUsage": {
-        "total": {"inputTokens": 501566, "cachedInputTokens": 435584,
-                  "outputTokens": 2163},
-        "last": {"totalTokens": 79835}, "modelContextWindow": 258400}})
-    note("thread/tokenUsage/updated", {**child, "tokenUsage": {
-        "total": {"inputTokens": 433471, "cachedInputTokens": 382336,
-                  "outputTokens": 1837},
-        "last": {"totalTokens": 85661}, "modelContextWindow": 258400}})
-    note("item/completed", {**main, "item": {
-        "type": "subAgentActivity", "kind": "completed",
-        "agentThreadId": "th-child", "agentPath": "/root/client_review"}})
-    note("turn/completed", {"threadId": "th-child", "turn": {
-        "id": "t-child", "rootTurnId": "t-main", "status": "completed"}})
-    note("item/completed", {**main, "item": {
-        "type": "commandExecution", "command": "git show b", "exitCode": 0}})
-    if drop:
-        note("item/completed", {**main, "item": {
-            "type": "subAgentActivity", "kind": "completed",
-            "agentThreadId": "th-late", "agentPath": "/root/late_check"}})
-        note("turn/completed", {"threadId": "th-late", "turn": {
-            "id": "t-late", "rootTurnId": "t-main", "status": "completed"}})
-        fail(DROP_MESSAGE, "other", reconnect=True)
-        return
-    note("item/completed", {**main, "item": {
-        "type": "agentMessage", "phase": "final_answer", "text": main_answer}})
-    note("item/completed", {**late, "item": {
-        "type": "agentMessage", "phase": "final_answer",
-        "text": "## Findings\nthe late child's subtask"}})
-    note("item/completed", {**main, "item": {
-        "type": "subAgentActivity", "kind": "completed",
-        "agentThreadId": "th-late", "agentPath": "/root/late_check"}})
-    note("turn/completed", {"threadId": "th-late", "turn": {
-        "id": "t-late", "rootTurnId": "t-main", "status": "completed"}})
-    note("turn/completed", {"threadId": "th-fake", "turn": {
-        "id": "t-main", "rootTurnId": "t-main", "status": "completed"}})
-
-
-# The scenarios where a child outlives the main answer (`live_child_turn`).
-LIVE_CHILD_SCENARIOS = (
-    "sub-agent-live", "sub-agent-gap", "sub-agent-stale", "sub-agent-stuck",
-    "sub-agent-continue", "sub-agent-busy-continue", "sub-agent-late-root",
-    "sub-agent-fail", "sub-agent-mixed", "sub-agent-deaf", "sub-agent-mute",
-    "subrep-live", "subrep-fail", "subrep-timeout", "subrep-silent",
-    "sub-agent-revive",
-    "sub-agent-idle-grand", "sub-agent-done-fail", "sub-agent-done-reject",
-    "sub-agent-restart-timeout", "sub-agent-restart-spawn",
-    "sub-agent-child-fail", "sub-agent-drain-done", "sub-agent-continue-fail",
-    "sub-agent-long", "subrep-silent-gatefail")
-# A child message past `subagents.ANSWER_CHARS`, with a mark at its very end.
-LONG_ANSWER = "L" * 30000 + "TAIL-MARK"
-# Children that never finish on their own: cut at the deadline.
-STUCK_SCENARIOS = ("sub-agent-stuck", "sub-agent-deaf", "sub-agent-mute",
-                   "sub-agent-revive", "sub-agent-restart-timeout",
-                   "sub-agent-restart-spawn", "sub-agent-drain-done")
-# What the last `turn/start` asked, for `wrapper_turn`.
-TURN_TEXT = ""
-# Names a turn the wrapper sends about its children may carry: results,
-# paths and files of the scenarios below.
-MARKERS = ("the kid's result", "the grand's result", "A's result",
-           "/root/kid/grand", "/root/b", "kid.py", "grand.py", "a.py", "b.py",
-           "restart it")
-
-
-# The main thread's turns, in the children's shapes below.
-def root_turn(turn_id):
-    child_turn("th-fake", turn_id)
-
-
-def root_says(text):
-    child_says("th-fake", text)
-
-
-def root_done(turn_id):
-    child_done("th-fake", turn_id)
-
-
-def spawn(parent, thread, path, turn_id=""):
-    """The parent's `subAgentActivity started` record (on the PARENT's
-    thread, as a grandchild's is on its parent's), then — unless `turn_id`
-    is withheld — the child's own `turn/started` (no `rootTurnId`, as in
-    reviewer rev-a's log)."""
-    note("item/completed", {"threadId": parent, "item": {
-        "type": "subAgentActivity", "kind": "started",
-        "agentThreadId": thread, "agentPath": path}})
-    if turn_id:
-        child_turn(thread, turn_id)
-
-
-def child_turn(thread, turn_id):
-    note("turn/started", {"threadId": thread, "turn": {
-        "id": turn_id, "status": "inProgress"}})
-
-
-def child_edit(thread, path):
-    note("item/completed", {"threadId": thread, "item": {
-        "type": "fileChange", "changes": [
-            {"path": path, "kind": {"type": "update"}}]}})
-
-
-def child_says(thread, text):
-    note("item/completed", {"threadId": thread, "item": {
-        "type": "agentMessage", "phase": "final_answer", "text": text}})
-
-
-def child_done(thread, turn_id, text="", status="completed", error=None,
-               verdict_text=""):
-    """`verdict_text`: a message carried only inside the verdict's
-    `turn.items`, as the real server repeats the final one there."""
-    if text:
-        child_says(thread, text)
-    turn = {"id": turn_id, "status": status}
-    if error:
-        turn["error"] = {"message": error}
-    if verdict_text:
-        turn["items"] = [{"type": "agentMessage", "text": verdict_text}]
-    note("turn/completed", {"threadId": thread, "turn": turn})
-
-
-def wrapper_turn(text=None):
-    """A turn the wrapper sent about the children. The stand-in has NO
-    inbox: its answer names only what that turn's PROMPT carried, so a
-    result the prompt left out is one the main thread never saw — the case
-    of a grandchild (delivered to its parent only) and of a child whose
-    result Codex routes after its terminal event."""
-    seen = [marker for marker in MARKERS if marker in TURN_TEXT]
-    root_turn("t-wrap")
-    root_says(text or ("## Findings\nsaw: " + (", ".join(seen) or "nothing")))
-    root_done("t-wrap")
-
-
-def live_child_turn():
-    """The main thread answers while a child still runs — the shape of
-    reviewer rev-a's log line 708. Turns after the first are the
-    wrapper's (`wrapper_turn`), except where a scenario says otherwise."""
-    report = os.environ.get("FAKE_REPORT_PATH", "")
-    attempt = attempt_number()
-    if attempt > 1:
-        if SCENARIO == "subrep-silent-gatefail" and attempt > 2:
-            # The gate follow-up, which fails.
-            root_turn("t-gate")
-            fail("You've hit your usage limit.", "usageLimitExceeded")
-        elif SCENARIO == "sub-agent-mute":
-            root_turn("t-wrap")
-            root_done("t-wrap")
-        elif SCENARIO == "sub-agent-revive":
-            # The restart turn resumes the cut child on its OWN thread (Codex
-            # v2 `followup_task`: a new turn there) and waits for it.
-            root_turn("t-wrap")
-            child_turn("th-kid", "t-kid2")
-            child_edit("th-kid", "kid2.py")
-            child_done("th-kid", "t-kid2", "the kid's second result")
-            root_says("## Findings\nrestarted the kid")
-            root_done("t-wrap")
-        elif SCENARIO == "sub-agent-restart-spawn":
-            # ... or starts a new child, and answers before it is done.
-            root_turn("t-wrap")
-            spawn("th-fake", "th-new", "/root/new", "t-new")
-            child_edit("th-new", "new.py")
-            root_says("## Findings\nstarted a new one")
-            root_done("t-wrap")
-        elif SCENARIO in ("sub-agent-restart-timeout", "sub-agent-done-reject"):
-            root_turn("t-wrap")  # and never completes (rejected: never runs)
-        elif SCENARIO == "sub-agent-done-fail":
-            root_turn("t-wrap")
-            fail("You've hit your usage limit.", "usageLimitExceeded")
-        elif SCENARIO in ("subrep-silent", "subrep-silent-gatefail"):
-            # Completes, answering in the message only: no new report.
-            wrapper_turn("merged the kid's result in the message only")
-        elif SCENARIO == "subrep-timeout":
-            # Keeps rewriting the report until the wrapper stops the server.
-            root_turn("t-wrap")
-            for _ in range(200):
-                with open(report, "w", encoding="utf-8", newline="") as handle:
-                    handle.write("## Report\n### Done\npartial")
-                time.sleep(0.05)
-        elif SCENARIO.startswith("subrep-"):
-            with open(os.path.join(WORK, "report_at_wrapper.txt"), "w",
-                      encoding="utf-8") as handle:
-                handle.write(str(os.path.exists(report)))
-            with open(report, "w", encoding="utf-8", newline="") as handle:
-                handle.write("## Report\n### Done\npartial" if
-                             SCENARIO == "subrep-fail" else
-                             "## Report\n### Done\nmerged the kid's result\n"
-                             "### Not done / open questions\nnone\n")
-            if SCENARIO == "subrep-fail":
-                root_turn("t-wrap")
-                fail("You've hit your usage limit.", "usageLimitExceeded")
-            else:
-                wrapper_turn("## Report\n### Not done / open questions\nnone")
-        else:
-            wrapper_turn()
-        return
-    if SCENARIO.startswith("subrep-"):
-        with open(report, "w", encoding="utf-8", newline="") as handle:
-            handle.write("## Report\n### Done\nfirst\n"
-                         "### Not done / open questions\nnone\n")
-    root_turn("t-main")
-    if SCENARIO == "sub-agent-gap":
-        # The record alone: the main turn completes before the child's
-        # `turn/started` (rev-a: lines 52 and 57, 36 ms apart).
-        spawn("th-fake", "th-kid", "/root/kid")
-    elif SCENARIO == "sub-agent-mixed":
-        spawn("th-fake", "th-a", "/root/a", "t-a")
-        child_edit("th-a", "a.py")
-        spawn("th-fake", "th-b", "/root/b", "t-b")
-        child_edit("th-b", "b.py")
-    elif SCENARIO == "sub-agent-stale":
-        spawn("th-fake", "th-kid", "/root/kid", "t-kid1")
-        child_turn("th-kid", "t-kid2")
-        child_says("th-kid", "kid2 progress")
-    else:
-        spawn("th-fake", "th-kid", "/root/kid", "t-kid")
-        child_edit("th-kid", "kid.py")
-    if SCENARIO == "sub-agent-stuck":
-        spawn("th-kid", "th-grand", "/root/kid/grand", "t-grand")
-        child_edit("th-grand", "grand.py")
-    if SCENARIO == "sub-agent-late-root":
-        return  # the main turn never completes; see `on_interrupt`
-    if SCENARIO == "sub-agent-fail":
-        fail("You've hit your usage limit.", "usageLimitExceeded")
-        return
-    if SCENARIO.startswith("subrep-"):
-        root_says("## Report\n### Not done / open questions\nnone")
-    elif SCENARIO != "sub-agent-mute":
-        root_says("## Findings\nwithout the kid")
-    root_done("t-main")
-    if SCENARIO in STUCK_SCENARIOS:
-        return
-    time.sleep(0.2)
-    if SCENARIO == "sub-agent-idle-grand":
-        # The child spawns a grandchild while the main thread is idle, then
-        # finishes; the grandchild finishes later still.
-        spawn("th-kid", "th-grand", "/root/kid/grand", "t-grand")
-        child_done("th-kid", "t-kid", "the kid's result")
-        time.sleep(0.3)
-        child_done("th-grand", "t-grand", "the grand's result")
-    elif SCENARIO == "sub-agent-continue-fail":
-        # A continuation the service drops, with the child still running.
-        root_turn("t-main2")
-        fail(DROP_MESSAGE, "other", reconnect=True)
-    elif SCENARIO == "sub-agent-child-fail":
-        child_done("th-kid", "t-kid", "half-done notes", status="failed",
-                   error="child broke")
-    elif SCENARIO == "sub-agent-gap":
-        child_turn("th-kid", "t-kid")
-        child_edit("th-kid", "kid.py")
-        child_done("th-kid", "t-kid", "the kid's result")
-    elif SCENARIO == "sub-agent-stale":
-        # The OLDER turn's late completion, with words of its own.
-        child_done("th-kid", "t-kid1", verdict_text="stale text")
-    elif SCENARIO == "sub-agent-mixed":
-        child_done("th-a", "t-a", "A's result")
-    elif SCENARIO in ("sub-agent-continue", "sub-agent-long"):
-        root_turn("t-main2")
-        child_done("th-kid", "t-kid", LONG_ANSWER if SCENARIO == "sub-agent-long"
-                   else "the kid's result")
-        root_says("## Findings\ncontinued")
-        root_done("t-main2")
-    elif SCENARIO == "sub-agent-busy-continue":
-        # A continuation that streams for 1.5 s with the child still open.
-        root_turn("t-main2")
-        for _ in range(60):
-            note("thread/tokenUsage/updated", {"threadId": "th-fake", "tokenUsage": {
-                "total": {"inputTokens": 10, "cachedInputTokens": 0,
-                          "outputTokens": 1}}})
-            time.sleep(0.025)
-        root_says("## Findings\ncontinued")
-        root_done("t-main2")
-    else:
-        child_done("th-kid", "t-kid", "the kid's result")
-
-
-def on_interrupt(request_id, params):
-    """As the app-server does (bespoke_event_handling.rs): the reply as the
-    turn aborts, then its `turn/completed`. "-deaf" never stops; "-late-root"
-    lets the never-finished main turn fail the way a service drop does first."""
-    out({"jsonrpc": "2.0", "id": request_id, "result": {}})
-    if SCENARIO == "sub-agent-deaf":
-        return
-    if SCENARIO == "sub-agent-late-root":
-        fail(DROP_MESSAGE, "other", reconnect=True)
-    if SCENARIO == "sub-agent-drain-done":
-        # It had just finished on its own: the verdict says completed.
-        child_done(params.get("threadId"), params.get("turnId"),
-                   "finished just in time")
-        return
-    note("turn/completed", {"threadId": params.get("threadId"), "turn": {
-        "id": params.get("turnId"), "status": "interrupted"}})
-
-
-def run_turn():
-    if SCENARIO in LIVE_CHILD_SCENARIOS:
-        live_child_turn()
-        return
-    if SCENARIO.startswith("report-"):
-        attempt = attempt_number()
-        report = os.environ["FAKE_REPORT_PATH"]
-        message = "## Report\n### Not done / open questions\nnone"
-        text = "## Report\n### Done\nEdited café.\n### Not done / open questions\nnone\n"
-        write = True
-        if SCENARIO == "report-empty":
-            text = " \n"
-        elif SCENARIO == "report-directory":
-            os.makedirs(report, exist_ok=True)
-            write = False
-        elif SCENARIO == "report-same":
-            text = message
-        elif SCENARIO == "report-newline":
-            text = message + "\n"
-        elif SCENARIO == "report-absent":
-            write = False
-        elif SCENARIO == "report-stale":
-            write = attempt == 1
-        elif SCENARIO in ("report-partial", "report-fallback", "report-failed",
-                          "report-silent", "report-file-only", "report-repeat",
-                          "report-fallback-then-fail") and attempt == 1:
-            text = "## Report\n### Done\nEdited café."
-        elif SCENARIO == "report-repeat":
-            write = False
-            message = "## Report\n### Done\nEdited café."
-        elif SCENARIO in ("report-silent", "report-file-only"):
-            message = ""
-            write = SCENARIO == "report-file-only"
-            text = "## Report\n### Done\nEdited café."
-        elif SCENARIO in ("report-fallback", "report-failed",
-                          "report-fallback-then-fail"):
-            write = False
-        elif SCENARIO == "report-gate-regress" and attempt == 2:
-            # The gate follow-up replaces a complete report with one word.
-            text = "fixed"
-        elif SCENARIO == "report-missing" and attempt == 1:
-            write = False
-            message = "Finished editing."
-        elif SCENARIO == "report-retry" and attempt > 1:
-            write = False
-        if write:
-            encoding = {"report-utf8-bom": "utf-8-sig",
-                        "report-utf16": "utf-16",
-                        "report-cp1252": "cp1252"}.get(SCENARIO, "utf-8")
-            with open(report, "w", encoding=encoding, newline="") as handle:
-                handle.write(text)
-        if SCENARIO == "report-retry" and attempt == 1:
-            fail(DROP_MESSAGE, "other", reconnect=True)
-            return
-        if SCENARIO == "report-failed" and attempt > 1:
-            fail("You've hit your usage limit.", "usageLimitExceeded")
-            return
-        item({"type": "agentMessage", "text": message})
-        # "-then-fail": the third (gate follow-up) turn says something and
-        # then fails, so its partial message must not take the kept answer's
-        # provenance with it.
-        if SCENARIO == "report-terminal-failure" or (
-                SCENARIO == "report-fallback-then-fail" and attempt > 2):
-            fail("You've hit your usage limit.", "usageLimitExceeded")
-            return
-        note("turn/completed", {"turn": {"status": "completed"}})
-        return
-    if SCENARIO in ("sub-agent-follow-up", "sub-agent-retry"):
-        # The split review's main answer is short of its Coverage, or the
-        # service drops the main thread after the child is done; the next
-        # attempt on the same thread runs no child, and the thread's own
-        # cumulative total grows past the first attempt's 501 566.
-        if attempt_number() == 1:
-            sub_agent_turn("## Findings\n1. server half",
-                           drop=SCENARIO == "sub-agent-retry")
-            return
-        note("thread/tokenUsage/updated", {
-            "threadId": "th-fake", "turnId": "t-main2", "tokenUsage": {
-                "total": {"inputTokens": 560000, "cachedInputTokens": 480000,
-                          "outputTokens": 2500},
-                "last": {"totalTokens": 81000}, "modelContextWindow": 258400}})
-        note("item/completed", {"threadId": "th-fake", "item": {
-            "type": "agentMessage", "text": "## Coverage\nall of them"}})
-        note("turn/completed", {"threadId": "th-fake", "turn": {
-            "id": "t-main2", "rootTurnId": "t-main2", "status": "completed"}})
-        return
-    if SCENARIO == "sub-agent":
-        sub_agent_turn("## Findings\n1. server half\n## Coverage\nall of them")
-        return
-    if SCENARIO == "die":
-        sys.exit(1)  # mid-turn death: the client must see EOF, not a stall
-    if SCENARIO.startswith("network-"):
-        attempt = attempt_number()
-        if SCENARIO in ("network-child-stale", "network-child-heartbeats"):
-            if attempt == 1:
-                origin = NETWORK_TIMES[0]
-                out({"method": "item/started", "params": {"threadId": "th-fake"},
-                     "emittedAtMs": origin})
-                NETWORK_FIXTURE["params"]["threadId"] = "th-child"
-                for elapsed in range(10, 8000, 60):
-                    if elapsed == 10 or SCENARIO == "network-child-heartbeats":
-                        out({**NETWORK_FIXTURE, "emittedAtMs": origin + elapsed * 1000})
-                    out({"method": "item/started", "params": {"threadId": "th-fake"},
-                         "emittedAtMs": origin + elapsed * 1000})
-            root_says("main kept working")
-            root_done("t1")
-            return
-        if SCENARIO == "network-rev-d":
-            # rev-d emittedAtMs: 1792073187371, 1792073370156,
-            # then first progress at 1792073447873 (2026-10-15).
-            origin = NETWORK_TIMES[0]
-            out({"method": "thread/tokenUsage/updated", "params": {},
-                 "emittedAtMs": origin})
-            for elapsed in (187371, 370156):
-                NETWORK_FIXTURE["params"]["threadId"] = "th-fake"
-                out({**NETWORK_FIXTURE, "emittedAtMs": origin + elapsed})
-            out({"method": "item/started", "params": {"threadId": "th-fake"},
-                 "emittedAtMs": origin + 447873})
-            root_says("recovered without a resend")
-            root_done("t1")
-            return
-        if SCENARIO == "network-complete-at-ceiling":
-            NETWORK_FIXTURE["params"]["threadId"] = "th-fake"
-            out(NETWORK_FIXTURE)
-            # Final message and completion are delivered at the ceiling.
-            out({"method": "item/completed", "emittedAtMs": NETWORK_TIMES[0] + 100000,
-                 "params": {"threadId": "th-fake", "item": {
-                     "type": "agentMessage", "text": "complete answer"}}})
-            root_done("t1")
-            return
-        if attempt == 1 or SCENARIO == "network-ceiling-across-retries":
-            event = NETWORK_FIXTURE
-            event["params"]["threadId"] = (
-                "th-child" if SCENARIO == "network-child-only" else "th-fake")
-            if SCENARIO == "network-429":
-                event["params"]["error"]["codexErrorInfo"] = "rateLimitExceeded"
-            elif SCENARIO == "network-stream-drop":
-                event["params"]["error"]["message"] = "Reconnecting... 5/5"
-            for stamp in NETWORK_TIMES:
-                event["emittedAtMs"] = stamp
-                out(event)
-                if SCENARIO == "network-child-only":
-                    # Main-thread progress does not recover the child's stream.
-                    note("item/started", {"threadId": "th-fake"})
-                if SCENARIO in ("network-stale", "network-ceiling-across-retries"):
-                    # Staleness alone leaves work time; only the second tick
-                    # exhausts the 100 s work budget plus credited silence.
-                    out({"method": "thread/tokenUsage/updated", "params": {},
-                         "emittedAtMs": stamp + 367000})
-                    out({"method": "thread/tokenUsage/updated", "params": {},
-                         "emittedAtMs": stamp + 467000})
-                    return
-            if SCENARIO == "network-child-only":
-                note("turn/completed", {"threadId": "th-child",
-                                        "turn": {"status": "completed"}})
-        item({"type": "agentMessage", "text": "network recovered"})
-        note("turn/completed", {"turn": {"status": "completed"}})
-        return
-    if SCENARIO in ("drop-once", "drop-always", "refuse", "drop-then-refuse"):
-        attempt = attempt_number()
-        if SCENARIO == "refuse" or (SCENARIO == "drop-then-refuse" and attempt > 1):
-            fail("You've hit your usage limit.", "usageLimitExceeded")
-            return
-        if SCENARIO == "drop-always" or attempt == 1:
-            # Work done before the stream died: the summary must keep it.
-            item({"type": "commandExecution", "command": "git diff --stat",
-                  "exitCode": 0})
-            item({"type": "fileChange", "changes": [
-                {"path": "half.py", "kind": {"type": "update"}}]})
-            usage(400578, 354560, 2869, 60754)
-            fail(DROP_MESSAGE, "other", reconnect=True)
-            return
-        item({"type": "agentMessage", "text": "picked up after the drop"})
-        usage(467645, 415232, 3075, 67273)
-        note("turn/completed", {"turn": {"status": "completed"}})
-        return
-    if SCENARIO in ("partial", "partial-twice", "partial-twice-then-refuse",
-                    "partial-then-silent"):
-        # A reviewer that answers one of the questions and stops; asked again
-        # on the same thread it adds the rest without repeating itself — or,
-        # "partial-twice", adds more findings and still no Coverage; the
-        # "-then-refuse" form then fails the third (gate follow-up) turn;
-        # "partial-then-silent" completes the follow-up with no message.
-        attempt = attempt_number()
-        if SCENARIO == "partial-then-silent" and attempt > 1:
-            note("turn/completed", {"turn": {"status": "completed"}})
-            return
-        if SCENARIO == "partial-twice-then-refuse" and attempt > 2:
-            fail("You've hit your usage limit.", "usageLimitExceeded")
-            return
-        if attempt == 1:
-            item({"type": "commandExecution", "command": "git show a",
-                  "exitCode": 0})
-            item({"type": "agentMessage", "text": "## Findings\n1. one thing"})
-        else:
-            item({"type": "commandExecution", "command": "git show b",
-                  "exitCode": 0})
-            item({"type": "agentMessage", "text": "## Coverage\nall of them"
-                  if SCENARIO == "partial" else "2. another thing"})
-        note("turn/completed", {"turn": {"status": "completed"}})
-        return
-    if SCENARIO == "approvals":
-        ask(9001, "item/permissions/requestApproval", {"itemId": "i1"})
-        ask(9002, "item/commandExecution/requestApproval", {"itemId": "i2"})
-        ask(9003, "execCommandApproval", {"callId": "c1"})
-        ask(9004, "totally/unknown/request", {})
-        ask(9005, "item/fileChange/requestApproval", {"itemId": "i9"})
-        item({"type": "agentMessage", "text": "approvals handled"})
-    elif SCENARIO == "file-approvals":
-        # An edit that failed inside the sandbox, asked to be retried outside
-        # it: the request names the item, its `item/started` names the files.
-        def change(item_id, *paths, move=None):
-            note("item/started", {"item": {
-                "type": "fileChange", "id": item_id, "changes": [
-                    {"path": path, "kind": {"type": "update", "move_path": move}}
-                    for path in paths]}})
-
-        def retry(request_id, item_id):
-            ask(request_id, "item/fileChange/requestApproval",
-                {"itemId": item_id, "threadId": "th-fake",
-                 "reason": "command failed; retry without sandbox?"})
-
-        inside = os.path.join(WORK, "src", "a.py")
-        outside = os.path.join(os.path.dirname(WORK), "elsewhere.py")
-        change("f1", inside)
-        retry(9201, "f1")
-        change("f2", inside, outside)
-        retry(9202, "f2")
-        item({"type": "fileChange", "id": "f2", "status": "declined",
-              "changes": [{"path": outside, "kind": {"type": "update"}}]})
-        change("f3", os.path.join(WORK, ".git", "config"))
-        retry(9203, "f3")
-        # Two files under the host's protected paths, named by the test
-        # (`FAKE_PROTECTED_EDITS`, a JSON list of two relative paths).
-        protected = json.loads(os.environ.get(
-            "FAKE_PROTECTED_EDITS", '["vault/note.md", "vault/0001.md"]'))
-        change("f4", os.path.join(WORK, *protected[0].split("/")))
-        retry(9204, "f4")
-        change("f5", os.path.join(WORK, *protected[1].split("/")))
-        retry(9205, "f5")
-        retry(9206, "never-started")
-        change("f7", inside, move=outside)
-        retry(9207, "f7")
-        change("f8", os.path.join(os.environ["FAKE_SCRATCH"], "m.txt"))
-        retry(9208, "f8")
-        # A session-wide root, on a seen item and on one never started.
-        change("f9", inside)
-        ask(9209, "item/fileChange/requestApproval",
-            {"itemId": "f9", "threadId": "th-fake", "grantRoot": WORK})
-        ask(9210, "item/fileChange/requestApproval",
-            {"itemId": "ghost", "threadId": "th-fake", "grantRoot": WORK})
-        item({"type": "agentMessage", "text": "file approvals handled"})
-    elif SCENARIO == "escalate":
-        ask(9101, "item/commandExecution/requestApproval",
-            {"itemId": "i3", "command": "npm test", "cwd": WORK})
-        ask(9102, "item/commandExecution/requestApproval",
-            {"itemId": "i4", "command": "rm -rf /", "cwd": WORK})
-        ask(9103, "item/commandExecution/requestApproval",
-            {"itemId": "i5", "command": "npm test",
-             "cwd": os.path.dirname(WORK)})
-        ask(9104, "item/commandExecution/requestApproval",
-            {"itemId": "i6", "command": "npm test", "cwd": WORK,
-             "kind": "writeStdin"})
-        ask(9105, "item/commandExecution/requestApproval",
-            {"itemId": "i7", "cwd": WORK, "command":
-             '"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\'
-             'powershell.exe" -Command \'npm run typecheck\''})
-        ask(9106, "item/commandExecution/requestApproval",
-            {"itemId": "i8", "cwd": WORK, "command":
-             '"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\'
-             'powershell.exe" -Command \'node -e "console.log(1)"\''})
-        item({"type": "agentMessage", "text": "escalation handled"})
-    elif SCENARIO == "commit":
-        # A worker in a pool slot commits its own work through commit.py.
-        slot = os.environ["FAKE_SLOT"]
-        approval_store = json.loads(os.environ["CODEX_COMMIT_APPROVAL_STORE"])
-        assert approval_store["workspace"] == slot
-        assert os.path.isdir(approval_store["directory"])
-        message = os.path.join(os.environ["FAKE_SCRATCH"], "msg.txt")
-        elsewhere = os.path.join(os.path.dirname(WORK), "elsewhere", "msg.txt")
-        wrap = ('"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\'
-                'powershell.exe" -Command \'{}\'')
-        for request_id, words in (
-                (9301, f"python tools/git/commit.py -F {message} src/a.ts"),
-                (9302, f"python tools/git/commit.py -F {message} ."),
-                (9303, f"python tools/git/commit.py -F {elsewhere} src/a.ts"),
-                (9304, f"python tools/git/commit.py --amend -F {message} src/a.ts")):
-            ask(request_id, "item/commandExecution/requestApproval",
-                {"itemId": f"c{request_id}", "cwd": slot,
-                 "command": wrap.format(words)})
-        item({"type": "agentMessage", "text": "commit handled"})
-    elif SCENARIO == "rate-limits":
-        # The account's weekly figure, the shape of `.codex-agents/fix-a`
-        # line 31: repeated unchanged, then changed, then a report with only
-        # a five-hour window (no weekly figure at all).
-        for window, used in ((10080, 82.5), (10080, 82.5), (10080, 90), (300, 5)):
-            note("account/rateLimits/updated", {"rateLimits": {
-                "limitId": "codex", "primary": {
-                    "usedPercent": used, "windowDurationMins": window,
-                    "resetsAt": 1794568554}, "secondary": None}})
-        item({"type": "agentMessage", "text": "fake answer"})
-    elif SCENARIO == "silent":
-        pass
-    elif SCENARIO == "callback":
-        seen = wait_for(os.path.join(WORK, "thread_seen"))
-        item({"type": "agentMessage",
-              "text": "callback:" + ("yes" if seen else "no")})
-    else:
-        item({"type": "commandExecution", "command": "git status",
-              "exitCode": 0})
-        item({"type": "fileChange", "changes": [
-            {"path": "a.py", "kind": {"type": "update"}},
-            {"path": "b.py", "kind": {"type": "add"}}]})
-        item({"type": "agentMessage", "text": "fake answer"})
-        note("thread/tokenUsage/updated", {"tokenUsage": {"total": {
-            "inputTokens": 120, "cachedInputTokens": 20, "outputTokens": 8}}})
-    note("turn/completed", {"turn": {"status": "completed"}})
-
-
-def main():
-    global TURN_TEXT
-    while True:
-        msg = read()
-        if msg is None:
-            return
-        method = msg.get("method")
-        request_id = msg.get("id")
-        if method == "initialize":
-            out({"jsonrpc": "2.0", "id": request_id,
-                 "result": {"userAgent": "fake-app-server"}})
-        elif method in ("thread/start", "thread/resume"):
-            note("thread/started", {"thread": {"id": "th-fake"}})
-            out({"jsonrpc": "2.0", "id": request_id,
-                 "result": {"thread": {"id": "th-fake"}}})
-        elif method == "thread/name/set":
-            out({"jsonrpc": "2.0", "id": request_id, "result": {}})
-        elif method == "turn/start":
-            # Whether each extra writable root exists AT THIS MOMENT — the
-            # agent starts writing right after this reply, so a root created
-            # later is one it could not use.
-            if SCENARIO == "sub-agent-done-reject" and os.path.exists(
-                    os.path.join(WORK, "attempts.txt")):
-                # The turn about the children is refused outright (as an
-                # input over Codex's size limit is).
-                with open(os.path.join(WORK, "rejected.txt"), "w") as handle:
-                    handle.write("1")
-                out({"jsonrpc": "2.0", "id": request_id, "error": {
-                    "code": -32600, "message": "input too large"}})
-                continue
-            policy = (msg.get("params") or {}).get("sandboxPolicy") or {}
-            roots = policy.get("writableRoots") or []
-            with open(os.path.join(WORK, "roots_at_turn_start.json"), "w",
-                      encoding="utf-8") as handle:
-                json.dump({root: os.path.isdir(root) for root in roots}, handle)
-            out({"jsonrpc": "2.0", "id": request_id, "result": {}})
-            TURN_TEXT = " ".join(str(part.get("text") or "") for part in
-                                 (msg.get("params") or {}).get("input") or [])
-            run_turn()
-        elif method == "turn/interrupt":
-            on_interrupt(request_id, msg.get("params") or {})
-        elif request_id is not None:
-            out({"jsonrpc": "2.0", "id": request_id, "result": {}})
-
-
-main()
-'''
-
-
-def _install_fake_server(monkeypatch, tmp_path, scenario):
-    """Point AppServer at the stand-in instead of the real CLI.
-
-    Only `Popen` is swapped, and only inside `llm_agents.codex.protocol` (the module
-    that starts the child): `_reap` needs the real `subprocess.run`/exception
-    classes, and a global patch of the stdlib module would leak into anything
-    else running in this interpreter.
-    """
-    script = tmp_path / "fake_app_server.py"
-    script.write_text(FAKE_APP_SERVER, encoding="utf-8")
-
-    class _SubprocessShim:
-        def __getattr__(self, name):
-            return getattr(subprocess, name)
-
-        def Popen(self, argv, **kwargs):
-            assert argv[1:] == ["app-server", "--stdio"]
-            return subprocess.Popen(
-                [sys.executable, str(script), scenario, str(tmp_path),
-                 DROPPED_TURN_MESSAGE,
-                 json.dumps([LOGGED_NETWORK_WAIT, NETWORK_WAIT_TIMES])], **kwargs)
-
-    monkeypatch.setattr(protocol, "subprocess", _SubprocessShim())
-    monkeypatch.setattr(protocol, "_codex_executable", lambda: "codex")
-
-
-def _received(tmp_path):
-    """Everything the client sent, in order."""
-    path = tmp_path / "received.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in
-            path.read_text(encoding="utf-8").splitlines() if line.strip()]
-
-
-def _first_request(tmp_path, method):
-    for message in _received(tmp_path):
-        if message.get("method") == method:
-            return message
-    raise AssertionError(f"the client never sent {method!r}")
-
-
-def _answers(tmp_path):
-    """Client replies to server-initiated requests, keyed by request id."""
-    return {message["id"]: message for message in _received(tmp_path)
-            if "method" not in message and message.get("id") is not None}
-
-
-def _run_fake_turn(tmp_path, monkeypatch, scenario, *, name="w", escalate="",
-                   sandbox="read-only", role="", cwd=None, **kwargs):
-    monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
-    _install_fake_server(monkeypatch, tmp_path, scenario)
-    record = AgentRecord(name=name, cwd=str(cwd or tmp_path), sandbox=sandbox,
-                         escalate=escalate, role=role)
-    kwargs.setdefault("timeout", 30.0)
-    return turn.run_turn(record=record, prompt="do the thing",
-                         resume=False, **kwargs)
 
 
 @pytest.fixture
@@ -1051,7 +110,7 @@ def network_clock(monkeypatch):
 
 def test_network_wait_completes_beyond_attempt_budget(
         tmp_path, monkeypatch, network_clock, capsys):
-    outcome = _run_fake_turn(
+    outcome = wire.run_fake_turn(
         tmp_path, monkeypatch, "network-complete", timeout=100,
         reachable=lambda: False, sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
@@ -1072,7 +131,7 @@ def test_network_wait_completes_beyond_attempt_budget(
 def test_network_wait_ceiling_is_terminal(tmp_path, monkeypatch, network_clock):
     monkeypatch.setattr(service, "MAX_NETWORK_WAIT_S", 100.0)
     checks = []
-    outcome = _run_fake_turn(
+    outcome = wire.run_fake_turn(
         tmp_path, monkeypatch, "network-ceiling", timeout=100,
         reachable=lambda: checks.append(True), sleep=lambda _: None)
     assert outcome.status == "failed"
@@ -1084,16 +143,16 @@ def test_network_wait_ceiling_is_terminal(tmp_path, monkeypatch, network_clock):
 def test_network_wait_timeout_resends_same_thread(
         tmp_path, monkeypatch, network_clock):
     checks, pauses = [], []
-    outcome = _run_fake_turn(
+    outcome = wire.run_fake_turn(
         tmp_path, monkeypatch, "network-stale", timeout=100,
         reachable=lambda: checks.append(True) or True, sleep=pauses.append)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.service_retries == 1
     assert outcome.network_wait_s == 366
     assert checks == [True] and pauses == [turn.SERVICE_RETRY_PAUSES_S[0]]
-    resumed = [m for m in _received(tmp_path) if m.get("method") == "thread/resume"]
+    resumed = [m for m in wire.received(tmp_path) if m.get("method") == "thread/resume"]
     assert len(resumed) == 1 and resumed[0]["params"]["threadId"] == "th-fake"
-    starts = [m for m in _received(tmp_path) if m.get("method") == "turn/start"]
+    starts = [m for m in wire.received(tmp_path) if m.get("method") == "turn/start"]
     assert len(starts) == 2 and starts[1]["params"]["threadId"] == "th-fake"
     prompt = starts[1]["params"]["input"][0]["text"]
     assert prompt == turn.NETWORK_RETRY_PROMPT
@@ -1105,7 +164,7 @@ def test_network_wait_timeout_resends_same_thread(
 def test_non_network_retries_keep_attempt_budget(
         tmp_path, monkeypatch, network_clock, scenario):
     checks = []
-    outcome = _run_fake_turn(
+    outcome = wire.run_fake_turn(
         tmp_path, monkeypatch, scenario, timeout=100,
         reachable=lambda: checks.append(True), sleep=lambda _: None)
     assert outcome.status == "timeout"
@@ -1117,7 +176,7 @@ def test_non_network_retries_keep_attempt_budget(
 def test_network_wait_ceiling_is_shared_by_resends(
         tmp_path, monkeypatch, network_clock):
     monkeypatch.setattr(service, "MAX_NETWORK_WAIT_S", 600.0)
-    outcome = _run_fake_turn(
+    outcome = wire.run_fake_turn(
         tmp_path, monkeypatch, "network-ceiling-across-retries", timeout=100,
         reachable=lambda: True, sleep=lambda _: None)
     assert outcome.status == "failed" and outcome.service_retries == 1
@@ -1148,7 +207,7 @@ def test_network_wait_completion_at_ceiling_keeps_answer(
         tmp_path, monkeypatch, network_clock):
     monkeypatch.setattr(service, "MAX_NETWORK_WAIT_S", 100)
     checks = []
-    outcome = _run_fake_turn(
+    outcome = wire.run_fake_turn(
         tmp_path, monkeypatch, "network-complete-at-ceiling", timeout=100,
         reachable=lambda: checks.append(True), sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
@@ -1163,7 +222,7 @@ def test_network_wait_rev1277_recovers_without_resend(
     # under-measured allowance must only stop crediting, not kill the turn.
     monkeypatch.setattr(service, "NETWORK_WAIT_GAP_S", gap)
     checks = []
-    outcome = _run_fake_turn(
+    outcome = wire.run_fake_turn(
         tmp_path, monkeypatch, "network-rev-d", timeout=1800,
         reachable=lambda: checks.append(True), sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
@@ -1197,7 +256,7 @@ def test_network_wait_staleness_keeps_remaining_work_budget():
 def test_sub_agent_only_network_wait_extends_main_budget(
         tmp_path, monkeypatch, network_clock):
     monkeypatch.setattr(AgentStore, "events_silent_s", lambda _: service.NETWORK_WAIT_GAP_S)
-    outcome = _run_fake_turn(
+    outcome = wire.run_fake_turn(
         tmp_path, monkeypatch, "network-child-only", timeout=100,
         reachable=lambda: False, sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
@@ -1214,7 +273,7 @@ def test_sub_agent_only_network_wait_extends_main_budget(
 def test_child_wait_with_busy_main_times_out_without_resend(
         tmp_path, monkeypatch, network_clock, scenario, credit):
     checks = []
-    outcome = _run_fake_turn(
+    outcome = wire.run_fake_turn(
         tmp_path, monkeypatch, scenario, timeout=1800,
         reachable=lambda: checks.append(True) or True, sleep=lambda _: None)
     assert outcome.status == "timeout"
@@ -1222,7 +281,7 @@ def test_child_wait_with_busy_main_times_out_without_resend(
     assert not outcome.network_wait_timeout
     assert outcome.network_wait_s == credit
     assert outcome.service_retries == 0 and not checks
-    assert len([m for m in _received(tmp_path) if m.get("method") == "turn/start"]) == 1
+    assert len([m for m in wire.received(tmp_path) if m.get("method") == "turn/start"]) == 1
 
 
 @pytest.mark.parametrize("waiting_thread", ["main", "child"])
@@ -1265,17 +324,6 @@ def test_child_credit_cap_survives_recovery_and_preserves_main_credit():
 # --- the wire -------------------------------------------------------------
 
 
-@pytest.fixture
-def worker_report(tmp_path, monkeypatch):
-    monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
-    monkeypatch.setattr(sandbox, "scratch_dir", lambda name: tmp_path / "scratch")
-    record = AgentRecord(name="w", cwd=str(tmp_path),
-                         sandbox="workspace-write", role="worker")
-    report = sandbox.report_path(record)
-    monkeypatch.setenv("FAKE_REPORT_PATH", str(report))
-    return record, report
-
-
 @pytest.mark.parametrize("scenario, source, differs", [
     ("report-file", "file", True),
     ("report-same", "file", False),
@@ -1286,7 +334,7 @@ def worker_report(tmp_path, monkeypatch):
 def test_worker_answer_source_and_stored_result(
         tmp_path, monkeypatch, capsys, worker_report, scenario, source, differs):
     record, report = worker_report
-    outcome = _run_fake_turn(tmp_path, monkeypatch, scenario,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, scenario,
                              sandbox=record.sandbox, role=record.role)
     message = "## Report\n### Not done / open questions\nnone"
     expected = report.read_text(encoding="utf-8") if source == "file" else message
@@ -1310,7 +358,7 @@ def test_worker_answer_source_and_stored_result(
         report_line += " (differs from the message)"
     assert report_line in capsys.readouterr().out.splitlines()
     assert AgentStore("w").last_turn().ended
-    briefing = _first_request(tmp_path, "thread/start")["params"]["developerInstructions"]
+    briefing = wire.first_request(tmp_path, "thread/start")["params"]["developerInstructions"]
     assert str(report) in briefing
 
 
@@ -1318,7 +366,7 @@ def test_worker_answer_source_and_stored_result(
 def test_worker_report_decodes_shell_encodings(
         tmp_path, monkeypatch, worker_report, scenario):
     record, report = worker_report
-    outcome = _run_fake_turn(tmp_path, monkeypatch, scenario,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, scenario,
                              sandbox=record.sandbox, role=record.role)
     expected = "## Report\n### Done\nEdited café.\n### Not done / open questions\nnone\n"
     if scenario == "report-cp1252":
@@ -1333,7 +381,7 @@ def test_worker_report_directory_falls_back_to_message(
     record, report = worker_report
     report.parent.mkdir(parents=True, exist_ok=True)
     report.mkdir()
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "report-directory",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "report-directory",
                              sandbox=record.sandbox, role=record.role)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.report_source == "message"
@@ -1354,13 +402,13 @@ def test_worker_report_directory_falls_back_to_message(
 def test_worker_expect_reads_the_file_and_requests_a_complete_file(
         tmp_path, monkeypatch, worker_report, scenario):
     record, report = worker_report
-    outcome = _run_fake_turn(tmp_path, monkeypatch, scenario,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, scenario,
                              sandbox=record.sandbox, role=record.role,
                              expect="^### Not done")
     assert outcome.status == "completed" and outcome.follow_ups == 1
     assert outcome.text == report.read_text(encoding="utf-8")
     assert outcome.text.count("## Report") == 1
-    starts = [m for m in _received(tmp_path) if m.get("method") == "turn/start"]
+    starts = [m for m in wire.received(tmp_path) if m.get("method") == "turn/start"]
     assert len(starts) == 2
     prompt = starts[1]["params"]["input"][0]["text"]
     assert str(report) in prompt and "COMPLETE report" in prompt
@@ -1371,7 +419,7 @@ def test_worker_expect_reads_the_file_and_requests_a_complete_file(
 def test_worker_send_does_not_reuse_the_previous_report(
         tmp_path, monkeypatch, worker_report):
     record, report = worker_report
-    first = _run_fake_turn(tmp_path, monkeypatch, "report-stale",
+    first = wire.run_fake_turn(tmp_path, monkeypatch, "report-stale",
                            sandbox=record.sandbox, role=record.role)
     assert first.report_source == "file" and report.exists()
     record.thread_id = first.thread_id
@@ -1387,7 +435,7 @@ def test_worker_send_does_not_reuse_the_previous_report(
 def test_worker_followup_without_a_file_keeps_one_answer(
         tmp_path, monkeypatch, capsys, worker_report, failed):
     record, report = worker_report
-    outcome = _run_fake_turn(tmp_path, monkeypatch,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch,
                              "report-failed" if failed else "report-fallback",
                              sandbox=record.sandbox, role=record.role,
                              expect="^### Not done")
@@ -1410,7 +458,7 @@ def test_worker_followup_without_a_file_keeps_one_answer(
 def test_worker_repeated_message_keeps_file_provenance(
         tmp_path, monkeypatch, worker_report):
     record, report = worker_report
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "report-repeat",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "report-repeat",
                              sandbox=record.sandbox, role=record.role,
                              expect="^### Not done")
     assert outcome.status == "completed" and outcome.follow_ups == 1
@@ -1430,7 +478,7 @@ def test_worker_locked_report_cleanup_does_not_abort_either_attempt(
         return unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "unlink", locked)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "report-partial",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "report-partial",
                              sandbox=record.sandbox, role=record.role,
                              expect="^### Not done")
     assert outcome.status == "completed" and not outcome.error
@@ -1454,7 +502,7 @@ def test_worker_report_is_read_once_after_service_retries(
         return read_bytes(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_bytes", capture)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "report-retry",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "report-retry",
                              sandbox=record.sandbox, role=record.role,
                              sleep=lambda _: None, reachable=lambda: True)
     assert outcome.status == "completed" and outcome.service_retries == 1
@@ -1466,7 +514,7 @@ def test_worker_report_is_read_once_after_service_retries(
 def test_worker_silent_followup_keeps_file_provenance(
         tmp_path, monkeypatch, worker_report, scenario):
     record, report = worker_report
-    outcome = _run_fake_turn(tmp_path, monkeypatch, scenario,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, scenario,
                              sandbox=record.sandbox, role=record.role,
                              expect="^### Not done")
     assert outcome.status == "completed" and not outcome.error
@@ -1497,7 +545,7 @@ def test_worker_aborted_turn_has_no_report_selection(
 def test_worker_failed_attempt_does_not_select_its_file(
         tmp_path, monkeypatch, worker_report):
     record, report = worker_report
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "report-terminal-failure",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "report-terminal-failure",
                              sandbox=record.sandbox, role=record.role)
     assert report.is_file()
     assert outcome.status == "failed" and outcome.error_kind == "usageLimitExceeded"
@@ -1512,11 +560,11 @@ def test_worker_failed_attempt_does_not_select_its_file(
 def test_spawn_prints_the_same_report_path_as_the_briefing(
         tmp_path, monkeypatch, capsys, worker_report):
     record, report = worker_report
-    _install_fake_server(monkeypatch, tmp_path, "report-file")
+    wire.install_fake_server(monkeypatch, tmp_path, "report-file")
     assert core_main(["spawn", record.name, "task", "--cwd", str(tmp_path),
                      "--role", "worker"]) == 0
     assert f"[codex:w] report {report}" in capsys.readouterr().out
-    briefing = _first_request(tmp_path, "thread/start")["params"]["developerInstructions"]
+    briefing = wire.first_request(tmp_path, "thread/start")["params"]["developerInstructions"]
     assert str(report) in briefing
     cli.cmd_status(cli.build_parser().parse_args(["status", "w"]))
     assert f"report={report}" in capsys.readouterr().out
@@ -1530,16 +578,16 @@ def test_initialize_opts_out_of_delta_notifications_on_the_wire(tmp_path, monkey
     """The point of the wrapper: the caller pays for the answer, not the
     stream. Deltas are the bulk of the traffic and are never rendered — but a
     list that never reaches `initialize` opts out of nothing."""
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "plain")
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "plain")
     assert outcome.status == "completed"
-    capabilities = _first_request(tmp_path, "initialize")["params"]["capabilities"]
+    capabilities = wire.first_request(tmp_path, "initialize")["params"]["capabilities"]
     assert capabilities["optOutNotificationMethods"] == protocol.NOISY_NOTIFICATIONS
     assert "item/agentMessage/delta" in capabilities["optOutNotificationMethods"]
     assert protocol.N_ITEM_COMPLETED not in capabilities["optOutNotificationMethods"]
 
 
 def test_a_full_turn_returns_the_final_message_and_its_counters(tmp_path, monkeypatch):
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "plain", timeout=10.0)
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "plain", timeout=10.0)
     assert outcome.status == "completed"
     assert outcome.error == ""
     assert outcome.thread_id == "th-fake"
@@ -1547,7 +595,7 @@ def test_a_full_turn_returns_the_final_message_and_its_counters(tmp_path, monkey
     assert (outcome.commands, outcome.file_changes) == (1, 2)
     assert (outcome.input_tokens, outcome.output_tokens) == (120, 8)
     assert AgentStore("w").read_answer() == "fake answer"
-    started = _first_request(tmp_path, "turn/start")["params"]
+    started = wire.first_request(tmp_path, "turn/start")["params"]
     assert started["threadId"] == "th-fake"
     assert started["input"] == [{"type": "text", "text": "do the thing"}]
 
@@ -1560,14 +608,14 @@ def test_an_answer_lacking_the_expected_section_is_followed_up_once(
     prompt names the missing pattern, the two answers are joined oldest
     first, the work of both is counted, and the log reopens the turn for
     `status` while it runs."""
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "partial",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "partial",
                              expect=r"^## Coverage", timeout=15.0)
     assert outcome.status == "completed" and outcome.error == ""
     assert outcome.text == "## Findings\n1. one thing\n\n## Coverage\nall of them"
     assert outcome.follow_ups == 1 and outcome.expect == r"^## Coverage"
     assert outcome.commands == 2
     assert AgentStore("w").read_answer() == outcome.text
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2
     follow_up = starts[1]["params"]["input"][0]["text"]
     assert "^## Coverage" in follow_up and "without repeating" in follow_up
@@ -1576,7 +624,7 @@ def test_an_answer_lacking_the_expected_section_is_followed_up_once(
     # follow-up orders the work finished before the answer is completed.
     assert "finish it first" in follow_up
     # Resumed, not restarted: a fresh thread would not have the first answer.
-    resumed = _first_request(tmp_path, "thread/resume")["params"]
+    resumed = wire.first_request(tmp_path, "thread/resume")["params"]
     assert resumed["threadId"] == "th-fake"
     trace = AgentStore("w").last_turn()
     assert trace.ended and trace.follow_ups == 1 and trace.commands == 2
@@ -1602,7 +650,7 @@ def test_a_sub_agent_finishing_first_neither_ends_the_turn_nor_answers_it(
     which has its Coverage, so nothing is resent. Both children ended before
     the main answer, so nothing is waited for either: no grace, no line."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent",
                              expect=r"^## Coverage", timeout=15.0)
     assert outcome.sub_agents.late == [] and outcome.sub_agents.wait_s == 0
     assert _sub_agent_lines() == [] and outcome.duration_s < 10
@@ -1615,7 +663,7 @@ def test_a_sub_agent_finishing_first_neither_ends_the_turn_nor_answers_it(
     assert (outcome.status, outcome.error) == ("completed", "")
     assert outcome.thread_id == "th-fake"
     assert outcome.follow_ups == 0 and outcome.expect_met is True
-    assert len(_turn_starts(tmp_path)) == 1
+    assert len(wire.turn_starts(tmp_path)) == 1
     assert AgentStore("w").read_answer() == main_answer
     # The child's command was really run; its tokens were really billed; its
     # window is not the one a `send` resumes.
@@ -1642,11 +690,11 @@ def test_a_sub_agents_tokens_outlive_the_attempt_that_spawned_it(
     after the `--expect` follow-up the summary showed the main thread's
     total alone. The bill is the main thread's newest total plus every
     child's last, whichever attempt it ran in."""
-    outcome = _run_fake_turn(tmp_path, monkeypatch, scenario,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, scenario,
                              expect=r"^## Coverage", timeout=15.0,
                              sleep=lambda _: None, reachable=lambda: True)
     assert outcome.status == "completed" and "## Coverage" in outcome.text
-    assert len(_turn_starts(tmp_path)) == 2
+    assert len(wire.turn_starts(tmp_path)) == 2
     assert outcome.input_tokens == 560000 + 433471
     assert outcome.cached_input_tokens == 480000 + 382336
     assert outcome.output_tokens == 2500 + 1837
@@ -1659,7 +707,7 @@ def _sub_agent_lines(name="w"):
 
 
 def _interrupts(tmp_path):
-    return [message["params"] for message in _received(tmp_path)
+    return [message["params"] for message in wire.received(tmp_path)
             if message.get("method") == protocol.M_TURN_INTERRUPT]
 
 
@@ -1683,7 +731,7 @@ def _cli(capsys, *argv):
 def test_cli_effort_on_wire_is_per_turn(tmp_path, monkeypatch, capsys, explicit):
     """A resumed thread must receive today's default, not its last override."""
     monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path / "state"))
-    _install_fake_server(monkeypatch, tmp_path, "ok")
+    wire.install_fake_server(monkeypatch, tmp_path, "ok")
     options = [] if explicit is None else ["--effort", explicit]
     _cli(capsys, "spawn", "effort", "task", "--cwd", str(tmp_path),
          "--sandbox", "read-only", "--quiet", *options)
@@ -1692,10 +740,10 @@ def test_cli_effort_on_wire_is_per_turn(tmp_path, monkeypatch, capsys, explicit)
     assert "effort" not in stored.to_json()
     _cli(capsys, "send", "effort", "continue", "--quiet", *options)
     _cli(capsys, "send", "effort", "continue again", "--quiet")
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert [start["params"].get("effort") for start in starts] == [
         explicit or "medium", explicit or "medium", "medium"]
-    assert len([m for m in _received(tmp_path)
+    assert len([m for m in wire.received(tmp_path)
                 if m.get("method") == "thread/resume"]) == 2
 
 
@@ -1708,17 +756,17 @@ def test_a_child_outliving_the_main_answer_is_waited_for_and_its_result_sent(
     child's result IN ITS TEXT: the stand-in has no inbox, so "saw: the
     kid's result" is only possible if the prompt carried it."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-live",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-live",
                              timeout=15.0)
     assert (outcome.status, outcome.error) == ("completed", "")
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2 and starts[1]["params"]["threadId"] == "th-fake"
     asked = _asked(starts[1])
     assert "finished only after your final answer" in asked
     assert "the kid's result" in asked and "kid.py" in asked
     assert outcome.message_text == "## Findings\nsaw: the kid's result, kid.py"
     assert not any(message.get("method") == "thread/resume"
-                   for message in _received(tmp_path))
+                   for message in wire.received(tmp_path))
     assert _interrupts(tmp_path) == []
     assert _fates(outcome) == [("/root/kid", "finished", ["kid.py"], True)]
     assert outcome.sub_agents.cut == [] and outcome.sub_agents.note == ""
@@ -1752,10 +800,10 @@ def test_a_child_known_only_by_its_spawn_record_is_waited_for(
     completing in that gap left a child the wrapper did not know was
     running, and it closed the server on it."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-gap",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-gap",
                              timeout=15.0)
     assert _sub_agent_lines()[0]["open"] == ["/root/kid"]
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2 and "the kid's result" in _asked(starts[1])
     assert _fates(outcome) == [("/root/kid", "finished", ["kid.py"], True)]
 
@@ -1767,12 +815,12 @@ def test_an_older_turns_late_completion_does_not_close_the_newer_one(
     one, arriving late, said nothing about the newer — read as the child's
     end, it let the wrapper close the server on a running child."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.5)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-stale",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-stale",
                              timeout=15.0)
     assert _interrupts(tmp_path) == [{"threadId": "th-kid", "turnId": "t-kid2"}]
     assert [fate.path for fate in outcome.sub_agents.cut] == ["/root/kid"]
     # Nor do its words speak for the newer turn.
-    asked = _asked(_turn_starts(tmp_path)[1])
+    asked = _asked(wire.turn_starts(tmp_path)[1])
     assert "kid2 progress" in asked and "stale text" not in asked
 
 
@@ -1786,13 +834,13 @@ def test_a_cut_child_and_grandchild_are_named_and_the_main_thread_asked_to_resta
     turn's answer is the outcome; the cut is still said everywhere a caller
     looks."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.5)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-stuck",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-stuck",
                              timeout=15.0)
     assert (outcome.status, outcome.error) == ("completed", "")
     assert _interrupts(tmp_path) == [
         {"threadId": "th-kid", "turnId": "t-kid"},
         {"threadId": "th-grand", "turnId": "t-grand"}]
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2
     asked = _asked(starts[1])
     for told in ("restart it", "/root/kid/grand", "kid.py", "grand.py"):
@@ -1839,10 +887,10 @@ def test_a_cut_and_a_finished_child_go_into_one_restart_turn(
     """One child finishes after the answer, the other has to be cut: one
     turn carries both — the finished one's result and the cut one's news."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.5)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-mixed",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-mixed",
                              timeout=15.0)
     assert _interrupts(tmp_path) == [{"threadId": "th-b", "turnId": "t-b"}]
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2
     for told in ("A's result", "/root/b", "a.py", "b.py"):
         assert told in _asked(starts[1]) and told in outcome.message_text
@@ -1861,7 +909,7 @@ def test_a_cut_child_the_restart_turn_resumes_on_its_thread_is_not_cut_again(
     waits for it. That new turn belongs to the main turn that started it —
     read as part of the expired wait, it was interrupted at once."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.5)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-revive",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-revive",
                              timeout=15.0)
     assert (outcome.status, outcome.error) == ("completed", "")
     assert _interrupts(tmp_path) == [{"threadId": "th-kid", "turnId": "t-kid"}]
@@ -1880,9 +928,9 @@ def test_a_grandchild_spawned_during_the_wait_is_waited_for_too(
     grandchild runs on the same deadline. Otherwise the turn about the
     children went out with it still running, and its result vanished."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-idle-grand",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-idle-grand",
                              timeout=15.0)
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2
     asked = _asked(starts[1])
     assert "the kid's result" in asked and "the grand's result" in asked
@@ -1899,7 +947,7 @@ def test_a_turn_about_the_children_that_fails_leaves_their_results_quoted(
     quoted under the kept answer and the failure is noted there — in
     `result` too, not only in the summary."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, scenario, timeout=15.0)
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, scenario, timeout=15.0)
     assert (outcome.status, outcome.error) == ("completed", "")
     assert outcome.message_text == "## Findings\nwithout the kid"
     assert _fates(outcome) == [("/root/kid", "finished", ["kid.py"], False)]
@@ -1911,7 +959,7 @@ def test_a_turn_about_the_children_that_fails_leaves_their_results_quoted(
 def test_a_restart_turn_that_times_out_keeps_the_answer_and_the_cut(
         tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.3)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-restart-timeout",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-restart-timeout",
                              timeout=2.0)
     assert (outcome.status, outcome.error) == ("completed", "")
     assert outcome.message_text == "## Findings\nwithout the kid"
@@ -1926,7 +974,7 @@ def test_a_restart_turn_that_times_out_keeps_the_answer_and_the_cut(
 def test_a_child_the_restart_turn_starts_and_leaves_running_is_cut_and_named(
         tmp_path, monkeypatch):
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.3)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-restart-spawn",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-restart-spawn",
                              timeout=15.0)
     assert outcome.message_text == "## Findings\nstarted a new one"
     assert _interrupts(tmp_path) == [{"threadId": "th-kid", "turnId": "t-kid"},
@@ -1947,7 +995,7 @@ def test_a_late_report_write_cannot_replace_the_restored_report(
     report was overwritten by the partial one and read as the answer."""
     record, report = worker_report
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "subrep-timeout",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "subrep-timeout",
                              sandbox=record.sandbox, role=record.role,
                              timeout=2.0)
     first = FIRST_REPORT
@@ -1962,7 +1010,7 @@ def test_a_turn_about_the_children_without_a_new_report_keeps_the_first(
     put back, and the message goes under it."""
     record, report = worker_report
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "subrep-silent",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "subrep-silent",
                              sandbox=record.sandbox, role=record.role,
                              timeout=15.0)
     first = FIRST_REPORT
@@ -1981,7 +1029,7 @@ def test_the_reply_joined_under_a_kept_report_survives_a_failed_gate_follow_up(
     record, report = worker_report
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
     monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
-    _install_fake_server(monkeypatch, tmp_path, "subrep-silent-gatefail")
+    wire.install_fake_server(monkeypatch, tmp_path, "subrep-silent-gatefail")
     gated = AgentRecord(name="w", cwd=str(tmp_path), sandbox=record.sandbox,
                         role=record.role, gates=["npm test"])
 
@@ -2001,7 +1049,7 @@ def test_a_capped_child_answer_points_at_a_command_that_prints_it_whole(
     """The quote of a long child message is capped; the command it names
     must print the rest — the line-per-action `logs` keeps one line."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-long",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-long",
                              timeout=15.0)
     command = subagents.full_text_command("w", "/root/kid")
     assert command in outcome.text and "TAIL-MARK" not in outcome.text
@@ -2016,8 +1064,8 @@ def test_a_child_whose_turn_failed_is_not_passed_off_as_finished(
     """A failed child turn's last message is commentary, not a result: the
     turn about it names the verdict and labels the message partial."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    _run_fake_turn(tmp_path, monkeypatch, "sub-agent-child-fail", timeout=15.0)
-    asked = _asked(_turn_starts(tmp_path)[1])
+    wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-child-fail", timeout=15.0)
+    asked = _asked(wire.turn_starts(tmp_path)[1])
     assert "### Finished (failed: child broke): /root/kid" in asked
     assert "PARTIAL" in asked and "half-done notes" in asked
 
@@ -2027,10 +1075,10 @@ def test_a_child_that_completed_during_its_interrupt_is_finished_not_cut(
     """Its verdict came back `completed`: it finished on its own, so it is
     passed on as finished, not reported as interrupted."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.3)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-drain-done",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-drain-done",
                              timeout=15.0)
     assert _fates(outcome) == [("/root/kid", "finished", ["kid.py"], True)]
-    asked = _asked(_turn_starts(tmp_path)[1])
+    asked = _asked(wire.turn_starts(tmp_path)[1])
     assert "### Finished: /root/kid" in asked and "Interrupted" not in asked
     assert outcome.sub_agents.turn == subagents.DONE_TURN
 
@@ -2041,12 +1089,12 @@ def test_a_failed_continuation_costs_the_continuation_not_the_answer(
     the service dropped: read as the attempt's verdict, it sent the complete
     answer to `_retry_service_drops`."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-continue-fail",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-continue-fail",
                              timeout=15.0, sleep=lambda _: None,
                              reachable=lambda: True)
     assert (outcome.status, outcome.error) == ("completed", "")
     assert outcome.message_text == "## Findings\nwithout the kid"
-    assert outcome.service_retries == 0 and len(_turn_starts(tmp_path)) == 1
+    assert outcome.service_retries == 0 and len(wire.turn_starts(tmp_path)) == 1
     assert outcome.sub_agents.note.startswith(
         "the main thread's own continuation failed")
     assert [fate.path for fate in outcome.sub_agents.cut] == ["/root/kid"]
@@ -2083,11 +1131,11 @@ def test_a_main_thread_continuing_by_itself_is_waited_out_not_prodded(
     INSIDE it is not sent back — nothing says the turn read it — so its
     answer is quoted to the caller, labelled unread."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-continue",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-continue",
                              timeout=15.0)
     assert (outcome.status, outcome.error) == ("completed", "")
     assert outcome.message_text == "## Findings\ncontinued"
-    assert len(_turn_starts(tmp_path)) == 1 and _interrupts(tmp_path) == []
+    assert len(wire.turn_starts(tmp_path)) == 1 and _interrupts(tmp_path) == []
     assert outcome.sub_agents.turn == ""
     assert _fates(outcome) == [("/root/kid", "finished", ["kid.py"], False)]
     assert "UNREAD by the main thread; touched kid.py. Its answer:\n  > the kid's result" in outcome.text
@@ -2105,7 +1153,7 @@ def test_a_main_thread_busy_with_its_own_turn_does_not_extend_the_wait(
     before that turn completes, and the cut child is then the restart
     turn's."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.3)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-busy-continue",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-busy-continue",
                              timeout=15.0)
     logged = list(AgentStore("w").events())
     cut_at = next(i for i, message in enumerate(logged)
@@ -2116,7 +1164,7 @@ def test_a_main_thread_busy_with_its_own_turn_does_not_extend_the_wait(
     assert cut_at < continued
     assert _interrupts(tmp_path) == [{"threadId": "th-kid", "turnId": "t-kid"}]
     assert outcome.sub_agents.turn == subagents.RESTART_TURN
-    assert len(_turn_starts(tmp_path)) == 2
+    assert len(wire.turn_starts(tmp_path)) == 2
 
 
 class _BusyServer:
@@ -2169,11 +1217,11 @@ def test_a_late_main_failure_during_the_drain_keeps_the_timeout_verdict(
     """The attempt timed out with a child open; interrupting the child, the
     server reports the never-finished main turn as failed by a service drop.
     Read, it turned the timeout into a "failed" the retry logic resends."""
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-late-root",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-late-root",
                              timeout=1.0, sleep=lambda _: None,
                              reachable=lambda: True)
     assert outcome.status == "timeout" and "did not answer" in outcome.error
-    assert outcome.service_retries == 0 and len(_turn_starts(tmp_path)) == 1
+    assert outcome.service_retries == 0 and len(wire.turn_starts(tmp_path)) == 1
     assert _interrupts(tmp_path) == [{"threadId": "th-kid", "turnId": "t-kid"}]
     assert [fate.path for fate in outcome.sub_agents.cut] == ["/root/kid"]
 
@@ -2183,10 +1231,10 @@ def test_a_failed_main_turn_cuts_its_children_at_once(tmp_path, monkeypatch):
     would resend it on a fresh server anyway): its child is interrupted and
     named without a waiting line or a turn about it."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-fail",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-fail",
                              timeout=15.0)
     assert outcome.status == "failed" and "usage limit" in outcome.error
-    assert outcome.duration_s < 10 and len(_turn_starts(tmp_path)) == 1
+    assert outcome.duration_s < 10 and len(wire.turn_starts(tmp_path)) == 1
     assert _interrupts(tmp_path) == [{"threadId": "th-kid", "turnId": "t-kid"}]
     assert [line["phase"] for line in _sub_agent_lines()] == [
         events.SUB_AGENTS_CUT, events.SUB_AGENTS_END]
@@ -2200,7 +1248,7 @@ def test_a_child_that_ignores_its_interrupt_costs_the_drain_bound_once(
     when the attempt ends."""
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.3)
     monkeypatch.setattr(subagents, "SUB_AGENT_INTERRUPT_S", 0.5)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-deaf",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-deaf",
                              timeout=15.0)
     assert outcome.duration_s < 8
     assert _interrupts(tmp_path) == [{"threadId": "th-kid", "turnId": "t-kid"}]
@@ -2218,7 +1266,7 @@ def test_a_worker_report_is_set_aside_for_the_sub_agent_turn(
     loss named."""
     record, report = worker_report
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 20.0)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, scenario,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, scenario,
                              sandbox=record.sandbox, role=record.role,
                              timeout=15.0)
     assert (tmp_path / "report_at_wrapper.txt").read_text(encoding="utf-8") == "False"
@@ -2249,7 +1297,7 @@ def test_with_no_answer_the_sub_agent_account_does_not_become_the_stored_answer(
     monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
     AgentStore("w").write_answer("an earlier turn's answer")
     monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0.3)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "sub-agent-mute",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "sub-agent-mute",
                              timeout=15.0)
     assert outcome.text == ""
     assert outcome.sub_agents.block.startswith(subagents.BLOCK_HEADING)
@@ -2449,12 +1497,12 @@ def test_an_answer_still_incomplete_after_the_follow_up_says_so(
     follow-up closed. The joined answer is re-judged: the status and exit code
     stay (the answer is kept), and the `Incomplete` line is the one
     `claude_agent` prints, so one search finds it in both reviews."""
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "partial-twice",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "partial-twice",
                              expect=r"^## Coverage", timeout=15.0)
     assert outcome.status == "completed" and outcome.error == ""
     assert outcome.text == "## Findings\n1. one thing\n\n2. another thing"
     assert outcome.follow_ups == 1 and outcome.expect_met is False
-    assert len(_turn_starts(tmp_path)) == 2  # one follow-up, not a loop
+    assert len(wire.turn_starts(tmp_path)) == 2  # one follow-up, not a loop
     for quiet in (False, True):
         assert cli.print_outcome("w", outcome, quiet=quiet) == 0
         assert ("[codex:w] Incomplete: the answer still lacks /^## Coverage/ "
@@ -2466,7 +1514,7 @@ def test_an_empty_completed_follow_up_keeps_the_first_answer(
     """A follow-up that completes without a word must not erase the first
     answer (`_carry_over` restores it before `join_answers` sees it), and the
     answer is still judged incomplete rather than passed as a gap closed."""
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "partial-then-silent",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "partial-then-silent",
                              expect=r"^## Coverage", timeout=15.0)
     assert outcome.status == "completed" and outcome.error == ""
     assert outcome.text == "## Findings\n1. one thing"
@@ -2484,14 +1532,14 @@ def test_an_empty_completed_follow_up_keeps_the_first_answer(
 def test_an_answer_that_matches_is_not_followed_up(tmp_path, monkeypatch):
     """The other half of the contract: a match costs nothing — no second
     turn, no resume, the answer as it came."""
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "plain",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "plain",
                              expect=r"fake answer", timeout=10.0)
     assert outcome.status == "completed"
     assert outcome.text == "fake answer"
     assert outcome.follow_ups == 0 and outcome.expect_met is True
-    assert len(_turn_starts(tmp_path)) == 1
+    assert len(wire.turn_starts(tmp_path)) == 1
     assert not any(message.get("method") == "thread/resume"
-                   for message in _received(tmp_path))
+                   for message in wire.received(tmp_path))
 
 
 def test_each_approval_request_is_answered_in_its_own_shape(tmp_path, monkeypatch):
@@ -2500,10 +1548,10 @@ def test_each_approval_request_is_answered_in_its_own_shape(tmp_path, monkeypatc
     answered, so a refusal it cannot parse stalls the turn until the timeout.
     The turn reaching `turn/completed` here is the proof that all four answers
     were accepted."""
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "approvals", timeout=15.0)
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "approvals", timeout=15.0)
     assert outcome.status == "completed"
     assert outcome.text == "approvals handled"
-    answers = _answers(tmp_path)
+    answers = wire.answers(tmp_path)
     # No `decision` field exists for permissions: an empty granted profile IS
     # the refusal.
     assert answers[9001]["result"] == {"permissions": {}}
@@ -2517,8 +1565,8 @@ def test_an_unknown_server_request_gets_an_error_not_an_invented_answer(
         tmp_path, monkeypatch):
     """A made-up payload can be accepted as a real answer and change what the
     agent does; a JSON-RPC error cannot."""
-    _run_fake_turn(tmp_path, monkeypatch, "approvals", timeout=15.0)
-    unknown = _answers(tmp_path)[9004]
+    wire.run_fake_turn(tmp_path, monkeypatch, "approvals", timeout=15.0)
+    unknown = wire.answers(tmp_path)[9004]
     assert "result" not in unknown
     assert unknown["error"]["code"] == -32601
 
@@ -2528,7 +1576,7 @@ def test_a_server_that_dies_mid_turn_is_reported_instead_of_waited_out(
     """Without the end-of-stream sentinel the client would sit out the whole
     turn timeout and then blame a slow model for a crash."""
     began = time.monotonic()
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "die", timeout=5.0)
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "die", timeout=5.0)
     elapsed = time.monotonic() - began
     assert outcome.status == "failed"
     assert "closed the connection" in outcome.error
@@ -2540,7 +1588,7 @@ def test_the_thread_id_is_handed_over_before_the_turn_ends(tmp_path, monkeypatch
     thread. The stand-in withholds `turn/completed` until the callback's file
     appears, so a callback that fires only at the end reads as "no"."""
     monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
-    _install_fake_server(monkeypatch, tmp_path, "callback")
+    wire.install_fake_server(monkeypatch, tmp_path, "callback")
     seen = tmp_path / "thread_seen"
     outcome = turn.run_turn(
         record=AgentRecord(name="w", cwd=str(tmp_path), sandbox="read-only"),
@@ -2555,7 +1603,7 @@ def test_a_textless_turn_does_not_erase_the_previous_answer(tmp_path, monkeypatc
     `last.md` loses a good report and makes `result` print nothing at all."""
     monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
     AgentStore("w").write_answer("previous answer")
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "silent")
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "silent")
     assert outcome.text == ""
     assert AgentStore("w").read_answer() == "previous answer"
 
@@ -2587,11 +1635,6 @@ CODEX_ERROR_INFO_MEMBERS = frozenset({
     "responseStreamDisconnected", "responseTooManyFailedAttempts",
     "activeTurnNotSteerable",
 })
-
-
-def _turn_starts(tmp_path):
-    return [message for message in _received(tmp_path)
-            if message.get("method") == "turn/start"]
 
 
 def test_the_drop_predicate_is_pinned_to_the_outage_it_was_written_for():
@@ -2671,7 +1714,7 @@ def test_a_dropped_turn_is_resent_on_the_same_thread_after_a_pause(
         checked.append(True)
         return True
 
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "drop-once",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "drop-once",
                              sleep=wait, reachable=alive)
 
     assert during == [(False, "", 0)]
@@ -2683,11 +1726,11 @@ def test_a_dropped_turn_is_resent_on_the_same_thread_after_a_pause(
     assert len(checked) == 1
     # The same thread, resumed — not a second `thread/start`, which would be a
     # fresh agent answering with none of the history it is asked to continue.
-    sent = _received(tmp_path)
+    sent = wire.received(tmp_path)
     assert len([m for m in sent if m.get("method") == "thread/start"]) == 1
     resumed = [m for m in sent if m.get("method") == "thread/resume"]
     assert len(resumed) == 1 and resumed[0]["params"]["threadId"] == "th-fake"
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2
     assert starts[0]["params"]["input"][0]["text"] == "do the thing"
     assert starts[1]["params"]["input"][0]["text"] == turn.SERVICE_RETRY_PROMPT
@@ -2731,12 +1774,12 @@ def test_an_unreachable_api_spends_the_slot_without_resending(tmp_path,
         checked.append(False)
         return False
 
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "drop-always",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "drop-always",
                              sleep=slept.append, reachable=down)
 
     assert outcome.status == "failed"
     assert outcome.service_retries == 0
-    assert len(_turn_starts(tmp_path)) == 1
+    assert len(wire.turn_starts(tmp_path)) == 1
     assert slept == list(turn.SERVICE_RETRY_PAUSES_S)
     assert len(checked) == turn.MAX_SERVICE_RETRIES
     assert "stream disconnected" in outcome.error
@@ -2751,12 +1794,12 @@ def test_a_service_that_keeps_dropping_stops_at_the_limit(tmp_path, monkeypatch)
     input tokens on a worker), so an outage outliving them has to reach the
     operator as the failure it is."""
     slept = []
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "drop-always",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "drop-always",
                              sleep=slept.append, reachable=lambda: True)
 
     assert outcome.status == "failed"
     assert outcome.service_retries == turn.MAX_SERVICE_RETRIES == 2
-    assert len(_turn_starts(tmp_path)) == turn.MAX_SERVICE_RETRIES + 1
+    assert len(wire.turn_starts(tmp_path)) == turn.MAX_SERVICE_RETRIES + 1
     assert slept == list(turn.SERVICE_RETRY_PAUSES_S)
     assert service.retried_note(turn.MAX_SERVICE_RETRIES) in outcome.error
     # Each attempt ran the same command and made the same edit, and the caller
@@ -2776,7 +1819,7 @@ def test_a_resend_that_fails_for_another_reason_still_names_the_retry(
     has spent minutes and a whole thread on the wire, and the first draft said
     so only when the SECOND failure happened to be a drop too."""
     slept = []
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "drop-then-refuse",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "drop-then-refuse",
                              sleep=slept.append, reachable=lambda: True)
 
     assert outcome.status == "failed"
@@ -2785,7 +1828,7 @@ def test_a_resend_that_fails_for_another_reason_still_names_the_retry(
     assert service.retried_note(1) in outcome.error
     assert outcome.service_retries == 1
     # And the second failure is not a drop, so the second slot goes unused.
-    assert len(_turn_starts(tmp_path)) == 2
+    assert len(wire.turn_starts(tmp_path)) == 2
     assert slept == [turn.SERVICE_RETRY_PAUSES_S[0]]
 
 
@@ -2794,7 +1837,7 @@ def test_a_failure_that_is_not_the_services_is_never_resent(tmp_path, monkeypatc
     outage does, answers identically a minute later, and a resend of the thread
     is the most expensive thing this script can do."""
     slept, checked = [], []
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "refuse",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "refuse",
                              sleep=slept.append,
                              reachable=lambda: checked.append(True) or True)
 
@@ -2802,7 +1845,7 @@ def test_a_failure_that_is_not_the_services_is_never_resent(tmp_path, monkeypatc
     assert outcome.error_kind == "usageLimitExceeded"
     assert outcome.service_retries == 0
     assert (slept, checked) == ([], [])
-    assert len(_turn_starts(tmp_path)) == 1
+    assert len(wire.turn_starts(tmp_path)) == 1
     # Nothing was appended to the message either: a turn nobody retried must
     # not be explained as one that was.
     assert "retried" not in outcome.error and "unreachable" not in outcome.error
@@ -3149,7 +2192,7 @@ def test_result_and_logs_read_exactly_what_the_turn_wrote(tmp_path, monkeypatch,
     and print them, so their names are a contract between two modules (kept in
     `paths`). Spell either side differently and nothing raises: `result` and
     `logs` just report an agent that has never run."""
-    assert _run_fake_turn(tmp_path, monkeypatch, "plain").text == "fake answer"
+    assert wire.run_fake_turn(tmp_path, monkeypatch, "plain").text == "fake answer"
     capsys.readouterr()
 
     cli.cmd_result(cli.build_parser().parse_args(["result", "w"]))
@@ -3655,13 +2698,13 @@ def test_a_turn_closes_its_own_log_entry_whatever_the_outcome(tmp_path, monkeypa
     `run_turn` writes, so that line must follow a completed turn, a failed one
     AND an operator-typo abort — the last one used to raise before the server
     ever started, leaving the opening line alone and the agent 'running'."""
-    _run_fake_turn(tmp_path, monkeypatch, "plain")
+    wire.run_fake_turn(tmp_path, monkeypatch, "plain")
     trace = AgentStore("w").last_turn()
     assert trace is not None and trace.ended and trace.status == "completed"
     assert (trace.commands, trace.file_changes) == (1, 2)
     assert trace.timeout_s == 30.0
 
-    _run_fake_turn(tmp_path, monkeypatch, "die")
+    wire.run_fake_turn(tmp_path, monkeypatch, "die")
     trace = AgentStore("w").last_turn()
     assert trace is not None and trace.ended and trace.status == "failed"
 
@@ -4223,7 +3266,7 @@ def test_a_turn_tells_the_counter_that_it_started(tmp_path, monkeypatch):
             closed.append(True)
 
     monkeypatch.setattr(beacon, "_open_or_start", _Handle)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "plain", name="w")
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "plain", name="w")
 
     assert outcome.status == "completed"
     assert json.loads(sent[0])["label"].startswith("w@")
@@ -4251,7 +3294,7 @@ def test_a_turn_tells_the_counter_its_weekly_remainder(tmp_path, monkeypatch, ca
     monkeypatch.setattr(beacon, "_week_complained", set())
     sent = []
     monkeypatch.setattr(beacon, "_open_or_start", lambda: _RecordingHandle(sent))
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "rate-limits", name="w")
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "rate-limits", name="w")
 
     assert outcome.status == "completed"
     assert [message.get("week_left") for message in sent] == [None, 17, 10]
@@ -4264,7 +3307,7 @@ def test_a_turn_without_a_weekly_figure_tells_the_counter_log_once(tmp_path, mon
     monkeypatch.setattr(beacon, "_week_complained", set())
     sent = []
     monkeypatch.setattr(beacon, "_open_or_start", lambda: _RecordingHandle(sent))
-    _run_fake_turn(tmp_path, monkeypatch, "plain", name="w")
+    wire.run_fake_turn(tmp_path, monkeypatch, "plain", name="w")
 
     assert all("week_left" not in message for message in sent)
     assert "agent_counter: no weekly-limit figure for codex" in capsys.readouterr().err

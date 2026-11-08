@@ -7,6 +7,11 @@ how a junction is made. Those live here, used by this repository's core tests
 and importable by a host's; every function takes the files it writes, so the
 host keeps only its data. `monkeypatch` is pytest's fixture, passed in: the
 module itself imports nothing outside the standard library.
+
+Beside it: `wire`, the offline stand-in for `codex app-server` and the
+helpers that read what the client sent; `fixtures`, the pytest fixtures a
+turn test registers by importing them (the one module here that needs
+pytest).
 """
 
 from __future__ import annotations

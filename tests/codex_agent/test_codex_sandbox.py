@@ -1,6 +1,6 @@
 """Sandbox configuration and role briefings."""
 
-from test_codex_agent import _no_badge  # noqa: F401 — see _no_badge docstring
+from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401 — see no_badge's docstring
 from pathlib import Path
 import pytest
 from llm_agents.codex import cli

@@ -5,7 +5,7 @@ checks and the stale-directory rule run on any platform; only the real owner
 reader and the hidden attribute need Windows, and say so where they do.
 """
 
-from test_codex_agent import _no_badge  # noqa: F401 — see _no_badge docstring
+from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401 — see no_badge's docstring
 import os
 import subprocess
 from pathlib import Path

@@ -1,14 +1,10 @@
 """Sandbox wire scenarios."""
 
-from test_codex_agent import _no_badge  # noqa: F401 — see _no_badge docstring
+from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401 — see no_badge's docstring
 import json
 import shutil
 import pytest
-from test_codex_agent import _answers
-from test_codex_agent import _first_request
-from test_codex_agent import _install_fake_server
-from test_codex_agent import _received
-from test_codex_agent import _run_fake_turn
+from llm_agents.codex.testing import wire
 from llm_agents.codex import cli
 from llm_agents.codex import paths
 from llm_agents.codex import sandbox
@@ -23,11 +19,11 @@ def test_escalation_lets_out_exactly_the_named_gate_and_nothing_else(
     match, must run inside the agent's workspace, and must be a command (not
     stdin to a running one). Without the rule every request is declined, and
     the thread never even offers the model a way to ask."""
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "escalate", timeout=15.0,
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "escalate", timeout=15.0,
                              escalate=r"^npm (test|run typecheck)\b")
     assert outcome.status == "completed"
     assert outcome.text == "escalation handled"
-    answers = _answers(tmp_path)
+    answers = wire.answers(tmp_path)
     assert answers[9101]["result"] == {"decision": "accept"}
     assert answers[9102]["result"] == {"decision": "decline"}  # not a gate
     assert answers[9103]["result"] == {"decision": "decline"}  # other tree
@@ -76,16 +72,16 @@ def test_a_workspace_write_agent_gets_a_second_root_outside_the_tree(
     root is one the agent cannot write to), and the briefing names it — and a
     `read-only` agent gets none of the three, or the mode would be a lie."""
     # The scratch path is keyed by the registry, so the registry is pointed at
-    # the test's directory BEFORE the path is read (`_run_fake_turn` does the
+    # the test's directory BEFORE the path is read (`wire.run_fake_turn` does the
     # same, later).
     monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
     scratch = paths.scratch_dir("w")
     if scratch.exists():
         shutil.rmtree(scratch)
-    outcome = _run_fake_turn(tmp_path, monkeypatch, "plain",
+    outcome = wire.run_fake_turn(tmp_path, monkeypatch, "plain",
                              sandbox="workspace-write")
     assert outcome.status == "completed"
-    started = _first_request(tmp_path, "turn/start")["params"]
+    started = wire.first_request(tmp_path, "turn/start")["params"]
     assert started["sandboxPolicy"] == {
         "type": "workspaceWrite", "writableRoots": [str(scratch)],
         "networkAccess": True}
@@ -98,16 +94,16 @@ def test_a_workspace_write_agent_gets_a_second_root_outside_the_tree(
     # Outside the tree, or the second root adds nothing the first lacks.
     assert tmp_path.resolve() not in scratch.resolve().parents
     # The briefing as SENT, not as a separate call would build it.
-    opened = _first_request(tmp_path, "thread/start")["params"]
+    opened = wire.first_request(tmp_path, "thread/start")["params"]
     assert str(scratch) in opened["developerInstructions"]
 
-    read_only = _run_fake_turn(tmp_path, monkeypatch, "plain", name="r",
+    read_only = wire.run_fake_turn(tmp_path, monkeypatch, "plain", name="r",
                                sandbox="read-only")
     assert read_only.status == "completed"
-    starts = [message["params"] for message in _received(tmp_path)
+    starts = [message["params"] for message in wire.received(tmp_path)
               if message.get("method") == "turn/start"]
     assert "sandboxPolicy" not in starts[-1]
-    opened_ro = [message["params"] for message in _received(tmp_path)
+    opened_ro = [message["params"] for message in wire.received(tmp_path)
                  if message.get("method") == "thread/start"][-1]
     assert str(paths.scratch_dir("r")) not in opened_ro["developerInstructions"]
     assert not paths.scratch_dir("r").exists()

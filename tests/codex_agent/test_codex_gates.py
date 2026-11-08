@@ -1,7 +1,8 @@
 """Gates the wrapper runs itself (`spawn --gates-from-prompt`, `gates.py`).
 
-The wire is the offline stand-in of `test_codex_agent.py`; the command runner
-is a fake (`_Runner`), except in the tests about `gates.run_gate` itself.
+The wire is the offline stand-in (`llm_agents.codex.testing.wire`); the command
+runner is a fake (`wire.GateRunner`), except in the tests about
+`gates.run_gate` itself.
 """
 
 import sys
@@ -9,46 +10,14 @@ from pathlib import Path
 
 import pytest
 
-# Fixture registration: see test_codex_agent._no_badge docstring.
-from test_codex_agent import (  # noqa: F401
-    _install_fake_server, _no_badge, _received, _turn_starts, worker_report,
-)
+from llm_agents.codex.testing import wire
+# Fixture registration: see no_badge's docstring.
+from llm_agents.codex.testing.fixtures import no_badge, worker_report  # noqa: F401
+from llm_agents.codex.testing.wire import GATES, GATES_PROMPT as PROMPT
 from llm_agents.codex import cli, events, gates, paths, sandbox, turn
 from llm_agents.codex.registry import AgentRecord, Registry
 from llm_agents.codex.store import AgentStore
 from core_policy import core_main
-
-PROMPT = """Task: convert X to Y.
-
-## Context
-```
-npm run not-a-gate
-```
-
-## Gates
-
-Run these from the usual place:
-
-```
-npm run typecheck
-# a comment, not a command
-
-python tools/check/rename_gate.py oldName
-```
-
-### Notes under the gates
-```powershell
-npm test -- test/hash.test.ts
-```
-
-## Scope
-```
-npm run also-not-a-gate
-```
-"""
-
-GATES = ["npm run typecheck", "python tools/check/rename_gate.py oldName",
-         "npm test -- test/hash.test.ts"]
 
 
 def test_prompt_gates_reads_only_fenced_lines_under_the_gates_heading():
@@ -134,39 +103,12 @@ def test_run_gate_reports_exit_output_and_timeout(tmp_path):
     assert missing.exit_code is None and "does not exist" in missing.output
 
 
-class _Runner:
-    """Stands in for `gates.run_gate`: every call is recorded, and each
-    command answers from its own queue (the last answer repeats)."""
-
-    def __init__(self, answers):
-        self.answers = {command: list(codes) for command, codes in answers.items()}
-        self.calls = []
-
-    def __call__(self, command, cwd, timeout):
-        self.calls.append((command, cwd))
-        codes = self.answers[command]
-        code = codes.pop(0) if len(codes) > 1 else codes[0]
-        output = "all good" if code == 0 else "line\n" * 60 + "FAILED boom"
-        return gates.GateRun(command, str(cwd), code, output, 1.0)
-
-
 def test_gate_runner_preserves_explicit_prefix_and_checks_its_exit(tmp_path):
     command = "npm --prefix app run typecheck"
-    runner = _Runner({command: [1]})
+    runner = wire.GateRunner({command: [1]})
     results = gates.run_gates([command], tmp_path, 60.0, runner, lambda _: None)
     assert runner.calls == [(command, tmp_path)]
     assert results[0].exit_code == 1 and not results[0].passed
-
-
-def _gated_turn(tmp_path, monkeypatch, scenario, runner, commands=GATES,
-                record=None, expect=""):
-    monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
-    _install_fake_server(monkeypatch, tmp_path, scenario)
-    if record is None:
-        record = AgentRecord(name="w", cwd=str(tmp_path), sandbox="read-only")
-    record.gates = list(commands)
-    return turn.run_turn(record=record, prompt="do the thing", resume=False,
-                         timeout=30.0, run_gate=runner, expect=expect)
 
 
 def test_run_gate_reaps_the_process_when_the_wait_is_interrupted(
@@ -204,11 +146,11 @@ def test_gates_share_one_budget(tmp_path):
 
 def test_a_red_gate_is_followed_up_once_with_its_tail_and_rerun(
         tmp_path, monkeypatch, capsys):
-    runner = _Runner({GATES[0]: [1, 0], GATES[1]: [0], GATES[2]: [0]})
-    outcome = _gated_turn(tmp_path, monkeypatch, "plain", runner)
+    runner = wire.GateRunner({GATES[0]: [1, 0], GATES[1]: [0], GATES[2]: [0]})
+    outcome = wire.gated_turn(tmp_path, monkeypatch, "plain", runner)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.gate_follow_ups == 1 and len(runner.calls) == 6
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2
     assert starts[1]["params"]["threadId"] == "th-fake"
     follow_up = starts[1]["params"]["input"][0]["text"]
@@ -262,9 +204,9 @@ def test_an_unknown_follow_up_kind_is_refused():
 
 def test_a_gate_still_red_after_the_follow_up_fails_the_call(
         tmp_path, monkeypatch, capsys):
-    runner = _Runner({GATES[0]: [1], GATES[1]: [0], GATES[2]: [2]})
-    outcome = _gated_turn(tmp_path, monkeypatch, "plain", runner)
-    assert len(_turn_starts(tmp_path)) == 2  # one follow-up, not a loop
+    runner = wire.GateRunner({GATES[0]: [1], GATES[1]: [0], GATES[2]: [2]})
+    outcome = wire.gated_turn(tmp_path, monkeypatch, "plain", runner)
+    assert len(wire.turn_starts(tmp_path)) == 2  # one follow-up, not a loop
     assert "(1/3 green, after 1 gate follow-up)" in outcome.text
     assert "- FAIL `npm test -- test/hash.test.ts`" in outcome.text
     assert "FAILED boom" in outcome.text
@@ -275,10 +217,10 @@ def test_a_gate_still_red_after_the_follow_up_fails_the_call(
 def test_the_gate_follow_up_answer_is_held_to_expect(tmp_path, monkeypatch):
     # "partial": the first answer has `## Findings`, every later one only
     # `## Coverage` — so the gate follow-up's replacement drops the section.
-    runner = _Runner({GATES[0]: [1, 0], GATES[1]: [0], GATES[2]: [0]})
-    outcome = _gated_turn(tmp_path, monkeypatch, "partial", runner,
+    runner = wire.GateRunner({GATES[0]: [1, 0], GATES[1]: [0], GATES[2]: [0]})
+    outcome = wire.gated_turn(tmp_path, monkeypatch, "partial", runner,
                           expect=r"^## Findings")
-    starts = _turn_starts(tmp_path)
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 3  # the turn, the gate follow-up, the expect one
     assert "## Findings" in starts[2]["params"]["input"][0]["text"]
     assert outcome.follow_ups == 1 and outcome.gate_follow_ups == 1
@@ -300,10 +242,10 @@ def test_expect_then_gate_then_expect_follow_ups_are_counted_apart(
     # "partial-twice": no answer ever has `## Coverage`, so the first answer
     # gets an expect follow-up, the red gate one more, and its replacement an
     # expect follow-up again inside `_check_gates`.
-    runner = _Runner({GATES[0]: [1, 0], GATES[1]: [0], GATES[2]: [0]})
-    outcome = _gated_turn(tmp_path, monkeypatch, "partial-twice", runner,
+    runner = wire.GateRunner({GATES[0]: [1, 0], GATES[1]: [0], GATES[2]: [0]})
+    outcome = wire.gated_turn(tmp_path, monkeypatch, "partial-twice", runner,
                           expect=r"^## Coverage")
-    assert len(_turn_starts(tmp_path)) == 4
+    assert len(wire.turn_starts(tmp_path)) == 4
     assert outcome.follow_ups == 2 and outcome.gate_follow_ups == 1
     assert _follow_up_kinds() == [events.FOLLOWUP_EXPECT, events.FOLLOWUP_GATES,
                                   events.FOLLOWUP_EXPECT]
@@ -320,10 +262,10 @@ def test_a_failed_gate_follow_up_keeps_the_incomplete_verdict(
         tmp_path, monkeypatch, capsys):
     # Both answers lack `## Coverage`, then the gate follow-up fails: the kept
     # answer is still the incomplete one, so the Incomplete line must survive.
-    runner = _Runner({GATES[0]: [1], GATES[1]: [0], GATES[2]: [0]})
-    outcome = _gated_turn(tmp_path, monkeypatch, "partial-twice-then-refuse",
+    runner = wire.GateRunner({GATES[0]: [1], GATES[1]: [0], GATES[2]: [0]})
+    outcome = wire.gated_turn(tmp_path, monkeypatch, "partial-twice-then-refuse",
                           runner, expect=r"^## Coverage")
-    assert len(_turn_starts(tmp_path)) == 3
+    assert len(wire.turn_starts(tmp_path)) == 3
     assert "gate follow-up failed" in outcome.error
     assert outcome.follow_ups == 1 and outcome.expect_met is False
     cli.print_outcome("w", outcome, quiet=True)
@@ -336,10 +278,10 @@ def test_a_failed_gate_follow_up_keeps_the_expect_note(
     # and the gate follow-up says something before it fails: the kept answer
     # keeps its whole provenance, the note included.
     record, report = worker_report
-    runner = _Runner({GATES[0]: [1], GATES[1]: [0], GATES[2]: [0]})
-    outcome = _gated_turn(tmp_path, monkeypatch, "report-fallback-then-fail",
+    runner = wire.GateRunner({GATES[0]: [1], GATES[1]: [0], GATES[2]: [0]})
+    outcome = wire.gated_turn(tmp_path, monkeypatch, "report-fallback-then-fail",
                           runner, record=record, expect=r"^### Not done")
-    assert len(_turn_starts(tmp_path)) == 3
+    assert len(wire.turn_starts(tmp_path)) == 3
     assert "gate follow-up failed" in outcome.error
     assert outcome.report_source == "file" and outcome.follow_ups == 1
     assert outcome.report_note == "follow-up answered in the message"
@@ -350,10 +292,10 @@ def test_a_failed_gate_follow_up_keeps_the_expect_note(
 def test_the_gate_follow_up_report_file_is_held_to_expect(
         tmp_path, monkeypatch, worker_report):
     record, report = worker_report
-    runner = _Runner({GATES[0]: [1, 0], GATES[1]: [0], GATES[2]: [0]})
-    outcome = _gated_turn(tmp_path, monkeypatch, "report-gate-regress", runner,
+    runner = wire.GateRunner({GATES[0]: [1, 0], GATES[1]: [0], GATES[2]: [0]})
+    outcome = wire.gated_turn(tmp_path, monkeypatch, "report-gate-regress", runner,
                           record=record, expect=r"^### Not done")
-    assert len(_turn_starts(tmp_path)) == 3
+    assert len(wire.turn_starts(tmp_path)) == 3
     assert outcome.status == "completed" and not outcome.error
     assert outcome.report_source == "file" and outcome.follow_ups == 1
     assert outcome.text.startswith(report.read_text(encoding="utf-8").rstrip())
@@ -362,8 +304,8 @@ def test_the_gate_follow_up_report_file_is_held_to_expect(
 
 
 def test_a_turn_that_did_not_complete_runs_no_gates(tmp_path, monkeypatch):
-    runner = _Runner({command: [0] for command in GATES})
-    outcome = _gated_turn(tmp_path, monkeypatch, "refuse", runner)
+    runner = wire.GateRunner({command: [0] for command in GATES})
+    outcome = wire.gated_turn(tmp_path, monkeypatch, "refuse", runner)
     assert outcome.status == "failed" and runner.calls == []
     assert outcome.gate_note == "gates not run: the turn did not complete"
     assert "Wrapper gates" not in outcome.text
@@ -381,8 +323,8 @@ def test_follow_up_prompt_names_the_report_file():
 def test_spawn_records_the_gates_and_send_reruns_them(
         tmp_path, monkeypatch, capsys):
     monkeypatch.setenv(paths.STATE_DIR_ENV, str(tmp_path))
-    _install_fake_server(monkeypatch, tmp_path, "plain")
-    runner = _Runner({command: [0] for command in GATES})
+    wire.install_fake_server(monkeypatch, tmp_path, "plain")
+    runner = wire.GateRunner({command: [0] for command in GATES})
     monkeypatch.setattr(gates, "run_gate", runner)
     prompt_file = tmp_path / "prompt.md"
     prompt_file.write_text(PROMPT, encoding="utf-8")
