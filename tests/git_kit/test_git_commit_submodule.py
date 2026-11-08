@@ -6,42 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from kit_support import kit_env, run_kit
+from kit_support import checkout_with_submodule, kit_env, out as git, run_kit
 from llm_agents.git import commit
 from llm_agents.git.commit_identity import ENV, write_approval
-
-
-def git(repo, *args):
-    return subprocess.run(
-        ["git", "-c", "user.name=Commit Test", "-c", "user.email=test@example.invalid",
-         *args], cwd=repo, capture_output=True, text=True, encoding="utf-8", check=True,
-    ).stdout.strip()
 
 
 @pytest.fixture
 def checkout(tmp_path, monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
-    source = tmp_path / "source"
-    source.mkdir()
-    git(source, "init", "--quiet")
-    (source / "work.txt").write_text("initial\n", encoding="utf-8")
-    git(source, "add", "work.txt")
-    git(source, "commit", "--quiet", "-m", "Initial")
-    main = tmp_path / "main"
-    main.mkdir()
-    git(main, "init", "--quiet")
-    git(main, "-c", "protocol.file.allow=always", "submodule", "add",
-        str(source), "lib/sub")
-    git(main, "commit", "--quiet", "-am", "Submodule")
-    slot = tmp_path / "main-wt1"
-    git(main, "worktree", "add", "--detach", str(slot))
-    git(slot, "-c", "protocol.file.allow=always", "submodule", "update", "--init")
-    sub = slot / "lib/sub"
-    git(sub, "config", "user.name", "Commit Test")
-    git(sub, "config", "user.email", "test@example.invalid")
-    assert Path(git(sub, "rev-parse", "--absolute-git-dir")) == (
-        main / ".git/worktrees/main-wt1/modules/lib/sub")
-    return slot, sub, source
+    return checkout_with_submodule(tmp_path, "lib/sub")
 
 
 def run_commit(slot, sub, message, *paths, env=None):

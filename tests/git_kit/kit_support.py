@@ -49,3 +49,24 @@ def run_kit(module: str, *args: str, cwd: Path, env: dict | None = None
         [sys.executable, "-m", f"llm_agents.git.{module}", *args], cwd=cwd,
         text=True, encoding="utf-8", capture_output=True,
         env=env if env is not None else kit_env())
+
+
+def checkout_with_submodule(tmp_path: Path, submodule_path: str) -> tuple[Path, Path, Path]:
+    """Create a source, a parent repository and its linked worktree with a submodule."""
+    source = repo(tmp_path, "source")
+    (source / "work.txt").write_text("initial\n", encoding="utf-8")
+    git(source, "add", "work.txt")
+    git(source, "commit", "--quiet", "-m", "Initial")
+    main = repo(tmp_path, "main")
+    git(main, "-c", "protocol.file.allow=always", "submodule", "add",
+        str(source), submodule_path)
+    git(main, "commit", "--quiet", "-am", "Submodule")
+    slot = tmp_path / "main-wt1"
+    git(main, "worktree", "add", "--detach", str(slot))
+    git(slot, "-c", "protocol.file.allow=always", "submodule", "update", "--init")
+    sub = slot / submodule_path
+    git(sub, "config", "user.name", "Commit Test")
+    git(sub, "config", "user.email", "test@example.invalid")
+    assert Path(out(sub, "rev-parse", "--absolute-git-dir")) == (
+        main / ".git/worktrees/main-wt1/modules" / submodule_path)
+    return slot, sub, source

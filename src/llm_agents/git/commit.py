@@ -68,8 +68,7 @@ class CommitHost:
 
 
 EMPTY = CommitHost()
-# The host `main` runs with when it is given none; a project's stand-in that
-# imports this module sets it, so a test of the stand-in sees its rules.
+# The host `main` runs with when it is given none.
 HOST: CommitHost = EMPTY
 
 # The one table of this script's options (dest -> spellings): `main` builds its

@@ -99,9 +99,7 @@ class PoolHost:
 
 
 EMPTY = PoolHost()
-# The host every function here reads; `main` installs the one it is given. A
-# project's stand-in that imports this module sets it, so a test of the
-# stand-in sees its rules.
+# The host every function here reads; `main` installs the one it is given.
 HOST: PoolHost = EMPTY
 
 HELP = {

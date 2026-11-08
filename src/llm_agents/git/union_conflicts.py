@@ -20,8 +20,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import textwrap
 from pathlib import Path
-from typing import Optional
 
 OURS = "<<<<<<< "
 SEP = "=======\n"
@@ -66,10 +66,21 @@ def resolve(text: str, specs: dict[int, str], default: str) -> tuple[str, int]:
     return "".join(out), hunk
 
 
-def main(description: Optional[str] = None) -> int:
-    """`description`: a host's own help text (its spelling of the command, its
-    precedents) in place of this module's docstring."""
-    ap = argparse.ArgumentParser(description=description or __doc__,
+def help_text(command: str, precedent: str = "") -> str:
+    """Keep the shared rules in the module docstring; hosts supply local context."""
+    text = __doc__.replace("python -m llm_agents.git.union_conflicts", command)
+    if precedent:
+        # Reflow only the tail that grows; preserve the existing help layout.
+        prefix, tail = text.split("hunk is where", 1)
+        tail = "hunk is where" + " ".join(tail.splitlines())
+        tail = tail.replace("silently.", f"silently{precedent}.")
+        text = prefix + textwrap.fill(tail, width=80, break_on_hyphens=False) + "\n"
+    return text
+
+
+def main(command: str = "python -m llm_agents.git.union_conflicts",
+         precedent: str = "") -> int:
+    ap = argparse.ArgumentParser(description=help_text(command, precedent),
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("file")
     ap.add_argument("--hunk", action="append", default=[], metavar="N=SPEC")
