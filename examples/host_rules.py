@@ -3,34 +3,41 @@ Example host rules: what a downstream project hands the git kit and the agent br
 
 `llm_agents.git` and the bridges know no project. Everything that names one —
 the sentinel file never committed, the submodules a new slot gets, the main
-branch and the remote, the paths no agent writes — is a value of a module like
-this one, and the project's own entry points (three small scripts, sketched at
-the bottom) hand it to each `main`. Nothing is read from here on its own: a kit
-script run without a host runs with the empty host and says so on stderr.
+branch and the remote, the paths no agent writes, the gate hook a review
+reuses — is a value of a module like this one, and the project's own entry
+points (four small scripts, sketched at the bottom) hand it to each `main`.
+Nothing is read from here on its own: a kit script run without a host runs
+with the empty host and says so on stderr.
 
-Copy this file into your project (say `tools/host_rules.py`), keep the fields
-you need and drop the rest. Every field's default is the empty host's answer;
-the fields and their meaning are documented on `PoolHost`, `CommitHost` and
-`HostPolicy` themselves, not repeated here.
+Where to put it: `tools/host_rules.py`, with the submodule at
+`tools/llm-loop` — the layout every path below assumes, and the one
+`tests/test_examples_host_rules.py` imports a copy under. The entry scripts
+beside it import it by name (`from host_rules import worktree_main`), since a
+script's own directory is on `sys.path`; one run as a package directory
+(`python tools/codex_agent`) puts `tools/` there first. Kept elsewhere, the
+file needs `ROOT` changed and nothing else: the submodule path and every
+project path derive from it.
+
+Keep the fields you need and drop the rest. Every field's default is the
+empty host's answer; the fields and their meaning are documented on
+`PoolHost`, `CommitHost`, `HostPolicy` and `ReviewProfile` themselves, not
+repeated here.
 """
 
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-# Make the vendored submodule importable. Adjust the path if you put the
-# submodule somewhere other than tools/llm-loop.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tools", "llm-loop", "src"))
+# The checkout these rules belong to: this file is tools/host_rules.py.
+ROOT = Path(__file__).resolve().parents[1]
+
+# Make the vendored submodule importable. First, because the imports below
+# resolve against it; derived from ROOT, so a moved copy changes one line.
+sys.path.insert(0, str(ROOT / "tools" / "llm-loop" / "src"))
 
 from llm_agents.git.commit import CommitHost
 from llm_agents.git.worktree import PoolHost, SharedDir
-from llm_agents.host_policy import GIT_STORE, HostPolicy
-
-# The checkout these rules belong to. This file sits at its root; a copy kept
-# under tools/ takes one more `.parent`.
-ROOT = Path(__file__).resolve().parent
+from llm_agents.host_policy import GIT_STORE, HostPolicy, ReviewProfile
 
 
 # --- the commit helper: python -m llm_agents.git.commit ---------------------
@@ -85,6 +92,17 @@ POLICY = HostPolicy(
     worker_lines=("Run the gates from the repository root.",),
     commit_script="tools/commit.py",
     pool_script="tools/worktree.py",
+    # What the Claude bridge's `review` profile reuses, and refuses to start
+    # without: the ask-user-gate hook the project already runs. `settings` is
+    # the project settings file whose PreToolUse entry names the compiled gate
+    # (`<gate>/hooks/ask_user_gate.exe`, built by `<gate>/cpp/build.py`); the
+    # vendored plugin directory is the gate here. `submodule` lets the
+    # reviewer read this one submodule's commits with `git -C` templates.
+    review=ReviewProfile(
+        settings=".claude/settings.json",
+        gate="tools/llm-loop/claude-plugin/ask-user-gate",
+        submodule="tools/llm-loop",
+    ),
 )
 # A worker's command allowlist (`HostPolicy.commands`) is the one table worth
 # a module of its own; the core's own test host,
@@ -94,9 +112,10 @@ POLICY = HostPolicy(
 
 # --- entry points -----------------------------------------------------------
 # In a project each is a script of its own (tools/worktree.py, tools/commit.py,
-# tools/codex_agent/__main__.py) ending in `sys.exit(<function>())`; they are
-# functions here so this file imports whole. `entry` is the path the bridge's
-# printed hints name (`python tools/codex_agent logs <name>`).
+# tools/codex_agent/__main__.py, tools/claude_agent/__main__.py) ending in
+# `sys.exit(<function>())`; they are functions here so this file imports whole.
+# `entry` is the path the bridge's printed hints name (`python tools/codex_agent
+# logs <name>`).
 
 def worktree_main() -> int:
     from llm_agents.git import worktree

@@ -59,21 +59,32 @@ The reason to have both: **a review by the other model finds what yours
 missed.** One commit reviewed by Codex and by a Claude subagent gave 8 and 11
 findings with 4 in common (measured 2026-08-24) — half of each list was visible
 to one model alone. So Claude's commits get a Codex review and Codex's a Claude
-review, with the same two commands:
+review.
+
+The Codex reviewer runs on an empty host, straight from the checkout:
 
 ```bash
 python -m llm_agents.codex spawn review-1 --role reviewer --sandbox read-only --prompt-file review.txt
 python -m llm_agents.codex result review-1
-python -m llm_agents.claude spawn review-2 --message-file review.txt
-python -m llm_agents.claude wait review-2 --until-done
 ```
 
-Run bare like this they use the **empty host policy** and say so on stderr:
+The Claude reviewer does not: its `review` profile (the default of `spawn`)
+reuses the project's ask-user-gate hook and refuses to start without one
+(`HostPolicy.review`; `python -m llm_agents.claude spawn --help` names the
+profiles). So it runs through the project's own entry point, a script that
+hands the bridge a policy with a `ReviewProfile` — `claude_agent_main` in
+[`examples/host_rules.py`](examples/host_rules.py) is one:
+
+```bash
+python tools/claude_agent spawn review-2 --message-file review.txt
+python tools/claude_agent wait review-2 --until-done
+```
+
+Run bare, a bridge uses the **empty host policy** and says so on stderr:
 nothing leaves the sandbox unless the call itself asks (`--escalate`,
-`--gates-from-prompt`), and Claude's `review` profile refuses to start without
-a host's gate hook. A project hands its rules to `cli.main(policy=..., root=...,
-entry=...)` from an entry point of its own — see *Host rules* below. The
-reasoning behind the sandboxes, how to cut a task so the worker returns one
+`--gates-from-prompt`). A project hands its rules to `cli.main(policy=...,
+root=..., entry=...)` from an entry point of its own — see *Host rules* below.
+The reasoning behind the sandboxes, how to cut a task so the worker returns one
 result, and the Windows sandbox's traps are in the package READMEs.
 
 ## Git kit — `llm_agents.git`
@@ -108,20 +119,22 @@ other modules.
 
 The kit and the bridges know no project. What one adds — the file never
 committed, the submodules a slot gets, the paths no agent writes, the commit
-command a worker is told — is a `PoolHost`, a `CommitHost` and a `HostPolicy`
-(`llm_agents.host_policy`) in one module of the project's own, which its entry
-points hand to each `main`:
+command a worker is told, the gate hook a review reuses — is a `PoolHost`, a
+`CommitHost` and a `HostPolicy` (`llm_agents.host_policy`) in one module of
+the project's own, `tools/host_rules.py`, which puts the vendored `src/` on
+`sys.path` itself. Each entry point beside it is then two lines:
 
 ```python
-from llm_agents.git import worktree
-from host_rules import POOL          # your copy of examples/host_rules.py
+# tools/worktree.py
+from host_rules import worktree_main      # your copy of examples/host_rules.py
 
-raise SystemExit(worktree.main(POOL))
+raise SystemExit(worktree_main())
 ```
 
-[`examples/host_rules.py`](examples/host_rules.py) is a complete, neutral
-example with every field a downstream project usually sets;
-`tests/test_examples_host_rules.py` keeps it importing.
+[`examples/host_rules.py`](examples/host_rules.py) is a neutral example with
+every field a downstream project usually sets, the review profile included,
+and the four entry points as functions; `tests/test_examples_host_rules.py`
+copies it into that layout and runs each entry point there.
 
 ## Test support for a host — `llm_agents.codex.testing`
 
