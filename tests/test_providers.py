@@ -320,7 +320,7 @@ def test_codex_process_bills_nested_agents_but_streams_only_the_root_turn():
                              "status": "completed"}}},
     ]
     raw = _FakeAgentProcess(
-        stdout="".join(json.dumps(message) + "\n" for message in messages))
+        stdout=_app_server_stream(*messages))
     proc = providers._CodexAppProcess(
         appserver.Connection(raw), [], thread_id="root-thread", turn_id="root-turn")
 
@@ -341,8 +341,7 @@ def test_codex_process_bills_nested_agents_but_streams_only_the_root_turn():
 
 def _app_server_stream(*items):
     """App-server stdout: dicts become JSON lines, strings stay as written."""
-    return "".join(item if isinstance(item, str) else json.dumps(item) + "\n"
-                   for item in items)
+    return JsonLinesProcess(*items).stdout.getvalue()
 
 
 _ROOT_MESSAGE = {"method": "item/completed", "params": {

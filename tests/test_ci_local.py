@@ -11,6 +11,7 @@ faked, so no uv runs here) and the venv root's key.
 
 import _thread
 import importlib.util
+import io
 import os
 import signal
 import subprocess
@@ -429,3 +430,27 @@ def test_the_venv_root_folds_case_only_on_windows():
             != ci_local.venv_root(Path("/foo"), windows=False))
     assert (ci_local.venv_root(Path("C:/Foo"), windows=True)
             == ci_local.venv_root(Path("c:/foo"), windows=True))
+
+
+@pytest.mark.parametrize("encoding", ["cp1252", "utf-8", None])
+def test_failed_run_tail_survives_console_encoding(tmp_path, monkeypatch, encoding):
+    log = tmp_path / "failed.log"
+    log.write_bytes(b"FAILED test_example: invalid byte \xff\n")
+    buffer = io.BytesIO()
+    stream = (io.TextIOWrapper(buffer, encoding=encoding)
+              if encoding else io.StringIO())
+    monkeypatch.setattr(ci_local.sys, "stdout", stream)
+    monkeypatch.setattr(ci_local, "VENVS", tmp_path)
+    monkeypatch.setattr(ci_local.shutil, "which", lambda name: name)
+
+    def failed_run(version, steps, log_path):
+        log_path.write_bytes(log.read_bytes())
+        return "tests (exit 1)"
+
+    monkeypatch.setattr(ci_local, "run_version", failed_run)
+    assert ci_local.main(["3.9"]) == 1
+    stream.flush()
+    output = buffer.getvalue().decode(encoding) if encoding else stream.getvalue()
+    assert "FAILED test_example: invalid byte " in output
+    assert ("?" if encoding == "cp1252" else "\ufffd") in output
+    assert "FAILED: 3.9" in output

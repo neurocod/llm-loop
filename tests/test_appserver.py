@@ -7,7 +7,6 @@ The wire tests drive BOTH clients against the same stand-in server
 transport is pinned once for the two of them.
 """
 
-import subprocess
 import sys
 import time
 

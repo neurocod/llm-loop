@@ -1136,62 +1136,62 @@ def cmd_hook_remove(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
     main, remote = HOST.main_branch, HOST.remote
     # Both flags are always accepted (`wants_push`), so a script written for
     # one host runs on another; only the one that changes something here is
     # listed in the help.
-    pushing = argparse.ArgumentParser(add_help=False)
+    pushing = argparse.ArgumentParser(allow_abbrev=False, add_help=False)
     pushing.add_argument("--no-push", action="store_true",
                          help=f"do not push {main} afterwards" if HOST.push_by_default
                          else argparse.SUPPRESS)
     pushing.add_argument("--push", action="store_true",
                          help=argparse.SUPPRESS if HOST.push_by_default
                          else f"push {main} to {remote} afterwards")
-    installing = argparse.ArgumentParser(add_help=False)
+    installing = argparse.ArgumentParser(allow_abbrev=False, add_help=False)
     installing.add_argument("--no-install", action="store_true", help=help_text("--no-install"))
     # Every command that names a slot takes it both ways — see `slot_named`.
-    naming = argparse.ArgumentParser(add_help=False)
+    naming = argparse.ArgumentParser(allow_abbrev=False, add_help=False)
     naming.add_argument("slot", nargs="?", help="wtN, N, or a slot directory")
     naming.add_argument("--dir", help="the same slot, as an option (either spelling works)")
 
-    sub.add_parser("status", help=f"slot state and unpushed {main}").set_defaults(func=cmd_status)
+    sub.add_parser("status", allow_abbrev=False, help=f"slot state and unpushed {main}").set_defaults(func=cmd_status)
 
-    p = sub.add_parser("new", parents=[pushing, installing], help=help_text("new"))
+    p = sub.add_parser("new", allow_abbrev=False, parents=[pushing, installing], help=help_text("new"))
     p.add_argument("number", nargs="?", type=int)
     p.add_argument("--submodules", choices=["default", "all"], default="default",
                    help=help_text("--submodules"))
     p.set_defaults(func=cmd_new)
 
-    p = sub.add_parser("equalize", parents=[pushing, installing, naming],
+    p = sub.add_parser("equalize", allow_abbrev=False, parents=[pushing, installing, naming],
                        help=f"slot branch := {main} (refuses dirty, unlanded or locked slots); "
                             "default slot: the current worktree")
     p.set_defaults(func=cmd_equalize)
 
     if HOST.shared:
-        p = sub.add_parser(HOST.share_command, parents=[naming], help=help_text("share"))
+        p = sub.add_parser(HOST.share_command, allow_abbrev=False, parents=[naming], help=help_text("share"))
         p.set_defaults(func=cmd_share)
 
-    p = sub.add_parser("land", parents=[pushing, naming],
+    p = sub.add_parser("land", allow_abbrev=False, parents=[pushing, naming],
                        help=f"{main} := slot branch (ff-only), unlock the slot"
                             + (", push" if HOST.push_by_default else ""))
     p.set_defaults(func=cmd_land)
 
-    sub.add_parser("push", help=f"push {main} to {remote}").set_defaults(func=cmd_push)
+    sub.add_parser("push", allow_abbrev=False, help=f"push {main} to {remote}").set_defaults(func=cmd_push)
 
-    p = sub.add_parser("next", parents=[naming], help="which slot the next WorktreeCreate hook hands out")
+    p = sub.add_parser("next", allow_abbrev=False, parents=[naming], help="which slot the next WorktreeCreate hook hands out")
     p.set_defaults(func=cmd_next)
 
-    p = sub.add_parser("release", parents=[naming], help="drop a slot's lock (the agent that held it is gone)")
+    p = sub.add_parser("release", allow_abbrev=False, parents=[naming], help="drop a slot's lock (the agent that held it is gone)")
     p.set_defaults(func=cmd_release)
 
-    p = sub.add_parser("drop", parents=[naming],
+    p = sub.add_parser("drop", allow_abbrev=False, parents=[naming],
                        help=help_text("drop shared" if HOST.shared else "drop"))
     p.set_defaults(func=cmd_drop)
 
-    sub.add_parser("hook-create", help="Claude Code WorktreeCreate hook").set_defaults(func=cmd_hook_create)
-    sub.add_parser("hook-remove", help="Claude Code WorktreeRemove hook").set_defaults(func=cmd_hook_remove)
+    sub.add_parser("hook-create", allow_abbrev=False, help="Claude Code WorktreeCreate hook").set_defaults(func=cmd_hook_create)
+    sub.add_parser("hook-remove", allow_abbrev=False, help="Claude Code WorktreeRemove hook").set_defaults(func=cmd_hook_remove)
     return ap
 
 

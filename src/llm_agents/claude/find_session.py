@@ -93,7 +93,7 @@ def paint(text, sgr, enabled):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.split("\n")[0])
     ap.add_argument("text", help="fragment of the prompt (case-insensitive)")
     ap.add_argument("--days", type=float, default=7, help="only transcripts modified within N days")
     ap.add_argument("--project", default="", help="only project dirs whose name contains this (case-insensitive)")

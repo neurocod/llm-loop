@@ -53,7 +53,7 @@ def changes(base: str, tip: str) -> dict[str, tuple[str, str | None]]:
 
 
 def main(command: str = COMMAND) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.replace(COMMAND, command),
+    ap = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.replace(COMMAND, command),
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ours")
     ap.add_argument("theirs")

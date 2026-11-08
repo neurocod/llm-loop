@@ -668,6 +668,12 @@ def tail(path: Path, count: int = 25) -> str:
     return "\n".join("    " + line for line in lines[-count:])
 
 
+def print_tail(path: Path) -> None:
+    """Keep a failed step report printable on legacy consoles and stream doubles."""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(tail(path).encode(encoding, errors="replace").decode(encoding))
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run the GitHub CI matrix locally, one uv venv per Python.")
@@ -714,7 +720,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         took = f"{time.monotonic() - started:.0f} s"
         if failed:
             failures.append(version)
-            print(f"   FAIL in {took} at {failed}\n   log: {log_path}\n{tail(log_path)}")
+            print(f"   FAIL in {took} at {failed}\n   log: {log_path}")
+            print_tail(log_path)
         else:
             print(f"   ok in {took}  (log: {log_path})")
     print("all passed" if not failures else f"FAILED: {' '.join(failures)}")

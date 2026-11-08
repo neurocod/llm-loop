@@ -107,7 +107,7 @@ def check(pathspecs: list[str], cwd: str = None) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(allow_abbrev=False,
         description="Check that index gitlinks and .gitmodules agree.")
     parser.add_argument("pathspecs", nargs="*", metavar="PATHSPEC",
                         help="limit the gitlink scan to these paths")

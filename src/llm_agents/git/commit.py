@@ -337,7 +337,7 @@ def approved_identity_problems(expected: Optional[dict]) -> list[str]:
 
 
 def build_parser(host: CommitHost) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(allow_abbrev=False,
         description="Commit exactly the given paths with a quoting-safe message.",
     )
     parser.add_argument(

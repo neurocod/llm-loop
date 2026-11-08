@@ -80,7 +80,7 @@ def help_text(command: str, precedent: str = "") -> str:
 
 def main(command: str = "python -m llm_agents.git.union_conflicts",
          precedent: str = "") -> int:
-    ap = argparse.ArgumentParser(description=help_text(command, precedent),
+    ap = argparse.ArgumentParser(allow_abbrev=False, description=help_text(command, precedent),
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("file")
     ap.add_argument("--hunk", action="append", default=[], metavar="N=SPEC")
