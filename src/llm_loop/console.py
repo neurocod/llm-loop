@@ -558,7 +558,8 @@ def capture_stdout_here():
     onto the screen and into the mirror log — and the status line's refresher,
     having captured nothing, would read the source as recovered. That check
     lives beside the route rather than as a flag the capturer must remember to
-    set, which is how backlog 0616's leak happened. Does not nest: an inner
+    set: such a flag was once forgotten, and a captured line leaked onto the
+    screen. Does not nest: an inner
     capture on the same thread ends the outer one.
     """
     ident = threading.get_ident()

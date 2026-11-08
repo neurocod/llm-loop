@@ -311,7 +311,7 @@ def test_independent_launch_does_not_release_the_owner(launch):
 
 def test_same_filename_in_different_directories_is_independent(launch):
     launch().until('READY')
-    output = launch('refactor/runCycle.py').until('READY')
+    output = launch('nested/runCycle.py').until('READY')
     assert 'Another instance' not in output
 
 
