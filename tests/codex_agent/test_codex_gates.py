@@ -138,7 +138,10 @@ def test_gates_share_one_budget(tmp_path):
     logged = []
     results = gates.run_gates(["npm test", "npm run typecheck"], tmp_path, 0.1,
                               slow, logged.append)
-    assert len(seen) == 1 and seen[0] <= 0.1
+    # `deadline - now` with no tick between them is the budget plus rounding:
+    # `(t + 0.1) - t` read 0.10000000000582 on Windows 3.9/3.10, whose
+    # monotonic clock advances in 15.6 ms steps.
+    assert len(seen) == 1 and seen[0] <= 0.1 + 1e-6
     assert results[0].passed
     assert results[1].exit_code is None and "budget" in results[1].output
     assert logged[-1]["skipped"] is True

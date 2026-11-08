@@ -725,9 +725,35 @@ def cmd_drop(args: argparse.Namespace) -> int:
     return 1
 
 
+class _PromptParser(argparse.ArgumentParser):
+    """Prompt words after an option reach `prompt` on every Python.
+
+    In `spawn rev --cwd X hello`, older argparse fills `name` and the
+    `nargs="*"` `prompt` from the first run of positionals, `rev` alone, so
+    `prompt` is `[]` and `hello` is left over: "unrecognized arguments:
+    hello" (measured on 3.9.x, 3.10.x, 3.11.9, 3.12.2 and 3.12.3; 3.13.7
+    defers the empty match and parses it). Here the leftover words that are not options are appended to
+    `prompt` in order, which is what the newer argparse gives; a leftover
+    option still fails as unrecognized. The subparsers are of this class too
+    (`add_subparsers` builds them with the parent's class), and it is theirs
+    that see the leftovers.
+    """
+
+    def parse_known_args(self, args=None, namespace=None):
+        namespace, extras = super().parse_known_args(args, namespace)
+        prompt = getattr(namespace, "prompt", None)
+        if isinstance(prompt, list) and extras:
+            words, options = [], []
+            for word in extras:
+                (words if word == "-" or not word.startswith("-") else options).append(word)
+            namespace.prompt = prompt + words
+            extras = options
+        return namespace, extras
+
+
 def build_parser() -> argparse.ArgumentParser:
     policy = host_policy.active()
-    parser = argparse.ArgumentParser(
+    parser = _PromptParser(
         prog="codex_agent",
         description="Run Codex CLI as a named worker; print only its answer.")
     subs = parser.add_subparsers(dest="command", required=True)

@@ -23,16 +23,23 @@ TEST_HOST = host_policy.HostPolicy()
 
 
 class CliWorkerTests(unittest.TestCase):
+    def enter(self, manager):
+        """`TestCase.enterContext`, which exists only from 3.11: the package
+        supports 3.9, and so do its tests."""
+        result = manager.__enter__()
+        self.addCleanup(manager.__exit__, None, None, None)
+        return result
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.enterContext(patch.dict("os.environ", {agent_counter.DISABLE_ENV: "0"}))
+        self.enter(patch.dict("os.environ", {agent_counter.DISABLE_ENV: "0"}))
         self.addCleanup(self.tmp.cleanup)
         self.cwd = Path(self.tmp.name)
         self.root = self.cwd / "state"
         self.store = Store(self.root)
-        self.launch = self.enterContext(patch.object(cli, "launch"))
-        self.worker_launch = self.enterContext(patch.object(worker, "launch"))
-        self.run_turn = self.enterContext(patch.object(follow_up, "run_turn", side_effect=AssertionError("Unconfigured fake turn")))
+        self.launch = self.enter(patch.object(cli, "launch"))
+        self.worker_launch = self.enter(patch.object(worker, "launch"))
+        self.run_turn = self.enter(patch.object(follow_up, "run_turn", side_effect=AssertionError("Unconfigured fake turn")))
 
     def invoke(self, *args):
         stdout, stderr = io.StringIO(), io.StringIO()

@@ -152,7 +152,7 @@ def test_network_wait_timeout_resends_same_thread(
     assert checks == [True] and pauses == [turn.SERVICE_RETRY_PAUSES_S[0]]
     resumed = [m for m in wire.received(tmp_path) if m.get("method") == "thread/resume"]
     assert len(resumed) == 1 and resumed[0]["params"]["threadId"] == "th-fake"
-    starts = [m for m in wire.received(tmp_path) if m.get("method") == "turn/start"]
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2 and starts[1]["params"]["threadId"] == "th-fake"
     prompt = starts[1]["params"]["input"][0]["text"]
     assert prompt == turn.NETWORK_RETRY_PROMPT
@@ -281,7 +281,7 @@ def test_child_wait_with_busy_main_times_out_without_resend(
     assert not outcome.network_wait_timeout
     assert outcome.network_wait_s == credit
     assert outcome.service_retries == 0 and not checks
-    assert len([m for m in wire.received(tmp_path) if m.get("method") == "turn/start"]) == 1
+    assert len(wire.turn_starts(tmp_path)) == 1
 
 
 @pytest.mark.parametrize("waiting_thread", ["main", "child"])
@@ -408,7 +408,7 @@ def test_worker_expect_reads_the_file_and_requests_a_complete_file(
     assert outcome.status == "completed" and outcome.follow_ups == 1
     assert outcome.text == report.read_text(encoding="utf-8")
     assert outcome.text.count("## Report") == 1
-    starts = [m for m in wire.received(tmp_path) if m.get("method") == "turn/start"]
+    starts = wire.turn_starts(tmp_path)
     assert len(starts) == 2
     prompt = starts[1]["params"]["input"][0]["text"]
     assert str(report) in prompt and "COMPLETE report" in prompt
@@ -2416,6 +2416,21 @@ def test_registry_round_trips_roles_and_status_keeps_old_records_unchanged(
     ]
 
 
+def test_prompt_words_after_options_parse_alike_on_every_python(capsys):
+    """Older argparse left a prompt word after an option unrecognized
+    (`cli._PromptParser`); the words keep their order wherever they sit, and
+    an unknown option is still refused."""
+    parse = cli.build_parser().parse_args
+    assert parse(["spawn", "w", "--quiet", "a", "b"]).prompt == ["a", "b"]
+    assert parse(["spawn", "w", "a", "--quiet", "b", "--effort", "high", "c"]
+                 ).prompt == ["a", "b", "c"]
+    assert parse(["send", "w", "--timeout", "5", "-"]).prompt == ["-"]
+    assert parse(["send", "w", "a", "b"]).prompt == ["a", "b"]
+    with pytest.raises(SystemExit):
+        parse(["spawn", "w", "a", "--bogus", "b"])
+    assert "unrecognized arguments: --bogus" in capsys.readouterr().err
+
+
 def test_a_mistyped_cwd_is_refused_instead_of_created(tmp_path, monkeypatch):
     """`run_turn` used to create whatever workspace it was handed, so
     `spawn rev --sandbox read-only --cwd <repo>/revieww` put a stray directory
@@ -3245,8 +3260,13 @@ def test_a_registry_failure_is_not_reported_as_a_failed_turn():
 # but cannot create one), so the round trip below is the single place both
 # halves are exercised together — and it is skipped rather than faked when the
 # exe is absent, because a green test that proved nothing is worse than a skip.
+# The counter is a Windows named pipe: off Windows `agent_counter.announce`
+# yields an empty Beacon before it opens anything, so there is nothing to pin.
+windows_counter = pytest.mark.skipif(os.name != "nt",
+                                     reason="announce is a no-op off Windows")
 
 
+@windows_counter
 def test_a_turn_tells_the_counter_that_it_started(tmp_path, monkeypatch):
     """The one thing no other test here pins: the PLACE of the announcement.
 
@@ -3286,6 +3306,7 @@ class _RecordingHandle:
         pass
 
 
+@windows_counter
 def test_a_turn_tells_the_counter_its_weekly_remainder(tmp_path, monkeypatch, capsys):
     """The figure comes off the turn's own `account/rateLimits/updated`, as
     the remainder, once per change; a report with no weekly window keeps
@@ -3302,6 +3323,7 @@ def test_a_turn_tells_the_counter_its_weekly_remainder(tmp_path, monkeypatch, ca
     assert "weekly-limit" not in capsys.readouterr().err
 
 
+@windows_counter
 def test_a_turn_without_a_weekly_figure_tells_the_counter_log_once(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv(beacon.DISABLE_ENV, raising=False)
     monkeypatch.setattr(beacon, "_week_complained", set())

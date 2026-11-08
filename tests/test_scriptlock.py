@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -79,6 +80,7 @@ sys.stdin.readline()
 """
 
 LOGGING_CHILD = """\
+import os
 from pathlib import Path
 import sys
 from llm_loop import StateFileDriver, console, cyclecore, runlifecycle, scriptlock
@@ -92,7 +94,7 @@ console.LOG_DIR = root
 args = cyclecore.parse_args(['--project-dir', str(project),
                              '--git-push', 'none', '--no-statusline'])
 runlifecycle.begin_run(StateFileDriver(), args, 'runCycle')
-print('READY', flush=True)
+print(f'READY pid={os.getpid()}', flush=True)
 sys.stdin.readline()
 """
 
@@ -126,6 +128,18 @@ class Child:
             output.append(line)
             if text in line:
                 return ''.join(output)
+
+    def ready_pid(self, output):
+        """The pid the child reported on its READY line.
+
+        Not `self.proc.pid`: under a Windows venv `sys.executable` is the
+        venv's launcher, which runs the base interpreter as a CHILD process, so
+        Popen's pid is the launcher's while the run record and the log name the
+        interpreter's own `os.getpid()` (measured in uv venvs of 3.9 and 3.13,
+        2026-11-08: the two pids differ)."""
+        match = re.search(r'READY pid=(\d+)', output)
+        assert match, output
+        return int(match.group(1))
 
     def send(self, text):
         self.proc.stdin.write(text + '\n')
@@ -269,8 +283,8 @@ def test_launch_decision_is_in_mirror_log_and_live_record(
         other.until('checking every 0.5 s')
         legacy.send('')
         legacy.wait()
-    other.until('READY')
-    record_path = tmp_path / f'runCycle-project.{other.proc.pid}.run.json'
+    pid = other.ready_pid(other.until('READY'))
+    record_path = tmp_path / f'runCycle-project.{pid}.run.json'
     decision = json.loads(record_path.read_text(encoding='utf-8'))['script_lock']
     assert decision['mode'] == mode
     assert decision['held_at_run_start'] is held
@@ -278,14 +292,14 @@ def test_launch_decision_is_in_mirror_log_and_live_record(
     assert 'live run pid' in decision['conflict']
     log = (tmp_path / 'runCycle-project.log').read_text(encoding='utf-8')
     assert f'script lock: {mode} (held when run began={held})' in log
-    assert f'pid {other.proc.pid}' in log
+    assert f'pid {pid}' in log
     assert decision['path'] in log
 
 
 def test_uncontended_launch_records_its_lock(launch, tmp_path):
     run = launch('runCycle.py', content=LOGGING_CHILD)
-    run.until('READY')
-    record_path = tmp_path / f'runCycle-project.{run.proc.pid}.run.json'
+    pid = run.ready_pid(run.until('READY'))
+    record_path = tmp_path / f'runCycle-project.{pid}.run.json'
     decision = json.loads(record_path.read_text(encoding='utf-8'))['script_lock']
     assert decision['mode'] == 'acquired'
     assert decision['held_at_run_start'] is True
