@@ -441,14 +441,24 @@ def test_stream_exits_0_when_its_reader_closes_the_pipe():
                              env={**os.environ, "PYTHONPATH": str(TOOLS)},
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        first = child.stdout.readline()
+        # A thread, so a child hanging before its first line fails within
+        # STREAM_CHILD_S instead of hanging the job.
+        lines = []
+        reader = threading.Thread(target=lambda: lines.append(child.stdout.readline()),
+                                  daemon=True)
+        reader.start()
+        reader.join(STREAM_CHILD_S)
+        first = lines[0] if lines else b""
         if not first:
-            # A child that died before its first line: the red must carry its
-            # exit code and traceback (seen once on ubuntu-latest 3.12 CI
-            # 2026-11-08, empty readline, not reproduced in 300 WSL runs).
-            child.wait(timeout=STREAM_CHILD_S)
-            err = child.stderr.read().decode(errors="replace")
-            pytest.fail(f"stream child printed nothing, exit {child.returncode}:\n{err}")
+            # A child that died (or hung) before its first line: the red must
+            # carry its exit code and traceback (seen once on ubuntu-latest
+            # 3.12 CI 2026-11-08, empty readline, not reproduced in 300 WSL
+            # runs). communicate drains stderr while it waits.
+            if not lines:
+                child.kill()
+            _, err = child.communicate(timeout=STREAM_CHILD_S)
+            pytest.fail(f"stream child printed nothing{'' if lines else ' in time'}, "
+                        f"exit {child.returncode}:\n{err.decode(errors='replace')}")
         assert json.loads(first)["load"] == 75, first
         child.stdout.close()
         child.wait(timeout=STREAM_CHILD_S)
@@ -539,6 +549,22 @@ def test_stream_reaps_child_and_stops_reader_on_every_exit(monkeypatch, capsys, 
         release.set()
         for reader in readers:
             real_thread.join(reader, STREAM_CHILD_S)
+
+
+def test_stream_does_not_pass_off_a_query_error_as_a_closed_reader(monkeypatch, capsys):
+    """Only a failed write to stdout means the reader left. An OSError from
+    PowerShell's pipe once exited 0 with an empty stderr, like a closed
+    reader: a suspect for the silent child of ubuntu CI 2026-11-08."""
+    def failing_pipe():
+        yield snapshot_line(T0, [("Idle", 0, 0)])
+        raise OSError("pipe read failed")
+
+    query = FakeStreamQuery([])
+    query.stdout = failing_pipe()
+    monkeypatch.setattr(cpu_load, "_stdout_to_devnull", lambda: None)
+    with pytest.raises(OSError, match="pipe read failed"):
+        run_stream(monkeypatch, capsys, ["--json", "--stream"], query)
+    assert query.killed and query.reaped
 
 
 @pytest.mark.parametrize("completed", [False, True], ids=["unterminated", "completed-lines"])

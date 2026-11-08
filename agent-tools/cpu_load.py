@@ -447,14 +447,20 @@ def stream(args: argparse.Namespace) -> int:
                 data = {"cpus": current.get("cpus"), "self": current.get("self"),
                         "first": previous, "second": rows}
                 try:
-                    print(json_line(*answer(data, args), args.top), flush=True)
+                    out = json_line(*answer(data, args), args.top)
                 except QueryError as exc:
                     print(f"error: {exc}", file=sys.stderr)
                     return 1
+                # Only the write to OUR stdout means the reader went away
+                # (Windows says EINVAL, not EPIPE, hence OSError). Caught
+                # around the whole loop, any other OSError exited 0 with an
+                # empty stderr -- indistinguishable from a closed reader.
+                try:
+                    print(out, flush=True)
+                except OSError:
+                    _stdout_to_devnull()
+                    return 0
             previous = rows
-    except (BrokenPipeError, OSError):
-        _stdout_to_devnull()
-        return 0
     finally:
         try:
             proc.kill()

@@ -78,6 +78,15 @@ def test_a_file_the_process_owns_is_not_renewed(tmp_path, monkeypatch, own_owner
     assert os.stat(old).st_ino == before
 
 
+def test_an_elevated_runs_directory_does_not_keep_a_stale_file(tmp_path, monkeypatch):
+    """Elevated, the project directory is owned by Administrators, one of
+    this process's own SIDs: a sandbox-owned file in it is renewed, not kept
+    as "its directory is stale too"."""
+    project, old, judge = _renewing_judge(tmp_path, monkeypatch,
+                                          own_owner=ADMINISTRATORS)
+    assert file_renewal.renew_file(old) == (True, "")
+
+
 def test_own_sids_are_the_user_and_the_default_owner(monkeypatch):
     """Off an elevated machine both token SIDs are one, so only this stub
     tells a set missing the default owner from the right one."""

@@ -141,9 +141,12 @@ def renew_file(path: Path) -> tuple[bool, str]:
     WRITE_DAC, so no `icacls /reset` — and taking ownership needs an
     elevated token. Replacing needs only DELETE, which Modify includes.
 
-    Only files that are actually stale are renewed: owned by someone other
-    than this process (`_owner_sid` outside `_own_sids`: a `CodexSandbox*`
-    account). A file the user owns gets the new capability SIDs pushed down like the
+    Only files that are actually stale are renewed: owned by another account
+    than this process (`_owner_sid` outside `_own_sids`) -- in the measured
+    case a `CodexSandbox*` account, but also e.g. Administrators for a file
+    an elevated shell once made under a non-elevated wrapper: the real user
+    has no WRITE_DAC on it either, so the new SIDs miss it the same way. A
+    file the user owns gets the new capability SIDs pushed down like the
     rest of the tree. Not renewed either: a hard link (the copy would split
     it), a read-only file (the replace fails on it), a file in a directory
     the sandbox account owns (the copy would inherit that stale list; the
@@ -171,7 +174,7 @@ def renew_file(path: Path) -> tuple[bool, str]:
         # Stale means owned by the FILE's owner, the sandbox account — not
         # "anyone but the user": a tree owned by Administrators or
         # TrustedInstaller is not the sandbox's (third review 2026-11-03).
-        return False, "its directory is stale too (owned by the sandbox account)"
+        return False, "its directory is stale too (owned by the file's owner, not this process)"
     try:
         before = os.stat(path)
     except OSError as exc:

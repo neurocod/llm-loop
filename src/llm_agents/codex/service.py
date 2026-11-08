@@ -145,6 +145,12 @@ MAX_NETWORK_WAIT_S = 2 * 60 * 60.0
 # the run; child heartbeats must not turn a working main thread's budget into
 # the two-hour main-outage allowance. Main-thread waits keep their own credit.
 MAX_CHILD_NETWORK_WAIT_S = 2 * NETWORK_WAIT_GAP_S
+# Credit is summed as differences of monotonic readings, which loses ULPs: a
+# wait that met the ceiling summed to 99.99999999999999 of 100 (ubuntu CI
+# 2026-11-08). Short of the clamp, `deadline` skipped the terminal exhaustion
+# and its `now + remaining` rounded to `now`: a RETRYABLE timeout instead.
+# A microsecond is far over that drift and far under any real wait.
+CEILING_SLACK_S = 1e-6
 
 
 class NetworkWaitTimeout(TimeoutError):
@@ -183,7 +189,8 @@ class NetworkWait:
                    if self.credited_at is not None else 0.0)
         if self.main_thread not in self.pending:
             current = min(current, max(0.0, MAX_CHILD_NETWORK_WAIT_S - self.child_s))
-        return min(MAX_NETWORK_WAIT_S, self.total_s + current)
+        total = self.total_s + current
+        return MAX_NETWORK_WAIT_S if total >= MAX_NETWORK_WAIT_S - CEILING_SLACK_S else total
 
     def _accrue(self, now: float) -> None:
         credited = self.seconds(now)

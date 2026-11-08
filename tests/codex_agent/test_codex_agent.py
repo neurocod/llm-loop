@@ -23,6 +23,7 @@ a coincidence, not the rule.
 
 import dataclasses
 import json
+import math
 import multiprocessing as mp
 import os
 import shutil
@@ -149,7 +150,9 @@ def test_network_wait_timeout_resends_same_thread(
         reachable=lambda: checks.append(True) or True, sleep=pauses.append)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.service_retries == 1
-    assert outcome.network_wait_s == pytest.approx(366)
+    # Summed monotonic differences drift by ULPs; abs keeps a lost
+    # millisecond of credit red (the default rel=1e-6 would allow 0.4 ms).
+    assert outcome.network_wait_s == pytest.approx(366, abs=1e-9)
     assert checks == [True] and pauses == [turn.SERVICE_RETRY_PAUSES_S[0]]
     resumed = [m for m in wire.received(tmp_path) if m.get("method") == "thread/resume"]
     assert len(resumed) == 1 and resumed[0]["params"]["threadId"] == "th-fake"
@@ -182,7 +185,7 @@ def test_network_wait_ceiling_is_shared_by_resends(
         reachable=lambda: True, sleep=lambda _: None)
     assert outcome.status == "failed" and outcome.service_retries == 1
     assert "no network for 10.0 min (wait limit reached)" in outcome.error
-    assert outcome.network_wait_s == pytest.approx(600)
+    assert outcome.network_wait_s == 600
 
 
 def test_network_wait_recovery_keeps_only_elapsed_credit():
@@ -213,9 +216,23 @@ def test_network_wait_completion_at_ceiling_keeps_answer(
         reachable=lambda: checks.append(True), sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.text == "complete answer"
-    # Credit is summed piecewise on a clock based at the real monotonic()
-    # value, so the total may land an ULP short of the clamp.
-    assert outcome.network_wait_s == pytest.approx(100) and not checks
+    # Exact: a total an ULP short of the ceiling is the ceiling
+    # (service.CEILING_SLACK_S).
+    assert outcome.network_wait_s == 100 and not checks
+
+
+def test_network_wait_an_ulp_short_of_the_ceiling_is_exhausted():
+    """ubuntu CI 2026-11-08 summed a wait that met the ceiling to an ULP short
+    of it; that must still end the turn as exhausted, not as a resendable
+    timeout through a deadline that rounds to `now`."""
+    wait = service.NetworkWait(main_thread=LOGGED_NETWORK_WAIT["params"]["threadId"])
+    now = 1_000_000.0
+    wait.observe(LOGGED_NETWORK_WAIT, now, "2026-11-08 12:00:00")
+    wait.total_s = math.nextafter(service.MAX_NETWORK_WAIT_S, 0.0)
+    assert wait.seconds(now) == service.MAX_NETWORK_WAIT_S
+    with pytest.raises(service.NetworkWaitTimeout) as raised:
+        wait.deadline(0.0, 0.0, now)
+    assert raised.value.exhausted
 
 
 @pytest.mark.parametrize("gap", [366.0, 128.0])
