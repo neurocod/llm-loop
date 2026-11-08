@@ -3,10 +3,11 @@ import json
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 
-from llm_loop import (codex_usage, compactline, console, ctrlc, cyclecore,
+from llm_loop import (appserver, codex_usage, compactline, console, ctrlc, cyclecore,
                       limits, parallel, providers, statusline, streamrender,
                       textwidth, wire)
 from llm_loop.agentwork import AgentCommand, Driver
@@ -326,7 +327,7 @@ def test_codex_process_bills_nested_agents_but_streams_only_the_root_turn():
     raw = _FakeAgentProcess(
         stdout="".join(json.dumps(message) + "\n" for message in messages))
     proc = providers._CodexAppProcess(
-        raw, [], thread_id="root-thread", turn_id="root-turn")
+        appserver.Connection(raw), [], thread_id="root-thread", turn_id="root-turn")
 
     context = next(proc.stdout)
     item = next(proc.stdout)
@@ -358,7 +359,7 @@ def test_codex_app_events_arrive_as_objects_and_diagnostics_as_lines():
     """No dumps/loads round trip between the provider and its renderers."""
     raw = _FakeAgentProcess(stdout=_app_server_stream(
         "npm warn deprecated\n", "[1]\n", _ROOT_MESSAGE))
-    proc = providers._CodexAppProcess(raw, [], "root", "turn")
+    proc = providers._CodexAppProcess(appserver.Connection(raw), [], "root", "turn")
 
     assert next(proc.stdout) == "npm warn deprecated\n"
     assert next(proc.stdout) == "[1]\n"
@@ -386,7 +387,7 @@ def test_a_json_non_object_is_a_diagnostic_in_both_renderers(
     """Printed live by one renderer, kept in the failure tail by the other."""
     raw = _FakeAgentProcess(returncode=1, stdout=_app_server_stream(
         "[1, 2, 3]\n", _ROOT_MESSAGE))
-    proc = providers._CodexAppProcess(raw, [], "root", "turn")
+    proc = providers._CodexAppProcess(appserver.Connection(raw), [], "root", "turn")
     monkeypatch.setattr(streamrender, "start_agent_process", lambda *a: proc)
     monkeypatch.setattr(parallel, "start_agent_process", lambda *a: proc)
 
@@ -404,7 +405,7 @@ def test_both_renderers_take_codex_app_events_as_objects(
     """The object path keeps diagnostics, raw JSONL and the outcome alike."""
     raw = _FakeAgentProcess(returncode=1, stdout=_app_server_stream(
         "provider said: boom\n", _ROOT_MESSAGE))
-    proc = providers._CodexAppProcess(raw, [], "root", "turn")
+    proc = providers._CodexAppProcess(appserver.Connection(raw), [], "root", "turn")
     monkeypatch.setattr(streamrender, "start_agent_process", lambda *a: proc)
     monkeypatch.setattr(parallel, "start_agent_process", lambda *a: proc)
 
@@ -624,21 +625,40 @@ def test_codex_context_reaches_status_before_turn_ends(monkeypatch, runner):
                            "total": {"totalTokens": 9_000_000},
                            "modelContextWindow": 258_400}}}) + "\n"
 
+    # The source runs on the connection's pump thread, which reads ahead of
+    # the renderer: each check first waits for the renderer to ask for the
+    # NEXT item (`_Lockstep`), so everything before it has been rendered.
+    # A failed check is recorded, not raised — raised there it would only
+    # end the pump thread.
+    failures = []
+    started = threading.Event()
+    holder = []
+
+    def check(asked, label, actual, expected):
+        holder[0].until_asked(asked)
+        if actual() != expected:
+            failures.append(f"{label}: {actual()!r} != {expected!r}")
+
     def source():
+        started.wait(10)
         yield usage(88_764)
-        assert job.snapshot().context_label() == "ctx 88k/258k (34%)"
+        check(2, "root reading", lambda: job.snapshot().context_label(),
+              "ctx 88k/258k (34%)")
         yield usage(240_000, thread="child", turn="child-turn")
         yield usage(240_000, turn="old-turn")
-        assert job.context_tokens == 88_764
+        check(4, "foreign readings", lambda: job.context_tokens, 88_764)
         yield usage(20_000)
-        assert job.snapshot().context_label() == "ctx 20k/258k (8%)"
+        check(5, "next root reading", lambda: job.snapshot().context_label(),
+              "ctx 20k/258k (8%)")
         yield json.dumps({"method": "turn/completed", "params": {
             "threadId": "root", "turn": {"id": "turn", "status": "completed"}
         }}) + "\n"
 
     raw = _FakeAgentProcess(has_stdin=True)
     raw.stdout = source()
-    proc = providers._CodexAppProcess(raw, [], "root", "turn")
+    holder.append(_Lockstep(raw))
+    started.set()
+    proc = providers._CodexAppProcess(holder[0], [], "root", "turn")
     monkeypatch.setattr(streamrender, "start_agent_process", lambda *a: proc)
     monkeypatch.setattr(parallel, "start_agent_process", lambda *a: proc)
     with statusline.describing(job):
@@ -648,6 +668,29 @@ def test_codex_context_reaches_status_before_turn_ends(monkeypatch, runner):
         else:
             assert streamrender.run_agent_streaming(
                 ["codex"], "codex", raw=runner == "raw") == 0
+    assert failures == []
+    assert holder[0].asked >= 5, "the source was not read to its end"
+
+
+class _Lockstep(appserver.Connection):
+    """A connection that counts the reader's requests for an item."""
+
+    def __init__(self, proc):
+        self.asked = 0
+        self._asked = threading.Condition()
+        super().__init__(proc)
+
+    def take(self, deadline, what):
+        with self._asked:
+            self.asked += 1
+            self._asked.notify_all()
+        return super().take(deadline, what)
+
+    def until_asked(self, count):
+        with self._asked:
+            # 10 s: the renderer handles an item in milliseconds; this bounds
+            # a loaded machine, and a miss is reported, never hung on.
+            self._asked.wait_for(lambda: self.asked >= count, timeout=10)
 
 
 @pytest.mark.parametrize("tokens,window,expected", [

@@ -18,17 +18,15 @@ and the second is the larger half:
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import json
 import os
 import shutil
 import subprocess
-import threading
 from typing import Iterator, Optional, Protocol
 
-from . import ctrlc, operator, wire
+from . import appserver, ctrlc, operator, wire
 from .codex_usage import CodexUsageSource
 from .operator import user_message_line
-from .procend import ask_agent_process_to_end, end_process_tree
+from .procend import ask_agent_process_to_end, end_unless_exited
 from .usage import UsageSource
 
 
@@ -102,33 +100,9 @@ class _CodexArgv(list):
         self.sandbox_mode = sandbox_mode
 
 
+# The bound on a note's acknowledgement (`turn/steer`): the server answers it
+# at once while the turn runs, so a longer wait is a turn already ending.
 APP_SERVER_RESPONSE_TIMEOUT = 15.0
-
-
-def _write_app_message(stream, message: dict) -> None:
-    stream.write(json.dumps(message, separators=(",", ":")) + "\n")
-    stream.flush()
-
-
-def _read_app_response(proc, request_id: int, buffered: list) -> dict:
-    """Read one startup response, preserving notifications for the renderer."""
-    for line in proc.stdout:
-        try:
-            message = json.loads(line)
-        except (TypeError, ValueError):
-            buffered.append(line)
-            continue
-        if not isinstance(message, dict):
-            buffered.append(line)
-            continue
-        if wire.codex_rpc_response_id(message) != request_id:
-            buffered.append(line)
-            continue
-        error = wire.codex_rpc_error(message)
-        if error:
-            raise RuntimeError(error)
-        return wire.codex_rpc_result(message)
-    raise RuntimeError("codex app-server closed before replying")
 
 
 class _CodexSteerStream:
@@ -160,7 +134,6 @@ class _CodexEventStream:
     def __init__(self, owner, buffered: list):
         self._owner = owner
         self._buffered = iter(buffered)
-        self._source = iter(owner._proc.stdout)
         # Each thread's latest cumulative reading (`wire.codex_app_token_usage`)
         # — the main thread's and every sub-agent's: the turn's usage is their
         # sum, so a review that delegated half its work bills that half too.
@@ -169,24 +142,26 @@ class _CodexEventStream:
     def __iter__(self):
         return self
 
+    def _next_item(self):
+        try:
+            return next(self._buffered)
+        except StopIteration:
+            pass
+        connection = self._owner.connection
+        try:
+            return connection.take(None, "turn")
+        except appserver.Closed:
+            connection.fail_pending("codex app-server closed")
+            raise StopIteration from None
+
     def __next__(self):
         while True:
-            try:
-                line = next(self._buffered)
-            except StopIteration:
-                try:
-                    line = next(self._source)
-                except StopIteration:
-                    self._owner.fail_pending("codex app-server closed")
-                    raise
-            try:
-                message = json.loads(line)
-            except (TypeError, ValueError):
-                return line
+            message = self._next_item()
             if not isinstance(message, dict):
-                return line
-            if wire.codex_rpc_response_id(message) is not None:
-                self._owner.resolve_response(message)
+                return message
+            if appserver.response_id(message) is not None:
+                # A note's acknowledgement (`steer`), or a stale reply.
+                self._owner.connection.resolve(message)
                 continue
             if wire.codex_app_from_sub_agent(message, self._owner.thread_id):
                 # A sub-agent's tokens are billed; nothing else of it reaches
@@ -208,26 +183,26 @@ class _CodexEventStream:
             self._usage_by_thread[wire.codex_app_event_thread(message)] = usage
 
     def close(self) -> None:
-        try:
-            self._owner._proc.stdout.close()
-        except (OSError, ValueError):
-            pass
+        """Nothing to close: the connection's pump owns the read end and
+        closes it at EOF (`appserver.Connection._pump_stdout`). It also keeps
+        the pipe drained, so the child is never left blocked on a write."""
 
 
 class _CodexAppProcess:
     """Popen-compatible app-server process with a steering channel."""
 
-    def __init__(self, proc, buffered: list, thread_id: str, turn_id: str):
-        self._proc = proc
+    def __init__(self, connection: appserver.Connection, buffered: list,
+                 thread_id: str, turn_id: str):
+        self.connection = connection
+        self._proc = connection.proc
         self.thread_id = thread_id
         self.turn_id = turn_id
-        self._write_lock = threading.Lock()
-        self._pending_lock = threading.Lock()
-        self._pending = {}
-        self._next_request_id = 3
-        self.input_closed = False
         self.stdin = _CodexSteerStream(self)
         self.stdout = _CodexEventStream(self, buffered)
+
+    @property
+    def input_closed(self) -> bool:
+        return self.connection.input_closed
 
     @property
     def pid(self):
@@ -250,59 +225,25 @@ class _CodexAppProcess:
         return self._proc.kill()
 
     def steer(self, text: str) -> None:
-        with self._pending_lock:
-            if self.input_closed:
-                raise OSError("the turn is over")
-            request_id = self._next_request_id
-            self._next_request_id += 1
-            pending = {"event": threading.Event(), "failure": ""}
-            self._pending[request_id] = pending
+        """Send a note into the running turn; `OSError` when it did not land.
+
+        Sent from the console's thread while the renderer reads: the
+        acknowledgement is settled by that reader (`_CodexEventStream`)."""
+        connection = self.connection
         try:
-            with self._write_lock:
-                if self.input_closed:
-                    raise OSError("the turn is over")
-                _write_app_message(
-                    self._proc.stdin,
-                    wire.codex_app_turn_steer(
-                        request_id, self.thread_id, self.turn_id, text),
-                )
-        except BaseException:
-            with self._pending_lock:
-                self._pending.pop(request_id, None)
-            raise
-        if not pending["event"].wait(APP_SERVER_RESPONSE_TIMEOUT):
-            with self._pending_lock:
-                self._pending.pop(request_id, None)
+            pending = connection.start_request(wire.codex_app_turn_steer(
+                None, self.thread_id, self.turn_id, text))
+        except appserver.InputClosed:
+            raise OSError("the turn is over") from None
+        if not pending.wait(APP_SERVER_RESPONSE_TIMEOUT):
+            connection.forget(pending)
             raise OSError("codex app-server did not acknowledge the note")
-        if pending["failure"]:
-            raise OSError(pending["failure"])
-
-    def resolve_response(self, message: dict) -> None:
-        request_id = wire.codex_rpc_response_id(message)
-        with self._pending_lock:
-            pending = self._pending.pop(request_id, None)
-        if pending is None:
-            return
-        pending["failure"] = wire.codex_rpc_error(message)
-        pending["event"].set()
-
-    def fail_pending(self, error: str) -> None:
-        with self._pending_lock:
-            pending, self._pending = self._pending, {}
-        for response in pending.values():
-            response["failure"] = error
-            response["event"].set()
+        if pending.failure:
+            raise OSError(pending.failure)
 
     def close_input(self) -> None:
-        with self._write_lock:
-            if self.input_closed:
-                return
-            self.input_closed = True
-            try:
-                self._proc.stdin.close()
-            except (BrokenPipeError, OSError, ValueError):
-                pass
-        self.fail_pending("the turn is over")
+        self.connection.close_input()
+        self.connection.fail_pending("the turn is over")
 
 
 def _console_isolation() -> dict:
@@ -330,43 +271,48 @@ def _console_isolation() -> dict:
 
 
 def _start_codex_app_server(argv: list, prompt: str, project_dir: str):
+    """Open the app-server's thread and turn; return the process streaming it.
+
+    Every startup reply is awaited within `appserver.STARTUP_TIMEOUT_S`, and
+    whatever the server says meanwhile is kept, in order, for the renderer."""
     options = argv if isinstance(argv, _CodexArgv) else None
     app_argv = [argv[0], "app-server", "--stdio"]
-    proc = subprocess.Popen(
-        runtime_argv(app_argv, "codex"),
-        cwd=project_dir,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        **_console_isolation(),
-    )
+    proc = appserver.spawn(runtime_argv(app_argv, "codex"), cwd=project_dir,
+                           merge_stderr=True, **_console_isolation())
+    connection = None
     buffered = []
+
+    def opener(body: dict) -> dict:
+        return connection.request(body, appserver.STARTUP_TIMEOUT_S,
+                                  on_other=buffered.append)
+
     try:
-        _write_app_message(proc.stdin, wire.codex_app_initialize(0))
-        _read_app_response(proc, 0, buffered)
-        _write_app_message(proc.stdin, wire.codex_app_initialized())
-        _write_app_message(proc.stdin, wire.codex_app_thread_start(
-            1, project_dir,
+        connection = appserver.Connection(proc)
+        opener(wire.codex_app_initialize(None))
+        connection.send(wire.codex_app_initialized())
+        thread = opener(wire.codex_app_thread_start(
+            None, project_dir,
             options.model if options is not None else "",
             options.sandbox_mode if options is not None else "",
         ))
-        thread = _read_app_response(proc, 1, buffered)
         thread_id = wire.codex_app_thread_id(thread)
         if not thread_id:
             raise RuntimeError("codex app-server returned no thread id")
-        _write_app_message(proc.stdin,
-                           wire.codex_app_turn_start(2, thread_id, prompt))
-        turn = _read_app_response(proc, 2, buffered)
+        turn = opener(wire.codex_app_turn_start(None, thread_id, prompt))
         turn_id = wire.codex_app_turn_id(turn)
         if not turn_id:
             raise RuntimeError("codex app-server returned no turn id")
-        return _CodexAppProcess(proc, buffered, thread_id, turn_id)
+        return _CodexAppProcess(connection, buffered, thread_id, turn_id)
     except BaseException:
-        reap_agent_process(proc)
+        # Not `reap_agent_process`: it closes stdout first, and with the pump
+        # inside `readline` that close blocks (`appserver._pump_stdout`).
+        try:
+            if connection is not None:
+                connection.close()
+            else:
+                end_unless_exited(proc)
+        except KeyboardInterrupt:
+            pass
         raise
 
 
@@ -630,12 +576,7 @@ def _reap(proc) -> None:
             proc.stdout.close()
         except OSError:
             pass
-    try:
-        if proc.poll() is not None:
-            return
-    except OSError:
-        return  # the handle is gone; there is nothing left to end
-    end_process_tree(proc)
+    end_unless_exited(proc)
 
 
 def build_agent_argv(command: AgentCommandLike, provider: str,

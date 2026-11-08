@@ -120,7 +120,7 @@ def test_run_gate_reaps_the_process_when_the_wait_is_interrupted(
     proc = _Proc()
     reaped = []
     monkeypatch.setattr(gates.subprocess, "Popen", lambda *a, **k: proc)
-    monkeypatch.setattr(gates, "_reap", reaped.append)
+    monkeypatch.setattr(gates, "end_unless_exited", reaped.append)
     with pytest.raises(KeyboardInterrupt):
         gates.run_gate("npm test", tmp_path, 60.0)
     assert reaped == [proc]

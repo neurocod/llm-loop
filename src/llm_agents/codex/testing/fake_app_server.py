@@ -443,6 +443,15 @@ def on_interrupt(request_id, params):
 
 
 def run_turn():
+    if SCENARIO in ("loop-turn", "id-clash"):
+        # The loop's provider stream reads only notifications that name its
+        # turn (`wire.codex_app_in_turn`), as the real server's all do.
+        scoped = {"threadId": "th-fake", "turnId": "t1"}
+        note("item/completed", {**scoped, "item": {
+            "id": "m1", "type": "agentMessage", "text": "fake answer"}})
+        note("turn/completed", {"threadId": "th-fake", "turn": {
+            "id": "t1", "status": "completed"}})
+        return
     if SCENARIO in LIVE_CHILD_SCENARIOS:
         live_child_turn()
         return
@@ -770,9 +779,17 @@ def main():
         method = msg.get("method")
         request_id = msg.get("id")
         if method == "initialize":
+            if SCENARIO == "mute-initialize":
+                continue  # a CLI that starts and never answers
             out({"jsonrpc": "2.0", "id": request_id,
                  "result": {"userAgent": "fake-app-server"}})
         elif method in ("thread/start", "thread/resume"):
+            if SCENARIO == "id-clash":
+                # A request of the server's own, numbered by ITS counter,
+                # that happens to carry the id the client awaits; asked
+                # without waiting, as a client may leave it unanswered.
+                out({"jsonrpc": "2.0", "id": request_id,
+                     "method": "item/tool/requestUserInput", "params": {}})
             note("thread/started", {"thread": {"id": "th-fake"}})
             out({"jsonrpc": "2.0", "id": request_id,
                  "result": {"thread": {"id": "th-fake"}}})
@@ -796,8 +813,9 @@ def main():
             with open(os.path.join(WORK, "roots_at_turn_start.json"), "w",
                       encoding="utf-8") as handle:
                 json.dump({root: os.path.isdir(root) for root in roots}, handle)
-            out({"jsonrpc": "2.0", "id": request_id, "result": {}})
-            TURN_TEXT = " ".join(str(part.get("text") or "") for part in
+            out({"jsonrpc": "2.0", "id": request_id,
+                 "result": {"turn": {"id": "t1", "status": "inProgress"}}})
+            TURN_TEXT =" ".join(str(part.get("text") or "") for part in
                                  (msg.get("params") or {}).get("input") or [])
             run_turn()
         elif method == "turn/interrupt":

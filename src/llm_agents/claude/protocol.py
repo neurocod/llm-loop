@@ -239,7 +239,7 @@ def child_environment(*, review: bool = False) -> dict[str, str]:
 def _end_child(proc: subprocess.Popen) -> None:
     """End the CLI child owned by this live Popen, never a persisted PID:
     bounded and never raising (`finally` blocks call it). The escalation is
-    `llm_loop.procend.end_process_tree`, as in `codex.protocol._reap`; this
+    `llm_loop.procend.end_process_tree`, as in `procend.end_unless_exited`; this
     keeps only its own prologue. On POSIX the child leads its own session
     (`start_new_session`), and a tool holding stdout can outlive a leader
     that already exited: `killpg` reaches the group either way. On Windows

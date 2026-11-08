@@ -17,7 +17,7 @@ not fail — it passes while the real code runs, which for these tests means
 spending a real Codex turn per run.
 
 Where a name's definer and its only consumer are the same module
-(`protocol.subprocess`, `registry.LOCK_WAIT_S`), both readings coincide; that is
+(`protocol._server_argv`, `registry.LOCK_WAIT_S`), both readings coincide; that is
 a coincidence, not the rule.
 """
 
@@ -43,6 +43,7 @@ from llm_agents.codex import (
     registry as registry_module, sandbox, service, subagent_wait, subagents,
     turn,
 )
+from llm_loop import appserver
 from llm_agents import agent_counter as beacon
 from llm_agents import host_policy
 from llm_agents.answer_contract import followed_up_note
@@ -71,9 +72,9 @@ def network_clock(monkeypatch):
     """
     now = [time.monotonic()]
     clock = SimpleNamespace(monotonic=lambda: now[0], strftime=time.strftime)
-    for module in (turn, protocol, subagent_wait):
+    for module in (turn, appserver, subagent_wait):
         monkeypatch.setattr(module, "time", clock)
-    original_take = protocol.AppServer._take
+    original_take = appserver.Connection.take
 
     def timed_take(server, deadline, what):
         message = getattr(server, "_test_pending_message", None)
@@ -94,7 +95,7 @@ def network_clock(monkeypatch):
         server._test_pending_message = None
         return message
 
-    monkeypatch.setattr(protocol.AppServer, "_take", timed_take)
+    monkeypatch.setattr(appserver.Connection, "take", timed_take)
     original = TurnRunner.on_event
     progress = []
 

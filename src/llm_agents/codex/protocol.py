@@ -4,21 +4,23 @@ Everything here is about the protocol and the child process that speaks it — n
 registry, no CLI. The names and reply shapes were taken from the schema bundle
 that `codex app-server generate-json-schema` prints, not guessed: a wrong one is
 accepted in silence and shows up as a turn that never completes.
+
+The transport itself — spawn, line-delimited JSON-RPC, id correlation and the
+ending — is `llm_loop.appserver`, shared with the loop's provider process; this
+module adds what an unattended agent needs on top: approvals, the edit judge's
+bookkeeping, and the names of the thread and turn methods.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import queue
 import shutil
-import subprocess
-import threading
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from llm_loop.procend import REAP_GRACE_S, end_process_tree
+from llm_loop import appserver
+from llm_loop.appserver import STARTUP_TIMEOUT_S
+from llm_loop.procend import REAP_GRACE_S
 
 # --- protocol names -------------------------------------------------------
 # Spelled out rather than inlined because a typo in any of them shows up as a
@@ -65,12 +67,8 @@ NOISY_NOTIFICATIONS = [
     "process/outputDelta",
 ]
 
-# The handshake and the thread/turn openers are answered in well under a second
-# by a healthy server; a separate, short bound keeps a misconfigured CLI from
-# looking like a slow model.
-STARTUP_TIMEOUT_S = 60.0
-
-# `REAP_GRACE_S` (imported above) bounds each step of ending the server.
+# `STARTUP_TIMEOUT_S` (imported above) bounds each handshake and opener
+# request; `REAP_GRACE_S` bounds each step of ending the server.
 
 
 # What to reply to each server-initiated request, per method. THREE DIFFERENT
@@ -172,33 +170,17 @@ def _codex_executable() -> str:
     return exe
 
 
-def _reap(proc: subprocess.Popen) -> None:
-    """End a child, aiming past the npm shim on Windows.
-
-    On Windows `codex` on PATH is `codex.cmd`, so the handle we hold is
-    `cmd.exe` and the real CLI is a GRANDCHILD: `terminate()` would leave it
-    running, still holding the pipes. `taskkill /T` reaches the tree. The
-    escalation — ask, wait, kill, wait, each bounded by `REAP_GRACE_S` — is
-    `llm_loop.procend.end_process_tree`, the one copy every owner of a
-    provider child shares; this keeps only its own prologue: a child that has
-    already exited is left alone.
-
-    Nothing here may raise: it runs from `finally` blocks, where an exception
-    would replace the one being unwound (`end_process_tree` absorbs every
-    `OSError`; a `KeyboardInterrupt` still propagates, as it always did).
-    """
-    if proc.poll() is not None:
-        return
-    end_process_tree(proc)
+def _server_argv() -> list[str]:
+    """The command line of the server: on Windows `codex` on PATH is the npm
+    shim `codex.cmd`, whose tree `appserver.Connection.close` ends."""
+    return [_codex_executable(), "app-server", "--stdio"]
 
 
 class AppServer:
     """One `codex app-server --stdio` process, spoken to over JSON-RPC.
 
-    Reading happens on a worker thread feeding a queue, so every wait in this
-    class can carry a timeout. A blocking `readline()` cannot: a server that
-    dies mid-turn, or a model that stalls, would hang the caller forever with no
-    way to report which of the two happened.
+    The reading, the waits and their timeouts are `appserver.Connection`'s;
+    this class decides what every message read means to an unattended agent.
     """
 
     def __init__(self, cwd: Path, log: Optional[Callable[[dict], None]] = None,
@@ -218,83 +200,33 @@ class AppServer:
         # One entry per fileChange approval answered, as logged — the turn
         # summary reads the declined ones (`turn._run_turn_logged`).
         self.file_decisions: list[dict] = []
-        self._next_id = 0
-        self._proc = subprocess.Popen(
-            [_codex_executable(), "app-server", "--stdio"],
-            cwd=str(cwd),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+        self._connection = appserver.Connection(appserver.spawn(
+            _server_argv(), cwd=str(cwd),
             env={**os.environ, **getattr(approve, "environment", {})},
-        )
-        self._inbox: "queue.Queue[Optional[dict]]" = queue.Queue()
-        self.stderr_lines: list[str] = []
-        self.finished = False  # the child's stdout reached EOF
-        threading.Thread(target=self._pump_stdout, daemon=True).start()
-        threading.Thread(target=self._pump_stderr, daemon=True).start()
+        ), first_id=1)
 
-    # -- plumbing
+    @property
+    def stderr_lines(self) -> list[str]:
+        return self._connection.stderr_lines
 
-    def _pump_stdout(self) -> None:
-        try:
-            for line in self._proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    self._inbox.put(json.loads(line))
-                except ValueError:
-                    self._inbox.put({"_raw": line})
-        except (OSError, ValueError):
-            pass
-        finally:
-            self._inbox.put(None)  # end of stream sentinel
-
-    def _pump_stderr(self) -> None:
-        try:
-            for line in self._proc.stderr:
-                line = line.rstrip()
-                if line:
-                    self.stderr_lines.append(line)
-        except (OSError, ValueError):
-            pass
-
-    def _send(self, message: dict) -> None:
-        self._proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-        self._proc.stdin.flush()
+    @property
+    def finished(self) -> bool:
+        """Whether the server's stdout has reached EOF (`Connection.take`)."""
+        return self._connection.finished
 
     def notify(self, method: str, params: Optional[dict] = None) -> None:
-        self._send({"jsonrpc": "2.0", "method": method, "params": params or {}})
+        self._connection.send(appserver.message(method, params))
 
     def request(self, method: str, params: Optional[dict] = None,
                 timeout: float = STARTUP_TIMEOUT_S,
                 on_event: Optional[Callable[[dict], None]] = None) -> dict:
         """Send a request and return its result, feeding events to `on_event`.
 
-        Notifications and server-initiated requests keep arriving while we wait,
-        so the wait cannot simply discard traffic: the server BLOCKS on an
-        approval request until it is answered, and a discarded one is a turn
-        that never ends.
-        """
-        self._next_id += 1
-        request_id = self._next_id
-        self._send({"jsonrpc": "2.0", "id": request_id,
-                    "method": method, "params": params or {}})
-        deadline = time.monotonic() + timeout
-        while True:
-            message = self._take(deadline, method)
-            if message.get("id") == request_id and "method" not in message:
-                error = message.get("error")
-                if error:
-                    detail = error.get("message") if isinstance(error, dict) else error
-                    raise RuntimeError(f"{method} failed: {detail}")
-                result = message.get("result")
-                return result if isinstance(result, dict) else {}
-            self._dispatch(message, on_event)
+        Notifications and server-initiated requests keep arriving while we
+        wait, and each is routed as it comes (`Connection.request`)."""
+        return self._connection.request(
+            appserver.message(method, params), timeout,
+            on_other=lambda item: self._received(item, on_event))
 
     def send_request(self, method: str, params: Optional[dict] = None) -> int:
         """Send a request without waiting for its answer; return its id.
@@ -303,33 +235,25 @@ class AppServer:
         (`turn/interrupt`: the reply comes as the turn aborts, just before its
         `turn/completed`, which is what the caller waits for): the reply is
         then one of the stale responses `_dispatch` logs and drops."""
-        self._next_id += 1
-        self._send({"jsonrpc": "2.0", "id": self._next_id,
-                    "method": method, "params": params or {}})
-        return self._next_id
+        return self._connection.send_request(appserver.message(method, params))
 
     def pump(self, deadline: float, on_event: Callable[[dict], None]) -> None:
         """Read exactly one incoming message and route it."""
-        self._dispatch(self._take(deadline, "turn"), on_event)
+        self._received(self._connection.take(deadline, "turn"), on_event)
 
-    def _take(self, deadline: float, what: str) -> dict:
-        timeout = max(0.0, deadline - time.monotonic())
-        try:
-            message = self._inbox.get(timeout=timeout)
-        except queue.Empty:
-            raise TimeoutError(f"codex app-server did not answer {what} in time")
-        if message is None:
-            # The sentinel arrives once. Record that the stream is over so a
-            # caller that catches this failure (the best-effort name/set) can
-            # tell "the server rejected my request" from "the server is gone",
-            # and put the sentinel back for whoever waits next.
-            self.finished = True
-            self._inbox.put(None)
-            tail = "; ".join(self.stderr_lines[-3:])
-            raise RuntimeError(
-                f"codex app-server closed the connection during {what}"
-                + (f" (stderr: {tail})" if tail else ""))
-        return message
+    def _received(self, item: appserver.Item,
+                  on_event: Optional[Callable[[dict], None]]) -> None:
+        """Route one item read: a line that is not a JSON object is logged as
+        `{"_raw": ...}`, a blank one dropped."""
+        if isinstance(item, str):
+            line = item.strip()
+            if not line:
+                return
+            item = {"_raw": line}
+        self._dispatch(item, on_event)
+
+    def _send(self, message: dict) -> None:
+        self._connection.send(message)
 
     def _dispatch(self, message: dict, on_event: Optional[Callable[[dict], None]]) -> None:
         self._log(message)
@@ -440,11 +364,7 @@ class AppServer:
         return answer
 
     def close(self) -> None:
-        try:
-            self._proc.stdin.close()
-        except (OSError, ValueError):
-            pass
-        _reap(self._proc)
+        self._connection.close()
         cleanup = getattr(self._approve, "close", None)
         if cleanup is not None:
             cleanup()

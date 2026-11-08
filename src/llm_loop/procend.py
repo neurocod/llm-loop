@@ -57,6 +57,21 @@ def ask_agent_process_to_end(proc) -> None:
         pass  # it died between the poll and here; `wait` below collects it
 
 
+def end_unless_exited(proc) -> None:
+    """`end_process_tree`, unless the child has already exited.
+
+    `poll()` is guarded too: on Windows it raises `OSError` on a handle the OS
+    has already reclaimed, and then there is nothing left to end. Never raises
+    `OSError`, like the escalation it fronts.
+    """
+    try:
+        if proc.poll() is not None:
+            return
+    except OSError:
+        return
+    end_process_tree(proc)
+
+
 def end_process_tree(proc) -> None:
     """Ask the child (tree) to end, wait, kill, wait — bounded, never raises.
 

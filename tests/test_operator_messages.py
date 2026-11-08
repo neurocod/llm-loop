@@ -19,7 +19,7 @@ import threading
 
 import pytest
 
-from llm_loop import (cyclecore, operator, parallel, providers, runlifecycle,
+from llm_loop import (appserver, cyclecore, operator, parallel, providers, runlifecycle,
                       streamrender, textwidth, wire)
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
@@ -230,7 +230,7 @@ class _RawAppServer:
 def test_a_codex_note_uses_turn_steer_and_its_replay_is_logged(capsys):
     raw = _RawAppServer()
     proc = providers._CodexAppProcess(
-        raw, [], thread_id="thread-1", turn_id="turn-1")
+        appserver.Connection(raw), [], thread_id="thread-1", turn_id="turn-1")
     mailbox = operator.Mailbox()
     delivered = []
 

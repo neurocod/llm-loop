@@ -27,7 +27,7 @@ from typing import Callable, Optional
 
 from ..host_policy import active as host_policy
 from .events import GATE_META
-from .protocol import _reap
+from llm_loop.procend import end_unless_exited
 
 # A heading named Gates, at any level; the section runs to the next heading of
 # the same level or higher. Trailing words are allowed ("## Gates (all green
@@ -215,7 +215,7 @@ def run_gate(command: str, cwd: Path, timeout: float) -> GateRun:
             # interrupt never reaches it, and a test or bake left running keeps
             # editing the shared tree after the wrapper is gone.
             if code is None:
-                _reap(proc)
+                end_unless_exited(proc)
         sink.seek(0)
         output = sink.read().decode("utf-8", "replace") + note
     return GateRun(command, str(cwd), code, output, time.monotonic() - started)

@@ -17,7 +17,6 @@ the fixtures themselves live in `fixtures` beside this module.
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -78,30 +77,25 @@ NETWORK_WAIT_TIMES = [1794038271329, 1794038334670, 1794038398202,
                       1794038461795, 1794038525197]
 
 
+def fake_server_argv(tmp_path: Path, scenario: str) -> list:
+    """The command line that runs the stand-in playing `scenario`, from a copy
+    in `tmp_path` (where it also writes `received.jsonl`)."""
+    script = tmp_path / "fake_app_server.py"
+    script.write_text(FAKE_APP_SERVER, encoding="utf-8")
+    return [sys.executable, str(script), scenario, str(tmp_path),
+            DROPPED_TURN_MESSAGE,
+            json.dumps([LOGGED_NETWORK_WAIT, NETWORK_WAIT_TIMES])]
+
+
 def install_fake_server(monkeypatch: Any, tmp_path: Path, scenario: str) -> None:
     """Point AppServer at the stand-in instead of the real CLI.
 
-    Only `Popen` is swapped, and only inside `llm_agents.codex.protocol` (the module
-    that starts the child): `_reap` needs the real `subprocess.run`/exception
-    classes, and a global patch of the stdlib module would leak into anything
-    else running in this interpreter.
+    Only the command line is swapped (`protocol._server_argv`): the child is
+    still started, read and ended by the real transport, `llm_loop.appserver`,
+    which the loop's provider process shares.
     """
-    script = tmp_path / "fake_app_server.py"
-    script.write_text(FAKE_APP_SERVER, encoding="utf-8")
-
-    class _SubprocessShim:
-        def __getattr__(self, name):
-            return getattr(subprocess, name)
-
-        def Popen(self, argv, **kwargs):
-            assert argv[1:] == ["app-server", "--stdio"]
-            return subprocess.Popen(
-                [sys.executable, str(script), scenario, str(tmp_path),
-                 DROPPED_TURN_MESSAGE,
-                 json.dumps([LOGGED_NETWORK_WAIT, NETWORK_WAIT_TIMES])], **kwargs)
-
-    monkeypatch.setattr(protocol, "subprocess", _SubprocessShim())
-    monkeypatch.setattr(protocol, "_codex_executable", lambda: "codex")
+    argv = fake_server_argv(tmp_path, scenario)
+    monkeypatch.setattr(protocol, "_server_argv", lambda: argv)
 
 
 def received(tmp_path: Path) -> list:

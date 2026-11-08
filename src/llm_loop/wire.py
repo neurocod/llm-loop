@@ -520,6 +520,8 @@ def codex_error(ev: dict) -> Any:
 
 
 # --- Codex app-server -----------------------------------------------------
+# A request builder's `request_id` may be None: `appserver.Connection` then
+# numbers the request itself.
 
 def _rpc(method: str, request_id: Optional[int] = None,
          params: Optional[dict] = None) -> dict:
@@ -531,7 +533,7 @@ def _rpc(method: str, request_id: Optional[int] = None,
     return message
 
 
-def codex_app_initialize(request_id: int) -> dict:
+def codex_app_initialize(request_id: Optional[int]) -> dict:
     return _rpc(APP_INITIALIZE, request_id, {"clientInfo": {
         "name": "llm_loop",
         "title": "llm-loop",
@@ -543,12 +545,12 @@ def codex_app_initialized() -> dict:
     return _rpc(APP_INITIALIZED, params={})
 
 
-def codex_app_rate_limits_read(request_id: int) -> dict:
+def codex_app_rate_limits_read(request_id: Optional[int]) -> dict:
     return _rpc(APP_RATE_LIMITS_READ, request_id)
 
 
-def codex_app_thread_start(request_id: int, project_dir: str, model: str,
-                           sandbox_mode: str) -> dict:
+def codex_app_thread_start(request_id: Optional[int], project_dir: str,
+                           model: str, sandbox_mode: str) -> dict:
     explicit_sandbox = bool(sandbox_mode)
     params = {
         "cwd": project_dir,
@@ -562,15 +564,16 @@ def codex_app_thread_start(request_id: int, project_dir: str, model: str,
     return _rpc(APP_THREAD_START, request_id, params)
 
 
-def codex_app_turn_start(request_id: int, thread_id: str, prompt: str) -> dict:
+def codex_app_turn_start(request_id: Optional[int], thread_id: str,
+                         prompt: str) -> dict:
     return _rpc(APP_TURN_START, request_id, {
         "threadId": thread_id,
         "input": [{"type": BLOCK_TEXT, "text": prompt}],
     })
 
 
-def codex_app_turn_steer(request_id: int, thread_id: str, turn_id: str,
-                         text: str) -> dict:
+def codex_app_turn_steer(request_id: Optional[int], thread_id: str,
+                         turn_id: str, text: str) -> dict:
     return _rpc(APP_TURN_STEER, request_id, {
         "threadId": thread_id,
         "expectedTurnId": turn_id,
