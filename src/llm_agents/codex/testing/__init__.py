@@ -17,8 +17,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
-from . import sandbox
-from .registry import AgentRecord
+from .. import sandbox
+from ..registry import AgentRecord
 
 
 class CodexWrap:
