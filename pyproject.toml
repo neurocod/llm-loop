@@ -74,7 +74,11 @@ llm_agents = ["py.typed"]
 # material, never shipped, and reachable only while testing. `agent-tools` is
 # for the tests that import a standalone script as a module (test_cpu_load.py,
 # test_find_refs.py); the scripts themselves never import one another by name.
-pythonpath = ["src", "ideas", "agent-tools"]
+# `tests/codex_agent` is for `core_policy`, which tests/conftest.py's
+# `_core_host` imports: collection puts that directory on sys.path only for a
+# test module directly in it, so a nested test or a text doctest selected alone
+# would not find it.
+pythonpath = ["src", "ideas", "agent-tools", "tests/codex_agent"]
 testpaths = ["tests"]
 # The `test` extra's floor, said where an older pytest reads it first.
 minversion = "8.0"

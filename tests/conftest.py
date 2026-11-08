@@ -112,7 +112,8 @@ def _leak_message(item, leaks) -> str:
             f"`_runfixtures.isolated_run`")
 
 
-_CORE_TESTS = Path(__file__).parent / "codex_agent"
+_TESTS = Path(__file__).parent
+_CORE_TESTS = _TESTS / "codex_agent"
 
 
 @pytest.fixture(autouse=True)
@@ -122,21 +123,58 @@ def _core_host(request):
 
     Here, scoped by path, and not as an autouse fixture in
     `codex_agent/conftest.py`: pytest 9.1 binds a subdirectory conftest's
-    fixtures to the FIRST `Dir` node of that directory, and command-line
-    paths that leave a directory and come back (`codex_agent/a.py
-    test_b.py codex_agent/c.py`) collect it a second time as another node
-    that gets none of them. Measured 2026-11-08: under that order every
-    test of the second node ran under `EMPTY`, and the one that needed the
-    host's gates (`..._survives_a_failed_gate_follow_up`) read
+    fixtures to the FIRST `Dir` node of that directory, and a FILE argument
+    lying directly in an ancestor directory, given between two arguments
+    below it (`codex_agent/a.py test_b.py codex_agent/c.py`), re-collects
+    that ancestor without deduplication (`handle_dupes=False`,
+    `_pytest/main.py:968-973` in pytest 9.1.1, `Session.collect`), so
+    `codex_agent/` comes back as a new `Dir` node that gets none of them.
+    Arguments that merely alternate between sibling directories reuse the
+    cached nodes and are harmless. Measured 2026-11-08: under that order
+    every test of the second node ran under `EMPTY`, and the one that needed
+    the host's gates (`..._survives_a_failed_gate_follow_up`) read
     `gate_follow_ups == 0` with "gates not run: no host policy". `tests/`
-    itself is collected once, since every path given lies under it.
+    itself is re-collected only by a file argument directly in the project
+    root; `pytest_collection_modifyitems` below refuses either case.
     """
     if not request.path.is_relative_to(_CORE_TESTS):
         yield
         return
-    from core_policy import CORE_POLICY  # codex_agent/'s own module
+    from core_policy import CORE_POLICY  # on `pythonpath` in pyproject.toml
     with host_policy.installed(CORE_POLICY):
         yield
+
+
+_SUITE_FIXTURES = ("isolate_process_policies", "isolate_launch_decision")
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(items):
+    """Refuse a run in which an item under `tests/` lost this file's autouse
+    fixtures — the re-collected `Dir` node of `_core_host`'s docstring.
+
+    A hook, because hooks are found by the conftest's path, not through the
+    `Dir` node that lost the fixtures, so the re-collection cannot hide it.
+    Unrefused, the loss reads as a test's own failure (or, worse, a pass under
+    the wrong policy). One set lookup per item.
+    """
+    missing = []
+    for item in items:
+        names = getattr(item, "fixturenames", None)
+        path = getattr(item, "path", None)
+        if names is None or path is None or not path.is_relative_to(_TESTS):
+            continue
+        need = (*_SUITE_FIXTURES, "_core_host") if path.is_relative_to(
+            _CORE_TESTS) else _SUITE_FIXTURES
+        if not set(need) <= set(names):
+            missing.append(f"{item.nodeid} (lacks "
+                           f"{', '.join(n for n in need if n not in names)})")
+    if missing:
+        raise pytest.UsageError(
+            f"{len(missing)} test(s) collected without tests/conftest.py's "
+            f"autouse fixtures: a file argument between two paths below its "
+            f"directory re-collected a Dir node; reorder or split the "
+            f"arguments: " + "; ".join(missing[:3]))
 
 
 @pytest.fixture(autouse=True)
