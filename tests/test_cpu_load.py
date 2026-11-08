@@ -441,7 +441,15 @@ def test_stream_exits_0_when_its_reader_closes_the_pipe():
                              env={**os.environ, "PYTHONPATH": str(TOOLS)},
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        assert json.loads(child.stdout.readline())["load"] == 75
+        first = child.stdout.readline()
+        if not first:
+            # A child that died before its first line: the red must carry its
+            # exit code and traceback (seen once on ubuntu-latest 3.12 CI
+            # 2026-11-08, empty readline, not reproduced in 300 WSL runs).
+            child.wait(timeout=STREAM_CHILD_S)
+            err = child.stderr.read().decode(errors="replace")
+            pytest.fail(f"stream child printed nothing, exit {child.returncode}:\n{err}")
+        assert json.loads(first)["load"] == 75, first
         child.stdout.close()
         child.wait(timeout=STREAM_CHILD_S)
         err = child.stderr.read().decode(errors="replace")
