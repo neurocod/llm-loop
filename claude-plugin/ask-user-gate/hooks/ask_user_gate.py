@@ -236,7 +236,7 @@ MONITOR_SLEEP_FIX = (
 # a Monitor of its own is alive. The loop that started the run then sits after
 # the turn's `done` line until the monitor times out. Measured, not guessed:
 # 5 of the 7 `tail -f` Monitors in this machine's transcripts (2026-09-23)
-# followed such a file, and one of them parked `refactor/runCycle.py` for 13+
+# followed such a file, and one of them parked a `runCycle.py` loop for 13+
 # minutes after its job had exited 0.
 #
 # Deliberately narrow: `tail -f` on a log that never ends (the dev log) is the
@@ -730,7 +730,7 @@ SELF_TEST_CASES = [
     ("tail -f webgame/.devlogs/latest.log | grep --line-buffered ERROR",
      "bash", False, "Monitor"),
     # ... but following a background TASK's output outlives the task. The first
-    # case is the one that parked refactor/runCycle.py (2026-09-23).
+    # case is the one that parked a runCycle.py loop (2026-09-23).
     ("tail -n +1 -f \"C:/Users/u/AppData/Local/Temp/claude/p/s/tasks/"
      "b4w56u3jv.output\" | grep --line-buffered -E \"^=== |FAIL|Error\"",
      "bash", True, "Monitor"),
