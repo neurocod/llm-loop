@@ -135,9 +135,8 @@ class Failure(Exception):
 class GhTimeout(Failure):
     """A gh call that did not answer within its timeout."""
 
-    def __init__(self, message: str, timeout: float):
+    def __init__(self, message: str):
         super().__init__(EXIT_GH_ERROR, message)
-        self.timeout = timeout
 
 
 class CmdError(Exception):
@@ -214,12 +213,18 @@ class Gh:
             proc = run_cmd(argv, timeout, stdout=stdout)
         except CmdError as exc:
             if exc.timed_out:
-                raise GhTimeout(f"gh did not answer within {timeout:g} s: {what}", timeout) from exc
+                raise GhTimeout(f"gh did not answer within {timeout:g} s: {what}") from exc
             raise Failure(EXIT_GH_ERROR, f"{exc} (gh {what})") from exc
         if proc.returncode != 0:
             said = (as_text(proc.stderr) or as_text(proc.stdout)).strip()
             raise gh_failure(what, proc.returncode, said, self.repo)
         return proc
+
+    def _run_to_file(self, argv: list, what: str, path: str, timeout: float) -> int:
+        """`_run` with gh's stdout written to `path` (never held in memory); its size."""
+        with open(path, "wb") as fh:
+            self._run(argv, what, timeout, stdout=fh)
+        return os.path.getsize(path)
 
     def call(self, args: list, timeout: float = GH_TIMEOUT_S) -> str:
         return as_text(self._run([self.path, *args, "--repo", self.repo], " ".join(args), timeout).stdout)
@@ -232,10 +237,7 @@ class Gh:
             raise Failure(EXIT_GH_ERROR, f"gh {' '.join(args)} returned invalid JSON: {exc}") from exc
 
     def call_to_file(self, args: list, path: str, timeout: float = GH_TIMEOUT_S) -> int:
-        """gh's stdout written to `path` (never held in memory); its size."""
-        with open(path, "wb") as fh:
-            self._run([self.path, *args, "--repo", self.repo], " ".join(args), timeout, stdout=fh)
-        return os.path.getsize(path)
+        return self._run_to_file([self.path, *args, "--repo", self.repo], " ".join(args), path, timeout)
 
     def job_log_to_file(self, job_id, path: str, timeout: float = GH_TIMEOUT_S) -> int:
         """One job's whole log into `path`; its size. Through the REST API,
@@ -247,14 +249,11 @@ class Gh:
         endpoint = f"repos/{self.repo}/actions/jobs/{job_id}/logs"
         flag = "--allow-escape-sequences"
         try:
-            with open(path, "wb") as fh:
-                self._run([self.path, "api", endpoint, flag], f"api {endpoint}", timeout, stdout=fh)
+            return self._run_to_file([self.path, "api", endpoint, flag], f"api {endpoint}", path, timeout)
         except Failure as exc:
             if "unknown flag" not in str(exc):
                 raise
-            with open(path, "wb") as fh:
-                self._run([self.path, "api", endpoint], f"api {endpoint}", timeout, stdout=fh)
-        return os.path.getsize(path)
+        return self._run_to_file([self.path, "api", endpoint], f"api {endpoint}", path, timeout)
 
 
 def check_auth(gh_path: str) -> None:
@@ -305,6 +304,7 @@ def derive_repo(cwd: str | None) -> str:
 # ones match several commits of a busy repository.
 MIN_SHA_CHARS = 7
 FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
+HEX_RE = re.compile(r"[0-9a-fA-F]+")
 
 
 def derive_sha(sha: str | None, cwd: str | None) -> str:
@@ -314,12 +314,12 @@ def derive_sha(sha: str | None, cwd: str | None) -> str:
         sha = sha.strip()
         if FULL_SHA_RE.fullmatch(sha):
             return sha.lower()
-        if re.fullmatch(r"[0-9a-fA-F]+", sha) and len(sha) < MIN_SHA_CHARS:
+        if HEX_RE.fullmatch(sha) and len(sha) < MIN_SHA_CHARS:
             raise Failure(EXIT_USAGE, f"--sha {sha} is shorter than {MIN_SHA_CHARS} hex characters")
         full = git(["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"], cwd)
         if full and FULL_SHA_RE.fullmatch(full):
             return full.lower()
-        if re.fullmatch(r"[0-9a-fA-F]+", sha):
+        if HEX_RE.fullmatch(sha):
             return sha.lower()
         raise Failure(EXIT_USAGE, f"--sha {sha} is neither a commit git knows here nor a hex prefix")
     head = git(["rev-parse", "HEAD"], cwd)
@@ -401,7 +401,7 @@ def wait_run(gh: Gh, run: dict, deadline: float) -> dict:
     return run
 
 
-# ---------------------------------------------------------------- the log
+# ---------------------------------------------------------------- the log: pytest's output
 
 
 # `gh run view --log-failed` prefixes every line with `<job>\t<step>\t`. The
@@ -462,6 +462,11 @@ SLOWEST_RE = re.compile(r"^slowest (?:\d+ )?durations$")
 STOP_RE = re.compile(r"^!{3,} .* !{3,}$")
 
 
+def drop_trailing_blanks(lines: list) -> None:
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+
 def is_section_banner(line: str, name: str) -> bool:
     return name in SECTION_BANNERS or bool(SLOWEST_RE.match(name)) or bool(OUTCOME_RE.match(line))
 
@@ -486,8 +491,7 @@ def parse_pytest(lines: list) -> tuple[list, list, list, int]:
         # The unbannered `-q` outcome line is the last of the last block.
         if pending is not None and blocks:
             body = blocks[-1][1]
-            while body and not body[-1].strip():
-                body.pop()
+            drop_trailing_blanks(body)
             if body and body[-1] == lines[pending]:
                 body.pop()
                 outcomes.append(lines[pending].strip("= "))
@@ -536,17 +540,17 @@ def parse_pytest(lines: list) -> tuple[list, list, list, int]:
     if section == "blocks":
         close_blocks()
     for _, body in blocks:
-        while body and not body[-1].strip():
-            body.pop()
+        drop_trailing_blanks(body)
         while body and not body[0].strip():
             body.pop(0)
     return blocks, entries, outcomes, end
 
 
-def entry_nodeid(entry_line: str) -> str:
-    """`FAILED tests/x.py::T::t[a] - msg` -> `tests/x.py::T::t[a]`."""
-    rest = ENTRY_RE.match(entry_line).group(2)
-    return rest.split(" - ", 1)[0].strip()
+def entry_parts(entry_line: str) -> tuple[str, str] | None:
+    """`FAILED tests/x.py::T::t[a] - msg` -> (`FAILED`, `tests/x.py::T::t[a]`);
+    None for a line that is not a summary entry."""
+    m = ENTRY_RE.match(entry_line)
+    return (m.group(1), m.group(2).split(" - ", 1)[0].strip()) if m else None
 
 
 def block_matches(title: str, nodeid: str, kind: str) -> bool:
@@ -605,20 +609,17 @@ def failure_units(lines: list, tail: int, failed_steps: int = 1, source: str = "
     blocks, entries, outcomes, end = parse_pytest(lines)
     units, used = [], set()
     for entry in entries:
-        nodeid = entry_nodeid(entry[0])
-        kind = ENTRY_RE.match(entry[0]).group(1)
+        kind, nodeid = entry_parts(entry[0])
         index = next((i for i, (title, _) in enumerate(blocks)
                       if i not in used and block_matches(title, nodeid, kind)), None)
         if index is None:
             units.append({"kind": "pytest", "headline": entry[0], "block": entry[1:]})
         else:
             used.add(index)
-            title, body = blocks[index]
-            units.append({"kind": "pytest", "headline": f"{kind} {nodeid}", "block": body,
-                          "title": title})
+            units.append({"kind": "pytest", "headline": f"{kind} {nodeid}", "block": blocks[index][1]})
     for i, (title, body) in enumerate(blocks):
         if i not in used:
-            units.append({"kind": "pytest", "headline": title, "block": body, "title": title})
+            units.append({"kind": "pytest", "headline": title, "block": body})
     if not units:
         units.append({"kind": "tail", "headline": f"no pytest failures in this job's {source}; its last lines",
                       "block": tail_before_error(lines, tail)})
@@ -627,6 +628,9 @@ def failure_units(lines: list, tail: int, failed_steps: int = 1, source: str = "
         units.append({"kind": "tail", "headline": f"the job's {source} after pytest ({why}); its last lines",
                       "block": tail_before_error(lines[end + 1:], tail) or tail_before_error(lines, tail)})
     return units, outcomes
+
+
+# ---------------------------------------------------------------- the dedup across jobs
 
 
 # What `normalize` replaces, in order. Only diagnostic metadata that one
@@ -716,10 +720,8 @@ def drop_frame_sources(lines: list) -> list:
 
 
 def normalize(text: str) -> str:
-    """The comparison key of a failure's text: without per-job noise (NOISE,
-    CARETS_RE, drop_frame_sources, pytest's timing totals, clock times in
-    argument lines) and without
-    trailing blanks. Never shown -- the report shows the first job's exact text."""
+    """The comparison key of a failure's text, without per-job noise. Never
+    shown -- the report shows the first job's exact text."""
     out = []
     lines = [posix_paths(ln) for ln in text.split("\n") if not CARETS_RE.match(ln)]
     for line in drop_frame_sources(lines):
@@ -740,17 +742,17 @@ def group_key(unit: dict) -> str:
     """A unit's identity: its kind and node id (or block title) exactly, the
     rest of its headline and its block through `normalize`."""
     head, rest = unit["headline"], ""
-    m = ENTRY_RE.match(head)
-    if unit["kind"] == "pytest" and m:
-        ident = f"{m.group(1)} {entry_nodeid(head)}"
+    parts = entry_parts(head)
+    if unit["kind"] == "pytest" and parts:
+        ident = " ".join(parts)
         head, rest = ident, head[len(ident):]
     return "\0".join([unit["kind"], head, normalize(rest + "\n" + "\n".join(unit["block"]))])
 
 
 def group_failures(per_job: list) -> list:
     """[(job, units)] -> groups of identical units: {"headline", "block",
-    "title", "kind", "jobs", "shownFrom"}, the most widespread first, ties in
-    order of first appearance."""
+    "kind", "jobs", "shownFrom"}, the most widespread first, ties in order of
+    first appearance."""
     groups: dict = {}
     for job, units in per_job:
         for unit in units:
@@ -904,6 +906,25 @@ def render(reports: list, raw_dir: str, report_path: str, cap: bool) -> list:
     return out
 
 
+def run_json(rep: dict) -> dict:
+    run = rep["run"]
+    return {"run": {k: run.get(k) for k in ("databaseId", "workflowName", "event", "headSha", "status",
+                                            "conclusion", "url", "displayTitle", "attempt")},
+            "exit": rep["code"], "note": rep["note"],
+            "jobs": [job_json(j, rep["outcomes"], rep["raw"]) for j in run.get("jobs") or []],
+            "failures": [{k: g.get(k) for k in ("kind", "headline", "jobs", "shownFrom", "block")}
+                         for g in rep["groups"]]}
+
+
+def job_json(job: dict, outcomes: dict, raw: dict) -> dict:
+    name = job.get("name")
+    return {"name": name, "status": job.get("status"), "conclusion": job.get("conclusion"),
+            "failedSteps": failed_steps(job), "outcome": outcomes.get(name, []), "rawLog": raw.get(name)}
+
+
+# ---------------------------------------------------------------- reading the failed jobs' logs
+
+
 def safe_name(name: str, taken: set) -> str:
     base = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "job"
     candidate, n = base, 1
@@ -980,6 +1001,9 @@ def analyse(gh: Gh, run: dict, raw_dir: str, tail: int, prefix: str, taken: set)
         outcomes[name] = outs
         per_job.append((name, units))
     return outcomes, group_failures(per_job), raw
+
+
+# ---------------------------------------------------------------- the command line
 
 
 def emit(lines: list, max_lines: int, report_path: str) -> None:
@@ -1059,22 +1083,6 @@ def answer(args: argparse.Namespace) -> int:
     else:
         emit(render(reports, raw_dir, report_path, cap=True), args.max_lines, report_path)
     return code
-
-
-def run_json(rep: dict) -> dict:
-    run = rep["run"]
-    return {"run": {k: run.get(k) for k in ("databaseId", "workflowName", "event", "headSha", "status",
-                                            "conclusion", "url", "displayTitle", "attempt")},
-            "exit": rep["code"], "note": rep["note"],
-            "jobs": [job_json(j, rep["outcomes"], rep["raw"]) for j in run.get("jobs") or []],
-            "failures": [{k: g.get(k) for k in ("kind", "headline", "jobs", "shownFrom", "block")}
-                         for g in rep["groups"]]}
-
-
-def job_json(job: dict, outcomes: dict, raw: dict) -> dict:
-    name = job.get("name")
-    return {"name": name, "status": job.get("status"), "conclusion": job.get("conclusion"),
-            "failedSteps": failed_steps(job), "outcome": outcomes.get(name, []), "rawLog": raw.get(name)}
 
 
 def main(argv: list | None = None) -> int:
