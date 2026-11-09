@@ -6,6 +6,7 @@ these pin the mechanism they all stand on, with the real signal.
 """
 
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -13,6 +14,7 @@ import sys
 import textwrap
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +25,42 @@ from llm_loop.limits import LimitPolicy, SessionLimit
 # start plus the package import, 0.27 / 0.25 / 0.28 s measured 2026-10-03; a press
 # that deadlocks never ends, so the bound only has to be far above that.
 CHILD_TIMEOUT_S = 30
+
+
+@pytest.mark.parametrize('provider', ['claude', 'codex'])
+def test_sigint_ends_a_silent_provider_without_another_output_line(provider):
+    # Windows measurements, 2026-11-09: child ended in 0.124 / 0.120 s,
+    # runner returned in 0.209 / 0.225 s. Allow more than 10x that; the
+    # independent 5 s rescue kills a regression, not a 30 s sleep per test.
+    done = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name('_silent_interrupt_probe.py')),
+         provider, '5'], capture_output=True, text=True, timeout=CHILD_TIMEOUT_S)
+    assert done.returncode == 0, done.stdout + done.stderr
+    measured = json.loads(done.stdout.splitlines()[-1])
+    assert not measured['rescued'], measured
+    assert measured['child_delay'] < 3, measured
+    assert measured['exit_delay'] < 3, measured
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows wakeup socket lifecycle')
+def test_capture_restores_wakeup_fd_and_joins_its_watcher():
+    import socket
+    reader, writer = socket.socketpair()
+    writer.setblocking(False)
+    previous = signal.set_wakeup_fd(writer.fileno())
+    try:
+        with ctrlc.captured():
+            watchers = [thread for thread in threading.enumerate()
+                        if thread.name == 'ctrlc-wakeup']
+            assert len(watchers) == 1
+            with ctrlc.captured():
+                assert watchers[0].is_alive()
+        assert not watchers[0].is_alive()
+        assert signal.set_wakeup_fd(-1) == writer.fileno()
+    finally:
+        signal.set_wakeup_fd(previous)
+        reader.close()
+        writer.close()
 
 
 @contextlib.contextmanager

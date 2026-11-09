@@ -22,18 +22,17 @@ exit push — and decides there what a press means:
     the snapshots and the notes are not waits, and still happen.
 
 When a press is noticed: a wait polls in slices of a quarter second or less
-(`stopchannel.STOP_RECHECK_SECONDS`, `runlifecycle.EXIT_PUSH_POLL_S`), and
-`time.sleep` on the main thread is woken by the signal anyway. A turn notices
-at the CLI's next output line when the press arrives as a SIGINT on Windows:
-the main thread is then blocked in a pipe read that the console's Ctrl+C does
-not interrupt, and Python runs a signal handler only between bytecodes — the
-same latency `KeyboardInterrupt` had there. A press read as a key by the status
-line (`deliver`) comes on the key reader's thread and runs the turn's
-`on_press` hook at once, which ends the CLI and with it the read.
+(`stopchannel.STOP_RECHECK_SECONDS`, `runlifecycle.EXIT_PUSH_POLL_S`). On
+Windows a wakeup socket hears SIGINT even while the main thread is blocked
+reading a silent CLI. Its watcher delivers the same press and hooks as the
+status line's key reader, ending the child and releasing the pipe read.
 """
 
 import contextlib
+import os
+import select
 import signal
+import socket
 import threading
 from typing import Callable, Iterator, List, NoReturn, Optional, Tuple
 
@@ -83,6 +82,9 @@ class Interrupt:
         the thing that unwinds the run it is telling to stop.
         """
         self._pressed.append(None)
+        self._notify_hooks()
+
+    def _notify_hooks(self) -> None:
         for hook in self._hooks:    # one read of an immutable tuple
             try:
                 hook()
@@ -134,6 +136,72 @@ class _Unheard(Interrupt):
 
 _UNHEARD = _Unheard()
 _active: Optional[Interrupt] = None
+
+
+class _SignalWakeup:
+    """Drain each signal byte once, from the handler or the Windows watcher.
+
+    Python's C signal handler writes the socket before the main thread can
+    run Python code. A blocking pipe read delayed that code by 29.8 seconds
+    against a silent child (2026-11-09). Only this drain counts presses; the
+    later Python handler must not count the same signal again.
+    """
+
+    def __init__(self, interrupt: Interrupt):
+        self.interrupt = interrupt
+        self.reader, self.writer = socket.socketpair()
+        self.reader.setblocking(False)
+        self.writer.setblocking(False)
+        self.lock = threading.RLock()
+        self.stopping = False
+        try:
+            self.previous = signal.set_wakeup_fd(self.writer.fileno())
+        except BaseException:
+            self.reader.close()
+            self.writer.close()
+            raise
+        self.thread = threading.Thread(target=self.watch, name='ctrlc-wakeup', daemon=True)
+        try:
+            self.thread.start()
+        except BaseException:
+            signal.set_wakeup_fd(self.previous)
+            self.reader.close()
+            self.writer.close()
+            raise
+
+    def drain(self):
+        # Serialize consumption AND counting: recv releases the GIL, so a
+        # Python handler can arrive after the watcher consumed the byte but
+        # before it counted it. Hooks run outside the lock: a handler must
+        # never wait for another thread's process-ending hook.
+        count = 0
+        with self.lock:
+            while True:
+                try:
+                    value = self.reader.recv(1)
+                except BlockingIOError:
+                    break
+                if not value:
+                    break
+                if value[0] == signal.SIGINT:
+                    self.interrupt._pressed.append(None)
+                    count += 1
+        for _ in range(count):
+            self.interrupt._notify_hooks()
+
+    def watch(self):
+        while not self.stopping:
+            select.select([self.reader], [], [])
+            self.drain()
+
+    def close(self):
+        signal.set_wakeup_fd(self.previous)
+        self.stopping = True
+        self.writer.send(b'\x00')
+        self.thread.join()
+        self.drain()
+        self.reader.close()
+        self.writer.close()
 
 
 def current() -> Interrupt:
@@ -189,21 +257,27 @@ def captured() -> Iterator[Interrupt]:
     interrupt = Interrupt()
     previous = None
     installed = False
+    wakeup = None
     if threading.current_thread() is threading.main_thread():
         try:
             previous = signal.signal(signal.SIGINT,
-                                     lambda signum, frame: interrupt.press())
+                                     lambda signum, frame: wakeup.drain()
+                                     if wakeup is not None else interrupt.press())
             installed = True
         except (ValueError, OSError):
             pass
     _active = interrupt
     try:
+        if installed and os.name == 'nt':
+            wakeup = _SignalWakeup(interrupt)
         yield interrupt
     finally:
         if installed:
             signal.signal(signal.SIGINT,
                           previous if previous is not None
                           else signal.default_int_handler)
+        if wakeup is not None:
+            wakeup.close()
         _active = None
     # Reached only when the block returned: an exception or an exit has left
     # through the `finally` above with its own ending.
