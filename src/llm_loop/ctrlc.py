@@ -96,9 +96,6 @@ class Interrupt:
         the thing that unwinds the run it is telling to stop.
         """
         self._pressed.append(None)
-        self._notify_hooks()
-
-    def _notify_hooks(self) -> None:
         for hook in self._hooks:    # one read of an immutable tuple
             try:
                 hook()
@@ -165,28 +162,12 @@ _active: Optional[Interrupt] = None
 class _SignalWakeup:
     """Wake blocked provider I/O; NEVER count signal bytes.
 
-    The Python callback alone calls Interrupt.press. Whether a C signal
-    arrives before installation, while attached, or after detachment, its
-    callback counts once, even if delayed across either boundary. A byte
-    merely invokes idempotent wake hooks so the blocked main thread can run
-    that callback. Byte delivery and callback execution can occur in either
-    order without changing the count. No descriptor inspection is needed
-    in the handler, and no pending-byte credit can swallow a later press.
-
-    Exact physical-keypress counting is impossible with this API: two C
-    signals before Python runs can write two bytes but coalesce into one
-    pending Python callback; a full wakeup socket can also drop bytes.
-    We preserve Python's counting semantics: exactly one count per callback,
-    never an extra count, and never zero for an isolated delivered SIGINT.
-    Bursts may coalesce, as outside capture. Wake hooks can run more than once
-    and must be idempotent. Ordinary on_press hooks run only from press().
-
-    Two physical Ctrl+C events before Python services the first can coalesce
-    into one callback: the second-press exit contract is per callback. This
-    is acceptable for a human pressing again after the first Python callback
-    has been serviced: the next is distinct. Observing provider termination
-    alone does not prove this, since the watcher can terminate it first.
-    A rapid double tap before callback service is not two guaranteed presses.
+    SIGINT bytes invoke idempotent wake hooks to release blocked I/O. The
+    Python callback calls Interrupt.press to count once and run ordinary
+    hooks. Bytes and callbacks may arrive in either order, including across
+    installation and removal of the fd. Signals may coalesce into one Python
+    callback, and a full socket may drop bytes: counts represent callbacks,
+    not physical keypresses.
 
     Foreign notification is NOT lossless during ownership changes. Activation
     probes by installing -1, then restores a foreign fd if one was present.
@@ -235,11 +216,8 @@ class _SignalWakeup:
         self.started = True
         return True
 
-    def handle(self):
-        self.interrupt.press()
-
     def drain(self):
-        # Only the watcher consumes bytes; the handler never touches sockets.
+        # The watcher drains while active; close drains after joining it.
         count = 0
         with self.lock:
             while True:
@@ -356,8 +334,7 @@ def captured() -> Iterator[Interrupt]:
     if threading.current_thread() is threading.main_thread():
         try:
             previous = signal.signal(signal.SIGINT,
-                                     lambda signum, frame: wakeup.handle()
-                                     if wakeup is not None else interrupt.press())
+                                     lambda signum, frame: interrupt.press())
             installed = True
         except (ValueError, OSError):
             pass

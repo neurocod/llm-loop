@@ -145,25 +145,37 @@ def test_activation_gap_is_explicit_and_drops_foreign_byte(monkeypatch):
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows wakeup fd')
 @pytest.mark.parametrize('boundary', ['installation', 'removal'])
-def test_delayed_callback_counts_once_across_fd_boundary(boundary):
-    interrupt = ctrlc.Interrupt()
-    wakeup = ctrlc._SignalWakeup(interrupt)
-    closed = False
-    try:
-        wakeup.activate()
+def test_delayed_callback_counts_once_across_fd_boundary(boundary, monkeypatch):
+    activate = ctrlc._SignalWakeup.activate
+    close = ctrlc._SignalWakeup.close
+    callback = None
+
+    def activate_with_callback(wakeup):
+        nonlocal callback
+        callback = signal.getsignal(signal.SIGINT)
+        result = activate(wakeup)
+        if boundary == 'installation':
+            # Signal arrived before the fd, hence no byte; callback after attach.
+            callback(signal.SIGINT, None)
+            assert wakeup.interrupt.presses == 1
+        return result
+
+    def close_with_callback(wakeup):
         if boundary == 'removal':
             # Inject the C-level byte independently of the delayed callback.
             wakeup.writer.send(bytes([signal.SIGINT]))
             wakeup.drain()
-            wakeup.close()
-            closed = True
-        # Installation: signal arrived before the fd, hence no byte.
-        # Removal: byte arrived while attached, callback after detachment.
-        wakeup.handle()
-        assert interrupt.presses == 1
-    finally:
-        if not closed:
-            wakeup.close()
+        close(wakeup)
+        if boundary == 'removal':
+            # Byte arrived while attached, callback after detachment.
+            callback(signal.SIGINT, None)
+        assert wakeup.interrupt.presses == 1
+
+    monkeypatch.setattr(ctrlc._SignalWakeup, 'activate', activate_with_callback)
+    monkeypatch.setattr(ctrlc._SignalWakeup, 'close', close_with_callback)
+    with pressed_run() as interrupt:
+        assert interrupt.presses == (1 if boundary == 'installation' else 0)
+    assert interrupt.presses == 1
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows wakeup ownership')

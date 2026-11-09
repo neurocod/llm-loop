@@ -51,7 +51,7 @@ def main(case):
                     result = close(wakeup)
                     if case == 'shutdown_signals':
                         # Also cover close returning with both sockets closed,
-                        # before captured has cleared its wakeup reference.
+                        # while captured still has its SIGINT callback installed.
                         signal.raise_signal(signal.SIGINT)
                     return result
                 def injected_join(thread, *args, **kwargs):
