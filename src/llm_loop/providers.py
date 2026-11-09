@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import os
 import shutil
 import subprocess
+import time
 from typing import Iterator, Optional, Protocol
 
 from . import appserver, ctrlc, operator, wire
@@ -133,12 +134,12 @@ class _CodexEventStream:
 
     def __init__(self, owner, buffered: list):
         from . import statusline
-        self.owner = owner
+        self._owner = owner
         self._buffered = iter(buffered)
         # Each thread's latest cumulative reading (`wire.codex_app_token_usage`)
         # — the main thread's and every sub-agent's: the turn's usage is their
         # sum, so a review that delegated half its work bills that half too.
-        self.usage_by_thread = {}
+        self._usage_by_thread = {}
         self.progress = lambda event: None
         self.stop_requested = statusline.stream_stop_requested
         from llm_agents.codex.loop_wait import LoopWait
@@ -148,12 +149,43 @@ class _CodexEventStream:
     def __iter__(self):
         return self
 
+    @property
+    def thread_id(self):
+        return self._owner.thread_id
+
+    @property
+    def turn_id(self):
+        return self._owner.turn_id
+
+    @property
+    def finished(self):
+        return self._owner.connection.finished
+
+    def follow_turn(self, turn_id):
+        self._owner.turn_id = turn_id
+
+    def request(self, method, params, *, on_event, on_poll):
+        return self._owner.connection.request(
+            appserver.message(method, params), on_other=on_event, on_poll=on_poll)
+
+    def send_request(self, method, params=None):
+        return self._owner.connection.send_request(appserver.message(method, params))
+
+    def next_event(self, deadline):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("codex app-server event deadline expired")
+        item = self.next_item(deadline)
+        return None if self._owner.connection.resolve(item) else item
+
+    def aggregate_usage(self):
+        return wire.codex_app_usage_sum(self._usage_by_thread.values())
+
     def next_item(self, deadline=None):
         try:
             return next(self._buffered)
         except StopIteration:
             pass
-        connection = self.owner.connection
+        connection = self._owner.connection
         try:
             return connection.take(deadline, "turn")
         except appserver.Closed:
@@ -167,7 +199,7 @@ class _CodexEventStream:
             try:
                 return next(self._ending)
             except StopIteration:
-                self.owner.close_input()
+                self._owner.close_input()
                 raise
         while True:
             message = self.next_item()
@@ -175,7 +207,7 @@ class _CodexEventStream:
                 return message
             if appserver.response_id(message) is not None:
                 # A note's acknowledgement (`steer`), or a stale reply.
-                self.owner.connection.resolve(message)
+                self._owner.connection.resolve(message)
                 continue
             event = self._wait.observe(message)
             if self._wait.done:
@@ -187,7 +219,7 @@ class _CodexEventStream:
     def observe_usage(self, message: dict) -> None:
         usage = wire.codex_app_token_usage(message)
         if usage is not None:
-            self.usage_by_thread[wire.codex_app_event_thread(message)] = usage
+            self._usage_by_thread[wire.codex_app_event_thread(message)] = usage
 
     def close(self) -> None:
         """Nothing to close: the connection's pump owns the read end and

@@ -362,3 +362,165 @@ def test_bound_run_stop_is_seen_during_idle_poll(monkeypatch, tmp_path, source):
     assert [c["method"] for c in server.calls] == ["turn/interrupt"]
     assert proc.stdout._wait.sub_agents.cut
     assert clock[0] < 2
+
+
+@pytest.mark.parametrize("phase", ["waiting", "cut", "end"])
+def test_raising_progress_does_not_skip_interrupts_or_account(monkeypatch, phase):
+    from llm_loop import diaglog
+    monkeypatch.setattr(subagents, "SUB_AGENT_GRACE_S", 0)
+    logged = []
+    monkeypatch.setattr(diaglog, "record", lambda *args: logged.append(args))
+    server = Server("timeout")
+    proc = providers._CodexAppProcess(server, [], "root", "first")
+    calls = []
+    def progress(event):
+        calls.append(event["phase"])
+        if event["phase"] == phase:
+            raise OSError("display unavailable")
+    proc.stdout.progress = progress
+    events = list(proc.stdout)
+    assert any(call["method"] == "turn/interrupt" for call in server.calls)
+    assert proc.stdout._wait.sub_agents.cut
+    assert events[-1]["type"] == "turn.completed"
+    assert "CUT" in events[-2]["item"]["text"]
+    assert calls[-1] == phase
+    assert logged == [("codex.sub_agents.progress_failed", "display unavailable")]
+
+
+def test_sequential_progress_runs_on_console_owner(monkeypatch, tmp_path):
+    import sys
+    import threading
+    from llm_loop import console, ownership
+    with isolated_run(monkeypatch, tmp_path):
+        server = Server("completed")
+        proc = providers._CodexAppProcess(server, [], "root", "first")
+        monkeypatch.setattr(streamrender, "start_agent_process", lambda *a: proc)
+        writes = []
+        original = sys.stdout
+        class RecordingOutput:
+            def write(self, text):
+                if '"_meta": "subagents"' in text:
+                    writes.append(threading.current_thread().name)
+                return original.write(text)
+
+            def __getattr__(self, name):
+                return getattr(original, name)
+        monkeypatch.setattr(sys, "stdout", RecordingOutput())
+        owner = ownership.OwnerThread("wait-progress-owner").start()
+        try:
+            with console.route_through(owner, post_timeout=10.0):
+                streamrender.run_agent_streaming(["codex"], "codex", raw=True)
+                # Same handshake bound as test_output_owner: 0.49 s measured
+                # for that file on 2026-09-25, with ample scheduling headroom.
+                assert owner.drain(10.0)
+        finally:
+            owner.close(10.0)
+        assert writes and set(writes) == {"wait-progress-owner"}
+
+
+@pytest.mark.parametrize("when", ["before_response", "unknown_id", "after_response"])
+@pytest.mark.parametrize("responds", [True, False])
+@pytest.mark.parametrize("continuation", [False, True])
+def test_stop_interrupts_dispatched_follow_up(monkeypatch, when, responds, continuation):
+    clock = [1.0]
+    monkeypatch.setattr(appserver.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(subagents, "SUB_AGENT_INTERRUPT_S", 2.0)
+    server = Server("completed")
+    if continuation:
+        server.events.insert(3, turn("turn/started", "root", "continuation"))
+        server.events.insert(4, message("root", "continuation", "automatic continuation"))
+        server.events.insert(5, turn("turn/completed", "root", "continuation", status="completed"))
+    stopped = [False]
+    pending = {}
+    requested = [False]
+    real_take = server.take
+
+    def item(kind, **fields):
+        return {"method": "item/completed", "params": {
+            "threadId": "root", "turnId": "follow-up", "item": {"type": kind, **fields}}}
+
+    def start_request(body):
+        server.calls.append(body)
+        requested[0] = True
+        reply = appserver.Pending(99, body["method"])
+        pending[99] = reply
+        start = [turn("turn/started", "root", "follow-up"),
+                 turn("turn/started", "new-child", "new-child-turn"),
+                 item("commandExecution", command="before stop", exitCode=0)]
+        response = {"id": 99, "result": {"turn": {"id": "follow-up"}}}
+        stop = {"method": "test/stop"}
+        if when == "unknown_id":
+            server.events.extend([stop, response, *start])
+        else:
+            server.events.extend([*start, *([stop, response] if when == "before_response"
+                                          else [response, stop])])
+        return reply
+
+    def resolve(event):
+        reply = pending.pop(appserver.response_id(event), None)
+        if reply:
+            reply.settle(event)
+        return reply is not None
+
+    def take(deadline, what):
+        if server.events:
+            event = real_take(deadline, what)
+            if event.get("method") == "test/stop":
+                stopped[0] = True
+            return event
+        assert requested[0]
+        clock[0] = deadline
+        raise TimeoutError(what)
+
+    def send_request(body):
+        server.calls.append(body)
+        thread = body["params"]["threadId"]
+        if thread == "root":
+            server.events.extend([
+                item("fileChange", changes=[{"path": "during-stop.py", "kind": "update"}]),
+                message("root", "follow-up", "partial follow-up")])
+        if responds or thread != "root":
+            server.events.append(turn("turn/completed", thread,
+                                      body["params"]["turnId"], status="interrupted"))
+        return len(server.calls)
+
+    server.start_request = start_request
+    server.forget = lambda reply: pending.pop(reply.id, None)
+    server.resolve = resolve
+    server.take = take
+    server.send_request = send_request
+    server.request = lambda body, **kwargs: appserver.Connection.request(server, body, **kwargs)
+    proc = providers._CodexAppProcess(server, [], "root", "first")
+    proc.stdout.stop_requested = lambda: stopped[0]
+    events = list(proc.stdout)
+    interrupts = [call["params"] for call in server.calls if call["method"] == "turn/interrupt"]
+    assert {"threadId": "root", "turnId": "follow-up"} in interrupts
+    assert {"threadId": "new-child", "turnId": "new-child-turn"} in interrupts
+    assert any(fate.thread_id == "new-child" for fate in proc.stdout._wait.sub_agents.cut)
+    kinds = [event.get("item", {}).get("type") for event in events]
+    assert "command_execution" in kinds and "file_change" in kinds
+    assert "partial follow-up" not in str(events)
+    assert events[-2]["item"]["text"].startswith("initial answer\n")
+    assert events[-1]["type"] == "turn.completed"
+    assert clock[0] <= 3.0
+    assert not pending
+
+
+def test_wait_stream_does_not_expose_provider_storage():
+    proc = providers._CodexAppProcess(Server("completed"), [], "root", "first")
+    assert not hasattr(proc.stdout, "owner")
+    assert not hasattr(proc.stdout, "usage_by_thread")
+    proc.stdout.follow_turn("next")
+    assert proc.turn_id == proc.stdout.turn_id == "next"
+    proc.stdout.observe_usage({"method": "thread/tokenUsage/updated", "params": {
+        "threadId": "root", "tokenUsage": {"total": {"inputTokens": 9}}}})
+    usage = proc.stdout.aggregate_usage()
+    usage["input_tokens"] = 1000
+    assert proc.stdout.aggregate_usage()["input_tokens"] == 9
+
+
+def test_wait_stream_deadline_bounds_buffered_events(monkeypatch):
+    monkeypatch.setattr(appserver.time, "monotonic", lambda: 3.0)
+    proc = providers._CodexAppProcess(Server("completed"), [{"method": "buffered"}], "root", "first")
+    with pytest.raises(TimeoutError):
+        proc.stdout.next_event(3.0)
