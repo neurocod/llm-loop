@@ -235,6 +235,35 @@ def test_network_wait_an_ulp_short_of_the_ceiling_is_exhausted():
     assert raised.value.exhausted
 
 
+@pytest.mark.parametrize("child_s, total_s, credited_s", [
+    # Credited up to now already: the sum alone is an ULP short.
+    (math.nextafter(service.MAX_CHILD_NETWORK_WAIT_S, 0.0),
+     math.nextafter(service.MAX_CHILD_NETWORK_WAIT_S, 0.0), 0.0),
+    # With main credit besides and the current wait far past the cap,
+    # `deadline`'s own child sum (child_s + spent - total_s) lands an ULP short.
+    (21.231827103605987, 3650.522797641964, service.MAX_CHILD_NETWORK_WAIT_S),
+], ids=["child-only", "with-main-credit"])
+def test_child_credit_an_ulp_short_of_the_child_cap_is_the_cap(child_s, total_s, credited_s):
+    """macos-latest 3.12 CI 2026-11-09 summed a child-only wait that met the
+    child cap to 731.9999999999999 of 732. That ULP must not stay
+    `remaining`: `now + remaining` rounds to `now`, a deadline that is
+    already due instead of the attempt's own budget."""
+    wait = service.NetworkWait(main_thread="main")
+    now = 1_000_000.0
+    child = {**LOGGED_NETWORK_WAIT, "params": {
+        **LOGGED_NETWORK_WAIT["params"], "threadId": "child"}}
+    wait.observe(child, now, "2026-11-09 12:00:00")
+    wait.child_s, wait.total_s = child_s, total_s
+    wait.credited_at = now - credited_s
+    spent = wait.seconds(now)
+    if child_s == total_s:
+        assert spent == service.MAX_CHILD_NETWORK_WAIT_S
+    base = now + 1800.0
+    assert wait.deadline(base, 0.0, now) == base + spent
+    wait.stop(now)
+    assert wait.child_s == service.MAX_CHILD_NETWORK_WAIT_S
+
+
 @pytest.mark.parametrize("gap", [366.0, 128.0])
 def test_network_wait_rev1277_recovers_without_resend(
         tmp_path, monkeypatch, network_clock, gap):
@@ -287,9 +316,13 @@ def test_sub_agent_only_network_wait_extends_main_budget(
 
 
 @pytest.mark.parametrize("scenario, credit", [
-    ("network-child-stale", 366.0),
+    # A monotonic difference to the freshness bound, not a clamp: it may
+    # drift by ULPs; abs keeps a lost millisecond of credit red.
+    ("network-child-stale", pytest.approx(366.0, abs=1e-9)),
+    # Exact: a child credit an ULP short of the child cap is the cap
+    # (service.at_cap; 731.9999999999999 on macos-latest 3.12 CI 2026-11-09).
     ("network-child-heartbeats", 732.0),
-])
+], ids=["network-child-stale-366.0", "network-child-heartbeats-732.0"])
 def test_child_wait_with_busy_main_times_out_without_resend(
         tmp_path, monkeypatch, network_clock, scenario, credit):
     checks = []

@@ -153,6 +153,18 @@ MAX_CHILD_NETWORK_WAIT_S = 2 * NETWORK_WAIT_GAP_S
 CEILING_SLACK_S = 1e-6
 
 
+def at_cap(credit: float, cap: float) -> float:
+    """`credit`, or exactly `cap` from CEILING_SLACK_S short of it on.
+
+    The ONE snap for both caps (MAX_NETWORK_WAIT_S, MAX_CHILD_NETWORK_WAIT_S),
+    so they cannot drift apart. The child cap needed it too: a child-only wait
+    summed to 731.9999999999999 of 732 (macos-latest 3.12 CI 2026-11-09),
+    after which `deadline` kept an ULP of child credit `remaining` and its
+    `now + remaining` rounded to `now`.
+    """
+    return cap if credit >= cap - CEILING_SLACK_S else credit
+
+
 class NetworkWaitTimeout(TimeoutError):
     """An outage outliving the work budget, or its total allowance exhausted."""
 
@@ -188,14 +200,15 @@ class NetworkWait:
         current = (max(0.0, min(now, self.last + NETWORK_WAIT_GAP_S) - self.credited_at)
                    if self.credited_at is not None else 0.0)
         if self.main_thread not in self.pending:
-            current = min(current, max(0.0, MAX_CHILD_NETWORK_WAIT_S - self.child_s))
-        total = self.total_s + current
-        return MAX_NETWORK_WAIT_S if total >= MAX_NETWORK_WAIT_S - CEILING_SLACK_S else total
+            child = at_cap(self.child_s + current, MAX_CHILD_NETWORK_WAIT_S)
+            current = max(0.0, child - self.child_s)
+        return at_cap(self.total_s + current, MAX_NETWORK_WAIT_S)
 
     def _accrue(self, now: float) -> None:
         credited = self.seconds(now)
         if self.main_thread not in self.pending:
-            self.child_s += credited - self.total_s
+            self.child_s = at_cap(self.child_s + credited - self.total_s,
+                                  MAX_CHILD_NETWORK_WAIT_S)
         self.total_s = credited
         if self.started is not None:
             self.credited_at = now
@@ -262,7 +275,8 @@ class NetworkWait:
         if self.started is not None:
             remaining = MAX_NETWORK_WAIT_S - spent
             if not main_waiting:
-                child_spent = self.child_s + spent - self.total_s
+                child_spent = at_cap(self.child_s + spent - self.total_s,
+                                     MAX_CHILD_NETWORK_WAIT_S)
                 remaining = min(remaining, max(0.0, MAX_CHILD_NETWORK_WAIT_S - child_spent))
             if remaining <= 0:
                 return extended
