@@ -1,19 +1,17 @@
 """Process-probe ownership, watchdog and descendant cleanup contracts."""
-import json
 import os
 import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
 from _process_probe import run_probe
 
-# The bound on a child Python that stages one press and exits: interpreter
-# start plus the package import, 0.27 / 0.25 / 0.28 s measured 2026-10-03; a press
-# that deadlocks never ends, so the bound only has to be far above that.
+# The bound on a short child Python: interpreter start plus the package
+# import, 0.27 / 0.25 / 0.28 s measured 2026-10-03; a hung child never ends,
+# so the bound only has to be far above that.
 CHILD_TIMEOUT_S = 30
 
 
@@ -84,16 +82,6 @@ def test_watchdog_can_end_probe_without_main_timeout():
     # Kill-on-close can report exit code zero on Windows. Finishing the body
     # (or reaching the main timeout) would mean the watchdog failed to act.
     assert 'finished' not in done.stdout
-
-
-def test_probe_rescue_covers_app_server_startup():
-    done = run_probe([sys.executable,
-                      str(Path(__file__).with_name('_silent_interrupt_probe.py')),
-                      'codex', '1', 'stall'], timeout=CHILD_TIMEOUT_S)
-    assert done.returncode == 0, done.stdout + done.stderr
-    measured = json.loads(done.stdout.splitlines()[-1])
-    assert measured['rescued']
-    assert measured['returncodes'] and all(code is not None for code in measured['returncodes'])
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows process-tree timeout cleanup')

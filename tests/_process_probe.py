@@ -8,7 +8,7 @@ import time
 
 
 def run_probe(argv, timeout, *, before_wait=None, watchdog=None, deadline=None):
-    """Timeout owns the entire probe tree, including a stalled provider."""
+    """Run argv as an owned process tree; the timeout ends every descendant."""
     # Completed timeout + cleanup measured 5.060 / 5.073 s on Windows,
     # 2026-11-09. The 15 s allowance exceeds twice either complete interval.
     # Callers may supply one absolute deadline shared with their own waits.
@@ -71,7 +71,9 @@ def run_probe(argv, timeout, *, before_wait=None, watchdog=None, deadline=None):
                     before_wait(proc)
                 stdout, stderr = proc.communicate(timeout=min(timeout, remaining()))
             finally:
-                # Join the watchdog before the main thread takes cleanup ownership.
+                # Join the watchdog before the main thread takes cleanup
+                # ownership. If the join times out, both may run stop_tree;
+                # Job.close swaps the handle under its lock, so that is safe.
                 finish_watchdog()
         except BaseException:
             stop_tree()

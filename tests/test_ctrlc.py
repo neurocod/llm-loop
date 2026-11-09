@@ -376,3 +376,15 @@ def test_the_key_reader_s_ctrl_c_is_a_keyboard_interrupt_outside_a_run():
     with pytest.raises(KeyboardInterrupt):
         reader._emit(lambda event: None, "\x03")
         time.sleep(1)   # interrupt_main is heard between bytecodes
+
+
+def test_probe_rescue_covers_app_server_startup():
+    # The scenario's own startup backstop (_silent_interrupt_probe.main), not
+    # the process-tree runner: no watchdog is passed here.
+    done = run_probe([sys.executable,
+                      str(Path(__file__).with_name('_silent_interrupt_probe.py')),
+                      'codex', '1', 'stall'], timeout=CHILD_TIMEOUT_S)
+    assert done.returncode == 0, done.stdout + done.stderr
+    measured = json.loads(done.stdout.splitlines()[-1])
+    assert measured['rescued']
+    assert measured['returncodes'] and all(code is not None for code in measured['returncodes'])
