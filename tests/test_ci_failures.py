@@ -152,15 +152,24 @@ LOG = "\n".join(prefixed(j, b) for j, b in [(MAC, MAC_BODY), (UBU, UBU_BODY), (W
                                              (OLD, OLD_BODY)])
 
 
-def job(name, conclusion="failure", step="Test", status="completed"):
+def job(name, conclusion="failure", step="Test", status="completed", job_id=None):
     steps = [{"name": "Install", "conclusion": "success"},
-             {"name": step, "conclusion": conclusion if conclusion != "success" else "success"},
+             {"name": step, "conclusion": conclusion},
              {"name": "Post Run actions/checkout@v4", "conclusion": "success"}]
-    return {"name": name, "status": status, "conclusion": conclusion if status == "completed" else "",
-            "steps": steps}
+    out = {"name": name, "status": status, "conclusion": conclusion if status == "completed" else "",
+           "steps": steps}
+    if job_id is not None:
+        out["databaseId"] = job_id
+    return out
 
 
-def run_json(status="completed", conclusion="failure", jobs=None):
+def own_log(lines) -> str:
+    """A job's own log as the API serves it: timestamped lines, a BOM first."""
+    return "\ufeff" + "\n".join(f"2026-11-09T00:00:00.{i:07d}Z {ln}" for i, ln in enumerate(lines))
+
+
+def run_payload(status="completed", conclusion="failure", jobs=None):
+    """What `gh run view --json` answers for run 42."""
     return {"databaseId": 42, "workflowName": "tests", "headSha": "0ca0abdb" + "0" * 32,
             "status": status, "conclusion": conclusion if status == "completed" else "",
             "url": "https://github.com/o/r/actions/runs/42", "displayTitle": "a commit", "attempt": 1,
@@ -492,16 +501,21 @@ def main(monkeypatch, rules, argv):
 
 
 AUTH = ("auth status", (0, "Logged in", ""))
+LOG_FAILED = ("run view 42 --log-failed", (0, LOG, ""))
 
 
 def view(run):
     return ("run view 42 --json", (0, json.dumps(run), ""))
 
 
+def run42(gh, *extra):
+    """The command line judging run 42 of o/r with the fake gh."""
+    return ["--gh", gh, "--repo", "o/r", "--run", "42", *(str(a) for a in extra)]
+
+
 def test_red_run_prints_jobs_groups_and_raw_logs(monkeypatch, capsys, gh, tmp_path):
     raw = tmp_path / "raw"
-    code, fake = main(monkeypatch, [AUTH, view(run_json()), ("run view 42 --log-failed", (0, LOG, ""))],
-                      ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(raw)])
+    code, fake = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED], run42(gh, "--raw-dir", raw))
     out = capsys.readouterr().out
     assert code == cf.EXIT_RED
     assert "pytest (ubuntu-latest, 3.10): success\n" in out
@@ -520,8 +534,8 @@ def test_red_run_prints_jobs_groups_and_raw_logs(monkeypatch, capsys, gh, tmp_pa
 
 def test_max_lines_cuts_the_print_and_names_the_full_report(monkeypatch, capsys, gh, tmp_path):
     raw = tmp_path / "raw"
-    code, _ = main(monkeypatch, [AUTH, view(run_json()), ("run view 42 --log-failed", (0, LOG, ""))],
-                   ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(raw), "--max-lines", "10"])
+    code, _ = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED],
+                   run42(gh, "--raw-dir", raw, "--max-lines", 10))
     out = capsys.readouterr().out.splitlines()
     report = raw / "report.txt"
     full = report.read_text(encoding="utf-8").splitlines()
@@ -532,8 +546,7 @@ def test_max_lines_cuts_the_print_and_names_the_full_report(monkeypatch, capsys,
 
 
 def test_json_output(monkeypatch, capsys, gh, tmp_path):
-    code, _ = main(monkeypatch, [AUTH, view(run_json()), ("run view 42 --log-failed", (0, LOG, ""))],
-                   ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(tmp_path), "--json"])
+    code, _ = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED], run42(gh, "--raw-dir", tmp_path, "--json"))
     data = json.loads(capsys.readouterr().out)
     assert code == data["exit"] == cf.EXIT_RED
     [run] = data["runs"]
@@ -543,9 +556,8 @@ def test_json_output(monkeypatch, capsys, gh, tmp_path):
 
 
 def test_green_run_exits_0_without_fetching_logs(monkeypatch, capsys, gh, tmp_path):
-    green = run_json(conclusion="success", jobs=[job(MAC, "success")])
-    code, fake = main(monkeypatch, [AUTH, view(green)],
-                      ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(tmp_path)])
+    green = run_payload(conclusion="success", jobs=[job(MAC, "success")])
+    code, fake = main(monkeypatch, [AUTH, view(green)], run42(gh, "--raw-dir", tmp_path))
     assert code == cf.EXIT_GREEN
     assert not any("--log-failed" in c for c in fake.calls)
     assert f"{MAC}: success" in capsys.readouterr().out
@@ -557,14 +569,14 @@ def listed(run_id, workflow="tests", created="2026-11-08T10:00:00Z", event="push
 
 
 def view_of(run_id, **kw):
-    run = run_json(**kw)
+    run = run_payload(**kw)
     run["databaseId"] = run_id
     return (f"run view {run_id} --json", (0, json.dumps(run), ""))
 
 
 def test_newest_run_for_the_sha_is_chosen(monkeypatch, capsys, gh, tmp_path):
     runs = [listed(41), listed(42, created="2026-11-08T11:00:00Z")]
-    green = run_json(conclusion="success", jobs=[job(MAC, "success")])
+    green = run_payload(conclusion="success", jobs=[job(MAC, "success")])
     code, fake = main(monkeypatch, [AUTH, ("run list", (0, json.dumps(runs), "")), view(green)],
                       ["--gh", gh, "--repo", "o/r", "--sha", "d" * 40, "--raw-dir", str(tmp_path)])
     assert code == cf.EXIT_GREEN
@@ -620,32 +632,30 @@ def test_no_run_for_the_sha_exits_not_found(monkeypatch, capsys, gh):
 
 def test_missing_run_id_exits_not_found(monkeypatch, gh):
     stderr = "failed to get run: HTTP 404: Not Found (https://api.github.com/repos/o/r/actions/runs/42)"
-    code, _ = main(monkeypatch, [AUTH, ("run view 42", (1, "", stderr))],
-                   ["--gh", gh, "--repo", "o/r", "--run", "42"])
+    code, _ = main(monkeypatch, [AUTH, ("run view 42", (1, "", stderr))], run42(gh))
     assert code == cf.EXIT_NOT_FOUND
 
 
 def test_running_run_without_wait_exits_running(monkeypatch, capsys, gh):
-    running = run_json(status="in_progress", jobs=[job(MAC, status="in_progress")])
-    code, _ = main(monkeypatch, [AUTH, view(running)], ["--gh", gh, "--repo", "o/r", "--run", "42"])
+    running = run_payload(status="in_progress", jobs=[job(MAC, status="in_progress")])
+    code, _ = main(monkeypatch, [AUTH, view(running)], run42(gh))
     out = capsys.readouterr().out
     assert code == cf.EXIT_RUNNING
     assert "run is in_progress; pass --wait" in out and f"{MAC}: in_progress" in out
 
 
 def test_wait_that_times_out_exits_running(monkeypatch, gh):
-    running = run_json(status="queued", jobs=[])
-    code, _ = main(monkeypatch, [AUTH, view(running)],
-                   ["--gh", gh, "--repo", "o/r", "--run", "42", "--wait", "--timeout", "0"])
+    running = run_payload(status="queued", jobs=[])
+    code, _ = main(monkeypatch, [AUTH, view(running)], run42(gh, "--wait", "--timeout", 0))
     assert code == cf.EXIT_RUNNING
 
 
 def test_wait_polls_until_the_run_completes(monkeypatch, gh, tmp_path):
-    answers = [(0, json.dumps(run_json(status="in_progress", jobs=[])), ""),
-               (0, json.dumps(run_json(status="in_progress", jobs=[])), ""),
-               (0, json.dumps(run_json(conclusion="success", jobs=[job(MAC, "success")])), "")]
+    answers = [(0, json.dumps(run_payload(status="in_progress", jobs=[])), ""),
+               (0, json.dumps(run_payload(status="in_progress", jobs=[])), ""),
+               (0, json.dumps(run_payload(conclusion="success", jobs=[job(MAC, "success")])), "")]
     code, fake = main(monkeypatch, [AUTH, ("run view 42 --json", answers)],
-                      ["--gh", gh, "--repo", "o/r", "--run", "42", "--wait", "--raw-dir", str(tmp_path)])
+                      run42(gh, "--wait", "--raw-dir", tmp_path))
     assert code == cf.EXIT_GREEN
     assert sum("--json" in c for c in fake.calls) == 3
 
@@ -666,7 +676,7 @@ def test_gh_found_nowhere_exits_no_gh(monkeypatch):
 
 def test_gh_logged_out_exits_no_gh(monkeypatch, capsys, gh):
     code, fake = main(monkeypatch, [("auth status", (1, "", "You are not logged into any GitHub hosts."))],
-                      ["--gh", gh, "--repo", "o/r", "--run", "42"])
+                      run42(gh))
     assert code == cf.EXIT_NO_GH and len(fake.calls) == 1
     assert "gh auth login" in capsys.readouterr().err
 
@@ -677,7 +687,7 @@ def test_gh_logged_out_exits_no_gh(monkeypatch, capsys, gh):
     subprocess.TimeoutExpired(["gh"], 120),
 ])
 def test_other_gh_failures_exit_gh_error(monkeypatch, gh, answer):
-    code, _ = main(monkeypatch, [AUTH, ("run view 42", answer)], ["--gh", gh, "--repo", "o/r", "--run", "42"])
+    code, _ = main(monkeypatch, [AUTH, ("run view 42", answer)], run42(gh))
     assert code == cf.EXIT_GH_ERROR
 
 
@@ -706,13 +716,9 @@ def any_log():
 
 def jobs_of(*conclusions):
     """Jobs j0, j1, ... with these conclusions; `in_progress` is a status."""
-    out = []
-    for i, c in enumerate(conclusions):
-        j = job(f"j{i}", "" if c == "in_progress" else c,
-                status="in_progress" if c == "in_progress" else "completed")
-        j["databaseId"] = 1000 + i
-        out.append(j)
-    return out
+    return [job(f"j{i}", "" if c == "in_progress" else c,
+                status="in_progress" if c == "in_progress" else "completed", job_id=1000 + i)
+            for i, c in enumerate(conclusions)]
 
 
 @pytest.mark.parametrize("conclusion, jobs, expected", [
@@ -740,11 +746,10 @@ def jobs_of(*conclusions):
     ("", jobs_of("success"), "INCOMPLETE"),
 ])
 def test_conclusion_matrix(monkeypatch, capsys, gh, tmp_path, conclusion, jobs, expected):
-    run = run_json(conclusion=conclusion, jobs=jobs if jobs is not None else [])
+    run = run_payload(conclusion=conclusion, jobs=jobs if jobs is not None else [])
     if jobs is None:
         del run["jobs"]
-    code, _ = main(monkeypatch, [AUTH, view(run)] + any_log(),
-                   ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(tmp_path)])
+    code, _ = main(monkeypatch, [AUTH, view(run)] + any_log(), run42(gh, "--raw-dir", tmp_path))
     # By name: the module of 713cfed had no EXIT_INCOMPLETE, and must still collect.
     assert code == getattr(cf, f"EXIT_{expected}")
 
@@ -756,9 +761,9 @@ def test_uncapped_report_keeps_the_whole_headline(monkeypatch, capsys, gh, tmp_p
     message = "AssertionError: " + "x" * 400
     body = "\n".join(["=== short test summary info ===", f"FAILED tests/x.py::t - {message}",
                       "1 failed in 0.10s", "##[error]Process completed with exit code 1."])
-    code, _ = main(monkeypatch, [AUTH, view(run_json(jobs=[job(MAC)])),
+    code, _ = main(monkeypatch, [AUTH, view(run_payload(jobs=[job(MAC)])),
                                  ("run view 42 --log-failed", (0, prefixed(MAC, body), ""))],
-                   ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(tmp_path)])
+                   run42(gh, "--raw-dir", tmp_path))
     out = capsys.readouterr().out
     assert code == cf.EXIT_RED
     assert message not in out and "x" * 200 + "..." in out
@@ -766,8 +771,8 @@ def test_uncapped_report_keeps_the_whole_headline(monkeypatch, capsys, gh, tmp_p
 
 
 def test_the_index_names_every_failure_before_the_cap(monkeypatch, capsys, gh, tmp_path):
-    code, _ = main(monkeypatch, [AUTH, view(run_json()), ("run view 42 --log-failed", (0, LOG, ""))],
-                   ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(tmp_path), "--max-lines", "14"])
+    code, _ = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED],
+                   run42(gh, "--raw-dir", tmp_path, "--max-lines", 14))
     out = capsys.readouterr().out
     assert code == cf.EXIT_RED
     assert "  [1] FAILED tests/test_cpu_load.py::" in out
@@ -776,18 +781,15 @@ def test_the_index_names_every_failure_before_the_cap(monkeypatch, capsys, gh, t
 
 
 def test_a_cancelled_job_missing_from_log_failed_shows_its_own_log(monkeypatch, capsys, gh, tmp_path):
-    cancelled = job(UBU, "cancelled")
-    cancelled["databaseId"] = 2002
-    own = "﻿" + "\n".join(f"2026-11-09T00:00:0{i}.0000000Z {ln}" for i, ln in enumerate(
-        ["Running tests", "##[error]The operation was canceled.", "Post job cleanup."]))
-    gone = job(WIN, "timed_out")
-    gone["databaseId"] = 2003
+    cancelled = job(UBU, "cancelled", job_id=2002)
+    own = own_log(["Running tests", "##[error]The operation was canceled.", "Post job cleanup."])
+    gone = job(WIN, "timed_out", job_id=2003)
     stderr = "HTTP 410: Gone (https://api.github.com/repos/o/r/actions/jobs/2003/logs)"
-    rules = [AUTH, view(run_json(jobs=[job(MAC), cancelled, gone])),
+    rules = [AUTH, view(run_payload(jobs=[job(MAC), cancelled, gone])),
              ("run view 42 --log-failed", (0, prefixed(MAC, TAIL_OF_JOB), "")),
              ("api repos/o/r/actions/jobs/2002/logs", (0, own, "")),
              ("api repos/o/r/actions/jobs/2003/logs", (1, "", stderr))]
-    code, fake = main(monkeypatch, rules, ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(tmp_path)])
+    code, fake = main(monkeypatch, rules, run42(gh, "--raw-dir", tmp_path))
     out = capsys.readouterr().out
     assert code == cf.EXIT_RED
     assert "##[error]The operation was canceled." in out and "own log" in out
@@ -796,13 +798,10 @@ def test_a_cancelled_job_missing_from_log_failed_shows_its_own_log(monkeypatch, 
 
 
 def test_a_running_run_shows_the_failures_already_known(monkeypatch, capsys, gh, tmp_path):
-    done = job(MAC)
-    done["databaseId"] = 1001
-    running = run_json(status="in_progress", jobs=[done, job(UBU, status="in_progress")])
-    own = "﻿" + "\n".join(f"2026-11-09T00:00:00.{i:07d}Z {ln}"
-                               for i, ln in enumerate(MAC_BODY.split("\n")))
+    running = run_payload(status="in_progress", jobs=[job(MAC, job_id=1001), job(UBU, status="in_progress")])
+    own = own_log(MAC_BODY.split("\n"))
     code, fake = main(monkeypatch, [AUTH, view(running), ("api repos/o/r/actions/jobs/1001/logs", (0, own, ""))],
-                      ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(tmp_path)])
+                      run42(gh, "--raw-dir", tmp_path))
     out = capsys.readouterr().out
     assert code == cf.EXIT_RUNNING
     assert "run is in_progress; pass --wait" in out
@@ -813,8 +812,7 @@ def test_a_running_run_shows_the_failures_already_known(monkeypatch, capsys, gh,
 
 def test_a_log_over_the_size_limit_is_named_not_parsed(monkeypatch, capsys, gh, tmp_path):
     monkeypatch.setattr(cf, "MAX_LOG_BYTES", 100)
-    code, _ = main(monkeypatch, [AUTH, view(run_json()), ("run view 42 --log-failed", (0, LOG, ""))],
-                   ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(tmp_path)])
+    code, _ = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED], run42(gh, "--raw-dir", tmp_path))
     out = capsys.readouterr().out
     saved = tmp_path / "log-failed.txt"
     assert code == cf.EXIT_RED
@@ -826,8 +824,8 @@ def test_a_multi_step_failure_names_every_step(monkeypatch, capsys, gh, tmp_path
     two = job(MAC)
     two["steps"].append({"name": "Deploy", "conclusion": "failure"})
     log = prefixed(MAC, "\n".join(DEPLOY_AFTER))
-    code, _ = main(monkeypatch, [AUTH, view(run_json(jobs=[two])), ("run view 42 --log-failed", (0, log, ""))],
-                   ["--gh", gh, "--repo", "o/r", "--run", "42", "--raw-dir", str(tmp_path)])
+    code, _ = main(monkeypatch, [AUTH, view(run_payload(jobs=[two])), ("run view 42 --log-failed", (0, log, ""))],
+                   run42(gh, "--raw-dir", tmp_path))
     out = capsys.readouterr().out
     assert code == cf.EXIT_RED
     assert f"{MAC}: failure @ Test, Deploy" in out and "deploy: permission denied" in out
@@ -850,11 +848,11 @@ class Clock:
 @pytest.mark.parametrize("timeout, bounds", [(30, []), (45, [15]), (100, [70, 40, 10])])
 def test_wait_never_outlives_the_timeout(monkeypatch, gh, timeout, bounds):
     clock = Clock()
-    fake = Fake([AUTH, view(run_json(status="in_progress", jobs=[]))])
+    fake = Fake([AUTH, view(run_payload(status="in_progress", jobs=[]))])
     monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(cf.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(cf.time, "sleep", clock.sleep)
-    code = cf.main(["--gh", gh, "--repo", "o/r", "--run", "42", "--wait", "--timeout", str(timeout)])
+    code = cf.main(run42(gh, "--wait", "--timeout", timeout))
     assert code == cf.EXIT_RUNNING
     views = [kw["timeout"] for argv, kw in zip(fake.calls, fake.kwargs) if "view" in argv]
     assert views[0] == cf.GH_TIMEOUT_S and views[1:] == bounds
@@ -878,9 +876,8 @@ def test_gh_given_by_name_is_looked_up_on_path(monkeypatch):
 
 
 def test_auth_is_checked_for_github_com(monkeypatch, gh, tmp_path):
-    green = run_json(conclusion="success", jobs=[job(MAC, "success")])
-    _, fake = main(monkeypatch, [AUTH, view(green)], ["--gh", gh, "--repo", "o/r", "--run", "42",
-                                                      "--raw-dir", str(tmp_path)])
+    green = run_payload(conclusion="success", jobs=[job(MAC, "success")])
+    _, fake = main(monkeypatch, [AUTH, view(green)], run42(gh, "--raw-dir", tmp_path))
     assert fake.calls[0][1:] == ["auth", "status", "--hostname", "github.com"]
 
 
@@ -889,13 +886,13 @@ def test_auth_is_checked_for_github_com(monkeypatch, gh, tmp_path):
     (subprocess.TimeoutExpired(["gh"], 120), "did not answer within 120 s"),
 ])
 def test_gh_start_failure_and_timeout_are_told_apart(monkeypatch, capsys, gh, answer, said):
-    code, _ = main(monkeypatch, [AUTH, ("run view 42", answer)], ["--gh", gh, "--repo", "o/r", "--run", "42"])
+    code, _ = main(monkeypatch, [AUTH, ("run view 42", answer)], run42(gh))
     assert code == cf.EXIT_GH_ERROR and said in capsys.readouterr().err
 
 
 def test_no_access_to_the_repository_is_said(monkeypatch, capsys, gh):
     stderr = "HTTP 403: Resource not accessible by integration (https://api.github.com/repos/o/r/actions/runs/42)"
-    code, _ = main(monkeypatch, [AUTH, ("run view 42", (1, "", stderr))], ["--gh", gh, "--repo", "o/r", "--run", "42"])
+    code, _ = main(monkeypatch, [AUTH, ("run view 42", (1, "", stderr))], run42(gh))
     assert code == cf.EXIT_NO_GH and "the gh login cannot read o/r" in capsys.readouterr().err
 
 
@@ -903,8 +900,7 @@ def test_default_raw_dir_is_named_by_the_run_and_printed(monkeypatch, capsys, gh
     temp = tmp_path / "temp"
     temp.mkdir()
     monkeypatch.setattr(cf.tempfile, "tempdir", str(temp))
-    code, _ = main(monkeypatch, [AUTH, view(run_json()), ("run view 42 --log-failed", (0, LOG, ""))],
-                   ["--gh", gh, "--repo", "o/r", "--run", "42"])
+    code, _ = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED], run42(gh))
     [made] = os.listdir(temp)
     assert code == cf.EXIT_RED and made.startswith("ci_failures_42_")
     assert str(temp / made) in capsys.readouterr().out
