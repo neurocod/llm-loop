@@ -307,10 +307,8 @@ Claude remains the default for compatibility. Select Codex per invocation with
 `--codex`, or set `provider = "codex"` on the Driver subclass. Codex normally runs
 through its app-server protocol, so `m` can steer the active turn; the same sequential and
 parallel renderers show agent messages, commands, file changes, failures, and
-final token counts. `--no-live-messages` falls back to `codex exec --json` and
-sends the prompt through a closed stdin stream (`codex exec ... -`) instead of
-argv. Both transports avoid Windows command-line length limits without entering
-the interactive UI. Claude keeps its existing provider-specific transport.
+final token counts. `--no-live-messages` disables operator notes.
+Claude keeps its existing provider-specific transport.
 The adapter grants writes only to the workspace and routes any approval through
 Codex's automatic reviewer; it does not bypass the sandbox.
 

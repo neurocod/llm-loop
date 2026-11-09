@@ -57,13 +57,12 @@ def test_codex_argv_can_select_a_workflow_specific_sandbox():
     assert argv.sandbox_mode == "danger-full-access"
 
 
-def test_codex_no_live_messages_keeps_the_closed_stdin_fallback(
+def test_codex_no_live_messages_keeps_the_app_server(
         no_live_messages):
     argv = build_agent_argv(AgentCommand("work", "gpt-test"), "codex", "/repo")
 
-    assert argv[:3] == ["codex", "exec", "--json"]
-    assert "--approve-for-me" in argv
-    assert argv[-1] == "-"
+    assert argv == ["codex", "app-server", "--stdio"]
+    assert argv.model == "gpt-test"
 
 
 def test_codex_app_server_thread_policy_matches_the_exec_policy():
@@ -425,12 +424,20 @@ def test_both_renderers_take_codex_app_events_as_objects(
         assert "корень готов" in out
 
 
-def test_codex_no_live_process_closes_stdin_after_the_prompt(
+def test_codex_no_live_process_closes_stdin_after_the_turn(
         monkeypatch, no_live_messages):
+    # Historical exec fallback: disabling notes must now retain the control
+    # channel until the provider has waited for children and the follow-up.
     created = []
 
     def fake_popen(argv, **kwargs):
-        proc = _FakeAgentProcess(has_stdin=True)
+        proc = _FakeAgentProcess(has_stdin=True, stdout=_app_server_stream(
+            {"id": 0, "result": {}},
+            {"id": 1, "result": {"thread": {"id": "root"}}},
+            {"id": 2, "result": {"turn": {"id": "turn"}}},
+            {"method": "turn/completed", "params": {
+                "threadId": "root", "turn": {"id": "turn", "status": "completed"}}},
+        ))
         created.append((argv, proc))
         return proc
 
@@ -439,8 +446,9 @@ def test_codex_no_live_process_closes_stdin_after_the_prompt(
 
     proc = start_agent_process(argv, "codex", "work", "/repo")
 
-    assert created[0][0][-1] == "-"
-    assert proc.stdin.text == "work"
+    assert created[0][0][-1] == "--stdio"
+    assert not proc.stdin.closed
+    assert list(proc.stdout)[-1]["type"] == "turn.completed"
     assert proc.stdin.closed
 
 

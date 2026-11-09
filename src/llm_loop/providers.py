@@ -67,7 +67,7 @@ def live_messages_enabled(provider: str) -> bool:
 def prompt_on_stdin(provider: str) -> bool:
     """Whether this provider's prompt travels on stdin rather than in argv.
 
-    True for codex always (as an app-server request, or the fallback ``exec -``),
+    True for codex always (as an app-server request),
     and for claude whenever the live-message transport is on. Claude's
     `--input-format stream-json` ignores an argv prompt (measured: the session
     did not start until the first stdin message arrived), so its two switches go
@@ -138,23 +138,34 @@ class _CodexEventStream:
         # — the main thread's and every sub-agent's: the turn's usage is their
         # sum, so a review that delegated half its work bills that half too.
         self._usage_by_thread = {}
+        from llm_agents.codex.loop_wait import LoopWait
+        self._wait = LoopWait(self)
+        self._ending = None
 
     def __iter__(self):
         return self
 
-    def _next_item(self):
+    def _next_item(self, deadline=None):
         try:
             return next(self._buffered)
         except StopIteration:
             pass
         connection = self._owner.connection
         try:
-            return connection.take(None, "turn")
+            return connection.take(deadline, "turn")
         except appserver.Closed:
             connection.fail_pending("codex app-server closed")
+            if deadline is not None:
+                raise
             raise StopIteration from None
 
     def __next__(self):
+        if self._ending is not None:
+            try:
+                return next(self._ending)
+            except StopIteration:
+                self._owner.close_input()
+                raise
         while True:
             message = self._next_item()
             if not isinstance(message, dict):
@@ -163,17 +174,10 @@ class _CodexEventStream:
                 # A note's acknowledgement (`steer`), or a stale reply.
                 self._owner.connection.resolve(message)
                 continue
-            if wire.codex_app_from_sub_agent(message, self._owner.thread_id):
-                # A sub-agent's tokens are billed; nothing else of it reaches
-                # the stream — its answer, completion and errors are the main
-                # thread's to act on, and its window is not the main one.
-                self._observe_usage(message)
-                continue
-            if not wire.codex_app_in_turn(message, self._owner.turn_id):
-                continue
-            self._observe_usage(message)
-            event = wire.codex_app_event(
-                message, wire.codex_app_usage_sum(self._usage_by_thread.values()))
+            event = self._wait.observe(message)
+            if self._wait.done:
+                self._ending = iter(self._wait.finish())
+                return next(self._ending)
             if event is not None:
                 return event
 
@@ -372,7 +376,7 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
                         project_dir: str):
     """Start a provider CLI with its provider-specific prompt transport.
 
-    Four shapes, selected by provider and the live-message switch:
+    The provider chooses its transport; the live-message switch controls notes:
 
       * claude with live messages - the prompt is the first JSON line on a stdin
         that STAYS OPEN, so the console can send more user messages while the
@@ -381,10 +385,8 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
         arrange the closing itself.
       * claude without them - the prompt sits in argv, stdin is inherited, and
         the process exits on its own when the turn is done.
-      * codex with live messages - app-server owns the open stdin and accepts
-        active-turn steering requests through it.
-      * codex without them - ``exec --json`` reads the prompt from a stdin closed
-        immediately after, preserving the old fallback transport.
+      * codex - app-server keeps children alive after the main answer and
+        accepts active-turn steering when live messages are enabled.
 
     The returned process's ``stdout`` yields ``str`` lines (JSONL or plain
     diagnostics) for every shape, plus already-decoded ``dict`` events for the
@@ -399,7 +401,7 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
     `UnicodeEncodeError` from the payload) would orphan the CLI before any
     caller had a handle to reap.
     """
-    if provider == "codex" and live_messages_enabled(provider):
+    if provider == "codex":
         return _start_codex_app_server(argv, prompt, project_dir)
 
     kwargs = {
@@ -609,36 +611,8 @@ def build_agent_argv(command: AgentCommandLike, provider: str,
             ]
         return argv
 
-    sandbox_mode = getattr(command, "sandbox_mode", "")
-    if live_messages_enabled(provider):
-        return _CodexArgv(
-            [spec.executable, "app-server", "--stdio"],
-            model=command.model,
-            sandbox_mode=sandbox_mode,
-        )
-
-    argv = [
-        spec.executable,
-        "exec",
-        "--json",
-    ]
-    if sandbox_mode:
-        # --approve-for-me itself selects workspace-write and cannot be combined
-        # with an explicit sandbox. An unattended explicit mode also needs an
-        # explicit non-interactive approval policy.
-        argv += [
-            "--sandbox", sandbox_mode,
-            "--config", 'approval_policy="never"',
-        ]
-    else:
-        # --approve-for-me already selects the workspace-write sandbox. Current
-        # Codex CLI versions reject combining it with an explicit --sandbox.
-        argv.append("--approve-for-me")
-    argv += [
-        "--skip-git-repo-check",
-        "-C", project_dir,
-    ]
-    if command.model:
-        argv += ["--model", command.model]
-    argv.append("-")
-    return argv
+    return _CodexArgv(
+        [spec.executable, "app-server", "--stdio"],
+        model=command.model,
+        sandbox_mode=getattr(command, "sandbox_mode", ""),
+    )
