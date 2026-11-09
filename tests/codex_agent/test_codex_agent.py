@@ -392,6 +392,29 @@ def test_network_wait_rev1277_recovers_without_resend(
     assert outcome.network_wait_s == {366.0: 260.502, 128.0: 205.717}[gap]
 
 
+def test_network_wait_error_exactly_on_the_freshness_bound_starts_a_new_wait():
+    """`_stale` is `>=`: an error landing exactly on the bound belongs to a
+    new continuous wait. Readings are whole seconds from the account's first
+    (its epoch), so the bound is exact on the microsecond grid."""
+    wait = service.NetworkWait(main_thread=MAIN)
+    child = {**LOGGED_NETWORK_WAIT, "params": {
+        **LOGGED_NETWORK_WAIT["params"], "threadId": "child"}}
+    start = 1_000_000.0
+    wait.observe(LOGGED_NETWORK_WAIT, start, "2026-11-09 12:00:00")
+    wait.observe(child, start + 100, "2026-11-09 12:01:40")
+    assert wait.tries == 2
+    bound = start + 100 + service.NETWORK_WAIT_GAP_S
+    # The hazard's precondition, or the case tests nothing.
+    assert wait._at(bound) == wait._fresh_until_us()
+    credit = wait.seconds(bound)
+    assert credit == 100 + service.NETWORK_WAIT_GAP_S
+    wait.observe(LOGGED_NETWORK_WAIT, bound, "2026-11-09 12:07:46")
+    assert wait.started == bound and wait.credited_at == bound
+    assert wait.tries == 1 and wait.since == "2026-11-09 12:07:46"
+    assert wait.seconds(bound) == credit
+    assert wait.pending == {MAIN: bound, "child": start + 100}
+
+
 def test_network_wait_staleness_keeps_remaining_work_budget():
     wait = service.NetworkWait(main_thread=LOGGED_NETWORK_WAIT["params"]["threadId"])
     wait.observe(LOGGED_NETWORK_WAIT, 187.371, "2026-10-15 12:30:00")
