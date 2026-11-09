@@ -154,6 +154,8 @@ def test_delayed_callback_counts_once_across_fd_boundary(boundary, monkeypatch):
         nonlocal callback
         callback = signal.getsignal(signal.SIGINT)
         result = activate(wakeup)
+        # A foreign fd would decline the takeover and cross neither boundary.
+        assert result
         if boundary == 'installation':
             # Signal arrived before the fd, hence no byte; callback after attach.
             callback(signal.SIGINT, None)

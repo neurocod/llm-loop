@@ -81,7 +81,8 @@ class Interrupt:
         """Release blocking I/O without counting a press.
 
         Only idempotent process-ending hooks opt in. The Python SIGINT
-        callback will later count the press and run its ordinary hooks.
+        callback, before or after this, counts the press and runs its
+        ordinary hooks.
         """
         for hook in self._wake_hooks:
             try:
@@ -217,7 +218,9 @@ class _SignalWakeup:
         return True
 
     def drain(self):
-        # The watcher drains while active; close drains after joining it.
+        # The watcher drains while active; close drains after joining it, or
+        # concurrently when the stop byte could not be sent — the lock
+        # serialises the two.
         count = 0
         with self.lock:
             while True:
