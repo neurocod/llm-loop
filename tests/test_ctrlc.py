@@ -28,7 +28,8 @@ from _silent_interrupt_probe import run_probe
 CHILD_TIMEOUT_S = 30
 
 
-def test_job_close_waits_for_active_members_before_releasing_handle():
+@pytest.mark.parametrize('expires', [False, True])
+def test_job_close_waits_for_active_members_before_releasing_handle(expires):
     from _process_job import Job
     from types import SimpleNamespace
     events = []
@@ -43,13 +44,16 @@ def test_job_close_waits_for_active_members_before_releasing_handle():
     job = Job.__new__(Job)
     job._lock = threading.Lock()
     job.handle = 77
-    job._member_handles = lambda handle: [88]
     job.api = SimpleNamespace(TerminateJobObject=terminate,
                               QueryInformationJobObject=query,
-                              WaitForSingleObject=lambda handle, timeout: events.append('wait') or 0,
                               CloseHandle=lambda handle: events.append(f'close {handle}'))
-    job.close()
-    assert events == ['terminate', 'query', 'query', 'wait', 'close 77', 'close 88']
+    if expires:
+        with pytest.raises(TimeoutError):
+            job.close(time.monotonic())
+        assert events == ['terminate', 'query', 'close 77']
+    else:
+        job.close(time.monotonic() + CHILD_TIMEOUT_S)
+        assert events == ['terminate', 'query', 'query', 'close 77']
 
 
 def test_concurrent_job_close_releases_handle_once():
@@ -64,11 +68,10 @@ def test_concurrent_job_close_releases_handle_once():
     job = Job.__new__(Job)
     job._lock = threading.Lock()
     job.handle = 77
-    job._member_handles = lambda handle: []
     job.api = SimpleNamespace(CloseHandle=close_handle)
-    job._end_members = lambda handle: None
-    first = threading.Thread(target=job.close)
-    second = threading.Thread(target=job.close)
+    job._end_members = lambda handle, deadline: None
+    first = threading.Thread(target=job.close, args=(time.monotonic() + CHILD_TIMEOUT_S,))
+    second = threading.Thread(target=job.close, args=(time.monotonic() + CHILD_TIMEOUT_S,))
     first.start()
     try:
         assert entered.wait(CHILD_TIMEOUT_S)
@@ -218,11 +221,17 @@ def test_probe_timeout_reaps_provider_child(tmp_path, parent_exits):
     kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
     kernel.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    # One overall deadline includes readiness, watchdog joining, job polling,
+    # and the test-owned process wait. 60 s also doubles the existing 30 s
+    # startup watchdog bound; completed cases measured 5.060 / 5.073 s.
+    overall_deadline = time.monotonic() + 60
+    def remaining_ms():
+        return max(0, int((overall_deadline - time.monotonic()) * 1000))
     handles = []
     def release_handle():
         for handle in handles:
             kernel.TerminateProcess(handle, 1)
-            kernel.WaitForSingleObject(handle, 5000)
+            kernel.WaitForSingleObject(handle, remaining_ms())
             kernel.CloseHandle(handle)
     # Retain identity before cleanup; reopening a PID afterwards can inspect
     # (and terminate) an unrelated process if Windows has reused that PID.
@@ -238,7 +247,7 @@ def test_probe_timeout_reaps_provider_child(tmp_path, parent_exits):
     # Interpreter + child startup measured below 0.8 s, 2026-11-09.
     measured = []
     def ready(proc):
-        deadline = time.monotonic() + CHILD_TIMEOUT_S
+        deadline = min(overall_deadline, time.monotonic() + CHILD_TIMEOUT_S)
         while not pid_file.exists():
             assert time.monotonic() < deadline, 'child never became ready'
             time.sleep(0.01)
@@ -249,19 +258,25 @@ def test_probe_timeout_reaps_provider_child(tmp_path, parent_exits):
         assert handle, ctypes.get_last_error()
         handles.append(handle)
         if parent_exits:
-            assert proc.wait(timeout=CHILD_TIMEOUT_S) == 0
+            assert proc.wait(timeout=max(0, overall_deadline - time.monotonic())) == 0
             assert proc.poll() is not None
         measured.append(time.monotonic())
-    # Independent watchdog: twice the existing 30 s child bound. It covers
-    # readiness and parent exit, separately from the orphan-cleanup deadline.
+    # The watchdog fires before the overall deadline, leaving time to join it.
+    # No cleanup operation starts a fresh timeout budget.
     try:
         with pytest.raises(subprocess.TimeoutExpired):
             run_probe([sys.executable, '-c', script, str(pid_file)], timeout=5,
-                      before_wait=ready, watchdog=60)
-        assert kernel.WaitForSingleObject(handles[0], 0) == 0, 'provider survived probe timeout'
+                      before_wait=ready, watchdog=30, deadline=overall_deadline)
+        # Zero job membership was observed before a process handle signaled
+        # in the previous regression. Job accounting is not a process join:
+        # measured lag 0.046056 / 0.045247 s (live/exited parent), Windows
+        # 2026-11-09. Cover it with the SAME overall deadline, not a new budget.
+        wait_started = time.monotonic()
+        assert kernel.WaitForSingleObject(handles[0], remaining_ms()) == 0, 'provider survived probe timeout'
+        print(f'handle wait after zero membership: {time.monotonic() - wait_started:.6f} s')
     finally:
         release_handle()
-    # Timeout plus cleanup after readiness: 5.016 s (live parent), 5.013 s
+    # Timeout plus cleanup after readiness: 5.060 s (live parent), 5.073 s
     # (exited parent), Windows 2026-11-09. 15 s exceeds twice both measurements.
     elapsed = time.monotonic() - measured[0]
     print(f'orphan cleanup after readiness: {elapsed:.3f} s')

@@ -24,9 +24,6 @@ class Job:
         self.api.SetInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD]
         self.api.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
         self.api.CloseHandle.argtypes = [w.HANDLE]
-        self.api.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
-        self.api.OpenProcess.restype = w.HANDLE
-        self.api.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
         self.api.TerminateJobObject.argtypes = [w.HANDLE, w.UINT]
         self.api.QueryInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int,
                                                        ctypes.c_void_p, w.DWORD,
@@ -38,7 +35,7 @@ class Job:
         limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if not self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
             error = ctypes.WinError(ctypes.get_last_error())
-            self.close()
+            self.close(time.monotonic())
             raise error
 
     def assign(self, proc):
@@ -48,58 +45,17 @@ class Job:
             if not self.api.AssignProcessToJobObject(self.handle, int(proc._handle)):
                 raise ctypes.WinError(ctypes.get_last_error())
 
-    def close(self):
-        # Transfer sole ownership under the lock before calling Win32. Closing
-        # outside it is safe: no other caller can obtain this handle again,
-        # and assign holds the same lock while using it. A concurrent close
-        # may return before CloseHandle finishes; run_probe joins its watchdog
-        # before main-path cleanup needs the tree to have ended.
+    def close(self, deadline):
+        # Swap under the lock; only the winner owns the native handle.
         with self._lock:
-            handle = self.handle
-            self.handle = None
+            handle, self.handle = self.handle, None
         if handle:
-            members = []
             try:
-                members = self._member_handles(handle)
-                self._end_members(handle)
-                for member in members:
-                    if self.api.WaitForSingleObject(member, 5000) != 0:
-                        raise TimeoutError('probe process did not finish exiting')
+                self._end_members(handle, deadline)
             finally:
                 self.api.CloseHandle(handle)
-                for member in members:
-                    self.api.CloseHandle(member)
 
-    def _member_handles(self, handle):
-        # Job accounting can reach zero before process handles are signaled.
-        # Retain identities before termination so cleanup can join them too.
-        capacity = 16
-        while True:
-            class Pids(ctypes.Structure):
-                _fields_ = [('assigned', w.DWORD), ('count', w.DWORD),
-                            ('pids', ctypes.c_size_t * capacity)]
-            pids = Pids()
-            if self.api.QueryInformationJobObject(handle, 3, ctypes.byref(pids),
-                                                 ctypes.sizeof(pids), None):
-                break
-            if ctypes.get_last_error() != 234:  # ERROR_MORE_DATA
-                raise ctypes.WinError(ctypes.get_last_error())
-            capacity *= 2
-        members = []
-        try:
-            for pid in pids.pids[:pids.count]:
-                member = self.api.OpenProcess(0x100000, False, pid)
-                if member:
-                    members.append(member)
-                elif ctypes.get_last_error() != 87:  # Already exited.
-                    raise ctypes.WinError(ctypes.get_last_error())
-            return members
-        except BaseException:
-            for member in members:
-                self.api.CloseHandle(member)
-            raise
-
-    def _end_members(self, handle):
+    def _end_members(self, handle, deadline):
         """Wait for job membership to drain before releasing its last handle.
 
         Kill-on-close requests termination; it does not join descendants.
@@ -110,10 +66,6 @@ class Job:
                         ('total', w.DWORD), ('active', w.DWORD), ('terminated', w.DWORD)]
         if not self.api.TerminateJobObject(handle, 1):
             raise ctypes.WinError(ctypes.get_last_error())
-        # Completed cleanup measured 0.023 / 0.020 s beyond the 5 s timeout
-        # (live/exited parent), Windows 2026-11-09. Allow 5 s for termination,
-        # far above twice either measured overhead.
-        deadline = time.monotonic() + 5
         while True:
             accounting = Accounting()
             if not self.api.QueryInformationJobObject(
@@ -123,4 +75,4 @@ class Job:
                 return
             if time.monotonic() >= deadline:
                 raise TimeoutError('probe job still has active processes after termination')
-            time.sleep(0.01)
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))

@@ -12,8 +12,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from llm_loop import ctrlc, providers, streamrender
 
 
-def run_probe(argv, timeout, *, before_wait=None, watchdog=None):
+def run_probe(argv, timeout, *, before_wait=None, watchdog=None, deadline=None):
     """Timeout owns the entire probe tree, including a stalled provider."""
+    # Completed timeout + cleanup measured 5.060 / 5.073 s on Windows,
+    # 2026-11-09. The 15 s allowance exceeds twice either complete interval.
+    # Callers may supply one absolute deadline shared with their own waits.
+    if deadline is None:
+        deadline = time.monotonic() + max(timeout, watchdog or 0) + 15
+    def remaining():
+        return max(0, deadline - time.monotonic())
     job = None
     launch = argv
     if os.name == 'nt':
@@ -30,20 +37,28 @@ def run_probe(argv, timeout, *, before_wait=None, watchdog=None):
                                 text=True, start_new_session=os.name != 'nt')
     except BaseException:
         if job:
-            job.close()
+            job.close(deadline)
         raise
+    rescue_errors = []
     def rescue():
-        if job:
-            job.close()
-        elif os.name != 'nt':
-            os.killpg(proc.pid, signal.SIGKILL)
-        if proc.poll() is None:
-            proc.kill()
+        try:
+            if job:
+                job.close(deadline)
+            elif os.name != 'nt':
+                os.killpg(proc.pid, signal.SIGKILL)
+            if proc.poll() is None:
+                proc.kill()
+        except Exception as exc:
+            rescue_errors.append(exc)
     timer = threading.Timer(watchdog, rescue) if watchdog is not None else None
     def stop_watchdog():
         if timer:
             timer.cancel()
-            timer.join()
+            timer.join(remaining())
+            if timer.is_alive():
+                raise TimeoutError('probe watchdog did not stop before deadline')
+            if rescue_errors:
+                raise rescue_errors[0]
     if timer:
         timer.start()
     try:
@@ -54,27 +69,33 @@ def run_probe(argv, timeout, *, before_wait=None, watchdog=None):
             proc.stdin = None
         if before_wait is not None:
             before_wait(proc)
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = proc.communicate(timeout=min(timeout, remaining()))
         return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
     except BaseException:
         stop_watchdog()
         if os.name == 'nt':
-            job.close()
+            job.close(deadline)
             if proc.poll() is None:
                 proc.kill()  # Also covers failure to assign the bootstrap.
-            proc.wait()
+            proc.wait(timeout=remaining())
         else:
             os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
+            proc.wait(timeout=remaining())
         raise
     finally:
-        stop_watchdog()
-        if job:
-            job.close()
+        try:
+            stop_watchdog()
+        finally:
+            if job:
+                job.close(deadline)
         if proc.stdin:
             proc.stdin.close()
-        proc.stdout.close()
-        proc.stderr.close()
+        # Windows communicate readers may still own the stream locks after a
+        # deadline failure. Do not turn bounded cleanup into an unbounded close.
+        for name in ('stdout', 'stderr'):
+            reader = getattr(proc, name + '_thread', None)
+            if reader is None or not reader.is_alive():
+                getattr(proc, name).close()
 
 
 def main():
