@@ -14,19 +14,44 @@ from llm_loop import ctrlc, procend, providers, streamrender
 
 def run_probe(argv, timeout):
     """Timeout owns the entire probe tree, including a stalled provider."""
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=os.name != 'nt')
+    job = None
+    launch = argv
+    if os.name == 'nt':
+        from _process_job import Job
+        job = Job()
+        # No descendants can start before assignment: bootstrap waits for a
+        # byte on stdin. The job handle is not inherited by the child.
+        launch = [sys.executable, '-c',
+                  'import subprocess,sys; sys.stdin.buffer.read(1); '
+                  'sys.exit(subprocess.call(sys.argv[1:]))', *argv]
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        proc = subprocess.Popen(launch, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.PIPE if job else None,
+                                text=True, start_new_session=os.name != 'nt')
+    except BaseException:
+        if job:
+            job.close()
+        raise
+    try:
+        if job:
+            job.assign(proc)
+        stdout, stderr = proc.communicate(input='x' if job else None, timeout=timeout)
         return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
     except BaseException:
         if os.name == 'nt':
-            procend.end_process_tree(proc)
+            job.close()
+            if proc.poll() is None:
+                proc.kill()  # Also covers failure to assign the bootstrap.
+            proc.wait()
         else:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
         raise
     finally:
+        if job:
+            job.close()
+        if proc.stdin:
+            proc.stdin.close()
         proc.stdout.close()
         proc.stderr.close()
 

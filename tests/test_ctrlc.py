@@ -28,6 +28,55 @@ from _silent_interrupt_probe import run_probe
 CHILD_TIMEOUT_S = 30
 
 
+@pytest.mark.skipif(os.name != 'nt', reason='Windows wakeup fd')
+@pytest.mark.parametrize('boundary', ['installation', 'removal'])
+def test_delayed_callback_counts_once_across_fd_boundary(boundary):
+    interrupt = ctrlc.Interrupt()
+    wakeup = ctrlc._SignalWakeup(interrupt)
+    closed = False
+    try:
+        wakeup.activate()
+        if boundary == 'removal':
+            # Inject the C-level byte independently of the delayed callback.
+            wakeup.writer.send(bytes([signal.SIGINT]))
+            wakeup.drain()
+            wakeup.close()
+            closed = True
+        # Installation: signal arrived before the fd, hence no byte.
+        # Removal: byte arrived while attached, callback after detachment.
+        wakeup.handle()
+        assert interrupt.presses == 1
+    finally:
+        if not closed:
+            wakeup.close()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows wakeup ownership')
+def test_foreign_owner_degrades_explicitly_without_handler_probes(monkeypatch, caplog):
+    import socket
+    reader, writer = socket.socketpair()
+    writer.setblocking(False)
+    previous = signal.set_wakeup_fd(writer.fileno())
+    original = signal.set_wakeup_fd
+    calls = []
+    def tracked(fd, **kwargs):
+        calls.append(fd)
+        return original(fd, **kwargs)
+    monkeypatch.setattr(signal, 'set_wakeup_fd', tracked)
+    try:
+        with pytest.raises(SystemExit):
+            with ctrlc.captured() as interrupt:
+                mark = len(calls)
+                signal.raise_signal(signal.SIGINT)
+                assert interrupt.presses == 1
+                assert len(calls) == mark, 'handler probed a foreign descriptor'
+        assert sum('foreign wakeup fd' in record.message for record in caplog.records) == 1
+    finally:
+        original(previous)
+        reader.close()
+        writer.close()
+
+
 @pytest.mark.skipif(os.name != 'nt', reason='Windows signal wakeup transitions')
 @pytest.mark.parametrize('case', ['activation', 'shutdown_signals', 'interrupted_join',
                                  'foreign_owner', 'replacement', 'socket_failure', 'fd_failure'])
@@ -49,16 +98,21 @@ def test_probe_rescue_covers_app_server_startup():
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows process-tree timeout cleanup')
-def test_probe_timeout_reaps_provider_child(tmp_path):
+@pytest.mark.parametrize('parent_exits', [False, True])
+def test_probe_timeout_reaps_provider_child(tmp_path, parent_exits):
     import ctypes
     pid_file = tmp_path / 'pid'
     script = ("import subprocess, sys, time; from pathlib import Path; "
               "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
-              "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+              "stdout=None, stderr=None); "
               "Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(30)")
+    if parent_exits:
+        script = script.rsplit('; time.sleep(30)', 1)[0]
     # Interpreter + child startup measured below 0.8 s, 2026-11-09.
+    started = time.monotonic()
     with pytest.raises(subprocess.TimeoutExpired):
         run_probe([sys.executable, '-c', script, str(pid_file)], timeout=5)
+    assert time.monotonic() - started < 10, 'orphan kept captured pipes open'
     pid = int(pid_file.read_text())
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.OpenProcess.restype = ctypes.c_void_p
@@ -94,9 +148,6 @@ def test_sigint_ends_a_silent_provider_without_another_output_line(provider):
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows wakeup socket lifecycle')
 def test_capture_restores_wakeup_fd_and_joins_its_watcher():
-    import socket
-    reader, writer = socket.socketpair()
-    writer.setblocking(False)
     previous = signal.set_wakeup_fd(-1)
     try:
         with ctrlc.captured():
@@ -109,8 +160,6 @@ def test_capture_restores_wakeup_fd_and_joins_its_watcher():
         assert signal.set_wakeup_fd(-1) == -1
     finally:
         signal.set_wakeup_fd(previous)
-        reader.close()
-        writer.close()
 
 
 @contextlib.contextmanager

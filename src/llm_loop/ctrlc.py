@@ -24,8 +24,8 @@ exit push — and decides there what a press means:
 When a press is noticed: a wait polls in slices of a quarter second or less
 (`stopchannel.STOP_RECHECK_SECONDS`, `runlifecycle.EXIT_PUSH_POLL_S`). On
 Windows a wakeup socket hears SIGINT even while the main thread is blocked
-reading a silent CLI. Its watcher delivers the same press and hooks as the
-status line's key reader, ending the child and releasing the pipe read.
+reading a silent CLI. Its watcher runs idempotent process-ending hooks to
+release the pipe read; only the Python SIGINT callback counts the press.
 """
 
 import contextlib
@@ -59,9 +59,8 @@ class Interrupt:
     """The Ctrl+C presses one run has heard. Safe from any thread.
 
     `press` is called by the SIGINT handler or the status line's key reader.
-    The wakeup drain also records presses, serializing byte consumption and
-    counting before notifying hooks outside its lock. Neither path raises
-    into whatever the run was doing.
+    The wakeup drain only releases blocked I/O; press is the sole counting
+    method. Neither path raises into whatever the run was doing.
 
     `press` TAKES NO LOCK, and that is load-bearing: the SIGINT handler runs on
     the main thread between any two bytecodes, the ones inside a `with lock:`
@@ -76,6 +75,19 @@ class Interrupt:
         self._lock = threading.Lock()
         self._pressed: List[None] = []
         self._hooks: Tuple[Callable[[], None], ...] = ()
+        self._wake_hooks: Tuple[Callable[[], None], ...] = ()
+
+    def wake(self) -> None:
+        """Release blocking I/O without counting a press.
+
+        Only idempotent process-ending hooks opt in. The Python SIGINT
+        callback will later count the press and run its ordinary hooks.
+        """
+        for hook in self._wake_hooks:
+            try:
+                hook()
+            except Exception:
+                pass
 
     def press(self) -> None:
         """One Ctrl+C: counted, then every `on_press` hook run once for it.
@@ -111,15 +123,21 @@ class Interrupt:
         return self.presses > mark
 
     @contextlib.contextmanager
-    def on_press(self, hook: Callable[[], None]) -> Iterator[None]:
+    def on_press(self, hook: Callable[[], None], *, wake: bool = False) -> Iterator[None]:
         """Run `hook` on every press made while the block runs.
 
         Not run for a press made before the block: a caller that must act on one
         already heard asks `requested` first — AFTER entering the block, so a
         press between its own check and the registration is not missed.
+
+        `wake=True` opts an idempotent I/O-release hook into early invocation
+        by signal bytes, before the Python callback can run. Such a hook may
+        run again when the callback counts the press; ordinary hooks do not.
         """
         with self._lock:
             self._hooks = self._hooks + (hook,)
+            if wake:
+                self._wake_hooks = self._wake_hooks + (hook,)
         try:
             yield
         finally:
@@ -127,6 +145,8 @@ class Interrupt:
                 hooks = list(self._hooks)
                 hooks.remove(hook)
                 self._hooks = tuple(hooks)
+                if wake:
+                    self._wake_hooks = tuple(h for h in self._wake_hooks if h is not hook)
 
 
 class _Unheard(Interrupt):
@@ -141,14 +161,23 @@ _active: Optional[Interrupt] = None
 
 
 class _SignalWakeup:
-    """Drain each signal byte once, from the handler or the Windows watcher.
+    """Wake blocked provider I/O; NEVER count signal bytes.
 
-    Python's C signal handler writes the socket before the main thread can
-    run Python code. A blocking pipe read delayed that code by 29.8 seconds
-    against a silent child (2026-11-09). While our fd receives signals, this
-    drain counts their bytes; the later Python handler must not count them
-    again. Before activation, after detachment, or with a foreign fd, the
-    Python handler records presses directly instead.
+    The Python callback alone calls Interrupt.press. Whether a C signal
+    arrives before installation, while attached, or after detachment, its
+    callback counts once, even if delayed across either boundary. A byte
+    merely invokes idempotent wake hooks so the blocked main thread can run
+    that callback. Byte delivery and callback execution can occur in either
+    order without changing the count. No descriptor inspection is needed
+    in the handler, and no pending-byte credit can swallow a later press.
+
+    Exact physical-keypress counting is impossible with this API: two C
+    signals before Python runs can write two bytes but coalesce into one
+    pending Python callback; a full wakeup socket can also drop bytes.
+    We preserve Python's counting semantics: exactly one count per callback,
+    never an extra count, and never zero for an isolated delivered SIGINT.
+    Bursts may coalesce, as outside capture. Wake hooks can run more than once
+    and must be idempotent. Ordinary on_press hooks run only from press().
     """
 
     def __init__(self, interrupt: Interrupt):
@@ -165,6 +194,7 @@ class _SignalWakeup:
         self.stopping = False
         self.thread = threading.Thread(target=self.watch, name='ctrlc-wakeup', daemon=True)
         self.started = False
+        self.owns_fd = False
 
     @staticmethod
     def current_fd():
@@ -179,25 +209,18 @@ class _SignalWakeup:
         # Do not steal another event loop's notifications (including SIGBREAK).
         # Keep ordinary handler/line-polling behavior when it owns this slot.
         if self.current_fd() != -1:
-            return
+            return False
         signal.set_wakeup_fd(self.writer.fileno())
+        self.owns_fd = True
         self.thread.start()
         self.started = True
+        return True
 
     def handle(self):
-        # Inspect the actual fd, not a flag assigned after set_wakeup_fd or
-        # Thread.start returns: SIGINT can arrive inside either transition.
-        fd = self.writer.fileno()
-        if fd != -1 and self.current_fd() == fd:
-            self.drain()
-        else:
-            self.interrupt.press()
+        self.interrupt.press()
 
     def drain(self):
-        # Serialize consumption AND counting: recv releases the GIL, so a
-        # Python handler can arrive after the watcher consumed the byte but
-        # before it counted it. Hooks run outside the lock: a handler must
-        # never wait for another thread's process-ending hook.
+        # Only the watcher consumes bytes; the handler never touches sockets.
         count = 0
         with self.lock:
             while True:
@@ -208,10 +231,9 @@ class _SignalWakeup:
                 if not value:
                     break
                 if value[0] == signal.SIGINT:
-                    self.interrupt._pressed.append(None)
                     count += 1
         for _ in range(count):
-            self.interrupt._notify_hooks()
+            self.interrupt.wake()
 
     def watch(self):
         while not self.stopping:
@@ -220,9 +242,14 @@ class _SignalWakeup:
 
     def close(self):
         try:
-            fd = signal.set_wakeup_fd(-1)
-            if fd != self.writer.fileno() and fd != -1:
-                signal.set_wakeup_fd(fd)
+            if self.owns_fd:
+                # Restore the -1 we replaced. The exchange's return value
+                # lets an overlapping replacement keep its slot; Python has
+                # no compare-and-swap API. A declined takeover never touches it.
+                fd = signal.set_wakeup_fd(-1)
+                self.owns_fd = False
+                if fd != self.writer.fileno() and fd != -1:
+                    signal.set_wakeup_fd(fd)
         except (ValueError, OSError):
             # Installation may itself be unavailable (e.g. a sub-interpreter).
             # The sockets still need closing on that fallback path.
@@ -320,7 +347,10 @@ def captured() -> Iterator[Interrupt]:
         if installed and os.name == 'nt':
             try:
                 wakeup = _SignalWakeup(interrupt)
-                wakeup.activate()
+                if not wakeup.activate():
+                    logging.getLogger(__name__).warning(
+                        'SIGINT wakeup disabled: foreign wakeup fd owns notifications; '
+                        'using output polling')
             except (ValueError, OSError) as exc:
                 if wakeup is not None:
                     wakeup.close()

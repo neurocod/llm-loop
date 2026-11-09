@@ -555,7 +555,7 @@ def ended_on_press(proc) -> Iterator[TurnStream]:
     Opened INSIDE `note_channel`, so the hook is gone before the pipe closes.
     """
     interrupt = ctrlc.current()
-    with interrupt.on_press(lambda: ask_agent_process_to_end(proc)):
+    with interrupt.on_press(lambda: ask_agent_process_to_end(proc), wake=True):
         if interrupt.requested:
             ask_agent_process_to_end(proc)
         yield TurnStream(proc, interrupt)
