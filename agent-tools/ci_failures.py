@@ -413,10 +413,12 @@ RUNS_JQ = ("{total_count, workflow_runs: [.workflow_runs[] | {id, workflow_id, n
 
 
 def runs_for_commit(gh: Gh, sha: str) -> list:
-    """Every run of the commit `sha` (40 hex), paged until the count the API
-    states is reached. Raises EXIT_INCOMPLETE when it is not: over RUNS_MAX,
-    or a page that came back short (runs created while paging shift them)."""
-    runs, total, page = {}, None, 1
+    """Every run of the commit `sha` (40 hex), paged until the count the
+    first page states is reached. Raises EXIT_INCOMPLETE when it is not: over
+    RUNS_MAX, a page that came back short, a later page stating another count
+    (a run created or deleted while paging shifts the pages, so one may have
+    been skipped), or distinct ids that do not add up to the first count."""
+    runs, first_total, page = {}, None, 1
     while True:
         data = gh.api_json(f"repos/{gh.repo}/actions/runs?head_sha={sha}&per_page={RUNS_PAGE}&page={page}",
                            RUNS_JQ)
@@ -424,14 +426,20 @@ def runs_for_commit(gh: Gh, sha: str) -> list:
         total = data.get("total_count") if isinstance(data, dict) else None
         if not isinstance(batch, list) or not isinstance(total, int):
             raise Failure(EXIT_GH_ERROR, f"the run listing of {sha} is not the API's shape: {str(data)[:200]}")
+        if first_total is None:
+            first_total = total
+        elif total != first_total:
+            raise Failure(EXIT_INCOMPLETE, f"the run count of commit {sha} changed while paging ({first_total} "
+                                           f"on page 1, {total} on page {page}): a red one may be missing; "
+                                           "run again, or judge one with --run")
         for r in batch:
             runs[r.get("id")] = r
-        if len(runs) >= total or not batch or page * RUNS_PAGE >= RUNS_MAX:
+        if len(runs) >= first_total or not batch or page * RUNS_PAGE >= RUNS_MAX:
             break
         page += 1
-    if len(runs) < total:
-        raise Failure(EXIT_INCOMPLETE, f"commit {sha} has {total} runs and only {len(runs)} could be listed "
-                                       f"(the API serves {RUNS_MAX} at most): a red one may be missing; "
+    if len(runs) != first_total:
+        raise Failure(EXIT_INCOMPLETE, f"commit {sha} has {first_total} runs and {len(runs)} distinct ones could "
+                                       f"be listed (the API serves {RUNS_MAX} at most): a red one may be missing; "
                                        "judge one with --run")
     return list(runs.values())
 
@@ -560,34 +568,68 @@ STOP_RE = re.compile(r"^!{3,} .* !{3,}$")
 # verbatim, unindented, so a child pytest's banners look like the outer run's.
 CAPTURED_RE = re.compile(r"^-+ Captured .+ -+$")
 SESSION_START = "test session starts"
+# The header pytest prints right under a session's banner (pytest 9.2.0:
+# `platform ...` on the next line, then rootdir, plugins, collected).
+CHILD_HEADER_RE = re.compile(r"^(?:platform \S+ -- Python |rootdir: |collect(?:ed|ing) \d+ items?\b)")
+CHILD_HEADER_LINES = 3
+# The sections of a session that hold `___ title ___` blocks; they all come
+# before its `short test summary info`.
+CHILD_BLOCK_SECTIONS = frozenset({"FAILURES", "ERRORS", "PASSES", "XFAILURES", "XPASSES"})
 
 
-def child_session_end(lines: list, start: int) -> int | None:
+def child_session_end(lines: list, start: int, title: str = "") -> int | None:
     """The index of the outcome line closing the child pytest session whose
-    `test session starts` banner is `lines[start]`, or None.
+    `test session starts` banner is `lines[start]` (in the captured output of
+    the block `title`), or None.
 
     pytest opens every session (outer or child) with that banner and closes
-    it with its outcome line (`=== 1 failed, 1 passed in 0.09s ===`), and the
-    outer session's banner comes once, before any FAILURES: inside a block's
-    captured output it can only be a child's. The child's lines up to its
-    outcome (its FAILURES, its blocks, its summary) are the block's, not
-    sections of the outer run. Nested children count. Not a close: the last
-    outcome line before the step's end (`##[`) -- that one is the outer run's
-    own, so a child that died before its outcome closes nothing: its banner
-    is a line of the block, and whatever banners it printed after it end the
-    block as before. A `-q` child prints no session banner and is not
-    recognised."""
+    it with its outcome line (`=== 1 failed, 1 passed in 0.09s ===`); the
+    child's lines up to its outcome (its FAILURES, its blocks, its summary)
+    are the block's, not sections of the outer run. A banner is a child only
+    with a session's shape, else it is a plain line of the block (a test may
+    print one) and hides nothing: the session header within
+    CHILD_HEADER_LINES lines and before any other banner; block titles only inside its block sections and
+    no block section after its summary; no summary entry naming `title`
+    itself (that summary is the outer run's); its outcome before the step's
+    end (`##[`) and not the last outcome line before it (the outer run's
+    own). Nested children count. A `-q` child prints no session banner and is
+    not recognised."""
     stop = next((j for j in range(start, len(lines)) if lines[j].startswith("##[")), len(lines))
     last_outcome = max((j for j in range(start, stop) if OUTCOME_RE.match(lines[j])), default=None)
-    depth = 0
-    for j in range(start, stop):
-        banner = BANNER_RE.match(lines[j])
-        if banner and banner.group(1).strip() == SESSION_START:
-            depth += 1
-        elif OUTCOME_RE.match(lines[j]):
-            depth -= 1
-            if depth == 0:
-                return j if j != last_outcome else None
+    return _child_end(lines, start, title, stop, last_outcome)
+
+
+def _child_end(lines: list, start: int, title: str, stop: int, last_outcome: int | None) -> int | None:
+    header = lines[start + 1:min(start + 1 + CHILD_HEADER_LINES, stop)]
+    header = header[:next((k for k, ln in enumerate(header) if BANNER_RE.match(ln)), len(header))]
+    if not any(CHILD_HEADER_RE.match(ln) for ln in header):
+        return None
+    phase, inner_title, j = "head", title, start + 1  # head -> blocks -> summary
+    while j < stop:
+        line = lines[j]
+        if OUTCOME_RE.match(line):
+            return j if j != last_outcome else None
+        banner = BANNER_RE.match(line)
+        name = banner.group(1).strip() if banner else ""
+        head = BLOCK_RE.match(line)
+        entry = entry_parts(line) if phase == "summary" else None
+        if name == SESSION_START:
+            inner = _child_end(lines, j, inner_title, stop, last_outcome)
+            j = j + 1 if inner is None else inner + 1
+            continue
+        if name in CHILD_BLOCK_SECTIONS:
+            if phase == "summary":
+                return None
+            phase = "blocks"
+        elif name == "short test summary info":
+            phase = "summary"
+        elif head and not re.fullmatch(r"[_ ]+", head.group(1)):
+            if phase != "blocks":
+                return None
+            inner_title = head.group(1)
+        elif entry and title and block_matches(title, entry[1], entry[0]):
+            return None
+        j += 1
     return None
 
 
@@ -639,7 +681,7 @@ def parse_pytest(lines: list) -> tuple[list, list, list, int]:
                 continue
             if captured and blocks and name == SESSION_START:
                 # Never the outer run's banner here; without its close, just a line.
-                close = child_session_end(lines, i)
+                close = child_session_end(lines, i, blocks[-1][0])
                 close = i if close is None else close
                 blocks[-1][1].extend(lines[i:close + 1])
                 skip_to = end = close
@@ -914,16 +956,20 @@ def normalize(text: str) -> str:
     """The comparison key of a failure's text, without per-job noise. Never
     shown -- the report shows the first job's exact text."""
     out, entry_head = [], True  # a block starts with its first entry's arguments
+    # Past a `--- Captured ... ---` header the rest of the block is the test's
+    # own output: a `_ _ _` or chained-exception line there opens no entry.
+    captured = False
     lines = [posix_paths(ln) for ln in text.split("\n") if not CARETS_RE.match(ln)]
     for line in drop_frame_sources(lines):
         for pattern, repl in NOISE:
             line = pattern.sub(repl, line)
         if OUTCOME_RE.match(re.sub(r"^E\s+", "", line)):
             line = TOTALS_RE.sub("in <dur>", line)
-        args = split_args(line) if entry_head else None
+        captured = captured or bool(CAPTURED_RE.match(line))
+        args = split_args(line) if entry_head and not captured else None
         if args:
             line = without_clock_times(args)
-        elif ENTRY_SEP_RE.match(line) or CHAIN_RE.match(line):
+        elif (ENTRY_SEP_RE.match(line) or CHAIN_RE.match(line)) and not captured:
             entry_head = True
         elif line.strip():
             entry_head = False

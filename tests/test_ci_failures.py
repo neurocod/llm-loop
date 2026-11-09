@@ -347,6 +347,56 @@ def test_a_child_session_without_its_outcome_closes_nothing():
     assert outcomes == ["2 failed, 5 passed in 0.84s"]
 
 
+def two_invocations(printed: list) -> list:
+    """Made up: two pytest runs in one step; test_a of the first prints the
+    lines `printed` (a banner shaped like a child's) and nothing else."""
+    return (["=== FAILURES ===", "___ test_a ___", "E   assert 0", "tests/x.py:2: AssertionError",
+             "----- Captured stdout call -----", *printed,
+             "___ test_b ___", "E   assert 3 == 4", "tests/x.py:5: AssertionError",
+             "=== short test summary info ===",
+             "FAILED tests/x.py::test_a - assert 0", "FAILED tests/x.py::test_b - assert 3 == 4",
+             "=== 2 failed in 0.10s ===",
+             "=== test session starts ===", "platform linux -- Python 3.13.7, pytest-9.2.0, pluggy-1.6.0",
+             "collected 1 item", "", "tests/y.py F",
+             "=== FAILURES ===", "___ test_c ___", "E   assert 0", "tests/y.py:2: AssertionError",
+             "=== short test summary info ===", "FAILED tests/y.py::test_c - assert 0",
+             "=== 1 failed in 0.05s ===", "##[error]Process completed with exit code 1."])
+
+
+@pytest.mark.parametrize("printed", [
+    ["=== test session starts ==="],
+    # With a header: test_b's title before any FAILURES of a child is the outer run's.
+    ["=== test session starts ===", "platform linux -- Python 3.13.7, pytest-9.2.0, pluggy-1.6.0"],
+    # A child that died in its FAILURES: the summary naming test_a itself is the outer run's.
+    ["=== test session starts ===", "platform linux -- Python 3.13.7, pytest-9.2.0, pluggy-1.6.0",
+     "collected 1 item", "=== FAILURES ===", "___ test_inner ___", "Killed"],
+])
+def test_a_printed_session_banner_hides_no_outer_failure(printed):
+    units, outcomes = cf.failure_units(two_invocations(printed), 10)
+    assert [u["headline"] for u in units][:3] == ["FAILED tests/x.py::test_a", "FAILED tests/x.py::test_b",
+                                                  "FAILED tests/y.py::test_c"]
+    assert units[1]["block"] == ["E   assert 3 == 4", "tests/x.py:5: AssertionError"]
+    assert outcomes == ["2 failed in 0.10s", "1 failed in 0.05s"]
+
+
+@pytest.mark.parametrize("printed, titles", [
+    (["=== test session starts ==="], ["test_a"]),
+    # With a header, but test_b's title comes before any FAILURES of a child.
+    (["=== test session starts ===", "platform linux -- Python 3.13.7, pytest-9.2.0, pluggy-1.6.0",
+      "___ test_b ___", "E   assert 3 == 4"], ["test_a", "test_b"]),
+])
+def test_a_printed_banner_without_a_sessions_shape_takes_no_outcome(printed, titles):
+    # Made up: `-rN` (no summary entry to tell the outer run by), test_a prints
+    # a banner; the first run's outcome is not a child's, and a second run follows.
+    lines = ["=== FAILURES ===", "___ test_a ___", "E   assert 0", "----- Captured stdout call -----", *printed,
+             "=== 2 failed in 0.10s ===",
+             "=== test session starts ===", "platform linux -- Python 3.13.7, pytest-9.2.0, pluggy-1.6.0",
+             "collected 1 item", "=== 1 passed in 0.05s ===", "##[error]Process completed with exit code 1."]
+    units, outcomes = cf.failure_units(lines, 10)
+    assert [u["headline"] for u in units] == titles
+    assert outcomes == ["2 failed in 0.10s", "1 passed in 0.05s"]
+
+
 def test_quiet_outcome_line_right_after_the_blocks_is_the_outcome():
     # `-q -rN`: no summary, the unbannered outcome line ends the output.
     lines = ["=== FAILURES ===", "___ test_a ___", "assert 0", "",
@@ -479,6 +529,13 @@ def test_clock_times_in_an_entrys_object_args_are_noise(left, right):
      clock_block("x = 1", "----- Captured stdout call -----\nactual = '12:45'")),
     (clock_block("x = 1", "----- Captured stdout call -----\nactual = ['since 12:30']"),
      clock_block("x = 1", "----- Captured stdout call -----\nactual = ['since 12:45']")),
+    # A separator or a chained-exception line in captured output opens no entry.
+    (clock_block("x = 1", "----- Captured stdout call -----\n_ _ _ _ _ _\nactual = ['12:30']"),
+     clock_block("x = 1", "----- Captured stdout call -----\n_ _ _ _ _ _\nactual = ['12:45']")),
+    (clock_block("x = 1", "----- Captured stderr call -----\n"
+                 "During handling of the above exception, another exception occurred:\nactual = ['12:30']"),
+     clock_block("x = 1", "----- Captured stderr call -----\n"
+                 "During handling of the above exception, another exception occurred:\nactual = ['12:45']")),
     # An `E` line of the verdict.
     (clock_block(CLOCK_A).replace("E       AssertionError", "E       assert '21:28' == '21:29'"),
      clock_block(CLOCK_A).replace("E       AssertionError", "E       assert '21:28' == '21:30'")),
@@ -762,6 +819,8 @@ def test_every_page_of_the_commit_runs_is_read(monkeypatch, capsys, gh, tmp_path
 @pytest.mark.parametrize("pages", [
     [(100, 1500)] * 10,           # over the 1000 the API serves for a head_sha query
     [(100, 150), (0, 150)],       # a page came back empty before the stated count
+    [(100, 101), (0, 100)],       # a run deleted while paging: the oldest was never read
+    [(100, 101), (2, 102)],       # a run created while paging
 ])
 def test_a_listing_that_cannot_be_shown_complete_is_never_green(monkeypatch, capsys, gh, tmp_path, pages):
     rules, made = [AUTH], 0
