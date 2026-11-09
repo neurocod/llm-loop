@@ -21,7 +21,7 @@ job without the prompt.
 | `find_refs.py` | whole-repository text search for a name, submodules and untracked files included |
 | `rename_gate.py` | the same search as a gate after a rename: any hit left exits 1 (needs `find_refs.py` beside it) |
 | `agent_context_watch.py` | reads how full a Claude Code subagent's context is, or waits until it reaches a mark |
-| `ci_failures.py` | a GitHub Actions run's failed jobs and their pytest failures, each once with the jobs it hit (needs `gh`) |
+| `ci_failures.py` | a commit's GitHub Actions runs (every workflow) or one run: failed jobs and their pytest failures, each once with the jobs it hit, also while a run is going (needs `gh`) |
 
 A host project that wants its own defaults (for example a `follow_file.py`
 preset for its test runner's end marker, the `--orphan-image`s of
