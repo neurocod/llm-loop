@@ -146,7 +146,9 @@ class Interrupt:
                 hooks.remove(hook)
                 self._hooks = tuple(hooks)
                 if wake:
-                    self._wake_hooks = tuple(h for h in self._wake_hooks if h is not hook)
+                    wake_hooks = list(self._wake_hooks)
+                    wake_hooks.remove(hook)
+                    self._wake_hooks = tuple(wake_hooks)
 
 
 class _Unheard(Interrupt):
@@ -178,6 +180,22 @@ class _SignalWakeup:
     never an extra count, and never zero for an isolated delivered SIGINT.
     Bursts may coalesce, as outside capture. Wake hooks can run more than once
     and must be idempotent. Ordinary on_press hooks run only from press().
+
+    Two physical Ctrl+C events before Python services the first can coalesce
+    into one callback: the second-press exit contract is per callback. This
+    is acceptable for a human pressing again after observing shutdown: the
+    first callback has then already been serviced, so the next is distinct.
+    A rapid double tap before that observation is not two guaranteed presses.
+
+    Foreign notification is NOT lossless during ownership changes. Activation
+    probes by installing -1, then restores a foreign fd if one was present.
+    Even a declined takeover has that gap. Close likewise restores -1 and
+    reinstalls any overlapping foreign replacement returned by the exchange.
+    Between either pair of calls, foreign wakeup bytes are lost (Python
+    handlers may still run). Neither gap has a wall-clock bound: scheduling
+    or a signal handler can delay restoration arbitrarily. Cooperative,
+    non-overlapping ownership is required where lossless foreign notification
+    matters; there is no public getter/compare-and-swap to guarantee it here.
     """
 
     def __init__(self, interrupt: Interrupt):

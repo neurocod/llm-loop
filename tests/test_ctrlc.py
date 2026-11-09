@@ -28,6 +28,53 @@ from _silent_interrupt_probe import run_probe
 CHILD_TIMEOUT_S = 30
 
 
+def test_nested_identical_wake_hook_keeps_outer_registration():
+    interrupt = ctrlc.Interrupt()
+    calls = []
+    hook = lambda: calls.append(True)
+    with interrupt.on_press(hook, wake=True):
+        with interrupt.on_press(hook, wake=True):
+            interrupt.wake()
+        interrupt.wake()
+    interrupt.wake()
+    assert len(calls) == 3
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows foreign SIGBREAK notification')
+def test_activation_gap_is_explicit_and_drops_foreign_byte(monkeypatch):
+    import socket
+    reader, writer = socket.socketpair()
+    reader.setblocking(False)
+    writer.setblocking(False)
+    original = signal.set_wakeup_fd
+    previous = original(writer.fileno())
+    previous_handler = signal.signal(signal.SIGBREAK, lambda *_: None)
+    injected = []
+    def exchange(fd, **kwargs):
+        result = original(fd, **kwargs)
+        if fd == -1 and not injected:
+            injected.append(True)
+            signal.raise_signal(signal.SIGBREAK)
+        return result
+    wakeup = ctrlc._SignalWakeup(ctrlc.Interrupt())
+    try:
+        monkeypatch.setattr(signal, 'set_wakeup_fd', exchange)
+        assert wakeup.activate() is False
+        with pytest.raises(BlockingIOError):
+            reader.recv(1)
+        signal.raise_signal(signal.SIGBREAK)
+        assert reader.recv(1) == bytes([signal.SIGBREAK])
+        # This is an acknowledged limitation, not a behavior fix. Pin the
+        # public explanation as well as reproducing the notification loss.
+        assert 'Neither gap has a wall-clock bound' in ctrlc._SignalWakeup.__doc__
+    finally:
+        wakeup.close()
+        original(previous)
+        signal.signal(signal.SIGBREAK, previous_handler)
+        reader.close()
+        writer.close()
+
+
 @pytest.mark.skipif(os.name != 'nt', reason='Windows wakeup fd')
 @pytest.mark.parametrize('boundary', ['installation', 'removal'])
 def test_delayed_callback_counts_once_across_fd_boundary(boundary):
@@ -102,17 +149,35 @@ def test_probe_rescue_covers_app_server_startup():
 def test_probe_timeout_reaps_provider_child(tmp_path, parent_exits):
     import ctypes
     pid_file = tmp_path / 'pid'
-    script = ("import subprocess, sys, time; from pathlib import Path; "
-              "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+    script = ("import subprocess, sys, time; "
+              "child = subprocess.Popen([sys.executable, '-c', "
+              "'import os,sys,time; from pathlib import Path; "
+              "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)', sys.argv[1]], "
               "stdout=None, stderr=None); "
-              "Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(30)")
+              "time.sleep(30)")
     if parent_exits:
         script = script.rsplit('; time.sleep(30)', 1)[0]
     # Interpreter + child startup measured below 0.8 s, 2026-11-09.
-    started = time.monotonic()
+    measured = []
+    def ready(proc):
+        deadline = time.monotonic() + CHILD_TIMEOUT_S
+        while not pid_file.exists():
+            assert time.monotonic() < deadline, 'child never became ready'
+            time.sleep(0.01)
+        if parent_exits:
+            assert proc.wait(timeout=CHILD_TIMEOUT_S) == 0
+            assert proc.poll() is not None
+        measured.append(time.monotonic())
+    # Independent watchdog: twice the existing 30 s child bound. It covers
+    # readiness and parent exit, separately from the orphan-cleanup deadline.
     with pytest.raises(subprocess.TimeoutExpired):
-        run_probe([sys.executable, '-c', script, str(pid_file)], timeout=5)
-    assert time.monotonic() - started < 10, 'orphan kept captured pipes open'
+        run_probe([sys.executable, '-c', script, str(pid_file)], timeout=5,
+                  before_wait=ready, watchdog=60)
+    # Timeout plus cleanup after readiness: 5.016 s (live parent), 5.013 s
+    # (exited parent), Windows 2026-11-09. 15 s exceeds twice both measurements.
+    elapsed = time.monotonic() - measured[0]
+    print(f'orphan cleanup after readiness: {elapsed:.3f} s')
+    assert elapsed < 15, 'orphan kept captured pipes open'
     pid = int(pid_file.read_text())
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.OpenProcess.restype = ctypes.c_void_p

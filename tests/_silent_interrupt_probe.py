@@ -9,10 +9,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from llm_loop import ctrlc, procend, providers, streamrender
+from llm_loop import ctrlc, providers, streamrender
 
 
-def run_probe(argv, timeout):
+def run_probe(argv, timeout, *, before_wait=None, watchdog=None):
     """Timeout owns the entire probe tree, including a stalled provider."""
     job = None
     launch = argv
@@ -32,10 +32,25 @@ def run_probe(argv, timeout):
         if job:
             job.close()
         raise
+    def rescue():
+        if job:
+            job.close()
+        elif os.name != 'nt':
+            os.killpg(proc.pid, signal.SIGKILL)
+        if proc.poll() is None:
+            proc.kill()
+    timer = threading.Timer(watchdog, rescue) if watchdog is not None else None
+    if timer:
+        timer.start()
     try:
         if job:
             job.assign(proc)
-        stdout, stderr = proc.communicate(input='x' if job else None, timeout=timeout)
+            proc.stdin.write('x')
+            proc.stdin.close()
+            proc.stdin = None
+        if before_wait is not None:
+            before_wait(proc)
+        stdout, stderr = proc.communicate(timeout=timeout)
         return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
     except BaseException:
         if os.name == 'nt':
@@ -48,6 +63,9 @@ def run_probe(argv, timeout):
             proc.wait()
         raise
     finally:
+        if timer:
+            timer.cancel()
+            timer.join()
         if job:
             job.close()
         if proc.stdin:
