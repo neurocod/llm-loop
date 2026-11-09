@@ -197,11 +197,11 @@ class NetworkWait:
         exhaustion and kept an ULP `remaining`, whose `now + remaining`
         rounded to `now`; past it, a credit exceeded its cap.
 
-        The epoch makes the one float step exact: two readings within a
-        factor of two subtract without rounding, so only the reading's own
-        error (half an ULP: 7.5e-9 s at 1e8 s of uptime) reaches the rounding
-        to microseconds, and a duration on the microsecond grid comes out
-        exact at any base below 2**31 s (68 years). Raw readings times 1e6
+        The epoch keeps the one float step inside half a microsecond: the
+        subtraction rounds by at most half an ULP of its result, the reading
+        carries half an ULP of its own (7.5e-9 s at 1e8 s of uptime), and
+        below 2**31 s (68 years) the two stay under 5e-7 s together, so a
+        duration on the microsecond grid comes out exact. Raw readings times 1e6
         would round near a half microsecond the same way at any uptime, one
         reading up and the next down. Rounding readings, not intervals, keeps
         the sum telescoping: off by at most 1 us per continuous wait, however
@@ -226,8 +226,13 @@ class NetworkWait:
             child += max(0, credited - total)
         return credited, child
 
-    def _fresh_until_us(self) -> int:
-        return self._at(self.last) + _us(NETWORK_WAIT_GAP_S)
+    def _fresh_until_us(self, last: Optional[float] = None) -> int:
+        return self._at(self.last if last is None else last) + _us(NETWORK_WAIT_GAP_S)
+
+    def _stale(self, now: float, last: Optional[float] = None) -> bool:
+        """THE freshness boundary for every caller: the integer bound that
+        `_credit_us` clamps to and `deadline` projects to."""
+        return self._at(now) >= self._fresh_until_us(last)
 
     def seconds(self, now: float) -> float:
         return self._credit_us(now)[0] / 1_000_000
@@ -253,7 +258,7 @@ class NetworkWait:
         method = str(message.get("method") or "")
         thread = str((message.get("params") or {}).get("threadId") or main_thread)
         if method == "error" and is_network_wait(message.get("params") or {}):
-            if self.started is not None and self._at(now) > self._fresh_until_us():
+            if self.started is not None and self._stale(now):
                 self.stop(now)
             if self.started is None:
                 self.started, self.since, self.tries = now, stamp, 0
@@ -269,7 +274,7 @@ class NetworkWait:
                 self.stop(now)
             else:
                 latest = max(self.pending.values())
-                if self._at(now) >= self._at(latest) + _us(NETWORK_WAIT_GAP_S):
+                if self._stale(now, latest):
                     # The recovering thread kept this interval fresh until
                     # now. Do not backdate its credit to an older thread.
                     self.stop(now)
@@ -294,7 +299,7 @@ class NetworkWait:
                 and main_waiting):
             raise NetworkWaitTimeout(spent, exhausted=True)
         if self.started is not None:
-            if self._at(now) >= self._fresh_until_us():
+            if self._stale(now):
                 self.stop(now)
         extended = base + spent - baseline_s
         if now >= extended and main_waiting:
@@ -306,9 +311,14 @@ class NetworkWait:
                                    max(0, _us(MAX_CHILD_NETWORK_WAIT_S) - child_us))
             if remaining_us <= 0:
                 return extended
-            fresh_until = min(self.last + NETWORK_WAIT_GAP_S,
-                              now + remaining_us / 1_000_000)
-            return min(extended + fresh_until - now, fresh_until)
+            # From the integer bound, as an offset from `now`: a float
+            # `last + NETWORK_WAIT_GAP_S` can round 1 us short of the bound
+            # the staleness check above uses, a deadline equal to `now` while
+            # the wait is still fresh. Not stale, `left_us >= 1`, and `now`
+            # plus a microsecond moves below 2**31 s. Reaching it may still
+            # find the wait 1 us fresh; the next call then projects 1 us on.
+            left_us = min(self._fresh_until_us() - self._at(now), remaining_us)
+            return min(extended, now) + left_us / 1_000_000
         return extended
 
 

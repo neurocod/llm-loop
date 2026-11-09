@@ -79,7 +79,9 @@ def network_clock_base():
 # bases (2026-11-09). Small ones are a fresh CI runner's uptime: there the
 # readings cross binades, and whole-second offsets stop being exact.
 DRIFT_BASES = [
-    pytest.param(time.monotonic(), id="monotonic"),
+    # Not a reproducible base: this machine's real clock at import, so the
+    # run also covers whatever uptime it happens to have.
+    pytest.param(time.monotonic(), id="live-clock"),
     pytest.param(34.49236500170073, id="732-short"),     # 731.9999999999998
     pytest.param(159.79856631731644, id="732-over"),     # 732.0000000000002
     pytest.param(1879.1222829485598, id="366-short"),    # 365.9999999999998
@@ -275,6 +277,67 @@ def test_network_wait_credit_is_exact_from_a_half_microsecond_base():
         "threadId": LOGGED_NETWORK_WAIT["params"]["threadId"]}},
         end, "2026-11-09 12:04:14")
     assert wait.seconds(end) == 253.868 and wait.started is None
+
+
+MAIN = LOGGED_NETWORK_WAIT["params"]["threadId"]
+
+
+@pytest.mark.parametrize("epoch, start", [
+    (22473.291321015793, 22473.395043515793),  # Codex review of 5764dc3
+    (41.4233037, 87.9370772),                  # Claude review: 4 of 200,000
+], ids=["codex-review", "claude-review"])
+def test_network_wait_deadline_at_the_freshness_bound_is_not_due(epoch, start):
+    """`last + NETWORK_WAIT_GAP_S` in float and the freshness bound in whole
+    microseconds can round 1 us apart. At such a `now` the wait was not yet
+    stale, but the float projection already equalled `now`: `_pump_main`
+    raised a plain "did not answer turn in time" instead of stopping the
+    stale wait and keeping the remaining work budget."""
+    wait = service.NetworkWait(main_thread=MAIN)
+    wait.seconds(epoch)  # the account's first reading is its epoch
+    wait.observe(LOGGED_NETWORK_WAIT, start, "2026-11-09 12:00:00")
+    now = start + service.NETWORK_WAIT_GAP_S
+    # The hazard's precondition, or the case tests nothing.
+    assert wait._at(now) < wait._fresh_until_us()
+    base = start + 1000.0
+    for _ in range(4):
+        due = wait.deadline(base, 0.0, now)
+        # The main thread is waiting: a due deadline is a generic timeout.
+        assert due > now
+        if wait.started is None:
+            break
+        now = due
+    assert wait.started is None and wait.seconds(now) == service.NETWORK_WAIT_GAP_S
+    assert due == base + service.NETWORK_WAIT_GAP_S
+
+
+def test_network_wait_a_fraction_of_a_microsecond_short_of_the_ceiling():
+    """Readings are rounded to whole microseconds (service.NetworkWait._at):
+    unrounded, a wait that met the ceiling came a fraction of a microsecond
+    short of it, and `deadline` kept that fraction `remaining` (the
+    retryable-instead-of-exhausted bug of ubuntu CI 2026-11-08)."""
+    wait = service.NetworkWait(main_thread=MAIN)
+    start = 1_000_000.0
+    for offset in [*range(0, 7199, 360), 7199]:
+        wait.observe(LOGGED_NETWORK_WAIT, start + offset, "2026-11-09 12:00:00")
+    now = start + service.MAX_NETWORK_WAIT_S - 3e-7
+    with pytest.raises(service.NetworkWaitTimeout) as raised:
+        wait.deadline(start + 10_000.0, 0.0, now)
+    assert raised.value.exhausted
+
+
+def test_network_wait_credit_does_not_depend_on_event_spacing():
+    """One continuous wait folded at ten events 0.4 us apart credits what it
+    credits settled once: readings are rounded, not intervals, so the sum
+    telescopes (service.NetworkWait._at). Rounding each interval credits 0."""
+    wait = service.NetworkWait(main_thread=MAIN)
+    start = 100.0
+    wait.observe(LOGGED_NETWORK_WAIT, start, "2026-11-09 12:00:00")
+    for k in range(1, 11):
+        assert not wait.observe({"method": "account/rateLimits/updated",
+                                 "params": {}}, start + k * 4e-7, "")
+    wait.observe({"method": "item/started", "params": {"threadId": MAIN}},
+                 start + 4e-6, "")
+    assert wait.started is None and wait.seconds(start + 4e-6) == 4e-6
 
 
 @pytest.mark.parametrize("child_s, total_s, credited_s, expected_s", [
