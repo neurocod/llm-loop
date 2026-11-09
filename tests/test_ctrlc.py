@@ -28,6 +28,72 @@ from _silent_interrupt_probe import run_probe
 CHILD_TIMEOUT_S = 30
 
 
+def test_job_close_waits_for_active_members_before_releasing_handle():
+    from _process_job import Job
+    from types import SimpleNamespace
+    events = []
+    active = iter([1, 0])
+    def terminate(handle, code):
+        events.append('terminate')
+        return True
+    def query(handle, kind, buffer, size, returned):
+        buffer._obj.active = next(active)
+        events.append('query')
+        return True
+    job = Job.__new__(Job)
+    job._lock = threading.Lock()
+    job.handle = 77
+    job._member_handles = lambda handle: [88]
+    job.api = SimpleNamespace(TerminateJobObject=terminate,
+                              QueryInformationJobObject=query,
+                              WaitForSingleObject=lambda handle, timeout: events.append('wait') or 0,
+                              CloseHandle=lambda handle: events.append(f'close {handle}'))
+    job.close()
+    assert events == ['terminate', 'query', 'query', 'wait', 'close 77', 'close 88']
+
+
+def test_concurrent_job_close_releases_handle_once():
+    from _process_job import Job
+    from types import SimpleNamespace
+    entered, release = threading.Event(), threading.Event()
+    closed = []
+    def close_handle(handle):
+        closed.append(handle)
+        entered.set()
+        assert release.wait(CHILD_TIMEOUT_S)
+    job = Job.__new__(Job)
+    job._lock = threading.Lock()
+    job.handle = 77
+    job._member_handles = lambda handle: []
+    job.api = SimpleNamespace(CloseHandle=close_handle)
+    job._end_members = lambda handle: None
+    first = threading.Thread(target=job.close)
+    second = threading.Thread(target=job.close)
+    first.start()
+    try:
+        assert entered.wait(CHILD_TIMEOUT_S)
+        second.start()
+        second.join(CHILD_TIMEOUT_S)
+        assert not second.is_alive()
+        assert closed == [77]
+        assert job.handle is None
+    finally:
+        release.set()
+        first.join(CHILD_TIMEOUT_S)
+        if second.ident is not None:
+            second.join(CHILD_TIMEOUT_S)
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows job watchdog')
+def test_watchdog_can_end_probe_without_main_timeout():
+    done = run_probe([sys.executable, '-c',
+                      'import time; time.sleep(30); print("finished")'],
+                     timeout=CHILD_TIMEOUT_S, watchdog=1)
+    # Kill-on-close can report exit code zero on Windows. Finishing the body
+    # (or reaching the main timeout) would mean the watchdog failed to act.
+    assert 'finished' not in done.stdout
+
+
 def test_nested_identical_wake_hook_keeps_outer_registration():
     interrupt = ctrlc.Interrupt()
     calls = []
@@ -64,9 +130,8 @@ def test_activation_gap_is_explicit_and_drops_foreign_byte(monkeypatch):
             reader.recv(1)
         signal.raise_signal(signal.SIGBREAK)
         assert reader.recv(1) == bytes([signal.SIGBREAK])
-        # This is an acknowledged limitation, not a behavior fix. Pin the
-        # public explanation as well as reproducing the notification loss.
-        assert 'Neither gap has a wall-clock bound' in ctrlc._SignalWakeup.__doc__
+        # This acknowledged limitation is explained in _SignalWakeup's
+        # docstring; this test pins notification loss, not its wording.
     finally:
         wakeup.close()
         original(previous)
@@ -148,6 +213,19 @@ def test_probe_rescue_covers_app_server_startup():
 @pytest.mark.parametrize('parent_exits', [False, True])
 def test_probe_timeout_reaps_provider_child(tmp_path, parent_exits):
     import ctypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    kernel.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    handles = []
+    def release_handle():
+        for handle in handles:
+            kernel.TerminateProcess(handle, 1)
+            kernel.WaitForSingleObject(handle, 5000)
+            kernel.CloseHandle(handle)
+    # Retain identity before cleanup; reopening a PID afterwards can inspect
+    # (and terminate) an unrelated process if Windows has reused that PID.
     pid_file = tmp_path / 'pid'
     script = ("import subprocess, sys, time; "
               "child = subprocess.Popen([sys.executable, '-c', "
@@ -164,36 +242,30 @@ def test_probe_timeout_reaps_provider_child(tmp_path, parent_exits):
         while not pid_file.exists():
             assert time.monotonic() < deadline, 'child never became ready'
             time.sleep(0.01)
+        while not pid_file.read_text():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        handle = kernel.OpenProcess(0x100001, False, int(pid_file.read_text()))
+        assert handle, ctypes.get_last_error()
+        handles.append(handle)
         if parent_exits:
             assert proc.wait(timeout=CHILD_TIMEOUT_S) == 0
             assert proc.poll() is not None
         measured.append(time.monotonic())
     # Independent watchdog: twice the existing 30 s child bound. It covers
     # readiness and parent exit, separately from the orphan-cleanup deadline.
-    with pytest.raises(subprocess.TimeoutExpired):
-        run_probe([sys.executable, '-c', script, str(pid_file)], timeout=5,
-                  before_wait=ready, watchdog=60)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            run_probe([sys.executable, '-c', script, str(pid_file)], timeout=5,
+                      before_wait=ready, watchdog=60)
+        assert kernel.WaitForSingleObject(handles[0], 0) == 0, 'provider survived probe timeout'
+    finally:
+        release_handle()
     # Timeout plus cleanup after readiness: 5.016 s (live parent), 5.013 s
     # (exited parent), Windows 2026-11-09. 15 s exceeds twice both measurements.
     elapsed = time.monotonic() - measured[0]
     print(f'orphan cleanup after readiness: {elapsed:.3f} s')
     assert elapsed < 15, 'orphan kept captured pipes open'
-    pid = int(pid_file.read_text())
-    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
-    kernel.OpenProcess.restype = ctypes.c_void_p
-    handle = kernel.OpenProcess(0x100001, False, pid)
-    if handle:
-        try:
-            kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-            assert kernel.WaitForSingleObject(handle, 0) == 0, 'provider survived probe timeout'
-        finally:
-            # A deliberately reverted timeout fix must not leave an orphan
-            # behind merely because this assertion correctly detected it.
-            kernel.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-            kernel.TerminateProcess(handle, 1)
-            kernel.WaitForSingleObject(handle, 5000)
-            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-            kernel.CloseHandle(handle)
 
 
 @pytest.mark.parametrize('provider', ['claude', 'codex'])

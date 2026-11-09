@@ -183,9 +183,10 @@ class _SignalWakeup:
 
     Two physical Ctrl+C events before Python services the first can coalesce
     into one callback: the second-press exit contract is per callback. This
-    is acceptable for a human pressing again after observing shutdown: the
-    first callback has then already been serviced, so the next is distinct.
-    A rapid double tap before that observation is not two guaranteed presses.
+    is acceptable for a human pressing again after the first Python callback
+    has been serviced: the next is distinct. Observing provider termination
+    alone does not prove this, since the watcher can terminate it first.
+    A rapid double tap before callback service is not two guaranteed presses.
 
     Foreign notification is NOT lossless during ownership changes. Activation
     probes by installing -1, then restores a foreign fd if one was present.

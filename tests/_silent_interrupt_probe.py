@@ -40,6 +40,10 @@ def run_probe(argv, timeout, *, before_wait=None, watchdog=None):
         if proc.poll() is None:
             proc.kill()
     timer = threading.Timer(watchdog, rescue) if watchdog is not None else None
+    def stop_watchdog():
+        if timer:
+            timer.cancel()
+            timer.join()
     if timer:
         timer.start()
     try:
@@ -53,6 +57,7 @@ def run_probe(argv, timeout, *, before_wait=None, watchdog=None):
         stdout, stderr = proc.communicate(timeout=timeout)
         return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
     except BaseException:
+        stop_watchdog()
         if os.name == 'nt':
             job.close()
             if proc.poll() is None:
@@ -63,9 +68,7 @@ def run_probe(argv, timeout, *, before_wait=None, watchdog=None):
             proc.wait()
         raise
     finally:
-        if timer:
-            timer.cancel()
-            timer.join()
+        stop_watchdog()
         if job:
             job.close()
         if proc.stdin:
