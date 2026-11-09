@@ -38,7 +38,7 @@ def raw(first, second, cpus=4, self_pid=999):
 
 def run_tool(monkeypatch, capsys, argv, *, data=None, error=None, stderr="", code=0):
     monkeypatch.setattr(sys, "argv", ["cpu_load.py", *argv])
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cpu_load, "WINDOWS", True)
 
     def query(*args, **kwargs):
         assert kwargs["timeout"] == cpu_load.QUERY_TIMEOUT_S
@@ -362,7 +362,7 @@ def snapshot_line(ts, procs, self_pid=999):
 
 def run_stream(monkeypatch, capsys, argv, query):
     monkeypatch.setattr(sys, "argv", ["cpu_load.py", *argv])
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cpu_load, "WINDOWS", True)
     started = []
 
     def popen(command, **kwargs):
@@ -428,7 +428,7 @@ class Query:
     def kill(self): pass
     def wait(self): return 0
 cpu_load.subprocess.Popen = lambda *a, **kw: Query()
-sys.platform = "win32"
+cpu_load.WINDOWS = True  # not sys.platform: see cpu_load.WINDOWS
 sys.argv = ["cpu_load.py", "--json", "--stream"]
 sys.exit(cpu_load.main())
 """
@@ -487,7 +487,7 @@ def test_stream_drains_powershells_stderr_and_reports_its_tail(monkeypatch, caps
         return started[-1]
 
     monkeypatch.setattr(sys, "argv", ["cpu_load.py", "--json", "--stream"])
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cpu_load, "WINDOWS", True)
     monkeypatch.setattr(cpu_load.subprocess, "Popen", popen)
     result = []
     runner = threading.Thread(target=lambda: result.append(cpu_load.main()), daemon=True)
@@ -597,7 +597,7 @@ def test_stream_needs_json(monkeypatch, capsys):
 
 def test_non_windows_reports_reason_without_spawning(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["cpu_load.py", "--json"])
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(cpu_load, "WINDOWS", False)
     monkeypatch.setattr(cpu_load.subprocess, "run", lambda *a, **kw: pytest.fail("spawned"))
     assert cpu_load.main() == 1
     assert "requires Windows" in capsys.readouterr().err

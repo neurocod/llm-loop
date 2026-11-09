@@ -46,6 +46,14 @@ import subprocess
 import sys
 import threading
 
+# The one platform check `main` makes, and the one point a test fakes Windows
+# at. Faking `sys.platform` itself fakes it for every stdlib module imported
+# after: a child that set it before argparse lazily imported shutil died in
+# `import _winapi` (macos-latest 3.12 CI 2026-11-09, whose argparse imports
+# shutil unguarded; likely also the silent child of ubuntu-latest 3.12 CI
+# 2026-11-08, where shutil may or may not be loaded at startup).
+WINDOWS = sys.platform == "win32"
+
 # Long enough for a counter that ticks in 100 ns to average over several
 # scheduler quanta; about half of a quiet call (QUERY_TIMEOUT_S has the timings).
 # A plain integer constant on purpose: a caller in another language may mirror
@@ -499,7 +507,7 @@ def main() -> int:
     if args.stream and not args.json:
         print("error: --stream needs --json", file=sys.stderr)
         return 2
-    if sys.platform != "win32":
+    if not WINDOWS:
         print("error: CPU query requires Windows", file=sys.stderr)
         return 1
     if args.stream:
