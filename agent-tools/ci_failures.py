@@ -19,10 +19,30 @@ later step, a timeout). Every failed job's whole log goes to `--raw-dir` (a
 fresh temp dir named by the run ids by default), next to `report.txt`, the
 report without any caps.
 
-Without `--run` and `--workflow`, every workflow that ran for the commit is
-judged: the newest run of each (workflow, event) pair. A run still going shows
-the failures of its jobs that already failed (from their own logs) and exits
-EXIT_RUNNING.
+Without `--run`, every workflow that ran for the commit (or every one named
+`--workflow`) is judged: the newest run of each (workflow id, event) pair,
+out of ALL the commit's runs -- a listing that cannot be shown complete exits
+EXIT_INCOMPLETE. A run still going shows the failures of its jobs that
+already failed (from their own logs) and exits EXIT_RUNNING. `--timeout` is
+one deadline from the start: every gh call, the `--wait` polls and the log
+downloads included, ends by it.
+
+The printed report is the head -- every run's jobs, its index of distinct
+failures and the paths of the saved logs, never cut -- then the failure
+blocks, which `--max-lines` cuts.
+
+`--json` prints one object (`"schema"` changes with any change of this shape):
+    schema   1
+    exit     the exit code below
+    rawDir   the directory of the saved logs; report  report.txt in it
+    runs     one object per run judged:
+      run       databaseId, workflowName, event, headSha, status,
+                conclusion, url, displayTitle, attempt (gh's names)
+      exit      this run's own code; note  why it is not green, or null
+      jobs      [{name, status, conclusion, failedSteps: [step names],
+                  outcome: [pytest outcome lines], rawLog: path or null}]
+      failures  [{kind: pytest | tail | missing, headline, jobs: [names],
+                  shownFrom: job name, block: [lines], savedLog: path or null}]
 
 Why: an agent fixing a red CI otherwise asks the human to copy the failed
 output into the chat, or reads `gh run view --log-failed` whole -- 1633 lines
@@ -59,6 +79,8 @@ EXIT_NOT_FOUND = 3
 # A run has not completed: no --wait, or --wait ran out of --timeout. The jobs
 # that already failed are reported all the same.
 EXIT_RUNNING = 4
+# The schema of --json (see the docstring); bumped by any change of its shape.
+JSON_SCHEMA = 1
 # gh is not installed, `gh auth status` fails, or its login cannot read the
 # repository.
 EXIT_NO_GH = 5
@@ -66,7 +88,8 @@ EXIT_NO_GH = 5
 EXIT_GH_ERROR = 6
 # The run completed but gives no verdict: it claims success without a job
 # list, with a job that has no conclusion or with every job skipped, or it
-# concluded neutral/skipped/action_required/stale.
+# concluded neutral/skipped/action_required/stale. Also: the commit's runs
+# could not all be listed, so a red one may be missing.
 EXIT_INCOMPLETE = 7
 # A defect of this tool (an unexpected exception; the traceback is on stderr).
 # Not 1: a crash must never read as "the run is red". 70 is sysexits' EX_SOFTWARE.
@@ -78,7 +101,7 @@ WINDOWS_GH = r"C:\Program Files\GitHub CLI\gh.exe"
 INSTALL_HINT = "install the GitHub CLI from https://cli.github.com/ and run `gh auth login`"
 GH_HOST = "github.com"
 
-# `--wait`'s default ceiling. The 8 runs of llm-loop's `tests` workflow before
+# `--timeout`'s default: the deadline of the whole answer, `--wait` included. The 8 runs of llm-loop's `tests` workflow before
 # 2026-11-09 took 9.3-15.4 min from creation to the last update (15.4 min:
 # run 42478828885, 10.9 min: run 42537657856), so 30 min is twice the slowest
 # measured and still ends a hung run within one coffee.
@@ -88,8 +111,8 @@ WAIT_TIMEOUT_S = 1800
 POLL_S = 30
 # One gh call. `--log-failed` of the 12 red jobs of run 42525390878 took 1.5 s
 # (2026-11-09); gh falls back to one request per job when the zip lacks job
-# names, unmeasured here, so the ceiling is generous rather than tight. Under
-# --wait a call is also bounded by what is left of --timeout.
+# names, unmeasured here, so the ceiling is generous rather than tight. A call
+# is also bounded by what is left of --timeout.
 GH_TIMEOUT_S = 120
 GIT_TIMEOUT_S = 30
 # The most bytes of one log this tool reads. The whole `--log-failed` of the 12
@@ -137,6 +160,20 @@ class GhTimeout(Failure):
 
     def __init__(self, message: str):
         super().__init__(EXIT_GH_ERROR, message)
+
+
+class DeadlineHit(GhTimeout):
+    """`--timeout` ran out before or during a gh call."""
+
+
+def bounded(deadline: float, own: float, what: str) -> tuple[float, bool]:
+    """(the timeout of one gh call, is it the deadline's) -- the call's own
+    timeout or what is left before the monotonic `deadline`, the smaller.
+    Raises DeadlineHit when nothing is left."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise DeadlineHit(f"--timeout ran out before gh {what}")
+    return min(own, left), left < own
 
 
 class CmdError(Exception):
@@ -205,15 +242,20 @@ def gh_failure(what: str, returncode: int, said: str, repo: str) -> Failure:
 
 
 class Gh:
-    def __init__(self, path: str, repo: str):
-        self.path, self.repo = path, repo
+    """gh for one repository; no call outlives the monotonic `deadline`."""
+
+    def __init__(self, path: str, repo: str, deadline: float):
+        self.path, self.repo, self.deadline = path, repo, deadline
 
     def _run(self, argv: list, what: str, timeout: float, stdout=None) -> subprocess.CompletedProcess:
+        bound, by_deadline = bounded(self.deadline, timeout, what)
         try:
-            proc = run_cmd(argv, timeout, stdout=stdout)
+            proc = run_cmd(argv, bound, stdout=stdout)
         except CmdError as exc:
+            if exc.timed_out and by_deadline:
+                raise DeadlineHit(f"--timeout ran out during gh {what} ({bound:.0f} s were left)") from exc
             if exc.timed_out:
-                raise GhTimeout(f"gh did not answer within {timeout:g} s: {what}") from exc
+                raise GhTimeout(f"gh did not answer within {bound:g} s: {what}") from exc
             raise Failure(EXIT_GH_ERROR, f"{exc} (gh {what})") from exc
         if proc.returncode != 0:
             said = (as_text(proc.stderr) or as_text(proc.stdout)).strip()
@@ -236,6 +278,16 @@ class Gh:
         except json.JSONDecodeError as exc:
             raise Failure(EXIT_GH_ERROR, f"gh {' '.join(args)} returned invalid JSON: {exc}") from exc
 
+    def api_json(self, endpoint: str, jq: str):
+        """`gh api endpoint --jq jq`, parsed (`gh api` takes no --repo: the
+        endpoint names it)."""
+        what = f"api {endpoint}"
+        out = as_text(self._run([self.path, "api", endpoint, "--jq", jq], what, GH_TIMEOUT_S).stdout)
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError as exc:
+            raise Failure(EXIT_GH_ERROR, f"gh {what} returned invalid JSON: {exc}") from exc
+
     def call_to_file(self, args: list, path: str, timeout: float = GH_TIMEOUT_S) -> int:
         return self._run_to_file([self.path, *args, "--repo", self.repo], " ".join(args), path, timeout)
 
@@ -256,12 +308,15 @@ class Gh:
         return self._run_to_file([self.path, "api", endpoint], f"api {endpoint}", path, timeout)
 
 
-def check_auth(gh_path: str) -> None:
+def check_auth(gh_path: str, deadline: float) -> None:
     """`gh auth status` must pass before any API call: logged out, gh answers
     a private repository with the same 404 as a missing run."""
+    bound, by_deadline = bounded(deadline, GH_TIMEOUT_S, "auth status")
     try:
-        proc = run_cmd([gh_path, "auth", "status", "--hostname", GH_HOST], GH_TIMEOUT_S)
+        proc = run_cmd([gh_path, "auth", "status", "--hostname", GH_HOST], bound)
     except CmdError as exc:
+        if exc.timed_out and by_deadline:
+            raise DeadlineHit(f"--timeout ran out during gh auth status ({bound:.0f} s were left)") from exc
         if exc.timed_out:
             raise Failure(EXIT_GH_ERROR, f"gh auth status: {exc}") from exc
         raise Failure(EXIT_NO_GH, f"{exc}; {INSTALL_HINT}") from exc
@@ -328,73 +383,111 @@ def derive_sha(sha: str | None, cwd: str | None) -> str:
     return head
 
 
-RUN_FIELDS = "databaseId,headSha,status,conclusion,workflowName,event,createdAt"
+def resolve_commit(gh: Gh, prefix: str) -> str:
+    """The full sha of a hex prefix git could not expand, from the repository
+    itself (`GET repos/R/commits/<prefix>`), so no listing window can hide a
+    second commit with that prefix. GitHub answers an unknown and an
+    ambiguous prefix alike: 422 "No commit found for SHA"."""
+    try:
+        # `{sha}`, not `.sha`: gh's --jq prints a bare string unquoted, not as JSON.
+        data = gh.api_json(f"repos/{gh.repo}/commits/{prefix}", "{sha}")
+    except Failure as exc:
+        if "No commit found" in str(exc) or "HTTP 422" in str(exc):
+            raise Failure(EXIT_NOT_FOUND, f"--sha {prefix}: no commit, or more than one, starts with it "
+                                          f"in {gh.repo} (GitHub does not tell which); give the full sha") from exc
+        raise
+    full = data.get("sha") if isinstance(data, dict) else None
+    if not isinstance(full, str) or not FULL_SHA_RE.fullmatch(full):
+        raise Failure(EXIT_GH_ERROR, f"gh api repos/{gh.repo}/commits/{prefix} gave no sha: {full!r}")
+    return full.lower()
+
+
+# The REST API's list of a commit's runs: 100 a page at most, and at most
+# 1000 runs for a `head_sha` query in all (GitHub's docs of "List workflow
+# runs for a repository": "up to 1,000 results for each search when using
+# ... head_sha"). A commit with more cannot be judged whole.
+RUNS_PAGE = 100
+RUNS_MAX = 1000
+RUNS_JQ = ("{total_count, workflow_runs: [.workflow_runs[] | {id, workflow_id, name, path, event, "
+           "head_sha, created_at}]}")
+
+
+def runs_for_commit(gh: Gh, sha: str) -> list:
+    """Every run of the commit `sha` (40 hex), paged until the count the API
+    states is reached. Raises EXIT_INCOMPLETE when it is not: over RUNS_MAX,
+    or a page that came back short (runs created while paging shift them)."""
+    runs, total, page = {}, None, 1
+    while True:
+        data = gh.api_json(f"repos/{gh.repo}/actions/runs?head_sha={sha}&per_page={RUNS_PAGE}&page={page}",
+                           RUNS_JQ)
+        batch = data.get("workflow_runs") if isinstance(data, dict) else None
+        total = data.get("total_count") if isinstance(data, dict) else None
+        if not isinstance(batch, list) or not isinstance(total, int):
+            raise Failure(EXIT_GH_ERROR, f"the run listing of {sha} is not the API's shape: {str(data)[:200]}")
+        for r in batch:
+            runs[r.get("id")] = r
+        if len(runs) >= total or not batch or page * RUNS_PAGE >= RUNS_MAX:
+            break
+        page += 1
+    if len(runs) < total:
+        raise Failure(EXIT_INCOMPLETE, f"commit {sha} has {total} runs and only {len(runs)} could be listed "
+                                       f"(the API serves {RUNS_MAX} at most): a red one may be missing; "
+                                       "judge one with --run")
+    return list(runs.values())
+
+
+def workflow_matches(run: dict, workflow: str) -> bool:
+    """`--workflow` as gh takes it: the name, the file (`tests.yml` or its
+    path) or the workflow id."""
+    path = str(run.get("path") or "")
+    return workflow in (run.get("name"), path, path.rsplit("/", 1)[-1], str(run.get("workflow_id")))
 
 
 def select_runs(gh: Gh, sha: str, workflow: str | None) -> list:
-    """The ids of the runs to judge for `sha`: the newest run of `workflow`, or
-    without it the newest run of every (workflow, event) pair, newest first.
-
-    `gh run list --commit` filters by the full sha only, so a short one that
-    git could not expand is matched by prefix among the latest 100 runs, and
-    must match one commit."""
-    args = ["run", "list", "--json", RUN_FIELDS]
+    """The ids of the runs to judge for `sha`: the newest run of every
+    (workflow id, event) pair among ALL the commit's runs (of `workflow` only,
+    when given), newest first. By id, not name: two workflow files may share a
+    display name, and the newest run of one must not hide the other's."""
+    full = sha if FULL_SHA_RE.fullmatch(sha) else resolve_commit(gh, sha)
+    runs = runs_for_commit(gh, full)
     if workflow:
-        args += ["--workflow", workflow]
-    if len(sha) == 40:
-        runs = gh.json(args + ["--commit", sha, "--limit", "50"])
-    else:
-        runs = [r for r in gh.json(args + ["--limit", "100"])
-                if str(r.get("headSha", "")).lower().startswith(sha)]
-        shas = sorted({str(r.get("headSha")) for r in runs})
-        if len(shas) > 1:
-            raise Failure(EXIT_USAGE, f"--sha {sha} matches runs of {len(shas)} commits "
-                                      f"({', '.join(s[:12] for s in shas)}); give more characters")
+        runs = [r for r in runs if workflow_matches(r, workflow)]
     if not runs:
         what = f" of workflow {workflow!r}" if workflow else ""
-        raise Failure(EXIT_NOT_FOUND, f"no run{what} for commit {sha} in {gh.repo} (not pushed yet?)")
-    runs.sort(key=lambda r: r.get("createdAt", ""), reverse=True)
-    if workflow:
-        return [int(runs[0]["databaseId"])]
+        raise Failure(EXIT_NOT_FOUND, f"no run{what} for commit {full} in {gh.repo} (not pushed yet?)")
+    runs.sort(key=lambda r: (str(r.get("created_at") or ""), int(r.get("id") or 0)), reverse=True)
     chosen, seen = [], set()
     for r in runs:
-        key = (r.get("workflowName"), r.get("event"))
+        key = (r.get("workflow_id"), r.get("event"))
         if key not in seen:
             seen.add(key)
-            chosen.append(int(r["databaseId"]))
+            chosen.append(int(r["id"]))
     return chosen
 
 
 VIEW_FIELDS = "databaseId,workflowName,event,headSha,status,conclusion,url,displayTitle,attempt,jobs"
 
 
-def fetch_run(gh: Gh, run_id: int, timeout: float = GH_TIMEOUT_S) -> dict:
-    return gh.json(["run", "view", str(run_id), "--json", VIEW_FIELDS], timeout)
+def fetch_run(gh: Gh, run_id: int) -> dict:
+    return gh.json(["run", "view", str(run_id), "--json", VIEW_FIELDS])
 
 
-def wait_run(gh: Gh, run: dict, deadline: float) -> dict:
-    """Poll until `run` completes or the monotonic `deadline` passes; the last
-    view either way. No gh call outlives the deadline: each is bounded by
-    what is left of it, and one that hits that bound ends the wait."""
+def wait_run(gh: Gh, run: dict) -> dict:
+    """Poll until `run` completes or gh's deadline passes; the last view
+    either way. A poll the deadline cuts short ends the wait."""
     status = run.get("status")
-    left = deadline - time.monotonic()
+    left = gh.deadline - time.monotonic()
     print(f"waiting for run {run.get('databaseId')} ({status}) up to {max(left, 0):.0f} s",
           file=sys.stderr, flush=True)
     while run.get("status") != "completed":
-        left = deadline - time.monotonic()
+        left = gh.deadline - time.monotonic()
         if left <= 0:
             break
         time.sleep(min(POLL_S, left))
-        left = deadline - time.monotonic()
-        if left <= 0:
-            break
-        bound = min(GH_TIMEOUT_S, left)
         try:
-            run = fetch_run(gh, run["databaseId"], bound)
-        except GhTimeout:
-            if bound < GH_TIMEOUT_S:
-                break
-            raise
+            run = fetch_run(gh, run["databaseId"])
+        except DeadlineHit:
+            break
         if run.get("status") != status:
             status = run.get("status")
             print(f"  run {run.get('databaseId')} is {status}", file=sys.stderr, flush=True)
@@ -462,6 +555,42 @@ SLOWEST_RE = re.compile(r"^slowest (?:\d+ )?durations$")
 STOP_RE = re.compile(r"^!{3,} .* !{3,}$")
 
 
+# pytest's header of a block's captured output: `---- Captured stdout call ----`
+# (stdout/stderr/log, setup/call/teardown). What follows is the test's output
+# verbatim, unindented, so a child pytest's banners look like the outer run's.
+CAPTURED_RE = re.compile(r"^-+ Captured .+ -+$")
+SESSION_START = "test session starts"
+
+
+def child_session_end(lines: list, start: int) -> int | None:
+    """The index of the outcome line closing the child pytest session whose
+    `test session starts` banner is `lines[start]`, or None.
+
+    pytest opens every session (outer or child) with that banner and closes
+    it with its outcome line (`=== 1 failed, 1 passed in 0.09s ===`), and the
+    outer session's banner comes once, before any FAILURES: inside a block's
+    captured output it can only be a child's. The child's lines up to its
+    outcome (its FAILURES, its blocks, its summary) are the block's, not
+    sections of the outer run. Nested children count. Not a close: the last
+    outcome line before the step's end (`##[`) -- that one is the outer run's
+    own, so a child that died before its outcome closes nothing: its banner
+    is a line of the block, and whatever banners it printed after it end the
+    block as before. A `-q` child prints no session banner and is not
+    recognised."""
+    stop = next((j for j in range(start, len(lines)) if lines[j].startswith("##[")), len(lines))
+    last_outcome = max((j for j in range(start, stop) if OUTCOME_RE.match(lines[j])), default=None)
+    depth = 0
+    for j in range(start, stop):
+        banner = BANNER_RE.match(lines[j])
+        if banner and banner.group(1).strip() == SESSION_START:
+            depth += 1
+        elif OUTCOME_RE.match(lines[j]):
+            depth -= 1
+            if depth == 0:
+                return j if j != last_outcome else None
+    return None
+
+
 def drop_trailing_blanks(lines: list) -> None:
     while lines and not lines[-1].strip():
         lines.pop()
@@ -481,11 +610,13 @@ def parse_pytest(lines: list) -> tuple[list, list, list, int]:
     SECTION_BANNERS banner, the final outcome banner or a runner `##[` line;
     `-q` prints the outcome line without a banner, so an outcome-looking line
     counts only when it is the last line before the `##[` line (else it is a
-    test's captured output). An entry is a `short test summary info` line with
-    its continuation lines: a multi-line message goes on unprefixed. Several
-    pytest runs in one job simply add up."""
+    test's captured output). A child pytest session in a block's captured
+    output stays in the block whole (`child_session_end`). An entry is a
+    `short test summary info` line with its continuation lines: a multi-line
+    message goes on unprefixed. Several pytest runs in one job simply add up."""
     blocks, entries, outcomes = [], [], []
     section, end, pending = None, -1, None
+    captured, skip_to = False, -1
 
     def close_blocks():
         # The unbannered `-q` outcome line is the last of the last block.
@@ -497,6 +628,8 @@ def parse_pytest(lines: list) -> tuple[list, list, list, int]:
                 outcomes.append(lines[pending].strip("= "))
 
     for i, line in enumerate(lines):
+        if i <= skip_to:
+            continue
         banner = BANNER_RE.match(line)
         name = banner.group(1).strip() if banner else ""
         if section == "blocks":
@@ -504,11 +637,20 @@ def parse_pytest(lines: list) -> tuple[list, list, list, int]:
                 close_blocks()
                 pending, section = None, None
                 continue
+            if captured and blocks and name == SESSION_START:
+                # Never the outer run's banner here; without its close, just a line.
+                close = child_session_end(lines, i)
+                close = i if close is None else close
+                blocks[-1][1].extend(lines[i:close + 1])
+                skip_to = end = close
+                continue
             if not (banner and is_section_banner(line, name)):
                 head = BLOCK_RE.match(line)
                 if head and not re.fullmatch(r"[_ ]+", head.group(1)):
                     blocks.append((head.group(1), []))
+                    captured = False
                 elif blocks:
+                    captured = captured or bool(CAPTURED_RE.match(line))
                     blocks[-1][1].append(line)
                     if OUTCOME_RE.match(line):
                         pending = i
@@ -663,15 +805,64 @@ NOISE = [
 ]
 # pytest's own timing total in an outcome line (a child pytest's, captured).
 TOTALS_RE = re.compile(r"\bin \d+(?:\.\d+)?s(?: \(\d+:\d\d:\d\d\))?")
-# pytest's `name = repr` lines of a test's arguments, above its source. A
-# parametrised value is in the node id, compared exactly; what is left is
-# fixtures, whose reprs can carry the wall clock: run 42525390878 split one
-# red over 3 jobs only by `network_clock = [' . RUNNING since 2026-11-08
-# 21:28:59 ... since 21:28 ...']`. Clock times are taken out of these lines
-# only, never out of `E` lines or headlines.
+# pytest's `name = repr` lines of a traceback entry's arguments (its
+# ReprFuncArgs: `a = 1, b = [2]`, a long repr alone on its line, then a blank
+# line), printed first in the entry: at the block's start or after the `_ _ _`
+# entry separator or a chained exception's message. A parametrised value is in
+# the node id, compared exactly; what is left can be a fixture whose repr
+# carries the wall clock: run 42525390878 split one red over 3 jobs only by
+# `network_clock = [' . RUNNING since 2026-11-08 21:28:59 (... since 21:28 ...)']`.
+# Clock times are taken out of such argument values only, and only of a
+# container or object repr (`[...]`, `(...)`, `{...}`, `<...>`, `Name(...)`):
+# a plain literal (`at = '12:30'`) is a value under test, and so is a line of
+# captured output (it comes after the traceback, not at an entry's head), an
+# `E` line or a headline.
 ARG_LINE_RE = re.compile(r"^[A-Za-z_]\w* = ")
+ARG_NEXT_RE = re.compile(r", [A-Za-z_]\w* = ")
+ENTRY_SEP_RE = re.compile(r"^_(?: _)+$")
+CHAIN_RE = re.compile(r"^(?:The above exception was the direct cause of the following exception:"
+                      r"|During handling of the above exception, another exception occurred:)$")
+OBJECT_REPR_RE = re.compile(r"^(?:[\[({<]|[A-Za-z_][\w.]*\()")
 CLOCK_RES = [(re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?Z?"), "<time>"),
              (re.compile(r"\b\d\d?:\d\d(?::\d\d)?\b"), "<hh:mm>")]
+
+
+def split_args(line: str) -> list | None:
+    """[[name, value]] of a ReprFuncArgs line, split at `, name = ` outside
+    quotes and brackets only; None for a line that is not one."""
+    if not ARG_LINE_RE.match(line):
+        return None
+    parts, start, depth, quote, k = [], 0, 0, None, 0
+    while k < len(line):
+        c = line[k]
+        if quote:
+            if c == "\\":
+                k += 1
+            elif c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        elif c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth = max(depth - 1, 0)
+        elif depth == 0 and ARG_NEXT_RE.match(line, k):
+            parts.append(line[start:k])
+            start = k + 2
+        k += 1
+    parts.append(line[start:])
+    return [p.split(" = ", 1) for p in parts]
+
+
+def without_clock_times(args: list) -> str:
+    """An argument line again, clock times out of its object reprs."""
+    out = []
+    for name, value in args:
+        if OBJECT_REPR_RE.match(value):
+            for pattern, repl in CLOCK_RES:
+                value = pattern.sub(repl, value)
+        out.append(f"{name} = {value}")
+    return ", ".join(out)
 # Windows paths, made comparable to POSIX ones: drive-letter paths (also
 # inside a repr, where the backslashes are doubled), pytest's location line
 # `tests\x.py:74: Error` and a traceback frame's file.
@@ -722,16 +913,20 @@ def drop_frame_sources(lines: list) -> list:
 def normalize(text: str) -> str:
     """The comparison key of a failure's text, without per-job noise. Never
     shown -- the report shows the first job's exact text."""
-    out = []
+    out, entry_head = [], True  # a block starts with its first entry's arguments
     lines = [posix_paths(ln) for ln in text.split("\n") if not CARETS_RE.match(ln)]
     for line in drop_frame_sources(lines):
         for pattern, repl in NOISE:
             line = pattern.sub(repl, line)
         if OUTCOME_RE.match(re.sub(r"^E\s+", "", line)):
             line = TOTALS_RE.sub("in <dur>", line)
-        if ARG_LINE_RE.match(line):
-            for pattern, repl in CLOCK_RES:
-                line = pattern.sub(repl, line)
+        args = split_args(line) if entry_head else None
+        if args:
+            line = without_clock_times(args)
+        elif ENTRY_SEP_RE.match(line) or CHAIN_RE.match(line):
+            entry_head = True
+        elif line.strip():
+            entry_head = False
         out.append(line.rstrip())
     while out and not out[-1]:
         out.pop()
@@ -746,7 +941,11 @@ def group_key(unit: dict) -> str:
     if unit["kind"] == "pytest" and parts:
         ident = " ".join(parts)
         head, rest = ident, head[len(ident):]
-    return "\0".join([unit["kind"], head, normalize(rest + "\n" + "\n".join(unit["block"]))])
+    # Apart: the block's first line is its first entry's head (`normalize`);
+    # the rest (` - message`) starts with a space, so it is never an argument line.
+    # A saved log is per job: two jobs' unparsed logs are two groups, each with its path.
+    return "\0".join([unit["kind"], head, normalize(rest), normalize("\n".join(unit["block"])),
+                      unit.get("savedLog") or ""])
 
 
 def group_failures(per_job: list) -> list:
@@ -854,8 +1053,20 @@ def group_jobs(group: dict, labels: dict) -> str:
     return ", ".join(labels.get(j, j) for j in group["jobs"])
 
 
+def failed_labels(run: dict) -> tuple[list, dict]:
+    failed = [j.get("name") for j in run.get("jobs") or [] if is_failed(j)]
+    return failed, short_names(failed)
+
+
+def saved_log_line(group: dict, indent: str) -> list:
+    """A path the reader acts on, on its own line: never inside a headline,
+    which the print cuts at HEADLINE_CHARS."""
+    return [f"{indent}saved log: {group['savedLog']}"] if group.get("savedLog") else []
+
+
 def render_group(index: int, group: dict, labels: dict, cap: bool, report_path: str) -> list:
     out = [f"[{index}] {cut_headline(group['headline'], cap)} -- {group_jobs(group, labels)}"]
+    out.extend(saved_log_line(group, "    "))
     block = group["block"]
     if len(group["jobs"]) > 1:
         out.append(f"    (text from {labels.get(group['shownFrom'], group['shownFrom'])})")
@@ -867,7 +1078,9 @@ def render_group(index: int, group: dict, labels: dict, cap: bool, report_path: 
     return out
 
 
-def render_run(rep: dict, raw_dir: str, report_path: str, cap: bool) -> list:
+def render_head(rep: dict, raw_dir: str, cap: bool) -> list:
+    """One run's jobs, its note, the index of its distinct failures and its
+    saved logs -- the part of the report the print never cuts."""
     run = rep["run"]
     out = [run_title(run), str(run.get("url", ""))]
     for job in run.get("jobs") or []:
@@ -876,34 +1089,52 @@ def render_run(rep: dict, raw_dir: str, report_path: str, cap: bool) -> list:
         out.append(rep["note"])
     groups = rep["groups"]
     if groups:
-        failed = [j.get("name") for j in run.get("jobs") or [] if is_failed(j)]
-        labels = short_names(failed)
+        failed, labels = failed_labels(run)
         out.append("")
-        # The index first: the printed cap may cut blocks, never a failure's existence.
         out.append(f"{len(groups)} distinct failure(s) in {len(failed)} failed job(s):")
         for i, group in enumerate(groups, 1):
             out.append(f"  [{i}] {cut_headline(group['headline'], cap)} -- {group_jobs(group, labels)}")
-        for i, group in enumerate(groups, 1):
-            out.append("")
-            out.extend(render_group(i, group, labels, cap, report_path))
+            out.extend(saved_log_line(group, "      "))
     if rep["raw"]:
-        out.append("")
-        out.append(f"raw logs in {raw_dir}: " + ", ".join(os.path.basename(p) for p in rep["raw"].values()))
+        out.append("raw logs: " + ", ".join(os.path.basename(p) for p in rep["raw"].values()))
+        out.append(f"  in {raw_dir}")
     return out
 
 
-def render(reports: list, raw_dir: str, report_path: str, cap: bool) -> list:
-    out = []
+def render_blocks(rep: dict, report_path: str, cap: bool, titled: bool) -> list:
+    """One run's failure blocks, numbered as in its index."""
+    groups = rep["groups"]
+    if not groups:
+        return []
+    _, labels = failed_labels(rep["run"])
+    out = [f"-- the failures of run {rep['run'].get('databaseId')}"] if titled else []
+    for i, group in enumerate(groups, 1):
+        if out:
+            out.append("")
+        out.extend(render_group(i, group, labels, cap, report_path))
+    return out
+
+
+def render(reports: list, raw_dir: str, report_path: str, cap: bool) -> tuple[list, list]:
+    """(head, detail): every run's head first, then every run's blocks, so
+    that a long first run cannot push the second run's index out of a cut
+    print; `emit` cuts the detail only."""
+    head = []
     if len(reports) > 1:
         sha = str(reports[0]["run"].get("headSha", ""))[:8]
-        out.append(f"{len(reports)} runs for commit {sha}:")
-        out.extend("  " + run_title(rep["run"]) for rep in reports)
-        out.append("")
-    for i, rep in enumerate(reports):
-        if i:
-            out.append("")
-        out.extend(render_run(rep, raw_dir, report_path, cap))
-    return out
+        head.append(f"{len(reports)} runs for commit {sha}:")
+        head.extend("  " + run_title(rep["run"]) for rep in reports)
+    for rep in reports:
+        if head:
+            head.append("")
+        head.extend(render_head(rep, raw_dir, cap))
+    detail = []
+    for rep in reports:
+        blocks = render_blocks(rep, report_path, cap, titled=len(reports) > 1)
+        if blocks:
+            detail.append("")
+            detail.extend(blocks)
+    return head, detail
 
 
 def run_json(rep: dict) -> dict:
@@ -912,7 +1143,7 @@ def run_json(rep: dict) -> dict:
                                             "conclusion", "url", "displayTitle", "attempt")},
             "exit": rep["code"], "note": rep["note"],
             "jobs": [job_json(j, rep["outcomes"], rep["raw"]) for j in run.get("jobs") or []],
-            "failures": [{k: g.get(k) for k in ("kind", "headline", "jobs", "shownFrom", "block")}
+            "failures": [{k: g.get(k) for k in ("kind", "headline", "jobs", "shownFrom", "block", "savedLog")}
                          for g in rep["groups"]]}
 
 
@@ -940,13 +1171,14 @@ def read_text(path: str) -> str:
         return fh.read()
 
 
-def over_limit(what: str, size: int, path: str) -> str:
-    return (f"{what} is {size} bytes, over the {MAX_LOG_BYTES}-byte limit "
-            f"(MAX_LOG_BYTES): not parsed; the whole log is in {path}")
+def over_limit(what: str, size: int, path: str) -> list:
+    """The unit of a log too big to parse; its path goes on its own line."""
+    return missing(f"{what} is {size} bytes, over the {MAX_LOG_BYTES}-byte limit "
+                   "(MAX_LOG_BYTES): not parsed; the whole log is saved", path)
 
 
-def missing(headline: str) -> list:
-    return [{"kind": "missing", "headline": headline, "block": []}]
+def missing(headline: str, saved_log: str | None = None) -> list:
+    return [{"kind": "missing", "headline": headline, "block": [], "savedLog": saved_log}]
 
 
 def analyse(gh: Gh, run: dict, raw_dir: str, tail: int, prefix: str, taken: set) -> tuple[dict, list, dict]:
@@ -961,19 +1193,24 @@ def analyse(gh: Gh, run: dict, raw_dir: str, tail: int, prefix: str, taken: set)
     if not failed:
         return outcomes, [], raw
     run_id = run.get("databaseId")
-    by_job, combined_note = {}, None
+    by_job, combined = {}, None
     if run.get("status") == "completed":
         path = os.path.join(raw_dir, f"{prefix}log-failed.txt")
-        size = gh.call_to_file(["run", "view", str(run_id), "--log-failed"], path)
-        if size > MAX_LOG_BYTES:
-            combined_note = over_limit("`gh run view --log-failed`", size, path)
+        try:
+            size = gh.call_to_file(["run", "view", str(run_id), "--log-failed"], path)
+        except DeadlineHit as exc:
+            # The verdict is known; the failures' text is not -- said per job.
+            combined = missing(f"`gh run view --log-failed` not read: {exc}")
         else:
-            by_job = split_log(read_text(path))
-            os.remove(path)
+            if size > MAX_LOG_BYTES:
+                combined = over_limit("`gh run view --log-failed`", size, path)
+            else:
+                by_job = split_log(read_text(path))
+                os.remove(path)
     for job in failed:
         name = job.get("name")
-        if combined_note:
-            per_job.append((name, missing(combined_note)))
+        if combined:
+            per_job.append((name, combined))
             continue
         path = os.path.join(raw_dir, safe_name(prefix + str(name), taken))
         lines, source = by_job.get(name), "log"
@@ -993,7 +1230,7 @@ def analyse(gh: Gh, run: dict, raw_dir: str, tail: int, prefix: str, taken: set)
                 continue
             if size > MAX_LOG_BYTES:
                 raw[name] = path
-                per_job.append((name, missing(over_limit("the job's own log", size, path))))
+                per_job.append((name, over_limit("the job's own log", size, path)))
                 continue
             lines, source = split_job_log(read_text(path)), "own log"
         raw[name] = path
@@ -1006,14 +1243,14 @@ def analyse(gh: Gh, run: dict, raw_dir: str, tail: int, prefix: str, taken: set)
 # ---------------------------------------------------------------- the command line
 
 
-def emit(lines: list, max_lines: int, report_path: str) -> None:
-    if len(lines) > max_lines:
-        shown = lines[:max(max_lines - 1, 0)]
-        shown.append(f"... report cut at {len(shown)} of {len(lines)} lines; full report: {report_path}")
-        lines = shown
-    else:
-        lines = lines + [f"full report: {report_path}"]
-    print("\n".join(lines))
+def emit(head: list, detail: list, max_lines: int, report_path: str) -> None:
+    """Print the head whole and as much of the detail as `max_lines` leaves;
+    the last line names the full report, on its own."""
+    room = max_lines - len(head) - 1
+    if len(detail) > room:
+        shown = detail[:max(room - 1, 0)]
+        detail = shown + [f"... failure blocks cut at {len(shown)} of {len(detail)} lines (--max-lines {max_lines})"]
+    print("\n".join(head + detail + [f"full report: {report_path}"]))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1026,15 +1263,18 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--repo", default=None, metavar="OWNER/NAME",
                     help="default: from `git remote get-url origin` of the cwd")
     ap.add_argument("--workflow", default=None, metavar="NAME",
-                    help="only the newest run of this workflow (default: the newest of every workflow and event)")
+                    help="only this workflow (name, file or id): the newest run of each event "
+                         "(default: of every workflow and event)")
     ap.add_argument("--wait", action="store_true", help="wait for unfinished runs to complete")
     ap.add_argument("--timeout", type=float, default=WAIT_TIMEOUT_S,
-                    help=f"--wait's ceiling in seconds (default {WAIT_TIMEOUT_S}, `WAIT_TIMEOUT_S`)")
+                    help="seconds for the whole answer, every gh call and --wait included "
+                         f"(default {WAIT_TIMEOUT_S}, `WAIT_TIMEOUT_S`)")
     ap.add_argument("--raw-dir", default=None, metavar="DIR",
                     help="where the failed jobs' whole logs and report.txt go (default: a new temp dir "
                          "named by the run ids, kept)")
     ap.add_argument("--max-lines", type=int, default=MAX_LINES, metavar="N",
-                    help=f"cap of the printed report (default {MAX_LINES}); report.txt has it all")
+                    help=f"cap of the printed report (default {MAX_LINES}); it cuts the failure blocks "
+                         "only, never the jobs and the index; report.txt has it all")
     ap.add_argument("--tail", type=int, default=TAIL_LINES, metavar="N",
                     help=f"lines kept of a failed job without pytest failures (default {TAIL_LINES})")
     ap.add_argument("--json", action="store_true", help="print jobs and grouped failures as JSON")
@@ -1044,22 +1284,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def answer(args: argparse.Namespace) -> int:
+    deadline = time.monotonic() + args.timeout
     gh_path = find_gh(args.gh)
     if gh_path is None:
         where = args.gh or f"PATH or {WINDOWS_GH}"
         raise Failure(EXIT_NO_GH, f"gh not found in {where}; {INSTALL_HINT}")
     cwd = os.getcwd()
     repo = args.repo or derive_repo(cwd)
-    check_auth(gh_path)
-    gh = Gh(gh_path, repo)
+    check_auth(gh_path, deadline)
+    gh = Gh(gh_path, repo, deadline)
     if args.run is not None:
         run_ids = [args.run]
     else:
         run_ids = select_runs(gh, derive_sha(args.sha, cwd), args.workflow)
     runs = [fetch_run(gh, run_id) for run_id in run_ids]
-    if args.wait and any(r.get("status") != "completed" for r in runs):
-        deadline = time.monotonic() + args.timeout
-        runs = [wait_run(gh, r, deadline) if r.get("status") != "completed" else r for r in runs]
+    if args.wait:
+        runs = [wait_run(gh, r) if r.get("status") != "completed" else r for r in runs]
     ids = "_".join(str(i) for i in run_ids[:4])
     raw_dir = os.path.abspath(args.raw_dir or tempfile.mkdtemp(prefix=f"ci_failures_{ids}_"))
     os.makedirs(raw_dir, exist_ok=True)
@@ -1074,14 +1314,15 @@ def answer(args: argparse.Namespace) -> int:
         reports.append({"run": run, "code": code, "note": note, "outcomes": outcomes,
                         "groups": groups, "raw": raw})
     code = combined_code([rep["code"] for rep in reports])
-    full = render(reports, raw_dir, report_path, cap=False)
+    head, detail = render(reports, raw_dir, report_path, cap=False)
     with open(report_path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write("\n".join(full) + "\n")
+        fh.write("\n".join(head + detail) + "\n")
     if args.json:
-        print(json.dumps({"exit": code, "rawDir": raw_dir, "report": report_path,
+        print(json.dumps({"schema": JSON_SCHEMA, "exit": code, "rawDir": raw_dir, "report": report_path,
                           "runs": [run_json(rep) for rep in reports]}))
     else:
-        emit(render(reports, raw_dir, report_path, cap=True), args.max_lines, report_path)
+        head, detail = render(reports, raw_dir, report_path, cap=True)
+        emit(head, detail, args.max_lines, report_path)
     return code
 
 

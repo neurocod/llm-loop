@@ -271,6 +271,82 @@ def test_pytest_lines_printed_by_a_test_stay_in_its_block():
     assert outcomes == ["2 failed, 7 passed in 1.50s"]
 
 
+# A test that runs pytest in a child and prints its output: pytest 9.2.0's
+# real text (2026-11-09, a scratch outer/child pair), paths shortened. The
+# child's session banner, FAILURES, block, warnings, summary and outcome are
+# all inside test_child_session_is_green's captured stdout.
+NESTED = r"""=================================== FAILURES ===================================
+_________________________ test_child_session_is_green __________________________
+
+    def test_child_session_is_green():
+        proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", str(CHILD)],
+                              capture_output=True, text=True, cwd=CHILD)
+        print(proc.stdout)
+>       assert proc.returncode == 0
+E       AssertionError: assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['/usr/bin/python3', '-m', 'pytest', ...], returncode=1, stdout='...').returncode
+
+tests/test_outer.py:12: AssertionError
+----------------------------- Captured stdout call -----------------------------
+============================= test session starts ==============================
+platform linux -- Python 3.13.7, pytest-9.2.0, pluggy-1.6.0
+rootdir: /tmp/pytest-of-runner/pytest-0/child
+collected 2 items
+
+test_inner.py .F                                                         [100%]
+
+=================================== FAILURES ===================================
+_______________________________ test_inner_fails _______________________________
+
+    def test_inner_fails():
+>       assert 2 + 2 == 5
+E       assert (2 + 2) == 5
+
+test_inner.py:6: AssertionError
+=============================== warnings summary ===============================
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED test_inner.py::test_inner_fails - assert (2 + 2) == 5
+=================== 1 failed, 1 passed, 1 warning in 0.09s =====================
+
+_____________________________ test_after_the_child _____________________________
+
+    def test_after_the_child():
+>       assert "outer" == "other"
+E       AssertionError: assert 'outer' == 'other'
+
+tests/test_outer.py:16: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_outer.py::test_child_session_is_green - AssertionError: assert 1 == 0
+FAILED tests/test_outer.py::test_after_the_child - AssertionError: assert 'outer' == 'other'
+========================= 2 failed, 5 passed in 0.84s ==========================
+##[error]Process completed with exit code 1."""
+
+
+def test_a_child_pytest_session_in_captured_output_stays_in_its_block():
+    units, outcomes = cf.failure_units(NESTED.split("\n"), 10)
+    assert [u["headline"] for u in units] == ["FAILED tests/test_outer.py::test_child_session_is_green",
+                                              "FAILED tests/test_outer.py::test_after_the_child"]
+    child = units[0]["block"]
+    assert child[-1] == "=================== 1 failed, 1 passed, 1 warning in 0.09s ====================="
+    assert "FAILED test_inner.py::test_inner_fails - assert (2 + 2) == 5" in child
+    assert units[1]["block"][-1] == "tests/test_outer.py:16: AssertionError"
+    assert outcomes == ["2 failed, 5 passed in 0.84s"]
+
+
+def test_a_child_session_without_its_outcome_closes_nothing():
+    # Made up: the child died after its banner; the outer run's own outcome
+    # must not be taken for the child's, or test_after_the_child would vanish.
+    lines = NESTED.split("\n")
+    cut = lines[:lines.index("platform linux -- Python 3.13.7, pytest-9.2.0, pluggy-1.6.0")]
+    cut += ["Killed"] + lines[lines.index("_____________________________ test_after_the_child _____________________________"):]
+    units, outcomes = cf.failure_units(cut, 10)
+    assert [u["headline"] for u in units] == ["FAILED tests/test_outer.py::test_child_session_is_green",
+                                              "FAILED tests/test_outer.py::test_after_the_child"]
+    assert units[0]["block"][-1] == "Killed"
+    assert outcomes == ["2 failed, 5 passed in 0.84s"]
+
+
 def test_quiet_outcome_line_right_after_the_blocks_is_the_outcome():
     # `-q -rN`: no summary, the unbannered outcome line ends the output.
     lines = ["=== FAILURES ===", "___ test_a ___", "assert 0", "",
@@ -366,12 +442,49 @@ def test_a_different_message_or_parameter_is_another_group():
     ("E     1 failed, 3 passed in 1.25s", "E     1 failed, 3 passed in 3.50s (0:00:03)"),
     ("tests\\x.py:74: AssertionError", "tests/x.py:74: AssertionError"),
     ("p = '/tmp/tmpab12cd_9/out'", "p = '/tmp/tmpzz99yy00/out'"),
-    # A fixture's repr (run 42525390878 split one red over 3 jobs by it).
-    ("network_clock = [' RUNNING since 2026-11-08 21:28:59 (RECONNECTING since 21:28 (1 tries))']",
-     "network_clock = [' RUNNING since 2026-11-08 21:29:09 (RECONNECTING since 21:29 (1 tries))']"),
 ])
 def test_normalize_takes_out_per_job_noise(left, right):
     assert cf.normalize(left) == cf.normalize(right)
+
+
+def clock_block(args: str, then: str = "") -> str:
+    """A block whose first entry has the argument line(s) `args`."""
+    return "\n".join([args, "", "    def test_x(network_clock):", ">       assert network_clock == []",
+                      "E       AssertionError", "", "tests/x.py:3: AssertionError", then])
+
+
+# Run 42525390878, ubuntu 3.10 and macOS 3.12: the one red of 3 jobs, apart
+# only by the fixture's wall clock.
+CLOCK_A = ("network_clock = [' · RUNNING since 2026-11-08 21:28:59 (0 cmd, 0 edits, RECONNECTING since 21:28 "
+           "(1 tries))', ' · RUNNING since 2026-11-08 21:28:59 (0 cmd, 0 edits, RECONNECTING since 21:28 (2 tries))']")
+CLOCK_B = CLOCK_A.replace("21:28:59", "21:28:57")
+
+
+@pytest.mark.parametrize("left, right", [
+    (clock_block(CLOCK_A), clock_block(CLOCK_B)),
+    (clock_block("tmp_path = PosixPath('/tmp/t0')\n" + CLOCK_A), clock_block("tmp_path = PosixPath('/tmp/t0')\n" + CLOCK_B)),
+    # The head of a later entry, after pytest's `_ _ _` separator.
+    (clock_block("x = 1") + "\n_ _ _ _ _ _ _ _\n\n" + CLOCK_A, clock_block("x = 1") + "\n_ _ _ _ _ _ _ _\n\n" + CLOCK_B),
+])
+def test_clock_times_in_an_entrys_object_args_are_noise(left, right):
+    assert cf.normalize(left) == cf.normalize(right)
+
+
+@pytest.mark.parametrize("left, right", [
+    # A plain literal argument is a value under test.
+    (clock_block("at = '12:30'"), clock_block("at = '12:45'")),
+    (clock_block("state = [1], at = '12:30'"), clock_block("state = [1], at = '12:45'")),
+    # Captured output after the traceback, even shaped as `name = value`.
+    (clock_block("x = 1", "----- Captured stdout call -----\nactual = '12:30'"),
+     clock_block("x = 1", "----- Captured stdout call -----\nactual = '12:45'")),
+    (clock_block("x = 1", "----- Captured stdout call -----\nactual = ['since 12:30']"),
+     clock_block("x = 1", "----- Captured stdout call -----\nactual = ['since 12:45']")),
+    # An `E` line of the verdict.
+    (clock_block(CLOCK_A).replace("E       AssertionError", "E       assert '21:28' == '21:29'"),
+     clock_block(CLOCK_A).replace("E       AssertionError", "E       assert '21:28' == '21:30'")),
+])
+def test_clock_times_elsewhere_tell_failures_apart(left, right):
+    assert cf.normalize(left) != cf.normalize(right)
 
 
 @pytest.mark.parametrize("left, right", [
@@ -381,6 +494,7 @@ def test_normalize_takes_out_per_job_noise(left, right):
     ("E   assert flags == 0x20", "E   assert flags == 0x30"),
     ("E   assert at == '12:30'", "E   assert at == '12:45'"),
     ("E   at = '12:30'", "E   at = '12:45'"),
+    ("at = '12:30'", "at = '12:45'"),
     ("    assert at == '12:30'", "    assert at == '12:45'"),
     ("E   assert s == 'a\\b'", "E   assert s == 'a/b'"),
     # A plain frame's `E` lines are pytest's verdict, not the frame's source.
@@ -532,24 +646,57 @@ def test_red_run_prints_jobs_groups_and_raw_logs(monkeypatch, capsys, gh, tmp_pa
     assert all("--repo" in c and "o/r" in c for c in fake.calls[1:])
 
 
-def test_max_lines_cuts_the_print_and_names_the_full_report(monkeypatch, capsys, gh, tmp_path):
+def test_max_lines_cuts_the_blocks_and_names_the_full_report(monkeypatch, capsys, gh, tmp_path):
     raw = tmp_path / "raw"
     code, _ = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED],
-                   run42(gh, "--raw-dir", raw, "--max-lines", 10))
+                   run42(gh, "--raw-dir", raw, "--max-lines", 30))
     out = capsys.readouterr().out.splitlines()
     report = raw / "report.txt"
     full = report.read_text(encoding="utf-8").splitlines()
-    assert code == cf.EXIT_RED and len(out) == 10
-    assert out[:9] == full[:9]
-    assert out[-1].startswith("... report cut at 9 of ") and out[-1].endswith(f"full report: {report}")
+    assert code == cf.EXIT_RED and len(out) == 30
+    assert out[:28] == full[:28]
+    assert out[-2].startswith("... failure blocks cut at ") and out[-1] == f"full report: {report}"
     assert "ModuleNotFoundError: No module named '_winapi'" in report.read_text(encoding="utf-8")
+
+
+# Made up: run 42 with 30 failures, each with a 20-line block, then run 7 with one.
+MANY = "\n".join(["=== FAILURES ==="]
+                 + [ln for i in range(30) for ln in [f"___ test_{i} ___"] + [f"line {k} of {i}" for k in range(20)]]
+                 + ["=== short test summary info ==="] + [f"FAILED tests/x.py::test_{i} - boom {i}" for i in range(30)]
+                 + ["30 failed in 1.00s", "##[error]Process completed with exit code 1."])
+
+
+@pytest.mark.parametrize("max_lines", [1, 80])
+def test_every_runs_index_is_printed_whatever_the_cap(monkeypatch, capsys, gh, tmp_path, max_lines):
+    runs = [listed(42, created="2026-11-08T11:00:00Z"), listed(7, workflow="lint")]
+    code, _ = main(monkeypatch, [AUTH, runs_rule(runs), view_of(42, jobs=[job(MAC)]),
+                                 ("run view 42 --log-failed", (0, prefixed(MAC, MANY), "")),
+                                 view_of(7, jobs=[job("lint", step="ruff")]),
+                                 ("run view 7 --log-failed", (0, prefixed("lint", "E501 too long\n"
+                                  "##[error]Process completed with exit code 1."), ""))],
+                   ["--gh", gh, *by_sha("--raw-dir", tmp_path, "--max-lines", max_lines)])
+    out = capsys.readouterr().out
+    assert code == cf.EXIT_RED
+    for i in range(30):
+        assert f"] FAILED tests/x.py::test_{i} -- " in out
+    lint = "  [1] no pytest failures in this job's log; its last lines -- lint"
+    assert lint in out
+    if max_lines > 1:  # the blocks follow every index
+        assert out.index(lint) < out.index("line 0 of 0")
+    assert out.rstrip().endswith(f"full report: {tmp_path / 'report.txt'}")
 
 
 def test_json_output(monkeypatch, capsys, gh, tmp_path):
     code, _ = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED], run42(gh, "--raw-dir", tmp_path, "--json"))
     data = json.loads(capsys.readouterr().out)
     assert code == data["exit"] == cf.EXIT_RED
+    # The shape the module docstring documents.
+    assert data["schema"] == cf.JSON_SCHEMA == 1
+    assert set(data) == {"schema", "exit", "rawDir", "report", "runs"}
     [run] = data["runs"]
+    assert set(run) == {"run", "exit", "note", "jobs", "failures"}
+    assert set(run["jobs"][0]) == {"name", "status", "conclusion", "failedSteps", "outcome", "rawLog"}
+    assert set(run["failures"][0]) == {"kind", "headline", "jobs", "shownFrom", "block", "savedLog"}
     assert run["exit"] == cf.EXIT_RED
     assert [f["jobs"] for f in run["failures"]][0] == [MAC, UBU, WIN]
     assert {j["name"]: j["failedSteps"] for j in run["jobs"]}[OLD] == ["Install"]
@@ -563,9 +710,25 @@ def test_green_run_exits_0_without_fetching_logs(monkeypatch, capsys, gh, tmp_pa
     assert f"{MAC}: success" in capsys.readouterr().out
 
 
-def listed(run_id, workflow="tests", created="2026-11-08T10:00:00Z", event="push", sha="d" * 40):
-    return {"databaseId": run_id, "workflowName": workflow, "event": event, "createdAt": created,
-            "headSha": sha}
+WORKFLOW_IDS = {"tests": 336505049, "lint": 336505050}
+
+
+def listed(run_id, workflow="tests", created="2026-11-08T10:00:00Z", event="push", sha="d" * 40,
+           workflow_id=None, path=None):
+    """One run as `gh api .../actions/runs --jq RUNS_JQ` lists it."""
+    return {"id": run_id, "workflow_id": workflow_id or WORKFLOW_IDS.get(workflow, 1),
+            "name": workflow, "path": path or f".github/workflows/{workflow}.yml", "event": event,
+            "head_sha": sha, "created_at": created}
+
+
+def runs_rule(runs, sha="d" * 40, page=1, total=None):
+    """The fake gh's answer to page `page` of the commit's run listing."""
+    body = {"total_count": len(runs) if total is None else total, "workflow_runs": runs}
+    return (f"api repos/o/r/actions/runs?head_sha={sha}&per_page=100&page={page} ", (0, json.dumps(body), ""))
+
+
+def by_sha(*extra):
+    return ["--repo", "o/r", "--sha", "d" * 40, *(str(a) for a in extra)]
 
 
 def view_of(run_id, **kw):
@@ -574,26 +737,79 @@ def view_of(run_id, **kw):
     return (f"run view {run_id} --json", (0, json.dumps(run), ""))
 
 
+GREEN = {"conclusion": "success", "jobs": [job(MAC, "success")]}
+
+
 def test_newest_run_for_the_sha_is_chosen(monkeypatch, capsys, gh, tmp_path):
     runs = [listed(41), listed(42, created="2026-11-08T11:00:00Z")]
-    green = run_payload(conclusion="success", jobs=[job(MAC, "success")])
-    code, fake = main(monkeypatch, [AUTH, ("run list", (0, json.dumps(runs), "")), view(green)],
-                      ["--gh", gh, "--repo", "o/r", "--sha", "d" * 40, "--raw-dir", str(tmp_path)])
+    code, fake = main(monkeypatch, [AUTH, runs_rule(runs), view_of(42, **GREEN)],
+                      ["--gh", gh, *by_sha("--raw-dir", tmp_path)])
     assert code == cf.EXIT_GREEN
-    listing = next(c for c in fake.calls if "list" in c)
-    assert listing[listing.index("--commit") + 1] == "d" * 40
-    assert not any("41" in c for c in fake.calls)
+    assert not any("41" in c for c in fake.calls)  # no argument is the older run's id
+
+
+def test_every_page_of_the_commit_runs_is_read(monkeypatch, capsys, gh, tmp_path):
+    # The red run is on page 2: a first-page-only listing would judge green.
+    page1 = [listed(100 + i, created=f"2026-11-08T11:{i:02d}:00Z") for i in range(100)]
+    page2 = [listed(7, workflow="lint", created="2026-11-08T09:00:00Z")]
+    code, fake = main(monkeypatch, [AUTH, runs_rule(page1, total=101), runs_rule(page2, page=2, total=101),
+                                    view_of(199, **GREEN), view_of(7, jobs=[job("lint", step="ruff")]),
+                                    ("run view 7 --log-failed", (0, prefixed("lint", "E501 too long"), ""))],
+                      ["--gh", gh, *by_sha("--raw-dir", tmp_path)])
+    assert code == cf.EXIT_RED and "E501 too long" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("pages", [
+    [(100, 1500)] * 10,           # over the 1000 the API serves for a head_sha query
+    [(100, 150), (0, 150)],       # a page came back empty before the stated count
+])
+def test_a_listing_that_cannot_be_shown_complete_is_never_green(monkeypatch, capsys, gh, tmp_path, pages):
+    rules, made = [AUTH], 0
+    for page, (count, total) in enumerate(pages, 1):
+        runs = [listed(1000 + made + i, created="2026-11-08T10:00:00Z") for i in range(count)]
+        made += count
+        rules.append(runs_rule(runs, page=page, total=total))
+    rules.append(("run view", (0, json.dumps(run_payload(**GREEN)), "")))
+    code, fake = main(monkeypatch, rules, ["--gh", gh, *by_sha("--raw-dir", tmp_path)])
+    assert code == cf.EXIT_INCOMPLETE and "a red one may be missing" in capsys.readouterr().err
+    assert not any("view" in c for c in fake.calls)
+    assert sum("api" in c for c in fake.calls) == len(pages)
+
+
+def test_two_workflows_with_one_display_name_are_both_judged(monkeypatch, capsys, gh, tmp_path):
+    runs = [listed(42, created="2026-11-08T11:00:00Z", workflow_id=1, path=".github/workflows/a.yml"),
+            listed(7, created="2026-11-08T09:00:00Z", workflow_id=2, path=".github/workflows/b.yml")]
+    code, _ = main(monkeypatch, [AUTH, runs_rule(runs), view_of(42, **GREEN),
+                                 view_of(7, jobs=[job("lint", step="ruff")]),
+                                 ("run view 7 --log-failed", (0, prefixed("lint", "E501 too long"), ""))],
+                   ["--gh", gh, *by_sha("--raw-dir", tmp_path)])
+    assert code == cf.EXIT_RED and "2 runs for commit" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("workflow", ["tests", "tests.yml", ".github/workflows/tests.yml", "336505049"])
+def test_workflow_by_name_file_or_id(monkeypatch, capsys, gh, tmp_path, workflow):
+    runs = [listed(42), listed(7, workflow="lint", created="2026-11-08T11:00:00Z")]
+    code, fake = main(monkeypatch, [AUTH, runs_rule(runs), view_of(42, **GREEN)],
+                      ["--gh", gh, *by_sha("--workflow", workflow, "--raw-dir", tmp_path)])
+    assert code == cf.EXIT_GREEN and not any("run view 7" in " ".join(c) for c in fake.calls)
+
+
+def test_a_prefix_git_does_not_know_is_resolved_by_the_repository(monkeypatch, capsys, gh, tmp_path):
+    full = "0ca0abd" + "1" * 33
+    code, fake = main(monkeypatch, [AUTH, ("rev-parse", (1, "", "")),
+                                    ("api repos/o/r/commits/0ca0abd --jq {sha}", (0, json.dumps({"sha": full}), "")),
+                                    runs_rule([listed(42, sha=full)], sha=full), view_of(42, **GREEN)],
+                      ["--gh", gh, "--repo", "o/r", "--sha", "0ca0abd", "--raw-dir", str(tmp_path)])
+    assert code == cf.EXIT_GREEN
 
 
 def test_every_workflow_and_event_of_the_commit_is_judged(monkeypatch, capsys, gh, tmp_path):
     runs = [listed(41), listed(42, created="2026-11-08T11:00:00Z"),
             listed(7, workflow="lint", created="2026-11-08T09:00:00Z"),
             listed(9, event="pull_request", created="2026-11-08T08:00:00Z")]
-    ok = {"conclusion": "success", "jobs": [job(MAC, "success")]}
-    code, fake = main(monkeypatch, [AUTH, ("run list", (0, json.dumps(runs), "")),
-                                    view_of(42, **ok), view_of(7, **ok),
+    code, fake = main(monkeypatch, [AUTH, runs_rule(runs), view_of(42, **GREEN), view_of(7, **GREEN),
                                     view_of(9, status="in_progress", jobs=[job(UBU, status="in_progress")])],
-                      ["--gh", gh, "--repo", "o/r", "--sha", "d" * 40, "--raw-dir", str(tmp_path)])
+                      ["--gh", gh, *by_sha("--raw-dir", tmp_path)])
     out = capsys.readouterr().out
     assert code == cf.EXIT_RUNNING
     assert "3 runs for commit 0ca0abdb:" in out
@@ -604,28 +820,27 @@ def test_every_workflow_and_event_of_the_commit_is_judged(monkeypatch, capsys, g
 
 def test_one_red_run_of_the_commit_makes_it_red(monkeypatch, capsys, gh, tmp_path):
     runs = [listed(42, created="2026-11-08T11:00:00Z"), listed(7, workflow="lint")]
-    code, _ = main(monkeypatch, [AUTH, ("run list", (0, json.dumps(runs), "")),
-                                 view_of(42, conclusion="success", jobs=[job(MAC, "success")]),
+    code, _ = main(monkeypatch, [AUTH, runs_rule(runs), view_of(42, **GREEN),
                                  view_of(7, jobs=[job("lint", step="ruff")]),
                                  ("run view 7 --log-failed", (0, prefixed("lint", "E501 too long\n"
                                   "##[error]Process completed with exit code 1."), ""))],
-                   ["--gh", gh, "--repo", "o/r", "--sha", "d" * 40, "--raw-dir", str(tmp_path / "raw")])
+                   ["--gh", gh, *by_sha("--raw-dir", tmp_path / "raw")])
     out = capsys.readouterr().out
     assert code == cf.EXIT_RED and "E501 too long" in out and "lint: failure @ ruff" in out
     assert sorted(os.listdir(tmp_path / "raw")) == ["7_lint.log", "report.txt"]
 
 
-def test_a_sha_prefix_matching_two_commits_is_a_usage_error(monkeypatch, capsys, gh):
-    runs = [listed(41, sha="0ca0abd" + "1" * 33), listed(42, sha="0ca0abd" + "2" * 33)]
-    code, fake = main(monkeypatch, [AUTH, ("rev-parse", (1, "", "")), ("run list", (0, json.dumps(runs), ""))],
+def test_a_sha_prefix_matching_no_commit_or_two_is_not_found(monkeypatch, capsys, gh):
+    stderr = "gh: No commit found for SHA: 0ca0abd (HTTP 422)"
+    code, fake = main(monkeypatch, [AUTH, ("rev-parse", (1, "", "")),
+                                    ("api repos/o/r/commits/0ca0abd", (1, "", stderr))],
                       ["--gh", gh, "--repo", "o/r", "--sha", "0ca0abd"])
-    assert code == cf.EXIT_USAGE and "matches runs of 2 commits" in capsys.readouterr().err
-    assert not any("view" in c for c in fake.calls)
+    assert code == cf.EXIT_NOT_FOUND and "more than one" in capsys.readouterr().err
+    assert not any("view" in c or "actions/runs" in " ".join(c) for c in fake.calls)
 
 
 def test_no_run_for_the_sha_exits_not_found(monkeypatch, capsys, gh):
-    code, _ = main(monkeypatch, [AUTH, ("run list", (0, "[]", ""))],
-                   ["--gh", gh, "--repo", "o/r", "--sha", "d" * 40])
+    code, _ = main(monkeypatch, [AUTH, runs_rule([])], ["--gh", gh, *by_sha()])
     assert code == cf.EXIT_NOT_FOUND
     assert "not pushed yet?" in capsys.readouterr().err
 
@@ -646,8 +861,11 @@ def test_running_run_without_wait_exits_running(monkeypatch, capsys, gh):
 
 def test_wait_that_times_out_exits_running(monkeypatch, gh):
     running = run_payload(status="queued", jobs=[])
-    code, _ = main(monkeypatch, [AUTH, view(running)], run42(gh, "--wait", "--timeout", 0))
-    assert code == cf.EXIT_RUNNING
+    clock = Clock()
+    monkeypatch.setattr(cf.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(subprocess, "run", Fake([AUTH, view(running)]))
+    monkeypatch.setattr(cf.time, "sleep", clock.sleep)
+    assert cf.main(run42(gh, "--wait", "--timeout", 10)) == cf.EXIT_RUNNING
 
 
 def test_wait_polls_until_the_run_completes(monkeypatch, gh, tmp_path):
@@ -810,14 +1028,38 @@ def test_a_running_run_shows_the_failures_already_known(monkeypatch, capsys, gh,
     assert not any("--log-failed" in c for c in fake.calls)
 
 
-def test_a_log_over_the_size_limit_is_named_not_parsed(monkeypatch, capsys, gh, tmp_path):
+@pytest.fixture
+def long_dir(tmp_path):
+    """A raw dir of at least 150 characters: with the ~110 of the message
+    before it, a path in the headline would pass HEADLINE_CHARS (240). Not
+    much longer: a Windows path over 260 characters needs long paths enabled."""
+    path = tmp_path / ("long_" + "d" * max(0, 150 - len(str(tmp_path))))
+    assert len(str(path)) >= 150
+    return path
+
+
+def test_a_log_over_the_size_limit_is_named_not_parsed(monkeypatch, capsys, gh, long_dir):
     monkeypatch.setattr(cf, "MAX_LOG_BYTES", 100)
-    code, _ = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED], run42(gh, "--raw-dir", tmp_path))
-    out = capsys.readouterr().out
-    saved = tmp_path / "log-failed.txt"
+    code, _ = main(monkeypatch, [AUTH, view(run_payload()), LOG_FAILED], run42(gh, "--raw-dir", long_dir))
+    out = capsys.readouterr().out.splitlines()
+    saved = long_dir / "log-failed.txt"
     assert code == cf.EXIT_RED
-    assert "over the 100-byte limit (MAX_LOG_BYTES)" in out and str(saved) in out
+    assert any("over the 100-byte limit (MAX_LOG_BYTES)" in ln for ln in out)
+    assert f"      saved log: {saved}" in out    # in the index, whole, on its own line
     assert saved.read_text(encoding="utf-8") == LOG
+
+
+def test_a_job_log_over_the_limit_keeps_its_own_path(monkeypatch, capsys, gh, long_dir):
+    monkeypatch.setattr(cf, "MAX_LOG_BYTES", 100)
+    jobs = [job(UBU, "cancelled", job_id=2002), job(WIN, "cancelled", job_id=2003)]
+    big = own_log(["x" * 200, "##[error]The operation was canceled."])
+    rules = [AUTH, view(run_payload(jobs=jobs)), ("run view 42 --log-failed", (0, "", "")),
+             ("api repos/o/r/actions/jobs/", (0, big, ""))]
+    code, _ = main(monkeypatch, rules, run42(gh, "--raw-dir", long_dir, "--json"))
+    data = json.loads(capsys.readouterr().out)
+    assert code == cf.EXIT_RED
+    assert sorted(f["savedLog"] for f in data["runs"][0]["failures"]) == sorted(
+        str(long_dir / n) for n in ("pytest_ubuntu-latest_3.13.log", "pytest_windows-latest_3.12.log"))
 
 
 def test_a_multi_step_failure_names_every_step(monkeypatch, capsys, gh, tmp_path):
@@ -855,7 +1097,48 @@ def test_wait_never_outlives_the_timeout(monkeypatch, gh, timeout, bounds):
     code = cf.main(run42(gh, "--wait", "--timeout", timeout))
     assert code == cf.EXIT_RUNNING
     views = [kw["timeout"] for argv, kw in zip(fake.calls, fake.kwargs) if "view" in argv]
-    assert views[0] == cf.GH_TIMEOUT_S and views[1:] == bounds
+    assert views[0] == min(cf.GH_TIMEOUT_S, timeout) and views[1:] == bounds
+    assert clock.now <= 1000.0 + timeout
+
+
+class SlowGh(Fake):
+    """A Fake whose every call takes `cost` seconds of `clock`, or times out
+    (as subprocess.run does) when its timeout is shorter."""
+
+    def __init__(self, rules, clock, cost):
+        super().__init__(rules)
+        self.clock, self.cost, self.left = clock, cost, []
+
+    def __call__(self, argv, **kwargs):
+        self.left.append((kwargs.get("timeout"), self.deadline - self.clock.now))
+        if kwargs.get("timeout") is not None and kwargs["timeout"] < self.cost:
+            self.calls.append(argv)
+            self.clock.now += kwargs["timeout"]
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        self.clock.now += self.cost
+        return super().__call__(argv, **kwargs)
+
+
+@pytest.mark.parametrize("timeout, cost, expected, said", [
+    # auth and the view eat the deadline: the view itself is cut short.
+    (50, 30, cf.EXIT_GH_ERROR, "--timeout ran out during gh run view 42"),
+    # auth and the view fit; the download is cut short: red stays red, and
+    # the report says why the failures' text is missing.
+    (100, 45, cf.EXIT_RED, "--timeout ran out during gh run view 42 --log-failed"),
+])
+def test_one_deadline_bounds_every_gh_call(monkeypatch, capsys, gh, tmp_path, timeout, cost, expected, said):
+    clock = Clock()
+    rules = [AUTH, view(run_payload()), ("run view 42 --log-failed", (0, prefixed(MAC, "x"), ""))]
+    fake = SlowGh(rules, clock, cost)
+    fake.deadline = 1000.0 + timeout
+    monkeypatch.setattr(subprocess, "run", fake)
+    monkeypatch.setattr(cf.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(cf.time, "sleep", clock.sleep)
+    code = cf.main(run42(gh, "--timeout", timeout, "--raw-dir", tmp_path))
+    captured = capsys.readouterr()
+    assert code == expected and code != cf.EXIT_GREEN
+    assert said in captured.out + captured.err
+    assert all(t <= left for t, left in fake.left)
     assert clock.now <= 1000.0 + timeout
 
 
