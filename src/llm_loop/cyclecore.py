@@ -853,7 +853,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # reason returned here is latched and this turn still runs.
             handback.latch(driver.item_started(command))
 
-            with statusline.describing(app.job(1)):
+            with statusline.describing(app.job(1), app):
                 if provider == "claude":
                     returncode = run_claude_streaming(
                         cmd, raw, partial=True, prompt=command.prompt,

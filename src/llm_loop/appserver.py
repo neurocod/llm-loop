@@ -315,7 +315,8 @@ class Connection:
             self._pending.pop(pending.id, None)
 
     def request(self, body: dict, timeout: float = STARTUP_TIMEOUT_S,
-                on_other: Optional[Callable[[Item], None]] = None) -> dict:
+                on_other: Optional[Callable[[Item], None]] = None,
+                on_poll: Optional[Callable[[], None]] = None) -> dict:
         """Send a request, read until its response, and return the result.
 
         Everything read meanwhile goes to `on_other`, in order, rather than
@@ -326,7 +327,17 @@ class Connection:
         deadline = time.monotonic() + timeout
         try:
             while not pending.done:
-                item = self.take(deadline, pending.method)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"codex app-server did not answer {pending.method} in time")
+                if on_poll is not None:
+                    on_poll()
+                limit = min(deadline, time.monotonic() + _IDLE_WAKE_S) if on_poll else deadline
+                try:
+                    item = self.take(limit, pending.method)
+                except TimeoutError:
+                    if on_poll is None:
+                        raise
+                    continue
                 if not self.resolve(item) and on_other is not None:
                     on_other(item)
         finally:

@@ -256,7 +256,8 @@ def full_text_command(agent: str, path: str) -> str:
 
 def _capped(text: str, limit: int, agent: str, path: str) -> str:
     text = text.strip()
-    if len(text) <= limit:
+    # Loop runs have no named-worker transcript store. Keep their text whole.
+    if agent is None or len(text) <= limit:
         return text
     return (text[:limit] + f"\n[... {len(text) - limit} more characters: "
             f"{full_text_command(agent, path)} prints them]")
@@ -423,7 +424,7 @@ class SubAgentTracker:
                         f"Files it changed: {files}\n")
                 if not child.answer.strip():
                     answer = "(no message)"
-                elif room <= 0:
+                elif room <= 0 and agent is not None:
                     answer = (f"(omitted: the quoted messages reached "
                               f"{PROMPT_CHARS} characters; "
                               f"{full_text_command(agent, child.path)} "

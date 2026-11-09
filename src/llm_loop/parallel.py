@@ -578,7 +578,7 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
     # `providers.reap_agent_process`.
     try:
         # The run's Ctrl+C ends this turn's CLI from the press itself.
-        with note_channel(proc, provider, mailbox) as channel, \
+        with note_channel(proc, provider, mailbox, progress=out.line) as channel, \
                 ended_on_press(proc) as stream:
             for item in stream:
                 ev, line = wire.decode_stream_item(item)
@@ -1332,7 +1332,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             console.record_timing(statlog.pool_iteration_started(
                 shared.log_session, job_id, command.label))
             provider_started = time.monotonic()
-            with statusline.describing(job):
+            with statusline.describing(job, app):
                 try:
                     rc, cost_usd, dur = run_job(job_id, command, mailbox)
                 finally:

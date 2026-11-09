@@ -422,6 +422,7 @@ class Job:
     context_tokens: Optional[int] = None
     # Includes waiting for the fleet's usage lock, before the provider starts.
     waiting_for_usage: bool = False
+    progress: str = ""
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
@@ -472,6 +473,7 @@ class Job:
             self.prompt = prompt
             self.started_at = time.time() if now is None else now
             self.running = True
+            self.progress = ""
             self.waiting_for_usage = False
 
     def select(self, model: str) -> None:
@@ -496,6 +498,7 @@ class Job:
         """
         with self._lock:
             self.running = False
+            self.progress = ""
             self.started_at = 0.0
             self.context_tokens = None
             self.context_window = None
@@ -544,7 +547,7 @@ class Job:
             return Job(self.job_id, self.running, self.iteration, self.item,
                        self.model, self.prompt, self.started_at,
                        self.resolved_model, self.context_window,
-                       self.context_tokens, self.waiting_for_usage)
+                       self.context_tokens, self.waiting_for_usage, self.progress)
 
 
 # The Job whose row describes the stream THIS thread is reading. Both renderers
@@ -558,14 +561,30 @@ _stream_job = threading.local()
 
 
 @contextmanager
-def describing(job: "Job"):
+def describing(job: "Job", app=None):
     """Route `observe_claude_event` on this thread to `job` for the block."""
     previous = getattr(_stream_job, "job", None)
+    previous_app = getattr(_stream_job, "app", None)
     _stream_job.job = job
+    _stream_job.app = app
     try:
         yield job
     finally:
         _stream_job.job = previous
+        _stream_job.app = previous_app
+
+
+def stream_stop_requested() -> bool:
+    """The bound run's stop key or sentinel, including during child waits."""
+    from . import stopchannel
+    return stopchannel.pending_stop(getattr(_stream_job, "app", None)) is not None
+
+
+def stream_progress(phase: str) -> None:
+    """Show the synchronous wait phase on this stream's job row."""
+    job = getattr(_stream_job, "job", None)
+    if job is not None:
+        job.update(progress=phase)
 
 
 def observe_claude_event(ev: dict) -> None:
@@ -1165,6 +1184,8 @@ class JobRow(Row):
             return ""
         glyph = "▶" if job.running else "·"
         item = job.item if (job.running and job.item) else "idle"
+        if job.running and job.progress:
+            item = f"{job.progress} · {item}"
         if not job.running and job.waiting_for_usage:
             glyph = PHASE_GLYPHS["waiting"]
             item = "waiting for usage budget"

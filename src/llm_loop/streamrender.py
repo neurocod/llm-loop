@@ -300,7 +300,7 @@ def run_agent_streaming(cmd: list, provider: str, raw: bool,
     provider_failed = False
     codex_outcome = wire.CodexOutcome()
     try:
-        with note_channel(proc, provider, mailbox) as channel, \
+        with note_channel(proc, provider, mailbox, progress=print) as channel, \
                 ended_on_press(proc) as stream:
             for item in stream:
                 ev, line = wire.decode_stream_item(item)

@@ -64,7 +64,7 @@ TEXT_DELTA = "text_delta"
 TOTAL_COST_USD = "total_cost_usd"
 DURATION_MS = "duration_ms"
 
-# --- Codex events normalised from `exec --json` or app-server -------------
+# --- Codex events normalized from app-server -------------
 THREAD_STARTED = "thread.started"
 ITEM_STARTED = "item.started"
 ITEM_COMPLETED = "item.completed"
@@ -714,12 +714,12 @@ def codex_app_in_turn(message: dict, turn_id: str) -> bool:
 
 def codex_app_token_usage(message: dict) -> Optional[dict]:
     """One thread's cumulative token counts so far (``tokenUsage.total``), in
-    the normalised ``exec --json`` shape; None for another notification, {}
+    the normalized loop event shape; None for another notification, {}
     for one that carries no total.
 
     ``total`` and not ``last``: ``last`` is the latest REQUEST alone — what the
     thread occupies in the window (`codex_context_usage`) — while a turn's
-    usage, as ``exec --json`` reported it, is what the turn cost. The main
+    usage is what the turn cost. The main
     thread and each sub-agent report their own totals, so the turn's usage is
     their sum (`codex_app_usage_sum`)."""
     if message.get("method") != APP_TOKEN_USAGE_UPDATED:
@@ -792,7 +792,7 @@ def codex_app_event(message: dict, usage: Optional[dict] = None) -> Optional[dic
 
     Keeping this adapter at the wire boundary lets both renderers and the old
     result parsers continue to consume exactly one provider-neutral Codex shape.
-    JSON-RPC responses and notifications with no ``exec --json`` counterpart
+    JSON-RPC responses and notifications with no loop event counterpart
     return ``None``.
     """
     method = message.get("method")

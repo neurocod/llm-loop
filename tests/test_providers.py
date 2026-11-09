@@ -187,8 +187,8 @@ def test_codex_provider_constructs_its_own_usage_source():
 def test_runtime_argv_resolves_windows_command_shim(monkeypatch):
     monkeypatch.setattr("llm_loop.providers.shutil.which",
                         lambda executable: "C:/npm/codex.CMD")
-    assert runtime_argv(["codex", "exec", "prompt"], "codex") == [
-        "C:/npm/codex.CMD", "exec", "prompt"]
+    assert runtime_argv(["codex", "app-server", "--stdio"], "codex") == [
+        "C:/npm/codex.CMD", "app-server", "--stdio"]
 
 
 class _PromptSink:
@@ -487,7 +487,7 @@ def test_sequential_codex_runner_forwards_prompt_to_stdin_transport(monkeypatch)
     monkeypatch.setattr(streamrender, "start_agent_process", fake_start)
 
     assert streamrender.run_agent_streaming(
-        ["codex", "exec", "--json", "-"], "codex", False,
+        ["codex", "app-server", "--stdio"], "codex", False,
         prompt="sequential prompt",
     ) == 0
     assert calls[0][1:3] == ("codex", "sequential prompt")
@@ -543,7 +543,7 @@ def test_sequential_runner_treats_non_object_json_as_diagnostic(
     )
 
     assert streamrender.run_agent_streaming(
-        ["codex", "exec", "--json", "-"], "codex", False,
+        ["codex", "app-server", "--stdio"], "codex", False,
     ) == 0
     assert capsys.readouterr().out.strip() == line
 
@@ -820,7 +820,7 @@ def test_a_dying_sequential_turn_does_not_leave_the_provider_running(monkeypatch
 
     with pytest.raises(BrokenPipeError):
         streamrender.run_agent_streaming(
-            ["codex", "exec", "--json", "-"], "codex", False)
+            ["codex", "app-server", "--stdio"], "codex", False)
 
     assert children, "the fake provider was never started — the pin proved nothing"
     assert not _outlived_the_runner(children[0]), \
@@ -1033,7 +1033,7 @@ def test_codex_terminal_outcome_controls_all_runners(
     else:
         monkeypatch.setattr(streamrender, "start_agent_process", lambda *args: proc)
         rc = streamrender.run_agent_streaming(
-            ["codex", "exec", "--json", "-"], "codex", runner == "raw")
+            ["codex", "app-server", "--stdio"], "codex", runner == "raw")
     assert rc == expected_rc
     output = capsys.readouterr().out
     if "error" in events:
@@ -1060,7 +1060,7 @@ def test_codex_failed_tool_does_not_fail_a_completed_turn(monkeypatch, runner):
     else:
         monkeypatch.setattr(streamrender, "start_agent_process", lambda *args: proc)
         rc = streamrender.run_agent_streaming(
-            ["codex", "exec", "--json", "-"], "codex", False)
+            ["codex", "app-server", "--stdio"], "codex", False)
     assert rc == 0
 
 
@@ -1082,15 +1082,15 @@ def test_a_failed_job_surfaces_the_providers_plain_text_diagnostics(
         monkeypatch, capsys):
     rc, _cost, _dur = _codex_job(
         monkeypatch,
-        "error: unexpected argument '--approve-for-me' found\n"
-        "try 'codex exec --help'\n",
+        "error: unexpected argument '--stdio' found\n"
+        "try 'codex app-server --help'\n",
         returncode=1)
 
     out = capsys.readouterr().out
     assert rc == 1
     assert "[job 4]" in out                      # attributed to the failing job
     assert "unexpected argument" in out
-    assert "try 'codex exec --help'" in out
+    assert "try 'codex app-server --help'" in out
 
 
 def test_a_successful_job_stays_quiet_about_skipped_lines(monkeypatch, capsys):

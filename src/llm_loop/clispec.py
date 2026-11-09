@@ -337,18 +337,16 @@ OPTIONS: Dict[str, Option] = {
         help="do not pin the interactive status rows at the bottom of "
              f"the terminal (same as {termio.ENV_FLAG}=0)",
     ),
-    # Same shape of rescue hatch as --no-statusline, and for the same reason: it
-    # turns off a transport, not a feature. A note typed with the `m` key still
-    # reaches the agent - with the next iteration's prompt instead of the one
-    # already running.
+    # Defer operator notes to the next prompt. Codex keeps app-server open
+    # regardless, so its sub-agents can finish after the initial answer.
     "--no-live-messages": Option(
         aliases=("--no-live-messages",),
         takes_value=False,
         kwargs=dict(dest="no_live_messages", action="store_true"),
-        help="do not keep the agent's stdin open for notes typed "
+        help="do not deliver live notes typed "
              "during an iteration; they wait for the next prompt "
              f"instead (same as {providers.LIVE_MESSAGES_ENV}=0)",
-        parallel_help="do not keep the agent's stdin open for notes typed "
+        parallel_help="do not deliver live notes typed "
                       "during an iteration; they wait for the next prompt "
                       f"instead (same as {providers.LIVE_MESSAGES_ENV}=0). "
                       "Notes need a single worker either way",

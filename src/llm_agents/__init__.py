@@ -18,6 +18,6 @@ The modules beside the two bridges are what both share: `host_policy`,
 (a worktree pool, a pathspec-exact commit helper, the commit-approval store),
 which the Codex bridge's commit judge reads its rules from.
 
-A separate top-level package from `llm_loop`, which it imports and which never
-imports it: `llm_loop`'s lazy front door stays untouched.
+A separate top-level package from `llm_loop`. The loop's Codex provider reuses
+the shared sub-agent wait phase through `codex.loop_wait`.
 """

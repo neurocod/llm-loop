@@ -123,7 +123,7 @@ class _CodexSteerStream:
 
 
 class _CodexEventStream:
-    """Turn app-server JSON-RPC notifications into ``exec --json`` events.
+    """Turn app-server JSON-RPC notifications into normalized loop events.
 
     An event is yielded as the decoded ``dict``, not re-serialized: both
     renderers would only parse the line straight back. A line that is not a
@@ -132,12 +132,15 @@ class _CodexEventStream:
     """
 
     def __init__(self, owner, buffered: list):
-        self._owner = owner
+        from . import statusline
+        self.owner = owner
         self._buffered = iter(buffered)
         # Each thread's latest cumulative reading (`wire.codex_app_token_usage`)
         # — the main thread's and every sub-agent's: the turn's usage is their
         # sum, so a review that delegated half its work bills that half too.
-        self._usage_by_thread = {}
+        self.usage_by_thread = {}
+        self.progress = lambda event: None
+        self.stop_requested = statusline.stream_stop_requested
         from llm_agents.codex.loop_wait import LoopWait
         self._wait = LoopWait(self)
         self._ending = None
@@ -145,12 +148,12 @@ class _CodexEventStream:
     def __iter__(self):
         return self
 
-    def _next_item(self, deadline=None):
+    def next_item(self, deadline=None):
         try:
             return next(self._buffered)
         except StopIteration:
             pass
-        connection = self._owner.connection
+        connection = self.owner.connection
         try:
             return connection.take(deadline, "turn")
         except appserver.Closed:
@@ -164,15 +167,15 @@ class _CodexEventStream:
             try:
                 return next(self._ending)
             except StopIteration:
-                self._owner.close_input()
+                self.owner.close_input()
                 raise
         while True:
-            message = self._next_item()
+            message = self.next_item()
             if not isinstance(message, dict):
                 return message
             if appserver.response_id(message) is not None:
                 # A note's acknowledgement (`steer`), or a stale reply.
-                self._owner.connection.resolve(message)
+                self.owner.connection.resolve(message)
                 continue
             event = self._wait.observe(message)
             if self._wait.done:
@@ -181,10 +184,10 @@ class _CodexEventStream:
             if event is not None:
                 return event
 
-    def _observe_usage(self, message: dict) -> None:
+    def observe_usage(self, message: dict) -> None:
         usage = wire.codex_app_token_usage(message)
         if usage is not None:
-            self._usage_by_thread[wire.codex_app_event_thread(message)] = usage
+            self.usage_by_thread[wire.codex_app_event_thread(message)] = usage
 
     def close(self) -> None:
         """Nothing to close: the connection's pump owns the read end and
@@ -415,29 +418,21 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
         **_console_isolation(),
     }
     on_stdin = prompt_on_stdin(provider)
-    keep_open = live_messages_enabled(provider)
     if on_stdin:
         kwargs["stdin"] = subprocess.PIPE
 
     proc = subprocess.Popen(runtime_argv(argv, provider), **kwargs)
     try:
         if on_stdin:
-            payload = user_message_line(prompt) if keep_open else prompt
+            payload = user_message_line(prompt)
             try:
                 proc.stdin.write(payload)
-                if keep_open:
-                    proc.stdin.flush()
+                proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 # The CLI may reject its flags before reading stdin. Its
                 # stdout/stderr still carries the useful diagnostic, so let the
                 # renderer show it.
                 pass
-            finally:
-                if not keep_open:
-                    try:
-                        proc.stdin.close()
-                    except (BrokenPipeError, OSError):
-                        pass
     except BaseException:
         # Re-raised, not swallowed: the caller asked for a running CLI and did
         # not get one, so it must hear why. All this guard owes the child is an
@@ -448,7 +443,8 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
 
 
 @contextmanager
-def note_channel(proc, provider: str, mailbox: Optional[object] = None):
+def note_channel(proc, provider: str, mailbox: Optional[object] = None,
+                 progress=None):
     """The live-note pipe of one process, closed however the caller leaves.
 
     The other half of `start_agent_process`: it decided to leave stdin open, so
@@ -468,6 +464,16 @@ def note_channel(proc, provider: str, mailbox: Optional[object] = None):
     covers the paths a caller cannot - an exception, KeyboardInterrupt, a stream
     that ends without ever reporting a result.
     """
+    if isinstance(proc, _CodexAppProcess):
+        def report(event):
+            import json
+            from . import diaglog, statusline
+            text = json.dumps(event, ensure_ascii=True)
+            diaglog.record("codex.sub_agents", text)
+            statusline.stream_progress(event["phase"])
+            if progress is not None:
+                progress(text)
+        proc.stdout.progress = report
     if live_messages_enabled(provider) and proc.stdin is not None:
         channel = operator.AgentChannel(proc.stdin, mailbox)
     else:
