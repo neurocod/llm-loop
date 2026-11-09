@@ -65,7 +65,7 @@ def test_windows_completion_sound_uses_native_message_beep(monkeypatch):
         MB_ICONASTERISK=64,
         MessageBeep=lambda kind: calls.append(kind),
     )
-    monkeypatch.setattr(notifications.sys, "platform", "win32")
+    monkeypatch.setattr(notifications, "WINDOWS", True)
     monkeypatch.setitem(sys.modules, "winsound", fake_winsound)
 
     notifications.play_completion_sound()
@@ -74,15 +74,22 @@ def test_windows_completion_sound_uses_native_message_beep(monkeypatch):
 
 
 def test_completion_sound_cannot_fail_when_output_streams_are_broken(monkeypatch):
+    written = []
+
     class BrokenStream:
-        def write(self, _text):
+        def write(self, text):
+            written.append(text)
             raise BrokenPipeError("closed")
 
         def flush(self):
             raise BrokenPipeError("closed")
 
-    monkeypatch.setattr(notifications.sys, "platform", "linux")
+    monkeypatch.setattr(notifications, "WINDOWS", False)
     monkeypatch.setattr(notifications.sys, "stdout", BrokenStream())
     monkeypatch.setattr(notifications.sys, "stderr", BrokenStream())
 
     notifications.play_completion_sound()
+
+    # The bell branch ran: on a Windows host a check of the real platform
+    # instead of notifications.WINDOWS would beep and write nothing.
+    assert written and written[0] == "\a"

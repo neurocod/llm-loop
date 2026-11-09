@@ -11,6 +11,12 @@ SETTINGS_ENV = "LLM_LOOP_SETTINGS"
 SETTINGS_FILENAME = "settings.json"
 COMPLETION_SOUND_KEY = "completion_sound"
 
+# The platform check `play_completion_sound` makes, and the one point a test
+# fakes it at. Faking `sys.platform` itself fakes it for every stdlib module
+# imported lazily meanwhile (see cpu_load.WINDOWS: a faked win32 child died in
+# `import _winapi` on macos-latest 3.12 CI 2026-11-09).
+WINDOWS = sys.platform == "win32"
+
 
 class SettingsError(ValueError):
     """A present llm-loop settings file is malformed."""
@@ -72,7 +78,7 @@ def completion_sound_enabled(path: Optional[Path] = None) -> bool:
 def play_completion_sound() -> None:
     """Play one best-effort native completion sound without failing the run."""
     try:
-        if sys.platform == "win32":
+        if WINDOWS:
             import winsound
             winsound.MessageBeep(winsound.MB_ICONASTERISK)
         else:

@@ -117,7 +117,10 @@ def test_network_wait_completes_beyond_attempt_budget(
         reachable=lambda: False, sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.service_retries == 0
-    assert outcome.network_wait_s == pytest.approx(253.868)
+    # Not abs=1e-9: the credit is a difference of monotonic arrival times,
+    # whose float error grows with uptime (1.85e-9 at 116 days, 3.7e-9 at
+    # 347). A lost credit is >= 1 ms (whole-ms inputs), so 1e-6 still catches it.
+    assert outcome.network_wait_s == pytest.approx(253.868, abs=service.CEILING_SLACK_S)
     assert outcome.network_wait_s > 100
     assert any("RECONNECTING since " in line and "(5 tries)" in line
                for line in network_clock)
@@ -235,15 +238,21 @@ def test_network_wait_an_ulp_short_of_the_ceiling_is_exhausted():
     assert raised.value.exhausted
 
 
-@pytest.mark.parametrize("child_s, total_s, credited_s", [
-    # Credited up to now already: the sum alone is an ULP short.
+@pytest.mark.parametrize("child_s, total_s, credited_s, expected_s", [
+    # Credited up to now already: the sum alone is an ULP short, and the
+    # total is the snapped child cap exactly.
     (math.nextafter(service.MAX_CHILD_NETWORK_WAIT_S, 0.0),
-     math.nextafter(service.MAX_CHILD_NETWORK_WAIT_S, 0.0), 0.0),
+     math.nextafter(service.MAX_CHILD_NETWORK_WAIT_S, 0.0), 0.0,
+     service.MAX_CHILD_NETWORK_WAIT_S),
     # With main credit besides and the current wait far past the cap,
-    # `deadline`'s own child sum (child_s + spent - total_s) lands an ULP short.
-    (21.231827103605987, 3650.522797641964, service.MAX_CHILD_NETWORK_WAIT_S),
+    # `deadline`'s own child sum (child_s + spent - total_s) lands ULPs short.
+    # The total is the main credit plus the child's remaining cap.
+    (21.231827103605987, 3650.522797641964, service.MAX_CHILD_NETWORK_WAIT_S,
+     pytest.approx(3650.522797641964 + service.MAX_CHILD_NETWORK_WAIT_S
+                   - 21.231827103605987, abs=service.CEILING_SLACK_S)),
 ], ids=["child-only", "with-main-credit"])
-def test_child_credit_an_ulp_short_of_the_child_cap_is_the_cap(child_s, total_s, credited_s):
+def test_child_credit_an_ulp_short_of_the_child_cap_is_the_cap(
+        child_s, total_s, credited_s, expected_s):
     """macos-latest 3.12 CI 2026-11-09 summed a child-only wait that met the
     child cap to 731.9999999999999 of 732. That ULP must not stay
     `remaining`: `now + remaining` rounds to `now`, a deadline that is
@@ -256,8 +265,13 @@ def test_child_credit_an_ulp_short_of_the_child_cap_is_the_cap(child_s, total_s,
     wait.child_s, wait.total_s = child_s, total_s
     wait.credited_at = now - credited_s
     spent = wait.seconds(now)
-    if child_s == total_s:
-        assert spent == service.MAX_CHILD_NETWORK_WAIT_S
+    assert spent == expected_s
+    # The hazard's precondition: unsnapped, the child sum `deadline` makes
+    # misses the cap by less than the snap. Hand-picked floats; a reordered
+    # float sum could land exactly, and the case would test nothing.
+    raw = child_s + spent - total_s
+    cap = service.MAX_CHILD_NETWORK_WAIT_S
+    assert raw != cap and abs(raw - cap) < service.CEILING_SLACK_S, raw
     base = now + 1800.0
     assert wait.deadline(base, 0.0, now) == base + spent
     wait.stop(now)
@@ -277,7 +291,9 @@ def test_network_wait_rev1277_recovers_without_resend(
     assert outcome.status == "completed" and not outcome.error
     assert outcome.text == "recovered without a resend"
     assert outcome.service_retries == 0 and not checks
-    assert outcome.network_wait_s == pytest.approx(min(gap, 182.785) + 77.717)
+    # abs, not 1e-9: see test_network_wait_completes_beyond_attempt_budget.
+    assert outcome.network_wait_s == pytest.approx(min(gap, 182.785) + 77.717,
+                                                   abs=service.CEILING_SLACK_S)
 
 
 def test_network_wait_staleness_keeps_remaining_work_budget():
@@ -309,7 +325,8 @@ def test_sub_agent_only_network_wait_extends_main_budget(
         tmp_path, monkeypatch, "network-child-only", timeout=100,
         reachable=lambda: False, sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
-    assert outcome.network_wait_s == pytest.approx(253.868)
+    # abs, not 1e-9: see test_network_wait_completes_beyond_attempt_budget.
+    assert outcome.network_wait_s == pytest.approx(253.868, abs=service.CEILING_SLACK_S)
     assert outcome.service_retries == 0
     assert any("(5 tries)" in line for line in network_clock)
     assert all("process was killed?" not in line for line in network_clock)
