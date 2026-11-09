@@ -20,6 +20,7 @@ import pytest
 
 from llm_loop import ctrlc, stopchannel, termio, usage
 from llm_loop.limits import LimitPolicy, SessionLimit
+from _silent_interrupt_probe import run_probe
 
 # The bound on a child Python that stages one press and exits: interpreter
 # start plus the package import, 0.27 / 0.25 / 0.28 s measured 2026-10-03; a press
@@ -27,14 +28,63 @@ from llm_loop.limits import LimitPolicy, SessionLimit
 CHILD_TIMEOUT_S = 30
 
 
+@pytest.mark.skipif(os.name != 'nt', reason='Windows signal wakeup transitions')
+@pytest.mark.parametrize('case', ['activation', 'shutdown_signals', 'interrupted_join',
+                                 'foreign_owner', 'replacement', 'socket_failure', 'fd_failure'])
+def test_wakeup_transition(case):
+    done = run_probe([sys.executable,
+                      str(Path(__file__).with_name('_ctrlc_transition_probe.py')), case],
+                     timeout=CHILD_TIMEOUT_S)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_probe_rescue_covers_app_server_startup():
+    done = run_probe([sys.executable,
+                      str(Path(__file__).with_name('_silent_interrupt_probe.py')),
+                      'codex', '1', 'stall'], timeout=CHILD_TIMEOUT_S)
+    assert done.returncode == 0, done.stdout + done.stderr
+    measured = json.loads(done.stdout.splitlines()[-1])
+    assert measured['rescued']
+    assert measured['returncodes'] and all(code is not None for code in measured['returncodes'])
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows process-tree timeout cleanup')
+def test_probe_timeout_reaps_provider_child(tmp_path):
+    import ctypes
+    pid_file = tmp_path / 'pid'
+    script = ("import subprocess, sys, time; from pathlib import Path; "
+              "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+              "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+              "Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(30)")
+    # Interpreter + child startup measured below 0.8 s, 2026-11-09.
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_probe([sys.executable, '-c', script, str(pid_file)], timeout=5)
+    pid = int(pid_file.read_text())
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel.OpenProcess(0x100001, False, pid)
+    if handle:
+        try:
+            kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            assert kernel.WaitForSingleObject(handle, 0) == 0, 'provider survived probe timeout'
+        finally:
+            # A deliberately reverted timeout fix must not leave an orphan
+            # behind merely because this assertion correctly detected it.
+            kernel.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            kernel.TerminateProcess(handle, 1)
+            kernel.WaitForSingleObject(handle, 5000)
+            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel.CloseHandle(handle)
+
+
 @pytest.mark.parametrize('provider', ['claude', 'codex'])
 def test_sigint_ends_a_silent_provider_without_another_output_line(provider):
     # Windows measurements, 2026-11-09: child ended in 0.124 / 0.120 s,
     # runner returned in 0.209 / 0.225 s. Allow more than 10x that; the
     # independent 5 s rescue kills a regression, not a 30 s sleep per test.
-    done = subprocess.run(
+    done = run_probe(
         [sys.executable, str(Path(__file__).with_name('_silent_interrupt_probe.py')),
-         provider, '5'], capture_output=True, text=True, timeout=CHILD_TIMEOUT_S)
+         provider, '5'], timeout=CHILD_TIMEOUT_S)
     assert done.returncode == 0, done.stdout + done.stderr
     measured = json.loads(done.stdout.splitlines()[-1])
     assert not measured['rescued'], measured
@@ -47,7 +97,7 @@ def test_capture_restores_wakeup_fd_and_joins_its_watcher():
     import socket
     reader, writer = socket.socketpair()
     writer.setblocking(False)
-    previous = signal.set_wakeup_fd(writer.fileno())
+    previous = signal.set_wakeup_fd(-1)
     try:
         with ctrlc.captured():
             watchers = [thread for thread in threading.enumerate()
@@ -56,7 +106,7 @@ def test_capture_restores_wakeup_fd_and_joins_its_watcher():
             with ctrlc.captured():
                 assert watchers[0].is_alive()
         assert not watchers[0].is_alive()
-        assert signal.set_wakeup_fd(-1) == writer.fileno()
+        assert signal.set_wakeup_fd(-1) == -1
     finally:
         signal.set_wakeup_fd(previous)
         reader.close()

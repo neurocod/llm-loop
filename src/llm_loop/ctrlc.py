@@ -29,6 +29,7 @@ status line's key reader, ending the child and releasing the pipe read.
 """
 
 import contextlib
+import logging
 import os
 import select
 import signal
@@ -57,9 +58,10 @@ WAIT_INTERRUPTED_LINE = "\nWait interrupted by user (Ctrl+C)."
 class Interrupt:
     """The Ctrl+C presses one run has heard. Safe from any thread.
 
-    `press` is called by the SIGINT handler (on the main thread, between two
-    bytecodes) or by the status line's key reader (on its own thread), and only
-    counts; it never raises into whatever the run was doing.
+    `press` is called by the SIGINT handler or the status line's key reader.
+    The wakeup drain also records presses, serializing byte consumption and
+    counting before notifying hooks outside its lock. Neither path raises
+    into whatever the run was doing.
 
     `press` TAKES NO LOCK, and that is load-bearing: the SIGINT handler runs on
     the main thread between any two bytecodes, the ones inside a `with lock:`
@@ -143,31 +145,53 @@ class _SignalWakeup:
 
     Python's C signal handler writes the socket before the main thread can
     run Python code. A blocking pipe read delayed that code by 29.8 seconds
-    against a silent child (2026-11-09). Only this drain counts presses; the
-    later Python handler must not count the same signal again.
+    against a silent child (2026-11-09). While our fd receives signals, this
+    drain counts their bytes; the later Python handler must not count them
+    again. Before activation, after detachment, or with a foreign fd, the
+    Python handler records presses directly instead.
     """
 
     def __init__(self, interrupt: Interrupt):
         self.interrupt = interrupt
         self.reader, self.writer = socket.socketpair()
-        self.reader.setblocking(False)
-        self.writer.setblocking(False)
+        try:
+            self.reader.setblocking(False)
+            self.writer.setblocking(False)
+        except BaseException:
+            self.reader.close()
+            self.writer.close()
+            raise
         self.lock = threading.RLock()
         self.stopping = False
-        try:
-            self.previous = signal.set_wakeup_fd(self.writer.fileno())
-        except BaseException:
-            self.reader.close()
-            self.writer.close()
-            raise
         self.thread = threading.Thread(target=self.watch, name='ctrlc-wakeup', daemon=True)
-        try:
-            self.thread.start()
-        except BaseException:
-            signal.set_wakeup_fd(self.previous)
-            self.reader.close()
-            self.writer.close()
-            raise
+        self.started = False
+
+    @staticmethod
+    def current_fd():
+        # Python has no get_wakeup_fd. Only the main thread can change it,
+        # so an exchange and restore also detects an overlapping owner.
+        fd = signal.set_wakeup_fd(-1)
+        if fd != -1:
+            signal.set_wakeup_fd(fd)
+        return fd
+
+    def activate(self):
+        # Do not steal another event loop's notifications (including SIGBREAK).
+        # Keep ordinary handler/line-polling behavior when it owns this slot.
+        if self.current_fd() != -1:
+            return
+        signal.set_wakeup_fd(self.writer.fileno())
+        self.thread.start()
+        self.started = True
+
+    def handle(self):
+        # Inspect the actual fd, not a flag assigned after set_wakeup_fd or
+        # Thread.start returns: SIGINT can arrive inside either transition.
+        fd = self.writer.fileno()
+        if fd != -1 and self.current_fd() == fd:
+            self.drain()
+        else:
+            self.interrupt.press()
 
     def drain(self):
         # Serialize consumption AND counting: recv releases the GIL, so a
@@ -195,13 +219,37 @@ class _SignalWakeup:
             self.drain()
 
     def close(self):
-        signal.set_wakeup_fd(self.previous)
-        self.stopping = True
-        self.writer.send(b'\x00')
-        self.thread.join()
-        self.drain()
-        self.reader.close()
-        self.writer.close()
+        try:
+            fd = signal.set_wakeup_fd(-1)
+            if fd != self.writer.fileno() and fd != -1:
+                signal.set_wakeup_fd(fd)
+        except (ValueError, OSError):
+            # Installation may itself be unavailable (e.g. a sub-interpreter).
+            # The sockets still need closing on that fallback path.
+            pass
+        finally:
+            self.stopping = True
+            try:
+                self.writer.send(b'\x00')
+                if self.started:
+                    interrupted = None
+                    while True:
+                        try:
+                            self.thread.join()
+                            break
+                        except KeyboardInterrupt as exc:
+                            # Real SIGINT still uses our non-raising handler.
+                            # An injected/asynchronous exception must not skip
+                            # resource closure either; re-raise after joining.
+                            interrupted = exc
+                    if interrupted is not None:
+                        raise interrupted
+            finally:
+                try:
+                    self.drain()
+                finally:
+                    self.reader.close()
+                    self.writer.close()
 
 
 def current() -> Interrupt:
@@ -246,9 +294,10 @@ def captured() -> Iterator[Interrupt]:
     operator pressed Ctrl+C while the phase was failing" opens the capture
     around the runner itself, and asks the Interrupt once the runner has left.
 
-    The handler is put back BEFORE the Interrupt stops being the open run's,
-    and the late press is looked for after both: a SIGINT in between is the
-    replaced handler's again (a KeyboardInterrupt), never a press nobody reads.
+    Wakeup delivery is detached and its watcher joined while SIGINT still
+    counts presses on this run. Then the previous handler is restored, and
+    the open Interrupt is cleared even if restoration or cleanup raises.
+    A signal after handler restoration belongs only to that previous handler.
     """
     global _active
     if _active is not None:
@@ -261,7 +310,7 @@ def captured() -> Iterator[Interrupt]:
     if threading.current_thread() is threading.main_thread():
         try:
             previous = signal.signal(signal.SIGINT,
-                                     lambda signum, frame: wakeup.drain()
+                                     lambda signum, frame: wakeup.handle()
                                      if wakeup is not None else interrupt.press())
             installed = True
         except (ValueError, OSError):
@@ -269,16 +318,29 @@ def captured() -> Iterator[Interrupt]:
     _active = interrupt
     try:
         if installed and os.name == 'nt':
-            wakeup = _SignalWakeup(interrupt)
+            try:
+                wakeup = _SignalWakeup(interrupt)
+                wakeup.activate()
+            except (ValueError, OSError) as exc:
+                if wakeup is not None:
+                    wakeup.close()
+                    wakeup = None
+                logging.getLogger(__name__).warning(
+                    'SIGINT wakeup unavailable; using output polling: %s', exc)
         yield interrupt
     finally:
-        if installed:
-            signal.signal(signal.SIGINT,
-                          previous if previous is not None
-                          else signal.default_int_handler)
-        if wakeup is not None:
-            wakeup.close()
-        _active = None
+        try:
+            if wakeup is not None:
+                wakeup.close()
+                wakeup = None
+        finally:
+            try:
+                if installed:
+                    signal.signal(signal.SIGINT,
+                                  previous if previous is not None
+                                  else signal.default_int_handler)
+            finally:
+                _active = None
     # Reached only when the block returned: an exception or an exit has left
     # through the `finally` above with its own ending.
     if interrupt.requested:

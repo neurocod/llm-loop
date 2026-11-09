@@ -2,20 +2,44 @@
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from llm_loop import ctrlc, providers, streamrender
+from llm_loop import ctrlc, procend, providers, streamrender
+
+
+def run_probe(argv, timeout):
+    """Timeout owns the entire probe tree, including a stalled provider."""
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=os.name != 'nt')
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+    except BaseException:
+        if os.name == 'nt':
+            procend.end_process_tree(proc)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        raise
+    finally:
+        proc.stdout.close()
+        proc.stderr.close()
 
 
 def main():
     provider = sys.argv[1]
     bound = float(sys.argv[2])
+    stalled = len(sys.argv) > 3 and sys.argv[3] == 'stall'
     child = """
 import json, sys, time
+if sys.argv[2] == 'stall':
+    print('startup-stalled', flush=True)
+    time.sleep(30)
 if sys.argv[1] == 'codex':
     for line in sys.stdin:
         request = json.loads(line)
@@ -29,15 +53,23 @@ if sys.argv[1] == 'codex':
 print('silent-child-ready', flush=True)
 time.sleep(30)
 """
-    providers.runtime_argv = lambda argv, name: [sys.executable, '-u', '-c', child, name]
+    providers.runtime_argv = lambda argv, name: [sys.executable, '-u', '-c', child, name,
+                                                'stall' if stalled else 'turn']
     stamps = {}
     processes = []
     threads = []
-    start = streamrender.start_agent_process
+    spawn_lock = threading.Lock()
+    expired = False
+    start = subprocess.Popen
 
-    def spawn(*args):
-        proc = start(*args)
-        processes.append(proc)
+    def spawn(argv, **kwargs):
+        proc = start(argv, **kwargs)
+        if argv[0] != sys.executable:
+            return proc
+        with spawn_lock:
+            processes.append(proc)
+            if expired:
+                proc.kill()
         def watch():
             proc.wait()
             stamps['ended'] = time.monotonic()
@@ -46,7 +78,7 @@ time.sleep(30)
         thread.start()
         return proc
 
-    streamrender.start_agent_process = spawn
+    subprocess.Popen = spawn
     original_print = print
 
     def output(*args, **kwargs):
@@ -66,9 +98,13 @@ time.sleep(30)
 
     streamrender.print = output
     def rescue():
+        nonlocal expired
         stamps['rescued'] = True
-        for proc in processes:
-            proc.kill()
+        with spawn_lock:
+            expired = True
+            for proc in processes:
+                if proc.poll() is None:
+                    proc.kill()
     backstop = threading.Timer(bound, rescue)
     backstop.start()
     try:
@@ -78,12 +114,23 @@ time.sleep(30)
             assert interrupt.presses == 1
     except SystemExit as exc:
         assert exc.code == ctrlc.EXIT_CODE
+    except providers.appserver.Closed:
+        if not stalled:
+            raise
     finally:
         stamps['exit'] = time.monotonic()
         backstop.cancel()
         backstop.join()
+        for proc in processes:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
         for thread in threads:
             thread.join()
+    if stalled:
+        original_print(json.dumps({'rescued': stamps.get('rescued', False),
+                                  'returncodes': [proc.returncode for proc in processes]}))
+        return
     original_print(json.dumps({'provider': provider,
         'child_delay': stamps['ended'] - stamps['press'],
         'exit_delay': stamps['exit'] - stamps['press'],
