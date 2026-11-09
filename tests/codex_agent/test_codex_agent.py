@@ -64,14 +64,38 @@ WRITERS = 6
 
 
 @pytest.fixture
-def network_clock(monkeypatch):
+def network_clock_base():
+    """Where the virtual clock starts: the real monotonic reading by default.
+
+    Kept large and arbitrary on purpose, like production uptimes: credit is
+    computed from differences of such readings. Parametrize this name to pin
+    a base that once broke the accounting.
+    """
+    return time.monotonic()
+
+
+# Bases that made float credit sums miss exact totals before
+# service.NetworkWait._at, found by sweeping the network tests over 1600
+# bases (2026-11-09). Small ones are a fresh CI runner's uptime: there the
+# readings cross binades, and whole-second offsets stop being exact.
+DRIFT_BASES = [
+    pytest.param(time.monotonic(), id="monotonic"),
+    pytest.param(34.49236500170073, id="732-short"),     # 731.9999999999998
+    pytest.param(159.79856631731644, id="732-over"),     # 732.0000000000002
+    pytest.param(1879.1222829485598, id="366-short"),    # 365.9999999999998
+    pytest.param(67106795.36360639, id="2-26-binade"),   # 253.86800000071526
+]
+
+
+@pytest.fixture
+def network_clock(monkeypatch, network_clock_base):
     """Real fake-server pipes, virtual elapsed time from the recorded events.
 
     All three deadline consumers see the same monotonic clock. Startup keeps
     protocol.STARTUP_TIMEOUT_S; virtual work budgets below are scenario
     boundaries, not guesses about how fast this machine runs.
     """
-    now = [time.monotonic()]
+    now = [network_clock_base]
     clock = SimpleNamespace(monotonic=lambda: now[0], strftime=time.strftime)
     for module in (turn, appserver, subagent_wait):
         monkeypatch.setattr(module, "time", clock)
@@ -110,6 +134,7 @@ def network_clock(monkeypatch):
     return progress
 
 
+@pytest.mark.parametrize("network_clock_base", DRIFT_BASES)
 def test_network_wait_completes_beyond_attempt_budget(
         tmp_path, monkeypatch, network_clock, capsys):
     outcome = wire.run_fake_turn(
@@ -117,10 +142,8 @@ def test_network_wait_completes_beyond_attempt_budget(
         reachable=lambda: False, sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.service_retries == 0
-    # Not abs=1e-9: the credit is a difference of monotonic arrival times,
-    # whose float error grows with uptime (1.85e-9 at 116 days, 3.7e-9 at
-    # 347). A lost credit is >= 1 ms (whole-ms inputs), so 1e-6 still catches it.
-    assert outcome.network_wait_s == pytest.approx(253.868, abs=service.CEILING_SLACK_S)
+    # Exact at any clock base: credit is whole microseconds (service._us).
+    assert outcome.network_wait_s == 253.868
     assert outcome.network_wait_s > 100
     assert any("RECONNECTING since " in line and "(5 tries)" in line
                for line in network_clock)
@@ -145,6 +168,7 @@ def test_network_wait_ceiling_is_terminal(tmp_path, monkeypatch, network_clock):
     assert not checks and outcome.service_retries == 0
 
 
+@pytest.mark.parametrize("network_clock_base", DRIFT_BASES)
 def test_network_wait_timeout_resends_same_thread(
         tmp_path, monkeypatch, network_clock):
     checks, pauses = [], []
@@ -153,9 +177,7 @@ def test_network_wait_timeout_resends_same_thread(
         reachable=lambda: checks.append(True) or True, sleep=pauses.append)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.service_retries == 1
-    # Summed monotonic differences drift by ULPs; abs keeps a lost
-    # millisecond of credit red (the default rel=1e-6 would allow 0.4 ms).
-    assert outcome.network_wait_s == pytest.approx(366, abs=1e-9)
+    assert outcome.network_wait_s == 366
     assert checks == [True] and pauses == [turn.SERVICE_RETRY_PAUSES_S[0]]
     resumed = [m for m in wire.received(tmp_path) if m.get("method") == "thread/resume"]
     assert len(resumed) == 1 and resumed[0]["params"]["threadId"] == "th-fake"
@@ -219,15 +241,15 @@ def test_network_wait_completion_at_ceiling_keeps_answer(
         reachable=lambda: checks.append(True), sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
     assert outcome.text == "complete answer"
-    # Exact: a total an ULP short of the ceiling is the ceiling
-    # (service.CEILING_SLACK_S).
     assert outcome.network_wait_s == 100 and not checks
 
 
 def test_network_wait_an_ulp_short_of_the_ceiling_is_exhausted():
     """ubuntu CI 2026-11-08 summed a wait that met the ceiling to an ULP short
     of it; that must still end the turn as exhausted, not as a resendable
-    timeout through a deadline that rounds to `now`."""
+    timeout through a deadline that rounds to `now`. A float total handed in
+    from an earlier attempt is still a float: whole microseconds make it the
+    ceiling (service._us)."""
     wait = service.NetworkWait(main_thread=LOGGED_NETWORK_WAIT["params"]["threadId"])
     now = 1_000_000.0
     wait.observe(LOGGED_NETWORK_WAIT, now, "2026-11-08 12:00:00")
@@ -238,18 +260,33 @@ def test_network_wait_an_ulp_short_of_the_ceiling_is_exhausted():
     assert raised.value.exhausted
 
 
+def test_network_wait_credit_is_exact_from_a_half_microsecond_base():
+    """A reading half a microsecond off the grid: rounding raw readings to
+    microseconds would round one end of the wait up and the other down
+    (253.868001 here); rounding their difference from the account's first
+    reading (service.NetworkWait._at) cannot."""
+    start = 9461670.6750565
+    end = start + 253.868
+    # The hazard's precondition, or the case tests nothing.
+    assert round(end * 1e6) - round(start * 1e6) != 253_868_000
+    wait = service.NetworkWait(main_thread=LOGGED_NETWORK_WAIT["params"]["threadId"])
+    wait.observe(LOGGED_NETWORK_WAIT, start, "2026-11-09 12:00:00")
+    wait.observe({"method": "item/started", "params": {
+        "threadId": LOGGED_NETWORK_WAIT["params"]["threadId"]}},
+        end, "2026-11-09 12:04:14")
+    assert wait.seconds(end) == 253.868 and wait.started is None
+
+
 @pytest.mark.parametrize("child_s, total_s, credited_s, expected_s", [
-    # Credited up to now already: the sum alone is an ULP short, and the
-    # total is the snapped child cap exactly.
+    # Credited up to now already: an ULP short is the child cap exactly.
     (math.nextafter(service.MAX_CHILD_NETWORK_WAIT_S, 0.0),
      math.nextafter(service.MAX_CHILD_NETWORK_WAIT_S, 0.0), 0.0,
      service.MAX_CHILD_NETWORK_WAIT_S),
-    # With main credit besides and the current wait far past the cap,
-    # `deadline`'s own child sum (child_s + spent - total_s) lands ULPs short.
-    # The total is the main credit plus the child's remaining cap.
+    # With main credit besides and the current wait far past the cap: the
+    # main credit plus the child's remaining cap, on whole microseconds.
+    # Under float sums `deadline`'s child credit landed ULPs short here.
     (21.231827103605987, 3650.522797641964, service.MAX_CHILD_NETWORK_WAIT_S,
-     pytest.approx(3650.522797641964 + service.MAX_CHILD_NETWORK_WAIT_S
-                   - 21.231827103605987, abs=service.CEILING_SLACK_S)),
+     4361.290971),
 ], ids=["child-only", "with-main-credit"])
 def test_child_credit_an_ulp_short_of_the_child_cap_is_the_cap(
         child_s, total_s, credited_s, expected_s):
@@ -257,6 +294,8 @@ def test_child_credit_an_ulp_short_of_the_child_cap_is_the_cap(
     child cap to 731.9999999999999 of 732. That ULP must not stay
     `remaining`: `now + remaining` rounds to `now`, a deadline that is
     already due instead of the attempt's own budget."""
+    # The inputs are off the microsecond grid, or the case tests nothing.
+    assert all(x != round(x, 6) for x in (child_s, total_s))
     wait = service.NetworkWait(main_thread="main")
     now = 1_000_000.0
     child = {**LOGGED_NETWORK_WAIT, "params": {
@@ -266,18 +305,13 @@ def test_child_credit_an_ulp_short_of_the_child_cap_is_the_cap(
     wait.credited_at = now - credited_s
     spent = wait.seconds(now)
     assert spent == expected_s
-    # The hazard's precondition: unsnapped, the child sum `deadline` makes
-    # misses the cap by less than the snap. Hand-picked floats; a reordered
-    # float sum could land exactly, and the case would test nothing.
-    raw = child_s + spent - total_s
-    cap = service.MAX_CHILD_NETWORK_WAIT_S
-    assert raw != cap and abs(raw - cap) < service.CEILING_SLACK_S, raw
     base = now + 1800.0
     assert wait.deadline(base, 0.0, now) == base + spent
     wait.stop(now)
     assert wait.child_s == service.MAX_CHILD_NETWORK_WAIT_S
 
 
+@pytest.mark.parametrize("network_clock_base", DRIFT_BASES)
 @pytest.mark.parametrize("gap", [366.0, 128.0])
 def test_network_wait_rev1277_recovers_without_resend(
         tmp_path, monkeypatch, network_clock, gap):
@@ -291,9 +325,8 @@ def test_network_wait_rev1277_recovers_without_resend(
     assert outcome.status == "completed" and not outcome.error
     assert outcome.text == "recovered without a resend"
     assert outcome.service_retries == 0 and not checks
-    # abs, not 1e-9: see test_network_wait_completes_beyond_attempt_budget.
-    assert outcome.network_wait_s == pytest.approx(min(gap, 182.785) + 77.717,
-                                                   abs=service.CEILING_SLACK_S)
+    # min(gap, 182.785) + 77.717, exact (service._us).
+    assert outcome.network_wait_s == {366.0: 260.502, 128.0: 205.717}[gap]
 
 
 def test_network_wait_staleness_keeps_remaining_work_budget():
@@ -325,21 +358,21 @@ def test_sub_agent_only_network_wait_extends_main_budget(
         tmp_path, monkeypatch, "network-child-only", timeout=100,
         reachable=lambda: False, sleep=lambda _: None)
     assert outcome.status == "completed" and not outcome.error
-    # abs, not 1e-9: see test_network_wait_completes_beyond_attempt_budget.
-    assert outcome.network_wait_s == pytest.approx(253.868, abs=service.CEILING_SLACK_S)
+    assert outcome.network_wait_s == 253.868
     assert outcome.service_retries == 0
     assert any("(5 tries)" in line for line in network_clock)
     assert all("process was killed?" not in line for line in network_clock)
 
 
 @pytest.mark.parametrize("scenario, credit", [
-    # A monotonic difference to the freshness bound, not a clamp: it may
-    # drift by ULPs; abs keeps a lost millisecond of credit red.
-    ("network-child-stale", pytest.approx(366.0, abs=1e-9)),
-    # Exact: a child credit an ULP short of the child cap is the cap
-    # (service.at_cap; 731.9999999999999 on macos-latest 3.12 CI 2026-11-09).
+    # The freshness bound: one gap of credit.
+    ("network-child-stale", 366.0),
+    # The child cap; under float sums 731.9999999999999 (macos-latest 3.12),
+    # 731.9999999999998 (ubuntu 3.9, macos 3.11) and 732.0000000000002
+    # (macos 3.10) on CI 2026-11-09, by clock base.
     ("network-child-heartbeats", 732.0),
 ], ids=["network-child-stale-366.0", "network-child-heartbeats-732.0"])
+@pytest.mark.parametrize("network_clock_base", DRIFT_BASES)
 def test_child_wait_with_busy_main_times_out_without_resend(
         tmp_path, monkeypatch, network_clock, scenario, credit):
     checks = []

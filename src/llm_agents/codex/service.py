@@ -145,24 +145,11 @@ MAX_NETWORK_WAIT_S = 2 * 60 * 60.0
 # the run; child heartbeats must not turn a working main thread's budget into
 # the two-hour main-outage allowance. Main-thread waits keep their own credit.
 MAX_CHILD_NETWORK_WAIT_S = 2 * NETWORK_WAIT_GAP_S
-# Credit is summed as differences of monotonic readings, which loses ULPs: a
-# wait that met the ceiling summed to 99.99999999999999 of 100 (ubuntu CI
-# 2026-11-08). Short of the clamp, `deadline` skipped the terminal exhaustion
-# and its `now + remaining` rounded to `now`: a RETRYABLE timeout instead.
-# A microsecond is far over that drift and far under any real wait.
-CEILING_SLACK_S = 1e-6
 
 
-def at_cap(credit: float, cap: float) -> float:
-    """`credit`, or exactly `cap` from CEILING_SLACK_S short of it on.
-
-    The ONE snap for both caps (MAX_NETWORK_WAIT_S, MAX_CHILD_NETWORK_WAIT_S),
-    so they cannot drift apart. The child cap needed it too: a child-only wait
-    summed to 731.9999999999999 of 732 (macos-latest 3.12 CI 2026-11-09),
-    after which `deadline` kept an ULP of child credit `remaining` and its
-    `now + remaining` rounded to `now`.
-    """
-    return cap if credit >= cap - CEILING_SLACK_S else credit
+def _us(seconds: float) -> int:
+    """A duration as whole microseconds (see `NetworkWait._at` for readings)."""
+    return round(seconds * 1_000_000)
 
 
 class NetworkWaitTimeout(TimeoutError):
@@ -195,21 +182,59 @@ class NetworkWait:
     main_thread: str = ""
     child_s: float = 0.0
     credited_at: Optional[float] = None
+    epoch: Optional[float] = field(default=None, repr=False)
+
+    def _at(self, reading: float) -> int:
+        """A monotonic reading as whole microseconds since this account's first.
+
+        ALL credit arithmetic runs on these integers; seconds are floats only
+        at the boundary (the fields, `seconds()`, `deadline()`). Credit used
+        to be summed as float differences of raw readings, and drifted by
+        ULPs that depend on the uptime: a wait that met a cap came to
+        99.99999999999999 of 100 (ubuntu CI 2026-11-08), 731.9999999999998
+        and 732.0000000000002 of 732 (ubuntu 3.9, macos 3.10/3.11 CI
+        2026-11-09). Short of a cap, `deadline` skipped the terminal
+        exhaustion and kept an ULP `remaining`, whose `now + remaining`
+        rounded to `now`; past it, a credit exceeded its cap.
+
+        The epoch makes the one float step exact: two readings within a
+        factor of two subtract without rounding, so only the reading's own
+        error (half an ULP: 7.5e-9 s at 1e8 s of uptime) reaches the rounding
+        to microseconds, and a duration on the microsecond grid comes out
+        exact at any base below 2**31 s (68 years). Raw readings times 1e6
+        would round near a half microsecond the same way at any uptime, one
+        reading up and the next down. Rounding readings, not intervals, keeps
+        the sum telescoping: off by at most 1 us per continuous wait, however
+        many events it folds. Caps then compare exactly, with no slack, and
+        a whole-microsecond `remaining` always moves `now` below 2**31 s.
+        """
+        if self.epoch is None:
+            self.epoch = reading
+        return _us(reading - self.epoch)
+
+    def _credit_us(self, now: float) -> tuple[int, int]:
+        """(total, child) credit up to `now`, in whole microseconds."""
+        now_us = self._at(now)
+        total, child = _us(self.total_s), _us(self.child_s)
+        current = (max(0, min(now_us, self._fresh_until_us())
+                       - self._at(self.credited_at))
+                   if self.credited_at is not None else 0)
+        if self.main_thread not in self.pending:
+            current = min(current, max(0, _us(MAX_CHILD_NETWORK_WAIT_S) - child))
+        credited = min(total + current, _us(MAX_NETWORK_WAIT_S))
+        if self.main_thread not in self.pending:
+            child += max(0, credited - total)
+        return credited, child
+
+    def _fresh_until_us(self) -> int:
+        return self._at(self.last) + _us(NETWORK_WAIT_GAP_S)
 
     def seconds(self, now: float) -> float:
-        current = (max(0.0, min(now, self.last + NETWORK_WAIT_GAP_S) - self.credited_at)
-                   if self.credited_at is not None else 0.0)
-        if self.main_thread not in self.pending:
-            child = at_cap(self.child_s + current, MAX_CHILD_NETWORK_WAIT_S)
-            current = max(0.0, child - self.child_s)
-        return at_cap(self.total_s + current, MAX_NETWORK_WAIT_S)
+        return self._credit_us(now)[0] / 1_000_000
 
     def _accrue(self, now: float) -> None:
-        credited = self.seconds(now)
-        if self.main_thread not in self.pending:
-            self.child_s = at_cap(self.child_s + credited - self.total_s,
-                                  MAX_CHILD_NETWORK_WAIT_S)
-        self.total_s = credited
+        total, child = self._credit_us(now)
+        self.total_s, self.child_s = total / 1_000_000, child / 1_000_000
         if self.started is not None:
             self.credited_at = now
 
@@ -228,7 +253,7 @@ class NetworkWait:
         method = str(message.get("method") or "")
         thread = str((message.get("params") or {}).get("threadId") or main_thread)
         if method == "error" and is_network_wait(message.get("params") or {}):
-            if self.started is not None and now - self.last > NETWORK_WAIT_GAP_S:
+            if self.started is not None and self._at(now) > self._fresh_until_us():
                 self.stop(now)
             if self.started is None:
                 self.started, self.since, self.tries = now, stamp, 0
@@ -244,7 +269,7 @@ class NetworkWait:
                 self.stop(now)
             else:
                 latest = max(self.pending.values())
-                if now >= latest + NETWORK_WAIT_GAP_S:
+                if self._at(now) >= self._at(latest) + _us(NETWORK_WAIT_GAP_S):
                     # The recovering thread kept this interval fresh until
                     # now. Do not backdate its credit to an older thread.
                     self.stop(now)
@@ -262,26 +287,27 @@ class NetworkWait:
         it is retryable only if the main thread is pending when its budget
         runs out. A child-only wait gives bounded credit, never a resend.
         """
-        spent = self.seconds(now)
+        spent_us, child_us = self._credit_us(now)
+        spent = spent_us / 1_000_000
         main_waiting = self.main_thread in self.pending
-        if spent >= MAX_NETWORK_WAIT_S and self.started is not None and main_waiting:
+        if (spent_us >= _us(MAX_NETWORK_WAIT_S) and self.started is not None
+                and main_waiting):
             raise NetworkWaitTimeout(spent, exhausted=True)
         if self.started is not None:
-            if now >= self.last + NETWORK_WAIT_GAP_S:
+            if self._at(now) >= self._fresh_until_us():
                 self.stop(now)
         extended = base + spent - baseline_s
         if now >= extended and main_waiting:
             raise NetworkWaitTimeout(spent, exhausted=False)
         if self.started is not None:
-            remaining = MAX_NETWORK_WAIT_S - spent
+            remaining_us = _us(MAX_NETWORK_WAIT_S) - spent_us
             if not main_waiting:
-                child_spent = at_cap(self.child_s + spent - self.total_s,
-                                     MAX_CHILD_NETWORK_WAIT_S)
-                remaining = min(remaining, max(0.0, MAX_CHILD_NETWORK_WAIT_S - child_spent))
-            if remaining <= 0:
+                remaining_us = min(remaining_us,
+                                   max(0, _us(MAX_CHILD_NETWORK_WAIT_S) - child_us))
+            if remaining_us <= 0:
                 return extended
             fresh_until = min(self.last + NETWORK_WAIT_GAP_S,
-                              now + remaining)
+                              now + remaining_us / 1_000_000)
             return min(extended + fresh_until - now, fresh_until)
         return extended
 
