@@ -1510,6 +1510,63 @@ def test_a_state_change_behind_a_stuck_frame_and_a_full_queue_is_kept(monkeypatc
         app.stop()
 
 
+def _claude_reading(tokens, model="claude-opus-5-5"):
+    return {"type": "assistant", "message": {
+        "model": model, "usage": {"input_tokens": tokens}}}
+
+
+def _codex_reading(tokens, window=258_000):
+    return {"type": "thread.token_usage.updated", "tokenUsage": {
+        "last": {"totalTokens": tokens}, "modelContextWindow": window}}
+
+
+def test_a_stream_behind_a_stuck_frame_keeps_its_latest_reading_not_every_event():
+    """A worker goes on reading its provider's stream while the painter is
+    stuck in a terminal write, and most events change nothing on the row.
+
+    The handle used to post every event whole, to be read on the painter: the
+    unbounded state deque grew with the stream and replayed it all once the
+    terminal came back. An event the row does not read is now dropped on the
+    worker, and a run of readings is one pending call holding the latest —
+    but never moved ahead of a change posted after it.
+    """
+    terminal = _paint_log()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    app.start()
+    try:
+        claude, codex = app.job(1), app.job(2)
+        claude.start(item="a.md", model="opus")
+        codex.start(item="b.md", model="gpt")
+        assert app.painter.drain(WAIT_S)
+        _hold_a_frame(app, terminal)
+        try:
+            before = len(app.painter._state_calls)
+            for n in range(500):
+                claude.observe_claude_event({"type": "stream_event", "event": {
+                    "type": "content_block_delta", "delta": {"text": "x"}}})
+                claude.observe_claude_event(_claude_reading(1000 + n))
+                codex.observe_codex_event({"type": "item.started"})
+                codex.observe_codex_event(_codex_reading(2000 + n))
+            queued = len(app.painter._state_calls) - before
+            # A start between two readings: the later reading runs after it.
+            claude.start(item="c.md", model="opus")
+            claude.observe_claude_event(_claude_reading(7777))
+            codex.observe_codex_event(_codex_reading(8888))
+        finally:
+            terminal.unstall.set()
+        assert app.painter.drain(WAIT_S)
+        rows = {job.job_id: job for job in app.snapshot().jobs}
+    finally:
+        app.stop()
+
+    # One pending reading per row: the two rows' readings interleave, and
+    # folding only into the queue's last call would keep 1000 of them.
+    assert queued == 2, f"{queued} state calls kept for 2000 stream events"
+    assert (rows[1].item, rows[1].context_tokens) == ("c.md", 7777)
+    assert (rows[2].context_tokens, rows[2].context_window) == (8888, 258_000)
+
+
 def test_a_paste_tail_posted_behind_its_enter_is_discarded_with_it():
     """Keys are posted, so the tail of a paste can be queued before its Enter
     is handled — and must go the way the reader's own discard sends the rest.

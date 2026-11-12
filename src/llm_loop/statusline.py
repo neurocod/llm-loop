@@ -394,6 +394,45 @@ def colorize(line: str) -> str:
 # --- data model ----------------------------------------------------------------
 
 
+class ClaudeChange(NamedTuple):
+    """What one Claude stream event can change on a `Job`, read from the event
+    alone (`claude_status_change`), so a worker can take it on its own thread
+    and post only this — not the event — to the row's owner."""
+
+    model: str                  # an init event's model, "" for none
+    reading: Optional[tuple]    # `wire.claude_context_usage`'s (model, tokens)
+    compacting: bool
+    result: Optional[dict]      # the `result` event itself, None otherwise
+
+    def is_reading(self) -> bool:
+        """A pure occupancy reading: a later one of the same model leaves the
+        row exactly as applying both would (`Painter.post_latest`) — the first
+        can only set `resolved_model` to that model or leave a tagged ID of it
+        (`…[1m]`) in place, which the second then compares the same way."""
+        return (self.reading is not None and not self.model
+                and not self.compacting and self.result is None)
+
+
+def claude_status_change(ev: dict) -> Optional[ClaudeChange]:
+    """The part of `ev` a `Job` row reads, or None when it reads nothing.
+
+    A pure function of `ev` (it calls only `wire`'s readers), so it is safe on
+    any thread. None for every event that cannot change the row — a subagent's,
+    a content delta — which then costs the painter nothing.
+    """
+    if not wire.is_root_claude_event(ev):
+        return None
+    model = wire.session_model(ev) if wire.is_session_start(ev) else ""
+    if not isinstance(model, str) or model == "?":
+        model = ""
+    reading = wire.claude_context_usage(ev)
+    compacting = wire.claude_context_compacting(ev)
+    result = ev if wire.event_type(ev) == wire.RESULT else None
+    if not (model or reading is not None or compacting or result is not None):
+        return None
+    return ClaudeChange(model, reading, compacting, result)
+
+
 @dataclass
 class Job:
     """One unit of display: a worker (or the sequential loop) and what it is on.
@@ -507,33 +546,41 @@ class Job:
 
     def observe_claude_event(self, ev: dict) -> None:
         """Take main-request occupancy and capacity from Claude's own stream."""
-        if not wire.is_root_claude_event(ev):
-            return
-        reading = wire.claude_context_usage(ev)
-        model = wire.session_model(ev) if wire.is_session_start(ev) else ""
-        if reading is not None:
-            message_model, _tokens = reading
+        change = claude_status_change(ev)
+        if change is not None:
+            self.apply_claude_change(change)
+
+    def apply_claude_change(self, change: "ClaudeChange") -> None:
+        """The stateful half of `observe_claude_event`: what the event says,
+        read against what this row already holds."""
+        model = change.model
+        if change.reading is not None:
+            message_model, _tokens = change.reading
             # Assistant messages omit the init event's routing suffix.
             if message_model != self.resolved_model.split("[", 1)[0]:
                 model = message_model
-        if isinstance(model, str) and model and model != "?":
+        if model and model != "?":
             if model != self.resolved_model:
                 self.resolved_model = model
                 self.context_tokens = None
                 self.context_window = None
-        if wire.claude_context_compacting(ev):
+        if change.compacting:
             self.context_tokens = None
-        elif reading is not None:
-            self.context_tokens = reading[1]
-        elif wire.event_type(ev) == wire.RESULT:
+        elif change.reading is not None:
+            self.context_tokens = change.reading[1]
+        elif change.result is not None:
             self.context_window = wire.result_context_window(
-                ev, self.resolved_model or self.model)
+                change.result, self.resolved_model or self.model)
 
     def observe_codex_event(self, ev: dict) -> None:
         """Replace context occupancy with the latest root-thread reading."""
         reading = wire.codex_context_usage(ev)
         if reading is not None:
-            self.context_tokens, self.context_window = reading
+            self.apply_codex_reading(reading)
+
+    def apply_codex_reading(self, reading: tuple) -> None:
+        """`wire.codex_context_usage`'s (tokens, window): the latest wins whole."""
+        self.context_tokens, self.context_window = reading
 
     def snapshot(self) -> "Job":
         """A detached copy, so one painted row cannot mix two iterations."""
@@ -2352,6 +2399,27 @@ def _call_name(call: Callable) -> str:
     return (getattr(call, "__name__", None) or type(call).__name__).lstrip("_")
 
 
+class _LatestCall:
+    """A queued `Painter.post_latest` reading: `call(value)` with the value it
+    holds when the owner runs it, which a later reading may have replaced."""
+
+    def __init__(self, painter: "Painter", group, kind, call: Callable, value):
+        self._painter = painter
+        self.group = group
+        self.kind = kind
+        self.call = call
+        self.value = value
+        self.taken = False          # (latest lock) the owner has read `value`
+        self.__name__ = _call_name(getattr(call, "func", call))
+
+    def __call__(self) -> None:
+        with self._painter._latest_lock:
+            self.taken = True
+            value = self.value
+            self._painter._end_latest(self.group, self)
+        self.call(value)
+
+
 class Painter:
     """The one thread that writes the status line's terminal, and its protocol.
 
@@ -2409,6 +2477,10 @@ class Painter:
         # "running" for the rest of the run — where a refused frame request
         # costs nothing the next frame does not repaint.
         self._state_calls: collections.deque = collections.deque()
+        # The `post_latest` reading still pending per group, and the lock that
+        # orders replacing its value against the owner taking it to run it.
+        self._latest: Dict[object, "_LatestCall"] = {}
+        self._latest_lock = threading.Lock()
         # Orders whoever runs the state calls. While a painter runs that is the
         # painter alone and the lock is never contended; it is there for the
         # stretches with no painter — before `open()`, after `close()`, and a
@@ -2603,7 +2675,8 @@ class Painter:
             # Queue full: the periodic frame draws this state instead.
             self._frame_posted = False
 
-    def post_state(self, call: Callable, *args, frame: bool = True) -> None:
+    def post_state(self, call: Callable, *args, frame: bool = True,
+                   group=None) -> None:
         """`call(*args)` changes the app's data: run it on the data's owner and
         ask for a frame of the result — never waiting for the painter.
 
@@ -2622,11 +2695,49 @@ class Painter:
         `frame=False` asks for no frame, for a caller whose next step draws one
         anyway: `StatusApp.start`, whose change would otherwise be painted on
         the caller just before the painter's first frame paints it again.
+
+        `group` names the data `call` changes when a `post_latest` reading
+        may change it too, so the reading keeps its place behind this call.
         """
+        if group is not None:
+            with self._latest_lock:
+                self._end_latest(group)
         self._state_calls.append((call, args))
         self.apply_state()          # here only on the owner, or with none
         if frame:
             self.request_frame()
+
+    def post_latest(self, group, kind, call: Callable, value) -> None:
+        """`post_state(call, value)` for a reading whose latest value wins.
+
+        `group` names the data the reading changes (a Job row's id), `kind`
+        the reading. While the last call posted for `group` is a reading of
+        the same `kind` that has not run yet, `value` replaces its value
+        instead of queueing a second call: applying the two in a row would
+        leave the data exactly as applying the later one does. Order is kept
+        by `post_state(..., group=g)`: any other change to that data ends the
+        pending reading, so a reading posted after it is a new call behind it.
+        Calls for other groups do not touch this data and need no order
+        against it; a poster racing this one from another thread has none.
+
+        A replaced call has its frame request already asked for (or kept by
+        `_on_idle` / `_draw`), so a replacement asks for none.
+        """
+        with self._latest_lock:
+            pending = self._latest.get(group)
+            if (pending is not None and pending.kind == kind
+                    and not pending.taken):
+                pending.value = value
+                return
+            pending = _LatestCall(self, group, kind, call, value)
+            self._latest[group] = pending
+        self.post_state(pending)
+
+    def _end_latest(self, group, pending=None) -> None:
+        """No later reading of `group` folds into its pending one (`pending`
+        only: the one that ran). Under `_latest_lock`."""
+        if pending is None or self._latest.get(group) is pending:
+            self._latest.pop(group, None)
 
     def apply_state(self) -> bool:
         """Run the state calls queued so far, then `published`, if this thread
@@ -3022,7 +3133,8 @@ class JobHandle:
 
     def _post(self, method: str, *args, **kwargs) -> None:
         self._app.painter.post_state(
-            functools.partial(self._call, method, *args, **kwargs))
+            functools.partial(self._call, method, *args, **kwargs),
+            group=self.job_id)
 
     def start(self, *, item: str = "", model: str = "", prompt: str = "",
               iteration: Optional[int] = None, now: Optional[float] = None) -> None:
@@ -3042,13 +3154,35 @@ class JobHandle:
         """`Job.update`, posted."""
         self._post("update", **fields)
 
+    # The two observers read the event HERE and post only what the row takes
+    # from it: a provider stream is mostly events that change nothing, and
+    # behind a painter stuck in a terminal write each posted event would sit in
+    # the unbounded state deque, whole, for as long as the stream runs.
+
     def observe_claude_event(self, ev: dict) -> None:
-        """`Job.observe_claude_event`, posted."""
-        self._post("observe_claude_event", ev)
+        """`Job.observe_claude_event`, posted: nothing for an event the row does
+        not read, one pending call for a run of same-model readings."""
+        change = claude_status_change(ev)
+        if change is None:
+            return
+        if change.is_reading():
+            self._post_latest(("claude", change.reading[0]),
+                              "apply_claude_change", change)
+        else:
+            self._post("apply_claude_change", change)
 
     def observe_codex_event(self, ev: dict) -> None:
-        """`Job.observe_codex_event`, posted."""
-        self._post("observe_codex_event", ev)
+        """`Job.observe_codex_event`, posted the same way."""
+        reading = wire.codex_context_usage(ev)
+        if reading is not None:
+            self._post_latest(("codex",), "apply_codex_reading", reading)
+
+    def _post_latest(self, kind: tuple, method: str, value) -> None:
+        # Grouped by the row's id, not by this handle: `app.job(k)` hands out
+        # a new handle per call, and a `finish` posted through another one
+        # must still end a reading pending here.
+        self._app.painter.post_latest(
+            self.job_id, kind, functools.partial(self._call, method), value)
 
     def snapshot(self) -> Optional[Job]:
         """This id's row in the published copy (`StatusApp.snapshot`), or None
