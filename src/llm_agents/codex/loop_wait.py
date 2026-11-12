@@ -1,5 +1,8 @@
 """Adapt the loop provider's connection to the shared sub-agent wait phase."""
 
+# The Protocol's `X | None` annotations would be evaluated at import on 3.9.
+from __future__ import annotations
+
 import time
 from typing import Callable, Protocol
 
