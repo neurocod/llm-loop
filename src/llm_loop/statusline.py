@@ -41,7 +41,8 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple,
+                    Union)
 
 from . import (cmdline, console, diaglog, gitpush, ownership, stopchannel,
                termio, textwidth, wire)
@@ -441,9 +442,10 @@ class Job:
     "sequential vs parallel" branch — and the parallel runner only has to feed
     data.
 
-    No lock: a live Job belongs to its `StatusApp` and is mutated only by the
-    state calls `Painter.post_state` runs — on the painter while one runs, else
-    on the caller under the painter's state lock. A runner never holds a live
+    No lock: `InvocationProgress`'s pool holds a Job across the runner's apps,
+    and the app running at the time writes it, only by the state calls its
+    `Painter.post_state` runs — on the painter while one runs, else on the
+    caller under the painter's state lock. A runner never holds a live
     Job: `StatusApp.job` hands it a `JobHandle`, whose methods post these
     mutators. The renderers read `snapshot()` copies, which the same owner takes.
     """
@@ -590,18 +592,20 @@ class Job:
                    self.context_tokens, self.waiting_for_usage, self.progress)
 
 
-# The Job whose row describes the stream THIS thread is reading. Both renderers
+# The row that describes the stream THIS thread is reading: the runners bind
+# the `JobHandle` `StatusApp.job` gave them, whose methods post to the live
+# Job; a bare `Job` (a test's) is written in place. Both renderers
 # know only the stream, not the row: the sequential one is a module with one run
 # in flight, the parallel one is `run_job(job_id, command, mailbox)` on a worker
-# thread. The Job travels by binding rather than by argument because two dozen
+# thread. The row travels by binding rather than by argument because two dozen
 # test doubles of those two functions pin their exact signatures, and a keyword
 # added to every call would break each of them for a cosmetic feature. The
-# caller that starts the Job binds it around the render (`describing`).
+# caller that starts the row binds it around the render (`describing`).
 _stream_job = threading.local()
 
 
 @contextmanager
-def describing(job: "Job", app=None):
+def describing(job: Union["Job", "JobHandle"], app=None):
     """Route `observe_claude_event` on this thread to `job` for the block."""
     previous = getattr(_stream_job, "job", None)
     previous_app = getattr(_stream_job, "app", None)
@@ -2413,11 +2417,7 @@ class _LatestCall:
         self.__name__ = _call_name(getattr(call, "func", call))
 
     def __call__(self) -> None:
-        with self._painter._latest_lock:
-            self.taken = True
-            value = self.value
-            self._painter._end_latest(self.group, self)
-        self.call(value)
+        self.call(self._painter._take_latest(self))
 
 
 class Painter:
@@ -2738,6 +2738,14 @@ class Painter:
         only: the one that ran). Under `_latest_lock`."""
         if pending is None or self._latest.get(group) is pending:
             self._latest.pop(group, None)
+
+    def _take_latest(self, pending: _LatestCall):
+        """(state call) `pending`'s value as it runs: no later reading folds
+        into it once read."""
+        with self._latest_lock:
+            pending.taken = True
+            self._end_latest(pending.group, pending)
+            return pending.value
 
     def apply_state(self) -> bool:
         """Run the state calls queued so far, then `published`, if this thread
@@ -3127,11 +3135,12 @@ class JobHandle:
             self._job = self._app._status.job(self.job_id)
         return self._job
 
-    def _call(self, method: str, *args, **kwargs) -> None:
-        """(state call) One of the row's own mutators."""
-        getattr(self._resolve(), method)(*args, **kwargs)
+    def _call(self, method: Callable[..., None], *args, **kwargs) -> None:
+        """(state call) One of the row's own mutators, given unbound
+        (`Job.start`), on the resolved row."""
+        method(self._resolve(), *args, **kwargs)
 
-    def _post(self, method: str, *args, **kwargs) -> None:
+    def _post(self, method: Callable[..., None], *args, **kwargs) -> None:
         self._app.painter.post_state(
             functools.partial(self._call, method, *args, **kwargs),
             group=self.job_id)
@@ -3139,20 +3148,20 @@ class JobHandle:
     def start(self, *, item: str = "", model: str = "", prompt: str = "",
               iteration: Optional[int] = None, now: Optional[float] = None) -> None:
         """`Job.start`, posted."""
-        self._post("start", item=item, model=model, prompt=prompt,
+        self._post(Job.start, item=item, model=model, prompt=prompt,
                    iteration=iteration, now=time.time() if now is None else now)
 
     def select(self, model: str) -> None:
         """`Job.select`, posted."""
-        self._post("select", model)
+        self._post(Job.select, model)
 
     def finish(self) -> None:
         """`Job.finish`, posted."""
-        self._post("finish")
+        self._post(Job.finish)
 
     def update(self, **fields) -> None:
         """`Job.update`, posted."""
-        self._post("update", **fields)
+        self._post(Job.update, **fields)
 
     # The two observers read the event HERE and post only what the row takes
     # from it: a provider stream is mostly events that change nothing, and
@@ -3167,17 +3176,18 @@ class JobHandle:
             return
         if change.is_reading():
             self._post_latest(("claude", change.reading[0]),
-                              "apply_claude_change", change)
+                              Job.apply_claude_change, change)
         else:
-            self._post("apply_claude_change", change)
+            self._post(Job.apply_claude_change, change)
 
     def observe_codex_event(self, ev: dict) -> None:
         """`Job.observe_codex_event`, posted the same way."""
         reading = wire.codex_context_usage(ev)
         if reading is not None:
-            self._post_latest(("codex",), "apply_codex_reading", reading)
+            self._post_latest(("codex",), Job.apply_codex_reading, reading)
 
-    def _post_latest(self, kind: tuple, method: str, value) -> None:
+    def _post_latest(self, kind: tuple, method: Callable[..., None],
+                     value) -> None:
         # Grouped by the row's id, not by this handle: `app.job(k)` hands out
         # a new handle per call, and a `finish` posted through another one
         # must still end a reading pending here.
@@ -3204,7 +3214,8 @@ class StatusApp:
     editor for them would take the registry here again.
 
     Public surface the loops use: start()/stop() (or `with`), update(**fields),
-    note(text), register_action(a), job(job_id), snapshot(). `painter` is
+    note(text), register_action(a), job(job_id), snapshot(),
+    mark_run_started(), refresh_quota_policy(rule). `painter` is
     exposed for the pins that watch its protocol. Everything else is an
     internal detail that a later wave extends by registering something.
 
@@ -3578,13 +3589,16 @@ class StatusApp:
         self._sync_stop_pending()
 
     def _sync_stop_pending(self) -> None:
-        """(state call) `stop_pending` from the key's flag, else the sentinel.
+        """(state call) `stop_pending` from `_stop_pending_now`."""
+        self._status.stop_pending = self._stop_pending_now()
+
+    def _stop_pending_now(self) -> str:
+        """`stop_pending` as it stands: the key's flag, else the sentinel.
 
         The key's request is this process's own and outlives whatever anyone
         does to the file, so the file is asked only while the key is down."""
-        self._status.stop_pending = (stopchannel.StopSource.KEY.value
-                                     if self._requested_stop
-                                     else self._sentinel_pending())
+        return (stopchannel.StopSource.KEY.value if self._requested_stop
+                else self._sentinel_pending())
 
     @property
     def paused(self) -> bool:
@@ -3741,11 +3755,10 @@ class StatusApp:
             # Catches a sentinel created by hand (`touch stop`) or by a
             # neighbouring run. It never touches `_requested_stop`: the key's
             # request is this process's own and outlives whatever anyone does
-            # to the file (`_sync_stop_pending`). Asked first, so an unchanged
-            # answer publishes nothing.
-            pending = (stopchannel.StopSource.KEY.value if self._requested_stop
-                       else self._sentinel_pending())
-            if pending != self.snapshot().stop_pending:
+            # to the file (`_stop_pending_now`). Asked first, so an unchanged
+            # answer publishes nothing. The state call asks again rather than
+            # taking this answer: a key change queued ahead of it runs first.
+            if self._stop_pending_now() != self.snapshot().stop_pending:
                 self.painter.post_state(self._sync_stop_pending)
 
     def _expire_note(self, note: str) -> None:
