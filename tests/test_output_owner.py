@@ -1433,12 +1433,81 @@ def test_a_note_is_stamped_and_expired_by_the_painter(monkeypatch):
     with app:
         app.note("short-lived")
         deadline = time.monotonic() + WAIT_S
-        while app.status.note and time.monotonic() < deadline:
+        while app.snapshot().note and time.monotonic() < deadline:
             time.sleep(0.01)
-        left = app.status.note
+        left = app.snapshot().note
 
     assert left == "", "the note never expired"
     assert stamped_on == [sl.PAINTER_THREAD_NAME]
+
+
+def test_a_running_apps_data_is_written_on_the_painter_alone(monkeypatch):
+    """A worker posts its row's changes; it never writes the row itself.
+
+    `app.job(k)` used to hand out the live Job, whose mutators every worker ran
+    on its own thread under the Job's lock, while `update` wrote the
+    LoopStatus from whichever thread called it.
+    """
+    writers = []
+
+    def spied(real):
+        def spy(self, *args, **kwargs):
+            writers.append(threading.current_thread().name)
+            return real(self, *args, **kwargs)
+        return spy
+
+    monkeypatch.setattr(sl.LoopStatus, "update", spied(sl.LoopStatus.update))
+    monkeypatch.setattr(sl.Job, "start", spied(sl.Job.start))
+    monkeypatch.setattr(sl.Job, "finish", spied(sl.Job.finish))
+    app = sl.StatusApp(terminal=_paint_log(), input_source=termio.NullInputSource(),
+                       refresh=60)
+    with app:
+        def worker():
+            job = app.job(2)
+            job.start(item="a.md", model="opus")
+            app.update(iteration=7)
+            job.finish()
+            job.start(item="b.md", model="opus")
+
+        thread = threading.Thread(target=worker, name="pin-worker")
+        thread.start()
+        thread.join(WAIT_S)
+        assert app.painter.drain(WAIT_S)
+        row = app.job(2).snapshot()
+        iteration = app.snapshot().iteration
+
+    assert writers and set(writers) == {sl.PAINTER_THREAD_NAME}, writers
+    # Applied in the order posted: the second start, not the finish, is last.
+    assert (row.running, row.item, row.iteration) == (True, "b.md", 2)
+    assert iteration == 7
+
+
+def test_a_state_change_behind_a_stuck_frame_and_a_full_queue_is_kept(monkeypatch):
+    """A full painter queue costs a frame request, never the change it carried.
+
+    A change refused for room would be a row left saying "running" — so the
+    change waits outside the bounded queue and runs once the painter is back,
+    and the poster does not wait for the stuck frame either.
+    """
+    monkeypatch.setattr(sl, "PAINTER_QUEUE_MAXSIZE", 2)
+    terminal = _paint_log()
+    app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
+                       refresh=60)
+    app.start()
+    try:
+        _hold_a_frame(app, terminal)
+        try:
+            while app.painter.try_post(lambda: None):
+                pass                        # fill the queue behind the frame
+            returned, _ = _returns_within(
+                BOUND_SLACK_S, lambda: app.update(iteration=5))
+            assert returned, "update() waited for room behind a stuck frame"
+        finally:
+            terminal.unstall.set()
+        assert _wait_for(lambda: app.snapshot().iteration == 5), \
+            "the change refused a frame request was lost"
+    finally:
+        app.stop()
 
 
 def test_a_paste_tail_posted_behind_its_enter_is_discarded_with_it():

@@ -152,7 +152,8 @@ _home("usage", "RateLimitEvent", "Usage", "UsageReading", "UsageSource",
       "oauth_token", "parse_usage", "rate_limit_event_from")
 _home("limits", "DayNightLimit", "LimitPolicy", "LimitRule", "SessionLimit",
       "WeeklyLimit", "default_policy")
-_home("statusline", "Action", "InvocationProgress", "Job", "LoopStatus", "Mode",
+_home("statusline", "Action", "InvocationProgress", "Job", "JobHandle",
+      "LoopStatus", "Mode",
       "NumberSetting", "PercentSetting", "QuotaRefresher", "Setting",
       "SettingsRegistry", "StatusApp", "push_quotas", "quota_rows", "render_rows")
 _home("drivers", "ListFileDriver", "StateFileDriver")

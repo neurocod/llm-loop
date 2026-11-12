@@ -46,7 +46,7 @@ def test_editor_appends_on_enter_and_esc_discards_only_the_draft(enter):
     press(app, enter)
     assert points.names == ("plan mode", "cleanup")
     assert isinstance(app.mode, sl.NormalMode)
-    assert "cleanup" in app.status.note
+    assert "cleanup" in app.snapshot().note
     press(app, "b", *"codex-review", enter)
     assert points.names == ("plan mode", "cleanup", "codex-review")
     press(app, "b", *"discard this", "\x1b", "s")

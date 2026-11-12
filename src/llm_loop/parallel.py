@@ -1159,8 +1159,9 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
     remains clear means
     everything left is in flight elsewhere, so we briefly back off and retry.
     `source`/`policy` are None when --ignore-usage disables the session-limit
-    gate. `app` is this run's status line; each worker owns the Job of its own
-    number, and Job's mutators are lock-guarded for exactly that. `progress`
+    gate. `app` is this run's status line; each worker feeds the row of its own
+    number through a `statusline.JobHandle`, whose calls the painter runs (see
+    `Painter.post_state`). `progress`
     carries the summary-row figures of the whole invocation.
     """
     # A disabled StatusApp is a Null object: no terminal, no threads, every call

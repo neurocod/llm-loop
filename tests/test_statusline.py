@@ -383,7 +383,7 @@ def test_help_key_shows_keys_and_prints_the_restart_command(monkeypatch, capsys,
 
     app.handle_event(tio.Key(key))
 
-    assert "s stop" in app.status.note and "h/? help" in app.status.note
+    assert "s stop" in app.snapshot().note and "h/? help" in app.snapshot().note
     expected = sl.cmdline.quote(
         [sys.executable, os.path.abspath(argv[0]), *argv[1:]], shell)
     assert capsys.readouterr().out == "Restart command:\n" + expected + "\n"
@@ -396,7 +396,7 @@ def test_help_keeps_working_when_a_restart_argument_is_not_pasteable(monkeypatch
 
     app.handle_event(tio.Key("h"))
 
-    assert "h/? help" in app.status.note
+    assert "h/? help" in app.snapshot().note
     assert "Cannot render restart command:" in capsys.readouterr().out
     assert isinstance(app.painter.terminal, tio.NullTerminal)
 
@@ -406,7 +406,7 @@ def test_an_unknown_key_points_at_the_help_key():
 
     app.handle_event(tio.Key("q"))
 
-    assert "press h for help" in app.status.note
+    assert "press h for help" in app.snapshot().note
 
 
 # --- the stop key --------------------------------------------------------------
@@ -418,11 +418,11 @@ def test_stop_key_requests_a_stop_and_pressing_it_again_cancels(tmp_path):
 
     app.handle_event(tio.Key("s"))
     assert app.stop_requested_here is True
-    assert app.status.stop_pending == stopchannel.StopSource.KEY.value
+    assert app.snapshot().stop_pending == stopchannel.StopSource.KEY.value
     assert "cancel stop" in app.render(width=200, now=NOW)[-2]
 
     app.handle_event(tio.Key("s"))
-    assert app.stop_requested_here is False and app.status.stop_pending == ""
+    assert app.stop_requested_here is False and app.snapshot().stop_pending == ""
 
 
 def test_the_stop_key_writes_no_sentinel_so_a_neighbouring_run_keeps_going(
@@ -506,12 +506,12 @@ def test_pause_key_holds_the_run_and_pressing_it_again_resumes():
     app = sl.StatusApp(enabled=False)
 
     app.handle_event(tio.Key("p"))
-    assert app.paused is True and app.status.paused is True
+    assert app.paused is True and app.snapshot().paused is True
     assert stopchannel.pause_requested(app) is True
     assert "p resume" in app.render(width=200, now=NOW)[-2]
 
     app.handle_event(tio.Key("p"))
-    assert app.paused is False and app.status.paused is False
+    assert app.paused is False and app.snapshot().paused is False
     assert stopchannel.pause_requested(app) is False
     assert "p pause" in app.render(width=200, now=NOW)[-2]
 
@@ -741,8 +741,8 @@ def test_a_disabled_app_writes_nothing_and_still_serves_its_api():
 
     assert app.enabled is False
     assert stream.getvalue() == ""
-    assert app.status.iteration == 3
-    assert app.job(1).iteration == 1
+    assert app.snapshot().iteration == 3
+    assert app.job(1).snapshot().iteration == 1
 
 
 def test_a_pinned_terminal_writes_its_rows_to_the_real_stream(monkeypatch):
@@ -1482,7 +1482,7 @@ def test_a_bounded_run_shows_the_quotas_and_never_polls_for_them(monkeypatch,
 
     app, _source = _run_with_status(monkeypatch, tmp_path, _OneShot())
 
-    assert app.status.quotas, "the provider's figures never reached the row"
+    assert app.snapshot().quotas, "the provider's figures never reached the row"
     # -m N deliberately skips the usage machinery: no forced-fresh poll either.
     assert app._services == []
 
@@ -1502,7 +1502,7 @@ def test_an_unbounded_run_keeps_the_quota_figures_refreshed(monkeypatch, tmp_pat
     app, _source = _run_with_status(monkeypatch, tmp_path, _OneShot(), max=None)
 
     assert [type(s).__name__ for s in app._services] == ["QuotaRefresher"]
-    assert app.status.quotas
+    assert app.snapshot().quotas
 
 
 def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
@@ -1528,8 +1528,8 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
     assert driver.calls == 2                          # the raised cap took effect
     # An edited cap shows up as the counter's denominator — the one place it is
     # shown at all, since a field of its own would say the same number twice.
-    assert app.status.max_iterations == 2
-    assert "max-runs" not in dict(app.status.script_limits)
+    assert app.snapshot().max_iterations == 2
+    assert "max-runs" not in dict(app.snapshot().script_limits)
 
 
 class _QueueDriver:
@@ -1590,7 +1590,7 @@ def test_a_later_runner_call_opens_on_how_far_the_queue_got(tmp_path):
     app = runlifecycle.open_status(ctx, _QueueDriver(3), job_count=1,
                                    messages=None)
 
-    assert (app.status.iteration, app.status.max_iterations) == (2, 5)
+    assert (app.snapshot().iteration, app.snapshot().max_iterations) == (2, 5)
 
 
 def test_the_restart_command_rewrites_with_the_hosts_switches(monkeypatch,
@@ -1652,7 +1652,7 @@ def test_a_paused_loop_holds_before_it_asks_the_driver_for_work(monkeypatch,
     assert seen[0] == 0
     assert seen[1:4] == [1, 1, 1]
     assert driver.calls == 2
-    assert app.status.iteration == 2
+    assert app.snapshot().iteration == 2
 
 
 def test_a_pause_pressed_at_the_usage_gate_holds_the_next_iteration(monkeypatch,
@@ -1753,8 +1753,8 @@ def test_a_driver_with_no_total_gets_no_invented_denominator(monkeypatch, tmp_pa
     app, _source = _run_with_status(monkeypatch, tmp_path, _counts_down(3),
                                     max=None, provider="codex")
 
-    assert app.status.iteration == 3
-    assert app.status.max_iterations is None
+    assert app.snapshot().iteration == 3
+    assert app.snapshot().max_iterations is None
     summary = app.render(width=200)[1]
     assert "iter 3" in summary and "iter 3/" not in summary
 
@@ -1790,11 +1790,11 @@ def test_a_driver_with_a_queue_of_its_own_gets_a_denominator(monkeypatch,
     app, _source = _run_with_status(monkeypatch, tmp_path, _DrainsAFolder(),
                                     max=None)
 
-    assert (app.status.iteration, app.status.max_iterations) == (2, 2)
+    assert (app.snapshot().iteration, app.snapshot().max_iterations) == (2, 2)
     assert "iter 2/2" in app.render(width=200)[1]
     # The window name is the summary row's first field verbatim, so it carries
     # the same total — that is the whole point of building it from the Segment.
-    assert sl.title_text(app.status).startswith("· iter 2/2")
+    assert sl.title_text(app.snapshot()).startswith("· iter 2/2")
 
 
 def test_a_capped_run_with_no_list_shows_the_cap_it_was_given(monkeypatch,
@@ -1808,7 +1808,7 @@ def test_a_capped_run_with_no_list_shows_the_cap_it_was_given(monkeypatch,
     app, _source = _run_with_status(monkeypatch, tmp_path, _counts_down(10),
                                     max=2, provider="codex")
 
-    assert (app.status.iteration, app.status.max_iterations) == (2, 2)
+    assert (app.snapshot().iteration, app.snapshot().max_iterations) == (2, 2)
     assert "iter 2/2" in app.render(width=200)[1]
 
 
@@ -1857,8 +1857,8 @@ def test_the_sequential_loop_counts_items_struck_not_iterations(monkeypatch,
     app, _source = _run_with_status(monkeypatch, tmp_path, driver, max=None,
                                     provider="codex")
 
-    assert (app.status.iteration, app.status.max_iterations) == (3, 3)
-    assert app.status.jobs[0].iteration == 4      # attempts, not items
+    assert (app.snapshot().iteration, app.snapshot().max_iterations) == (3, 3)
+    assert app.snapshot().jobs[0].iteration == 4      # attempts, not items
     assert "iter 3/3" in app.render(width=200)[1]
 
 
@@ -1895,12 +1895,14 @@ def test_a_second_runner_call_resumes_the_job_row(monkeypatch, tmp_path):
                            progress=progress)
 
     first, second = made
-    assert first.status.jobs[0] is second.status.jobs[0]
-    assert (first.status.iteration, second.status.iteration) == (2, 4)
-    assert second.status.jobs[0].iteration == 4
+    # The live rows, not the published copies: the pool hands both calls the
+    # same Job object.
+    assert first._status.jobs[0] is second._status.jobs[0]
+    assert (first.snapshot().iteration, second.snapshot().iteration) == (2, 4)
+    assert second.snapshot().jobs[0].iteration == 4
     # The 2 each call was allowed to run sized a batch, not the run: with no
     # invocation-level --max there is nothing honest to put after the slash.
-    assert second.status.max_iterations is None
+    assert second.snapshot().max_iterations is None
 
 
 def test_a_setting_flag_is_checked_against_the_command_line_table():
@@ -2043,11 +2045,11 @@ def test_a_background_quota_poll_notes_its_failure_instead_of_printing(capsys):
         refresher.start()
         # The whole test takes 0.02-0.03 s (five runs, measured 2026-09-25).
         deadline = time.time() + 5
-        while not app.status.note and time.time() < deadline:
+        while not app.snapshot().note and time.time() < deadline:
             time.sleep(0.01)
         refresher.stop()
 
-    assert "quota refresh" in app.status.note and "401" in app.status.note
+    assert "quota refresh" in app.snapshot().note and "401" in app.snapshot().note
     assert capsys.readouterr().out == ""          # nothing reached the stream
 
 
@@ -2111,15 +2113,15 @@ def test_a_routed_quota_poll_notes_a_failed_usage_query_instead_of_printing(
                 refresher.start()
                 # Measured with the unrouted twin above: 0.02-0.03 s.
                 deadline = time.time() + 5
-                while not app.status.note and time.time() < deadline:
+                while not app.snapshot().note and time.time() < deadline:
                     time.sleep(0.01)
                 refresher.stop()
             assert owner.drain(5)
     finally:
         assert owner.close(5)
 
-    assert "quota refresh" in app.status.note
-    assert "no usage figures" in app.status.note
+    assert "quota refresh" in app.snapshot().note
+    assert "no usage figures" in app.snapshot().note
     assert capsys.readouterr().out == ""          # nothing reached the stream
 
 
@@ -2215,6 +2217,8 @@ def test_the_sequential_row_shows_what_the_stream_resolved(monkeypatch, tmp_path
     def stream(cmd, raw, partial, prompt="", mailbox=None):
         sl.observe_claude_event(_INIT_OPUS)
         sl.observe_claude_event(_RESULT_1M)
+        # The events are the painter's to apply: read once it has.
+        apps[0].painter.drain()
         rendered.append(" ".join(apps[0].render(200)))
         return 0
 

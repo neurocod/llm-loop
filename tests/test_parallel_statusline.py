@@ -135,9 +135,11 @@ def test_weekly_ceiling_finishes_active_tasks_and_names_waiting_rows(tmp_path,
     real_update = sl.Job.update
 
     def watch_waiting(job, **fields):
+        # A state call: the live rows are this thread's to read here, and
+        # `snapshot()` would answer with the copy from before this batch.
         real_update(job, **fields)
         app = made.get("app")
-        if app is not None and all(j.waiting_for_usage for j in app.status.snapshot().jobs):
+        if app is not None and all(j.waiting_for_usage for j in app._status.jobs):
             all_waiting.set()
 
     monkeypatch.setattr(sl.Job, "update", watch_waiting)
@@ -145,9 +147,11 @@ def test_weekly_ceiling_finishes_active_tasks_and_names_waiting_rows(tmp_path,
     def run(job_id, command, mailbox=None):
         tasks.append(command.label)
         job = made["app"].job(job_id)
-        assert job.running and not job.waiting_for_usage
+        made["app"].painter.drain()     # the worker's own posts, applied
+        row = job.snapshot()
+        assert row.running and not row.waiting_for_usage
         job.update(context_tokens=88_764, context_window=258_400)
-        if job.iteration == 1:
+        if row.iteration == 1:
             started.wait()
             source.percent = 97
             if job_id == 1:
@@ -163,7 +167,7 @@ def test_weekly_ceiling_finishes_active_tasks_and_names_waiting_rows(tmp_path,
         done, result = _run_in_thread(driver, args)
         assert gate_entered.wait(wait_seconds), "the fleet never reached 97%"
         all_waiting.clear()
-        if not all(j.waiting_for_usage for j in made["app"].status.snapshot().jobs):
+        if not all(j.waiting_for_usage for j in made["app"].snapshot().jobs):
             assert all_waiting.wait(wait_seconds), "a worker waiting for the usage lock looked idle"
         assert len(tasks) == 2
         assert made["shared"].done == 2
@@ -181,7 +185,7 @@ def test_weekly_ceiling_finishes_active_tasks_and_names_waiting_rows(tmp_path,
 
     assert result["value"].completed == 4
     assert len(tasks) == 4 and driver.pending_lines() == []
-    assert all(not job.waiting_for_usage for job in made["app"].status.jobs)
+    assert all(not job.waiting_for_usage for job in made["app"].snapshot().jobs)
 
 
 def _run_in_thread(driver, args, done=None):
@@ -212,7 +216,7 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
     running = threading.Barrier(3, timeout=5)
 
     def record_job(job_id, command, mailbox=None):
-        frozen = made["app"].status.snapshot()
+        frozen = made["app"].snapshot()
         seen[job_id] = [j for j in frozen.jobs if j.job_id == job_id][0]
         running.wait()          # hold all three at once: three rows, three items
         return 0, 0.0, 0.01
@@ -223,7 +227,7 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
                           app_name="pytest-parallel-statusline")
 
     app = made["app"]
-    assert [j.job_id for j in app.status.jobs] == [1, 2, 3]
+    assert [j.job_id for j in app.snapshot().jobs] == [1, 2, 3]
     assert sorted(seen) == [1, 2, 3]
     for job_id, job in seen.items():
         assert job.running and job.started_at > 0
@@ -234,8 +238,8 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
     assert len({job.item for job in seen.values()}) == 3
     # And every row is idle again once the run is over.
     assert all(not job.running and job.started_at == 0
-               for job in app.status.jobs)
-    assert app.status.iteration == 3     # the run's own counter, not a job's
+               for job in app.snapshot().jobs)
+    assert app.snapshot().iteration == 3     # the run's own counter, not a job's
 
 
 def test_each_worker_row_learns_the_model_its_own_stream_resolved(tmp_path,
@@ -251,7 +255,8 @@ def test_each_worker_row_learns_the_model_its_own_stream_resolved(tmp_path,
         running.wait()          # both streams in flight before either reports
         sl.observe_claude_event({"type": "result", "modelUsage": {
             f"claude-test-{job_id}": {"contextWindow": 200_000 * job_id}}})
-        frozen = made["app"].status.snapshot()
+        made["app"].painter.drain()     # the painter applies the events
+        frozen = made["app"].snapshot()
         labels[job_id] = [j for j in frozen.jobs
                           if j.job_id == job_id][0].model_label()
         return 0, 0.0, 0.01
@@ -288,9 +293,9 @@ def test_plus_starts_another_worker_and_adds_its_live_surfaces(tmp_path,
         app.handle_event(tio.Key("+"))
         assert entered[2].wait(5), "the + key did not start worker 2"
 
-        assert [job.job_id for job in app.status.jobs] == [1, 2]
+        assert [job.job_id for job in app.snapshot().jobs] == [1, 2]
         assert app.messages.target_ids == (1, 2)
-        assert "worker 2 started" in app.status.note
+        assert "worker 2 started" in app.snapshot().note
 
         release.set()
         assert done.wait(10), "the widened pool did not drain the queue"
@@ -337,7 +342,7 @@ def test_minus_retires_one_worker_after_its_current_file(tmp_path, monkeypatch):
         app = made["app"]
         app.handle_event(tio.Key("-"))
         assert app.messages.target_ids == (1,)
-        assert "worker 2 retiring" in app.status.note
+        assert "worker 2 retiring" in app.snapshot().note
 
         release.set()
         assert done.wait(10), "the narrowed pool did not drain the queue"
@@ -346,7 +351,7 @@ def test_minus_retires_one_worker_after_its_current_file(tmp_path, monkeypatch):
 
     assert result["value"].completed == 4
     assert calls.count(2) == 1
-    assert [job.job_id for job in made["app"].status.jobs] == [1]
+    assert [job.job_id for job in made["app"].snapshot().jobs] == [1]
     assert progress.worker_count(99) == 1
 
 
@@ -360,7 +365,7 @@ def test_minus_keeps_the_last_worker():
 
     action.run_key(app, "-")
 
-    assert "at least one worker" in app.status.note
+    assert "at least one worker" in app.snapshot().note
     assert pool.shrink() == (None, 1)
 
 
@@ -451,7 +456,7 @@ def test_a_dead_worker_leaves_no_row_claiming_to_run(tmp_path, monkeypatch):
                           app_name="pytest-parallel-statusline")
 
     assert [(j.job_id, j.running, j.started_at)
-            for j in made["app"].status.jobs] == [(1, False, 0.0)]
+            for j in made["app"].snapshot().jobs] == [(1, False, 0.0)]
 
 
 def test_the_summary_row_shows_the_run_counters(tmp_path, monkeypatch):
@@ -463,10 +468,10 @@ def test_the_summary_row_shows_the_run_counters(tmp_path, monkeypatch):
                           app_name="pytest-parallel-statusline")
 
     app = made["app"]
-    assert app.status.max_iterations == 2
-    assert app.status.iteration == 2
+    assert app.snapshot().max_iterations == 2
+    assert app.snapshot().iteration == 2
     # The cap is the counter's denominator, so it gets no field of its own.
-    assert not [entry for entry in app.status.script_limits
+    assert not [entry for entry in app.snapshot().script_limits
                 if entry[0] == "max-runs"]
     summary = app.render(width=200)[1]
     assert "iter 2/2" in summary and "2 jobs" in summary
@@ -728,7 +733,7 @@ def test_product_and_promotion_counts_share_the_header_and_exit_record(
     progress = sl.InvocationProgress()
 
     def finish_product(job_id, command, mailbox=None):
-        samples.append(made["app"].status.total_iterations)
+        samples.append(made["app"].snapshot().total_iterations)
         return 0, 0.0, 0.01
 
     class Promotion(Driver):
@@ -772,9 +777,9 @@ def test_product_and_promotion_counts_share_the_header_and_exit_record(
     # RunResult stays local: wrappers subtract it from the product-only cap.
     assert (second.attempted, second.completed) == (11, 11)
     assert min(samples[20:]) >= 22
-    assert made["app"].status.iteration == 31   # completed products, same queue
-    assert made["app"].status.total_iterations == 32
-    assert "total 32" in sl.IterationSegment().text(made["app"].status.snapshot())
+    assert made["app"].snapshot().iteration == 31   # completed products, same queue
+    assert made["app"].snapshot().total_iterations == 32
+    assert "total 32" in sl.IterationSegment().text(made["app"].snapshot())
     assert progress.count_fields() == dict(iterations=32, completed=32)
     exitlog.finish()
     assert "32 iteration(s), 32 completed" in capsys.readouterr().out
@@ -857,8 +862,8 @@ def test_batches_of_one_invocation_share_one_rising_counter(tmp_path, monkeypatc
     def sample_then_finish(job_id, command, mailbox=None):
         # Sampled from inside the work, so a batch is also pinned where it OPENS
         # — before any of its own files have finished.
-        samples.append((made["app"].status.iteration,
-                        made["app"].status.max_iterations))
+        samples.append((made["app"].snapshot().iteration,
+                        made["app"].snapshot().max_iterations))
         return 0, 0.0, 0.01
 
     monkeypatch.setattr(parallel, "run_job", sample_then_finish)
@@ -872,7 +877,7 @@ def test_batches_of_one_invocation_share_one_rising_counter(tmp_path, monkeypatc
         first = len(samples)
         _batch(driver, args, progress)
         opening.append(samples[first])
-        status = made["app"].status
+        status = made["app"].snapshot()
         seen.append((status.iteration, status.max_iterations))
 
     assert seen == [(3, 7), (6, 7), (7, 7)]
@@ -890,18 +895,18 @@ def test_the_denominator_is_the_smaller_of_the_queue_and_the_cap(tmp_path,
     progress = sl.InvocationProgress(max_items=2)
     args = par_args(tmp_path, jobs=2, max=1)     # one file per batch
     _batch(capped, args, progress)
-    first = (made["app"].status.iteration, made["app"].status.max_iterations)
+    first = (made["app"].snapshot().iteration, made["app"].snapshot().max_iterations)
     _batch(capped, args, progress)
-    second = (made["app"].status.iteration, made["app"].status.max_iterations)
+    second = (made["app"].snapshot().iteration, made["app"].snapshot().max_iterations)
 
     # Queue smaller than the cap: the queue is all there is to do.
     short = _MemDriver([f"products/g{i}.md" for i in range(3)])
     roomy = sl.InvocationProgress(max_items=10)
     args = par_args(tmp_path, jobs=2, max=2)
     _batch(short, args, roomy)
-    third = (made["app"].status.iteration, made["app"].status.max_iterations)
+    third = (made["app"].snapshot().iteration, made["app"].snapshot().max_iterations)
     _batch(short, args, roomy)
-    fourth = (made["app"].status.iteration, made["app"].status.max_iterations)
+    fourth = (made["app"].snapshot().iteration, made["app"].snapshot().max_iterations)
 
     assert (first, second) == ((1, 2), (2, 2))
     assert (third, fourth) == ((2, 3), (3, 3))
@@ -925,7 +930,7 @@ def test_job_rows_resume_in_the_next_call_of_the_invocation(tmp_path, monkeypatc
     for _batch_number in (1, 2):
         _batch(driver, args, progress)
         both.reset()
-        status = made["app"].status
+        status = made["app"].snapshot()
         rows.append({job.job_id: job.iteration for job in status.jobs})
         assert status.provider == "codex"
         assert all(job.model == "gpt-5.6-terra" for job in status.jobs)

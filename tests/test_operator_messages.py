@@ -670,7 +670,7 @@ def test_typing_a_note_and_sending_it(tmp_path):
     app.handle_event(tio.Key("\r"))
 
     assert mailbox.take_queued() == ["use the studs"]
-    assert "queued for the next iteration" in app.status.note
+    assert "queued for the next iteration" in app.snapshot().note
     assert app.mode.name == "message" and app.mode.buffer == "", \
         "Enter sends and stays: leaving here would hand the rest of a paste " \
         "to the normal keys"
@@ -765,13 +765,13 @@ def test_an_unbound_key_is_swallowed_rather_than_dispatched(tmp_path):
     """
     app = _app(operator.Mailbox(), stop_file=str(tmp_path / "stop"))
     app.handle_event(tio.Key("m"))
-    hint = app.status.note
+    hint = app.snapshot().note
 
     app.handle_event(tio.Key("pgup"))
     app.handle_event(tio.Key("\x00"))
 
     assert app.mode.name == "message" and app.mode.buffer == ""
-    assert app.status.note == hint
+    assert app.snapshot().note == hint
 
 
 # --- editing the line ----------------------------------------------------------
@@ -949,7 +949,7 @@ def test_an_unknown_fleet_job_does_not_steal_the_note(tmp_path):
     app.handle_event(tio.Key("\r"))
 
     assert app.mode.name == "message-target"
-    assert "job 2 is not available" in app.status.note
+    assert "job 2 is not available" in app.snapshot().note
     assert mailboxes.queued_count == 0
 
 

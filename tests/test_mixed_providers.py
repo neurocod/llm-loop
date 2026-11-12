@@ -114,14 +114,14 @@ def test_state_cycle_dispatches_each_provider_and_preserves_its_session(
         assert provider == "codex"
         assert argv[0] == "codex"
         assert argv.model == ""
-        assert runtime.apps[0].status.provider == provider
+        assert runtime.apps[0].snapshot().provider == provider
         return 0
 
     def claude(argv, raw, partial, **kwargs):
         calls.append("claude")
         assert argv[0] == "claude"
         assert argv[argv.index("--model") + 1] == "opus"
-        assert runtime.apps[0].status.provider == "claude"
+        assert runtime.apps[0].snapshot().provider == "claude"
         return 0
 
     monkeypatch.setattr(cyclecore, "run_agent_streaming", codex)
@@ -131,7 +131,7 @@ def test_state_cycle_dispatches_each_provider_and_preserves_its_session(
 
     def check_model(policy, source, session_start, **kwargs):
         expected = "opus" if source.provider == "claude" else ""
-        assert runtime.apps[0].job(1).model == expected
+        assert runtime.apps[0].job(1).snapshot().model == expected
         return check(policy, source, session_start, **kwargs)
 
     monkeypatch.setattr(Policy, "check_and_wait", check_model)

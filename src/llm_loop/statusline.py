@@ -32,6 +32,7 @@ chain, adding a boolean to `LoopStatus`, or hard-coding a key into the legend.
 """
 
 import atexit
+import collections
 import functools
 import os
 import re
@@ -399,11 +400,13 @@ class Job:
 
     A sequential run is a run with exactly one Job, so no renderer anywhere has a
     "sequential vs parallel" branch — and the parallel runner only has to feed
-    data. Every mutator takes the lock because wave-3 workers update their own
-    Job from N threads while the repaint thread reads them all.
+    data.
 
-    Mutating a Job notifies nobody on purpose: the repaint thread picks the new
-    values up within a tick, so a worker never blocks on the terminal.
+    No lock: a live Job belongs to its `StatusApp` and is mutated only by the
+    state calls `Painter.post_state` runs — on the painter while one runs, else
+    on the caller under the painter's state lock. A runner never holds a live
+    Job: `StatusApp.job` hands it a `JobHandle`, whose methods post these
+    mutators. The renderers read `snapshot()` copies, which the same owner takes.
     """
 
     job_id: int = 1
@@ -423,9 +426,6 @@ class Job:
     # Includes waiting for the fleet's usage lock, before the provider starts.
     waiting_for_usage: bool = False
     progress: str = ""
-
-    def __post_init__(self) -> None:
-        self._lock = threading.Lock()
 
     def model_label(self) -> str:
         """The model as the rows show it: `claude-opus-5-5 · 1M`.
@@ -463,18 +463,17 @@ class Job:
     def start(self, *, item: str = "", model: str = "", prompt: str = "",
               iteration: Optional[int] = None, now: Optional[float] = None) -> None:
         """Claim an iteration: bump the counter and record what is in flight."""
-        with self._lock:
-            self.iteration = (self.iteration + 1) if iteration is None else iteration
-            self.item = item
-            self.model = model or ""
-            self.resolved_model = ""
-            self.context_window = None
-            self.context_tokens = None
-            self.prompt = prompt
-            self.started_at = time.time() if now is None else now
-            self.running = True
-            self.progress = ""
-            self.waiting_for_usage = False
+        self.iteration = (self.iteration + 1) if iteration is None else iteration
+        self.item = item
+        self.model = model or ""
+        self.resolved_model = ""
+        self.context_window = None
+        self.context_tokens = None
+        self.prompt = prompt
+        self.started_at = time.time() if now is None else now
+        self.running = True
+        self.progress = ""
+        self.waiting_for_usage = False
 
     def select(self, model: str) -> None:
         """Name the NEXT step's model while the row is still idle.
@@ -483,11 +482,10 @@ class Job:
         step may not run — another selector, or the same "" on another provider
         — and the quota waits before `start` can hold this row for hours.
         """
-        with self._lock:
-            self.model = model or ""
-            self.resolved_model = ""
-            self.context_window = None
-            self.context_tokens = None
+        self.model = model or ""
+        self.resolved_model = ""
+        self.context_window = None
+        self.context_tokens = None
 
     def finish(self) -> None:
         """Release the iteration and its context; occupancy is not task progress.
@@ -496,58 +494,53 @@ class Job:
         weekly ceiling look like unfinished agents frozen halfway through work.
         The item and prompt remain available for inspecting the previous turn.
         """
-        with self._lock:
-            self.running = False
-            self.progress = ""
-            self.started_at = 0.0
-            self.context_tokens = None
-            self.context_window = None
-            self.waiting_for_usage = False
+        self.running = False
+        self.progress = ""
+        self.started_at = 0.0
+        self.context_tokens = None
+        self.context_window = None
+        self.waiting_for_usage = False
 
     def update(self, **fields) -> None:
-        with self._lock:
-            for name, value in fields.items():
-                setattr(self, name, value)
+        for name, value in fields.items():
+            setattr(self, name, value)
 
     def observe_claude_event(self, ev: dict) -> None:
         """Take main-request occupancy and capacity from Claude's own stream."""
         if not wire.is_root_claude_event(ev):
             return
         reading = wire.claude_context_usage(ev)
-        with self._lock:
-            model = wire.session_model(ev) if wire.is_session_start(ev) else ""
-            if reading is not None:
-                message_model, _tokens = reading
-                # Assistant messages omit the init event's routing suffix.
-                if message_model != self.resolved_model.split("[", 1)[0]:
-                    model = message_model
-            if isinstance(model, str) and model and model != "?":
-                if model != self.resolved_model:
-                    self.resolved_model = model
-                    self.context_tokens = None
-                    self.context_window = None
-            if wire.claude_context_compacting(ev):
+        model = wire.session_model(ev) if wire.is_session_start(ev) else ""
+        if reading is not None:
+            message_model, _tokens = reading
+            # Assistant messages omit the init event's routing suffix.
+            if message_model != self.resolved_model.split("[", 1)[0]:
+                model = message_model
+        if isinstance(model, str) and model and model != "?":
+            if model != self.resolved_model:
+                self.resolved_model = model
                 self.context_tokens = None
-            elif reading is not None:
-                self.context_tokens = reading[1]
-            elif wire.event_type(ev) == wire.RESULT:
-                self.context_window = wire.result_context_window(
-                    ev, self.resolved_model or self.model)
+                self.context_window = None
+        if wire.claude_context_compacting(ev):
+            self.context_tokens = None
+        elif reading is not None:
+            self.context_tokens = reading[1]
+        elif wire.event_type(ev) == wire.RESULT:
+            self.context_window = wire.result_context_window(
+                ev, self.resolved_model or self.model)
 
     def observe_codex_event(self, ev: dict) -> None:
         """Replace context occupancy with the latest root-thread reading."""
         reading = wire.codex_context_usage(ev)
         if reading is not None:
-            with self._lock:
-                self.context_tokens, self.context_window = reading
+            self.context_tokens, self.context_window = reading
 
     def snapshot(self) -> "Job":
         """A detached copy, so one painted row cannot mix two iterations."""
-        with self._lock:
-            return Job(self.job_id, self.running, self.iteration, self.item,
-                       self.model, self.prompt, self.started_at,
-                       self.resolved_model, self.context_window,
-                       self.context_tokens, self.waiting_for_usage, self.progress)
+        return Job(self.job_id, self.running, self.iteration, self.item,
+                   self.model, self.prompt, self.started_at,
+                   self.resolved_model, self.context_window,
+                   self.context_tokens, self.waiting_for_usage, self.progress)
 
 
 # The Job whose row describes the stream THIS thread is reading. Both renderers
@@ -648,6 +641,11 @@ class LoopStatus:
     `quotas` is a list of `QuotaRow` and `script_limits` is [(label, text)] —
     both are lists rather than named fields exactly so a new figure is a new
     entry, not a new attribute plus a renderer edit.
+
+    No lock, for the reason `Job` has none: an app's live LoopStatus is written
+    only by `Painter.post_state` calls, and everybody else reads the copy the
+    owner publishes (`StatusApp.snapshot`). A LoopStatus nobody has handed to an
+    app — a pin's fixture — is its creator's, like any object.
     """
 
     jobs: List[Job] = field(default_factory=lambda: [Job(1)])
@@ -671,14 +669,12 @@ class LoopStatus:
     note: str = ""
 
     def __post_init__(self) -> None:
-        self._lock = threading.Lock()
         if not self.jobs:      # a run ALWAYS has at least one Job to display
             self.jobs = [Job(1)]
 
     def update(self, **fields) -> None:
-        with self._lock:
-            for name, value in fields.items():
-                setattr(self, name, value)
+        for name, value in fields.items():
+            setattr(self, name, value)
 
     def refresh_quota_policy(self, rule) -> None:
         """Redraw an edited ceiling without querying usage on the input thread.
@@ -689,22 +685,20 @@ class LoopStatus:
         from .usage import QUOTA_BY_FIELD, UsageReading
 
         label = QUOTA_BY_FIELD[rule.quota].short
-        with self._lock:
-            self.quotas = [
-                row._replace(policy=_policy_part(
-                    rule, UsageReading(row.percent, row.reset_ts), time.time()))
-                if row.label == label else row for row in self.quotas]
+        self.quotas = [
+            row._replace(policy=_policy_part(
+                rule, UsageReading(row.percent, row.reset_ts), time.time()))
+            if row.label == label else row for row in self.quotas]
 
     def job(self, job_id: int = 1) -> Job:
         """The Job with this id, created on first use (ids are 1-based)."""
-        with self._lock:
-            for job in self.jobs:
-                if job.job_id == job_id:
-                    return job
-            job = Job(job_id)
-            self.jobs.append(job)
-            self.jobs.sort(key=lambda j: j.job_id)
-            return job
+        for job in self.jobs:
+            if job.job_id == job_id:
+                return job
+        job = Job(job_id)
+        self.jobs.append(job)
+        self.jobs.sort(key=lambda j: j.job_id)
+        return job
 
     def elapsed(self, now: Optional[float] = None) -> Optional[float]:
         """Total time since the run's FIRST iteration — the run's cost so far."""
@@ -714,28 +708,27 @@ class LoopStatus:
 
     def mark_run_started(self, now: Optional[float] = None) -> None:
         """Latch the run clock on the first iteration; later calls are no-ops."""
-        with self._lock:
-            if not self.run_started_at:
-                self.run_started_at = time.time() if now is None else now
+        if not self.run_started_at:
+            self.run_started_at = time.time() if now is None else now
 
     def snapshot(self) -> "LoopStatus":
-        with self._lock:
-            copy = LoopStatus(
-                jobs=[j.snapshot() for j in self.jobs],
-                iteration=self.iteration,
-                max_iterations=self.max_iterations,
-                total_iterations=self.total_iterations,
-                random_order=self.random_order,
-                provider=self.provider,
-                run_started_at=self.run_started_at,
-                phase=self.phase,
-                quotas=list(self.quotas),
-                script_limits=list(self.script_limits),
-                stop_pending=self.stop_pending,
-                paused=self.paused,
-                note=self.note,
-            )
-        return copy
+        """A detached copy: what `StatusApp.snapshot` publishes, read-only by
+        agreement since every reader of the published one shares it."""
+        return LoopStatus(
+            jobs=[j.snapshot() for j in self.jobs],
+            iteration=self.iteration,
+            max_iterations=self.max_iterations,
+            total_iterations=self.total_iterations,
+            random_order=self.random_order,
+            provider=self.provider,
+            run_started_at=self.run_started_at,
+            phase=self.phase,
+            quotas=list(self.quotas),
+            script_limits=list(self.script_limits),
+            stop_pending=self.stop_pending,
+            paused=self.paused,
+            note=self.note,
+        )
 
 
 class _InvocationCounts:
@@ -1987,7 +1980,7 @@ class WeeklyLimitMode(Mode):
                 self.app.note("enter a weekly limit from 0 to 100")
             else:
                 self.rule.limit = float(self.editor.value)
-                self.app.status.refresh_quota_policy(self.rule)
+                self.app.refresh_quota_policy(self.rule)
                 self.app.note("weekly limit disabled (N/A)" if self.rule.limit in (0, 100)
                               else f"weekly limit set to {self.rule.limit:.0f}%")
                 self.app.pop_mode(discard_pending=True)
@@ -2379,13 +2372,18 @@ class Painter:
         the last `close()` released is not re-pinned before the next `open()`
         (`_REGION_CLOSED`): a frame, a resize and the idle hook all ask;
       * a key the reader cannot post is dropped and counted, never waited for
-        (`post_key`), and the count is named once the painter is back.
+        (`post_key`), and the count is named once the painter is back;
+      * the app's DATA is the terminal owner's too: a change to it is a state
+        call (`post_state`) run by the owner before anything it paints reads
+        the data, and the readers on other threads get the copy `published`
+        took after the last batch (`StatusApp.snapshot`).
 
     WHAT is painted is the app's, handed in as callables and only ever called
     by the terminal's owner: `render(width)` the rows as plain text, `title()`
     the window title, `row_count()` how many rows the region needs,
-    `tick(count)` the app's checks that ride on the periodic frame, and
-    `note(text)` where a report of dropped keys goes.
+    `tick(count)` the app's checks that ride on the periodic frame,
+    `note(text)` where a report of dropped keys goes, and `published()` the
+    app's copy of its data for readers, taken after state calls ran.
     """
 
     def __init__(self, terminal: termio.Terminal, *,
@@ -2394,6 +2392,7 @@ class Painter:
                  row_count: Callable[[], int],
                  tick: Callable[[int], None],
                  note: Callable[[str], None],
+                 published: Callable[[], None] = lambda: None,
                  refresh: float = REFRESH_SECONDS):
         # Swapped for a NullTerminal by `disable`, for good (read: `terminal`).
         self._terminal = terminal
@@ -2403,6 +2402,23 @@ class Painter:
         self._row_count = row_count
         self._app_tick = tick
         self._note = note
+        self._published = published
+        # State calls posted and not yet run (see `post_state`). A deque of its
+        # own rather than the owner's queue: that one is bounded, and a state
+        # call refused for room would be a change lost — a row left saying
+        # "running" for the rest of the run — where a refused frame request
+        # costs nothing the next frame does not repaint.
+        self._state_calls: collections.deque = collections.deque()
+        # Orders whoever runs the state calls. While a painter runs that is the
+        # painter alone and the lock is never contended; it is there for the
+        # stretches with no painter — before `open()`, after `close()`, and a
+        # whole run with the status line off, whose workers each run their own
+        # posts on their own thread — and for the hand-over between the two.
+        # Held only across the state calls and `published`: no wait, no
+        # terminal write. Re-entrant for a state call that reads `snapshot`
+        # (`_applying` then answers it with the copy published so far).
+        self._state_lock = threading.RLock()
+        self._applying = False      # (state lock) a batch is running
         self._owner = ownership.OwnerThread(
             PAINTER_THREAD_NAME, maxsize=PAINTER_QUEUE_MAXSIZE,
             idle=self._on_idle)
@@ -2587,6 +2603,66 @@ class Painter:
             # Queue full: the periodic frame draws this state instead.
             self._frame_posted = False
 
+    def post_state(self, call: Callable, *args, frame: bool = True) -> None:
+        """`call(*args)` changes the app's data: run it on the data's owner and
+        ask for a frame of the result — never waiting for the painter.
+
+        The data has the terminal's owner: on the painter itself, and with no
+        painter running, the call runs here and now (`apply_state`); from any
+        other thread it is queued and the frame request it rides (`request_frame`)
+        runs it on the painter, ahead of the frame. Queued calls keep the order
+        they were posted in, from every thread. A call is never dropped: one
+        whose frame request found the queue full runs on the painter's next
+        idle pass or frame, whichever comes first (`_on_idle`, `_draw`), or
+        at the next `apply_state` once the painter has handed back.
+
+        A failing call costs that call only (it is recorded, not raised): the
+        caller is a run that asked for a cosmetic change and has already gone on.
+
+        `frame=False` asks for no frame, for a caller whose next step draws one
+        anyway: `StatusApp.start`, whose change would otherwise be painted on
+        the caller just before the painter's first frame paints it again.
+        """
+        self._state_calls.append((call, args))
+        self.apply_state()          # here only on the owner, or with none
+        if frame:
+            self.request_frame()
+
+    def apply_state(self) -> bool:
+        """Run the state calls queued so far, then `published`, if this thread
+        is the data's owner — the painter, or any caller while there is none.
+        False, with nothing run, on any other thread: the painter runs them.
+
+        A caller with no painter takes the state lock for the batch, so callers
+        racing here (a parallel run with the status line off) run the calls one
+        at a time and in the order they were posted.
+        """
+        thread = self._owner.thread
+        if thread is not None and thread is not threading.current_thread():
+            return False
+        with self._state_lock:
+            # Asked again from inside a state call (one that reads `snapshot`):
+            # the batch already running is this thread's, and it runs the
+            # rest in order once that call returns.
+            if self._applying or not self._state_calls:
+                return True
+            self._applying = True
+            try:
+                while self._state_calls:
+                    call, args = self._state_calls.popleft()
+                    try:
+                        call(*args)
+                    except Exception as exc:
+                        diaglog.record("Painter state call raised",
+                                       _call_name(call), exc=exc)
+                try:
+                    self._published()
+                except Exception as exc:
+                    diaglog.record("Painter publish raised", exc=exc)
+            finally:
+                self._applying = False
+        return True
+
     # --- the terminal's owner only (the painter, or the caller with none) --
 
     # The public three check the caller (`_check_owner`); the painter's own
@@ -2657,9 +2733,11 @@ class Painter:
     # --- frames --------------------------------------------------------------
 
     def _take_frame_request(self) -> None:
-        """A posted frame request, or with no painter the frame itself."""
+        """A posted frame request, or with no painter the frame itself. The
+        state calls queued before it run first (see `post_state`)."""
         self._frame_posted = False
         if self._owner.owns_current_thread:
+            self.apply_state()
             self._schedule_frame()
         else:
             self._draw()
@@ -2673,7 +2751,9 @@ class Painter:
     def _draw(self, *, reassert: bool = False) -> None:
         """One frame: the title, then the rows. On the painter, or on the
         caller when there is none (see `request_frame`). None once the region
-        is closed (see `_REGION_CLOSED`)."""
+        is closed (see `_REGION_CLOSED`). The state calls still queued run
+        first, a closed region included: the data outlives the region."""
+        self.apply_state()
         self._frame_due = None
         if self._region == _REGION_CLOSED:
             return
@@ -2776,7 +2856,13 @@ class Painter:
         next. Nothing outside an open region (see `_REGION_OPEN`): a
         reopened painter's first idle pass, before `_open_region` has run,
         must not tick — and re-pin — the region the last close released.
+
+        State calls a full queue kept their frame request from (`post_state`)
+        run here, once the queue has drained, rather than a `refresh` later.
         """
+        if self._state_calls:
+            self.apply_state()
+            self._schedule_frame()
         if self._region != _REGION_OPEN:
             return None
         try:
@@ -2796,6 +2882,9 @@ class Painter:
 
     def _tick(self) -> None:
         """(painter) The periodic frame and the checks that ride on it."""
+        # The app's checks read the data: state calls a full queue left
+        # behind (see `post_state`) run before them, not only before the frame.
+        self.apply_state()
         self._ticks += 1
         size = self.terminal.size()
         if size != self._last_size:
@@ -2899,6 +2988,77 @@ def _stderr_writer(line: str) -> Callable[[], None]:
     return write
 
 
+class JobHandle:
+    """What `StatusApp.job` hands a runner instead of the live `Job`: the
+    row's mutators, each one a state call (`Painter.post_state`), so a worker
+    never waits for the terminal and never writes the data itself.
+
+    The row is the Job the FIRST of the handle's calls finds or creates — on
+    the data's owner, and in the order of everybody's posts, so it is the
+    row `app.job(k)` named when it was asked. Kept for the handle's later
+    calls rather than looked up again: a row a narrower worker pool has since
+    taken off the display (`update(jobs=...)`) takes the retiring worker's
+    last `finish` without coming back.
+
+    Times are read on the caller, when the call is made: the painter may run
+    it a frame later, and `start`'s clock is the row's iteration timer.
+    """
+
+    def __init__(self, app: "StatusApp", job_id: int):
+        self.job_id = job_id
+        self._app = app
+        self._job: Optional[Job] = None     # (state calls) the resolved row
+        app.painter.post_state(self._resolve)
+
+    def _resolve(self) -> Job:
+        """(state call) The row, found or created by the handle's first call."""
+        if self._job is None:
+            self._job = self._app._status.job(self.job_id)
+        return self._job
+
+    def _call(self, method: str, *args, **kwargs) -> None:
+        """(state call) One of the row's own mutators."""
+        getattr(self._resolve(), method)(*args, **kwargs)
+
+    def _post(self, method: str, *args, **kwargs) -> None:
+        self._app.painter.post_state(
+            functools.partial(self._call, method, *args, **kwargs))
+
+    def start(self, *, item: str = "", model: str = "", prompt: str = "",
+              iteration: Optional[int] = None, now: Optional[float] = None) -> None:
+        """`Job.start`, posted."""
+        self._post("start", item=item, model=model, prompt=prompt,
+                   iteration=iteration, now=time.time() if now is None else now)
+
+    def select(self, model: str) -> None:
+        """`Job.select`, posted."""
+        self._post("select", model)
+
+    def finish(self) -> None:
+        """`Job.finish`, posted."""
+        self._post("finish")
+
+    def update(self, **fields) -> None:
+        """`Job.update`, posted."""
+        self._post("update", **fields)
+
+    def observe_claude_event(self, ev: dict) -> None:
+        """`Job.observe_claude_event`, posted."""
+        self._post("observe_claude_event", ev)
+
+    def observe_codex_event(self, ev: dict) -> None:
+        """`Job.observe_codex_event`, posted."""
+        self._post("observe_codex_event", ev)
+
+    def snapshot(self) -> Optional[Job]:
+        """This id's row in the published copy (`StatusApp.snapshot`), or None
+        while it has none."""
+        for job in self._app.snapshot().jobs:
+            if job.job_id == self.job_id:
+                return job
+        return None
+
+
 class StatusApp:
     """Owns the Layout, the input, the Mode stack, the Actions, the
     LoopStatus and the `Painter` — which owns the Terminal and the repaint
@@ -2910,9 +3070,17 @@ class StatusApp:
     editor for them would take the registry here again.
 
     Public surface the loops use: start()/stop() (or `with`), update(**fields),
-    note(text), register_action(a), job(job_id). `painter` is exposed for the
-    pins that watch its protocol. Everything else is an internal detail that a
-    later wave extends by registering something.
+    note(text), register_action(a), job(job_id), snapshot(). `painter` is
+    exposed for the pins that watch its protocol. Everything else is an
+    internal detail that a later wave extends by registering something.
+
+    The LoopStatus is the painter's, like the terminal: every change to it is a
+    state call (`Painter.post_state`) — `update`, `note`, a `JobHandle`'s
+    methods, the stop and pause keys, the sentinel poll — and every reader,
+    the renderers included, reads the copy published after the last batch
+    (`snapshot`). Two things are read without waiting for the painter, and
+    both are named where they are served: `stop_requested_here` (a flag only
+    state calls write) and `paused` (a field of that copy).
     """
 
     def __init__(self, *, status: Optional[LoopStatus] = None,
@@ -2924,7 +3092,12 @@ class StatusApp:
                  stop_file: Optional[str] = None,
                  default_actions: bool = True,
                  flag_aliases: Optional[Dict[str, cmdline.Flag]] = None):
-        self.status = status or LoopStatus()
+        # The live data: touched only by state calls and the publication
+        # (see `Painter.post_state`), so only under the painter's state lock.
+        self._status = status or LoopStatus()
+        # The copy every reader gets (`snapshot`), replaced after each batch of
+        # state calls and never changed in place.
+        self._snapshot = self._status.snapshot()
         # What the restart command is rewritten with (`HelpAction`): the
         # engine's rows plus the host's recorded flags (`clispec.flag_aliases`).
         self.flag_aliases = (cmdline.FLAG_ALIASES if flag_aliases is None
@@ -2943,10 +3116,11 @@ class StatusApp:
             terminal if terminal is not None
             else termio.terminal_for(enabled=enabled),
             render=lambda width: self.render(width),
-            title=lambda: title_text(self.status),
+            title=lambda: title_text(self.snapshot()),
             row_count=lambda: len(self.rows()),
             tick=lambda count: self._tick(count),
             note=lambda text: self.note(text),
+            published=self._publish,
             refresh=refresh)
         self.layout = layout or Layout(self.legend_entries)
         self.actions: List[Action] = []
@@ -2965,21 +3139,14 @@ class StatusApp:
         self._note_stamp: Tuple[str, float] = ("", 0.0)
         self._started = False
         self._services: List[object] = []
-        self._requested_stop = False      # has `s` been pressed here? (see below)
-        # Guards the request flag against the sentinel poll: the key press, the
-        # cancel and the repaint's re-sync all move the pair together.
-        self._stop_lock = threading.Lock()
+        # Has `s` been pressed here? Written only by `_set_stop_request`, a
+        # state call, together with the `stop_pending` it implies; the sentinel
+        # poll (`_tick`) re-derives that field from the flag on the same thread,
+        # so the pair needs no lock of its own. Read by the runners from any
+        # thread (`stop_requested_here`): a bool read is atomic.
+        self._requested_stop = False
         self._atexit_registered = False
         self._signal_handlers: List[Tuple[int, object]] = []
-        # The `p` key's flag: what the RUNNERS read (through
-        # stopchannel.pause_requested), while the row reads `status.paused`. Two
-        # spellings of one fact, moved together by request_pause/resume, and
-        # under no lock unlike `_requested_stop`: nothing else writes either of
-        # them, a bool read is atomic, and a reader one poll interval behind
-        # simply holds a quarter-second longer. The lock on the stop flag is
-        # there for a different reason — the sentinel poll re-derives
-        # `stop_pending` from the file and the flag TOGETHER.
-        self._paused = False
         if default_actions:
             self.register_action(StopAction())
             self.register_action(PauseAction())
@@ -3017,8 +3184,8 @@ class StatusApp:
             return self
         self._started = True
         try:
-            with self._stop_lock:
-                self.status.update(stop_pending=self._sentinel_pending())
+            # No frame: the painter's first one (`open`) paints it.
+            self.painter.post_state(self._sync_stop_pending, frame=False)
             if isinstance(self.terminal, termio.NullTerminal):
                 return self   # disabled: no region to pin, no keys to read
             # Before the region is asked for, so a signal from here on finds
@@ -3182,16 +3349,33 @@ class StatusApp:
 
     # --- state -------------------------------------------------------------
 
+    def snapshot(self) -> LoopStatus:
+        """The data as of the last batch of state calls, as a detached copy.
+
+        The one way to read it, renderers included. Shared by every reader and
+        replaced, never changed, by the next batch: treat it as read-only. With
+        no painter running the calls still queued run first, here (see
+        `Painter.apply_state`), so a caller reads its own changes at once.
+        While a painter runs, a change posted from another thread shows up once
+        the painter has run it — a pin that reads straight after one drains the
+        painter first (`painter.drain()`).
+        """
+        self.painter.apply_state()
+        return self._snapshot
+
+    def _publish(self) -> None:
+        """(state lock) Replace the copy readers get; `Painter`'s `published`."""
+        self._snapshot = self._status.snapshot()
+
     def update(self, **fields) -> None:
-        self.status.update(**fields)
-        self.painter.request_frame()
+        self.painter.post_state(functools.partial(self._status.update, **fields))
 
     def note(self, text: str) -> None:
         """Show `text` on the note row until NOTE_TTL passes or another note
-        replaces it. The text is state and set at once; WHEN it was set is the
-        painter's, which is the thread that expires it. Never waits for the
-        painter: a stamp that finds its queue full is left to `_tick`, which
-        starts the clock of a note it holds no stamp for."""
+        replaces it. The text is a state call like any change; WHEN it was set
+        is the painter's, which is the thread that expires it. Never waits for
+        the painter: a stamp that finds its queue full is left to `_tick`,
+        which starts the clock of a note it holds no stamp for."""
         stamp = (text, time.time())
         self.update(note=text)
         self.painter.try_post(self._stamp_note, stamp)
@@ -3199,13 +3383,19 @@ class StatusApp:
     def _stamp_note(self, stamp: Tuple[str, float]) -> None:
         self._note_stamp = stamp
 
-    def job(self, job_id: int = 1) -> Job:
-        """The Job with this id (created on first use). Wave 3 hands one per
-        worker; the sequential loop uses job 1."""
-        return self.status.job(job_id)
+    def job(self, job_id: int = 1) -> "JobHandle":
+        """A handle on the row with this id (created on first use). Wave 3
+        hands one per worker; the sequential loop uses job 1. See `JobHandle`."""
+        return JobHandle(self, job_id)
 
     def mark_run_started(self, now: Optional[float] = None) -> None:
-        self.status.mark_run_started(now)
+        # The clock is read here, not when the painter runs the call.
+        self.painter.post_state(self._status.mark_run_started,
+                                time.time() if now is None else now)
+
+    def refresh_quota_policy(self, rule) -> None:
+        """Redraw an edited ceiling (`LoopStatus.refresh_quota_policy`)."""
+        self.painter.post_state(self._status.refresh_quota_policy, rule)
 
     @property
     def stop_file(self) -> str:
@@ -3226,6 +3416,11 @@ class StatusApp:
         than off `enabled`: a stop file written by somebody else (a script's
         `touch stop`, another run) must halt this run as promptly as it always
         did — nobody is sitting at this terminal waiting to press `s` again.
+
+        Read on the runners' threads without waiting for the painter: the key
+        is applied ON the painter, where `request_stop` runs its state call at
+        once, so the flag is up before the key's frame is drawn. A request from
+        another thread while a painter runs is up once the painter has run it.
         """
         return self._requested_stop
 
@@ -3233,19 +3428,29 @@ class StatusApp:
         """Ask this run to stop. Sets the flag only — no file is written, so a
         cancel before the loop notices leaves no trace, an abrupt kill leaves no
         sentinel to clean up, and the loop next door keeps running."""
-        with self._stop_lock:
-            self._requested_stop = True
-            self.status.update(stop_pending=stopchannel.StopSource.KEY.value)
+        self.painter.post_state(self._set_stop_request, True)
         self.note("stop requested — this run halts at the next iteration "
                   "boundary (other runs are unaffected)")
 
     def cancel_stop(self) -> None:
         """Withdraw this run's own request. A stop file is left alone: it is not
         ours to remove, and the run stays pending on it."""
-        with self._stop_lock:
-            self._requested_stop = False
-            self.status.update(stop_pending=self._sentinel_pending())
+        self.painter.post_state(self._set_stop_request, False)
         self.note("stop request cancelled")
+
+    def _set_stop_request(self, asked: bool) -> None:
+        """(state call) The key's flag, and the row's `stop_pending` with it."""
+        self._requested_stop = asked
+        self._sync_stop_pending()
+
+    def _sync_stop_pending(self) -> None:
+        """(state call) `stop_pending` from the key's flag, else the sentinel.
+
+        The key's request is this process's own and outlives whatever anyone
+        does to the file, so the file is asked only while the key is down."""
+        self._status.stop_pending = (stopchannel.StopSource.KEY.value
+                                     if self._requested_stop
+                                     else self._sentinel_pending())
 
     @property
     def paused(self) -> bool:
@@ -3255,24 +3460,26 @@ class StatusApp:
         raised mid-iteration, and that iteration still finishes. What it
         promises is that no new one starts while it is up — see
         `stopchannel.wait_while_paused`, which is where both runners honour it.
+
+        Read off the published copy (`snapshot`), the row's own field, so the
+        runners and the row cannot disagree: the key's state call runs on the
+        painter at once and publishes before the key's frame is drawn.
         """
-        return self._paused
+        return self.snapshot().paused
 
     def request_pause(self) -> None:
         """Hold this run at the next iteration boundary."""
-        self._paused = True
         self.update(paused=True)
         self.note("paused — the iteration in flight finishes, then the loop "
                   "holds (p resumes, s stops, m queues a note)")
 
     def resume(self) -> None:
         """Let a held run go again."""
-        self._paused = False
         self.update(paused=False)
         self.note("resumed")
 
     def _sentinel_pending(self) -> str:
-        """The stop-file half of `stop_pending` (call under `_stop_lock`)."""
+        """The stop-file half of `stop_pending`."""
         try:
             return (stopchannel.StopSource.FILE.value
                     if os.path.exists(self.stop_file) else "")
@@ -3370,7 +3577,7 @@ class StatusApp:
     # --- rendering ---------------------------------------------------------
 
     def rows(self) -> List[Row]:
-        snapshot = self.status.snapshot()
+        snapshot = self.snapshot()
         return self.layout.rows(snapshot) + self.mode.rows(snapshot)
 
     def render(self, width: Optional[int] = None,
@@ -3378,35 +3585,37 @@ class StatusApp:
         """The pinned rows as plain text (no escapes) — what the tests read."""
         if width is None:
             width = self.terminal.size()[0] or 100
-        snapshot = self.status.snapshot()
+        snapshot = self.snapshot()
         rows = self.layout.rows(snapshot) + self.mode.rows(snapshot)
         return [row.render(snapshot, width, now) for row in rows]
 
     def _tick(self, count: int) -> None:
         """(painter) The app's checks that ride on the periodic frame
         (`Painter._tick`, which passes its `count` since the region opened):
-        the note's expiry, and every fourth tick the stop sentinel."""
+        the note's expiry, and every fourth tick the stop sentinel. Their
+        changes are state calls, which on the painter run at once."""
         note, noted_at = self._note_stamp
-        shown = self.status.note
+        shown = self.snapshot().note
         if shown and shown != note:
             # A note whose stamp found the queue full (see `note`): its clock
             # starts now. One whose stamp is merely still queued gets it next.
             note, noted_at = self._note_stamp = (shown, time.time())
         if note and time.time() - noted_at > NOTE_TTL:
             self._note_stamp = ("", 0.0)
-            # Only the note that was stamped: a newer one set since has its own
-            # stamp on the way.
-            if self.status.note == note:
-                self.status.update(note="")
+            self.painter.post_state(self._expire_note, note)
         if count % 4 == 0:
             # Catches a sentinel created by hand (`touch stop`) or by a
             # neighbouring run. It never touches `_requested_stop`: the key's
             # request is this process's own and outlives whatever anyone does
-            # to the file. Under the same lock as the key press so the flag
-            # and the row cannot disagree.
-            with self._stop_lock:
-                pending = (stopchannel.StopSource.KEY.value
-                           if self._requested_stop
-                           else self._sentinel_pending())
-                if pending != self.status.stop_pending:
-                    self.status.update(stop_pending=pending)
+            # to the file (`_sync_stop_pending`). Asked first, so an unchanged
+            # answer publishes nothing.
+            pending = (stopchannel.StopSource.KEY.value if self._requested_stop
+                       else self._sentinel_pending())
+            if pending != self.snapshot().stop_pending:
+                self.painter.post_state(self._sync_stop_pending)
+
+    def _expire_note(self, note: str) -> None:
+        """(state call) Clear the note row — if it still shows `note`: a newer
+        note set since has its own stamp on the way."""
+        if self._status.note == note:
+            self._status.note = ""

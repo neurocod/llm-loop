@@ -64,8 +64,8 @@ def test_open_cancel_apply_and_reopen_edit_the_real_gate(enter):
     assert isinstance(app.mode, sl.NormalMode)
     assert len(app.modes) == 1
     assert not any(row.startswith(sl.WeeklyLimitRow.prefix) for row in app.render(120))
-    assert "99%" in app.status.quotas[0].policy
-    assert app.status.quotas[0].percent == 98
+    assert "99%" in app.snapshot().quotas[0].policy
+    assert app.snapshot().quotas[0].percent == 98
     usage = Usage(UsageReading(0, None), UsageReading(98, None),
                   UsageReading(None, None), [])
     assert not policy._violations(policy._status(usage, 0))
@@ -83,7 +83,7 @@ def test_invalid_submission_stays_in_editor_without_changing_limit(text):
     press(app, "w", "\x15", *text, "\r")
     assert isinstance(app.mode, sl.WeeklyLimitMode)
     assert rule.limit == 98
-    assert "0 to 100" in app.status.note
+    assert "0 to 100" in app.snapshot().note
 
 
 @pytest.mark.parametrize("unlimited", ["0", "100"])
@@ -94,9 +94,9 @@ def test_zero_disables_weekly_limit_and_can_be_reenabled(unlimited):
     app.update(quotas=[sl.QuotaRow("week", 100, None, "ceil 98%")])
     press(app, "w", "\x15", *unlimited, "\r")
     assert isinstance(app.mode, sl.NormalMode)
-    assert app.status.quotas[0].policy == "ceil N/A"
-    assert app.status.quotas[0].percent == 100
-    assert "N/A" in app.status.note
+    assert app.snapshot().quotas[0].policy == "ceil N/A"
+    assert app.snapshot().quotas[0].percent == 100
+    assert "N/A" in app.snapshot().note
     usage = Usage(UsageReading(0, None), UsageReading(100, None),
                   UsageReading(None, None), [])
     assert not policy._violations(policy._status(usage, 0))
@@ -105,7 +105,7 @@ def test_zero_disables_weekly_limit_and_can_be_reenabled(unlimited):
     press(app, "w")
     assert app.mode.editor.buffer == unlimited
     press(app, "\x15", "9", "8", "\r")
-    assert app.status.quotas[0].policy == "ceil 98%"
+    assert app.snapshot().quotas[0].policy == "ceil 98%"
     assert [rule for rule, _, _ in policy._violations(policy._status(usage, 0))] == [weekly]
 
 
