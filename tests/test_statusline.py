@@ -1336,38 +1336,66 @@ def test_a_resize_the_region_cannot_satisfy_stops_painting(monkeypatch):
 # --- concurrent writers (the net under wave 3's N workers) ---------------------
 
 
-def test_concurrent_job_updates_never_tear_a_snapshot():
-    status = sl.LoopStatus(jobs=[sl.Job(i) for i in range(1, 5)])
-    stop = threading.Event()
+def test_concurrent_job_updates_never_tear_a_snapshot(monkeypatch):
+    """Four workers churn their rows through `app.job(k)` handles of a RUNNING
+    app while the main thread reads `app.snapshot()`: a published row is ONE
+    iteration, never half of two.
+
+    The Jobs have no lock, so this holds only because every write is a state
+    call the painter runs between publications. A write made on the worker
+    tears a copy only when the GIL switches mid-copy — rare enough that the
+    row checks alone pass with such a write in place (CI caught one tear in
+    run 43208408766) — so the mutators' thread is what pins the bypass."""
+    writers = set()
+
+    def spied(real):
+        def spy(self, *args, **kwargs):
+            writers.add(threading.current_thread().name)
+            return real(self, *args, **kwargs)
+        return spy
+
+    monkeypatch.setattr(sl.Job, "start", spied(sl.Job.start))
+    monkeypatch.setattr(sl.Job, "finish", spied(sl.Job.finish))
+    app = sl.StatusApp(
+        status=sl.LoopStatus(jobs=[sl.Job(i) for i in range(1, 5)]),
+        terminal=LiveTerminal(), input_source=tio.NullInputSource(), refresh=60)
+    cycles = 2000
     errors = []
 
-    def churn(job):
+    def churn(job_id):
         try:
-            while not stop.is_set():
-                job.start(item=f"item-{job.job_id}.md", model="opus")
+            job = app.job(job_id)
+            for _ in range(cycles):
+                job.start(item=f"item-{job_id}.md", model="opus")
                 job.finish()
         except Exception as exc:              # noqa: BLE001 - reported below
             errors.append(exc)
 
-    threads = [threading.Thread(target=churn, args=(job,), daemon=True)
-               for job in status.jobs]
-    for thread in threads:
-        thread.start()
-    try:
-        for _ in range(300):
-            frozen = status.snapshot()
-            assert [j.job_id for j in frozen.jobs] == [1, 2, 3, 4]
-            for job in frozen.jobs:
-                # A painted row is ONE iteration, never half of two.
-                assert (job.started_at > 0) is job.running
-                assert job.item in ("", f"item-{job.job_id}.md")
-            sl.render_rows(status, 120)
-    finally:
-        stop.set()
+    with app:
+        threads = [threading.Thread(target=churn, args=(k,), daemon=True)
+                   for k in range(1, 5)]
         for thread in threads:
-            thread.join(timeout=2)
+            thread.start()
+        try:
+            while any(thread.is_alive() for thread in threads):
+                frozen = app.snapshot()
+                assert [j.job_id for j in frozen.jobs] == [1, 2, 3, 4]
+                for job in frozen.jobs:
+                    assert (job.started_at > 0) is job.running, job
+                    assert job.item in ("", f"item-{job.job_id}.md"), job
+                sl.render_rows(frozen, 120)
+        finally:
+            for thread in threads:
+                thread.join(timeout=10)
+        # The whole test: 0.06 s and 0.5 s, measured 2026-11-12.
+        assert app.painter.drain(10)
+        final = app.snapshot()
 
     assert not errors
+    assert writers == {sl.PAINTER_THREAD_NAME}, writers
+    # A painter batch may hold a start AND its finish, so no published copy
+    # is owed a running row; the final one is owed every posted iteration.
+    assert [(j.running, j.iteration) for j in final.jobs] == [(False, cycles)] * 4
 
 
 # --- the loop's wiring: live caps, primed quotas, no forced polls ---------------
