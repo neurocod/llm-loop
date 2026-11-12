@@ -216,6 +216,7 @@ def test_a_job_row_per_worker_carries_its_item_and_model(tmp_path, monkeypatch):
     running = threading.Barrier(3, timeout=5)
 
     def record_job(job_id, command, mailbox=None):
+        made["app"].painter.drain()     # the worker's own posts, applied
         frozen = made["app"].snapshot()
         seen[job_id] = [j for j in frozen.jobs if j.job_id == job_id][0]
         running.wait()          # hold all three at once: three rows, three items
@@ -733,6 +734,9 @@ def test_product_and_promotion_counts_share_the_header_and_exit_record(
     progress = sl.InvocationProgress()
 
     def finish_product(job_id, command, mailbox=None):
+        # A read on a worker sees the job start it posted only once the painter
+        # has run it (`StatusApp.snapshot`); a slow painter left it at 21.
+        made["app"].painter.drain()
         samples.append(made["app"].snapshot().total_iterations)
         return 0, 0.0, 0.01
 
