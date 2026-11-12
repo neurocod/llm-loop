@@ -23,7 +23,10 @@ jobs:
         # resolve to those older patch releases rather than failing (manifest
         # checked 2026-11-08). No x86 macos-13 fallback: that runner image is
         # being retired, and the floor is still tested on an old patch.
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Ubuntu is pinned to 24.04: ubuntu-latest moved to 26.04, for which
+        # actions/python-versions publishes no 3.9 at all, so setup-python
+        # failed before any test ran (run 43212713099, 2026-11-12).
+        os: [ubuntu-24.04, windows-latest, macos-latest]
         # The floor declared in pyproject (requires-python = ">=3.9"). Listing
         # it here is what turns that declaration into a tested claim rather
         # than a hopeful one.
