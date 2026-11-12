@@ -568,23 +568,15 @@ _CLAUDE_MODEL_STREAM = "".join(json.dumps(ev) + "\n" for ev in [
 ])
 
 
-def _row(model: str) -> "statusline.JobHandle":
-    """The handle the runners bind, on a disabled app: with no painter its
-    posts run at once, so `snapshot()` reads each event's effect."""
-    job = statusline.StatusApp(enabled=False).job(1)
-    job.update(model=model)
-    return job
-
-
 @pytest.mark.parametrize("runner", ["sequential", "parallel"])
 def test_both_renderers_tell_the_bound_job_what_the_cli_runs(
-        monkeypatch, no_live_messages, capsys, runner):
+        monkeypatch, no_live_messages, capsys, status_row, runner):
     """The init and result events reach the row the caller bound — through the
     real stream loop of each runner, not a stub of it."""
     def fake_start(*args):
         return _FakeAgentProcess(has_stdin=False, stdout=_CLAUDE_MODEL_STREAM)
 
-    job = _row("opus")
+    job = status_row("opus")
     with statusline.describing(job):
         if runner == "sequential":
             monkeypatch.setattr(streamrender, "start_agent_process", fake_start)
@@ -598,8 +590,9 @@ def test_both_renderers_tell_the_bound_job_what_the_cli_runs(
 
 
 @pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
-def test_claude_context_reaches_status_while_streaming(monkeypatch, runner):
-    job = _row("opus")
+def test_claude_context_reaches_status_while_streaming(monkeypatch, status_row,
+                                                       runner):
+    job = status_row("opus")
 
     def source():
         yield json.dumps({"type": "stream_event", "event": {
@@ -624,9 +617,10 @@ def test_claude_context_reaches_status_while_streaming(monkeypatch, runner):
 
 
 @pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
-def test_codex_context_reaches_status_before_turn_ends(monkeypatch, runner):
+def test_codex_context_reaches_status_before_turn_ends(monkeypatch, status_row,
+                                                      runner):
     """Exercise app-server normalization and both real stream readers."""
-    job = _row("gpt-test")
+    job = status_row("gpt-test")
 
     def usage(tokens, thread="root", turn="turn"):
         return json.dumps({"method": "thread/tokenUsage/updated", "params": {
@@ -725,8 +719,8 @@ class _Lockstep(appserver.Connection):
     ("1234", None, ""),
     (True, None, ""),
 ])
-def test_codex_context_unknowns_and_reset(tokens, window, expected):
-    job = _row("gpt-test")
+def test_codex_context_unknowns_and_reset(status_row, tokens, window, expected):
+    job = status_row("gpt-test")
     event = {"type": "thread.token_usage.updated", "tokenUsage": {
         "last": {"totalTokens": tokens}, "modelContextWindow": window}}
     job.observe_codex_event(event)
@@ -740,8 +734,8 @@ def test_codex_context_unknowns_and_reset(tokens, window, expected):
     assert job.snapshot().context_label() == ""
 
 
-def test_exec_cumulative_usage_is_not_displayed_as_context():
-    job = _row("gpt-test")
+def test_exec_cumulative_usage_is_not_displayed_as_context(status_row):
+    job = status_row("gpt-test")
     job.observe_codex_event({"type": "turn.completed", "usage": {
         "input_tokens": 9_000_000, "output_tokens": 1234}})
     assert job.snapshot().model_label() == "gpt-test"

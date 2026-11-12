@@ -2,7 +2,7 @@
 
 import pytest
 
-from llm_loop import statusline as sl, wire
+from llm_loop import wire
 
 
 MODEL = "claude-opus-5-5"
@@ -24,24 +24,16 @@ def capacity():
                                   "contextWindow": 1_000_000}}}
 
 
-def row(model=""):
-    """The handle the runners bind, on a disabled app: with no painter its
-    posts run at once, so `snapshot()` reads each event's effect."""
-    job = sl.StatusApp(enabled=False).job(1)
-    job.update(model=model)
-    return job
-
-
-def job_with_usage():
-    job = row(model="opus")
+def job_with_usage(status_row):
+    job = status_row("opus")
     job.observe_claude_event({"type": "system", "subtype": "init",
                               "model": MODEL + "[1m]"})
     job.observe_claude_event(request())
     return job
 
 
-def test_live_tokens_then_reported_capacity_and_duplicate_snapshots():
-    job = job_with_usage()
+def test_live_tokens_then_reported_capacity_and_duplicate_snapshots(status_row):
+    job = job_with_usage(status_row)
     assert job.snapshot().context_label() == "ctx 40k"
     assert job.snapshot().context_window is None  # A routing tag is not a measurement.
     job.observe_claude_event(request())
@@ -53,8 +45,9 @@ def test_live_tokens_then_reported_capacity_and_duplicate_snapshots():
     assert job.snapshot().context_label() == "ctx 10k/1M (1%)"
 
 
-def test_message_start_updates_but_output_deltas_do_not_change_occupancy():
-    job = row()
+def test_message_start_updates_but_output_deltas_do_not_change_occupancy(
+        status_row):
+    job = status_row("")
     job.observe_claude_event({"type": "stream_event", "event": {
         "type": "message_start", "message": request()["message"]}})
     assert job.snapshot().context_tokens == 40_408
@@ -68,8 +61,9 @@ def test_message_start_updates_but_output_deltas_do_not_change_occupancy():
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_cli_synthetic_errors_do_not_replace_the_real_model_or_usage(streaming):
-    job = job_with_usage()
+def test_cli_synthetic_errors_do_not_replace_the_real_model_or_usage(
+        status_row, streaming):
+    job = job_with_usage(status_row)
     job.observe_claude_event(capacity())
     event = request(0, 0, 0, "<synthetic>")
     event["isApiErrorMessage"] = True
@@ -91,8 +85,8 @@ def test_cli_synthetic_errors_do_not_replace_the_real_model_or_usage(streaming):
     {"type": "stream_event", "event": {
         "type": "message_start", "message": request(900_000)["message"]}},
 ])
-def test_subagent_events_cannot_change_the_main_context(event):
-    job = job_with_usage()
+def test_subagent_events_cannot_change_the_main_context(status_row, event):
+    job = job_with_usage(status_row)
     job.observe_claude_event(dict(event, parent_tool_use_id="child-tool"))
     seen = job.snapshot()
     assert seen.context_tokens == 40_408
@@ -105,8 +99,8 @@ def test_subagent_events_cannot_change_the_main_context(event):
      "compact_metadata": {"pre_tokens": 900_000}},
     {"type": "system", "subtype": "status", "status": "compacting"},
 ])
-def test_compaction_clears_occupancy_until_next_request(event):
-    job = job_with_usage()
+def test_compaction_clears_occupancy_until_next_request(status_row, event):
+    job = job_with_usage(status_row)
     job.observe_claude_event(capacity())
     job.observe_claude_event(event)
     assert job.snapshot().context_label() == ""
@@ -120,16 +114,16 @@ def test_compaction_clears_occupancy_until_next_request(event):
 @pytest.mark.parametrize("value", [None, True, -1, "2", 2.5])
 @pytest.mark.parametrize("field", [
     "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"])
-def test_invalid_input_counters_do_not_invent_a_reading(field, value):
-    job = job_with_usage()
+def test_invalid_input_counters_do_not_invent_a_reading(status_row, field, value):
+    job = job_with_usage(status_row)
     event = request()
     event["message"]["usage"][field] = value
     job.observe_claude_event(event)
     assert job.snapshot().context_tokens is None
 
 
-def test_missing_cache_fields_and_zero_input_are_supported():
-    job = job_with_usage()
+def test_missing_cache_fields_and_zero_input_are_supported(status_row):
+    job = job_with_usage(status_row)
     event = request()
     event["message"]["usage"] = {"input_tokens": 0}
     job.observe_claude_event(event)
@@ -141,8 +135,8 @@ def test_missing_cache_fields_and_zero_input_are_supported():
     {"type": "system", "subtype": "init", "model": "new-model"},
     request(1, 0, 0, "new-model"),
 ])
-def test_model_switch_forgets_previous_capacity(event):
-    job = job_with_usage()
+def test_model_switch_forgets_previous_capacity(status_row, event):
+    job = job_with_usage(status_row)
     job.observe_claude_event(capacity())
     job.observe_claude_event(event)
     seen = job.snapshot()
@@ -152,8 +146,8 @@ def test_model_switch_forgets_previous_capacity(event):
 
 
 @pytest.mark.parametrize("action", ["start", "select"])
-def test_next_iteration_forgets_claude_context(action):
-    job = job_with_usage()
+def test_next_iteration_forgets_claude_context(status_row, action):
+    job = job_with_usage(status_row)
     job.observe_claude_event(capacity())
     getattr(job, action)(model="next")
     assert job.snapshot().context_label() == ""
@@ -178,7 +172,7 @@ def test_capacity_does_not_take_a_lone_auxiliary_model_or_ambiguous_match():
     {"type": "stream_event", "event": None},
     {"type": "stream_event", "event": {"type": "message_start", "message": []}},
 ])
-def test_malformed_events_leave_the_last_reading_alone(event):
-    job = job_with_usage()
+def test_malformed_events_leave_the_last_reading_alone(status_row, event):
+    job = job_with_usage(status_row)
     job.observe_claude_event(event)
     assert job.snapshot().context_tokens == 40_408

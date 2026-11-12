@@ -2161,16 +2161,8 @@ _RESULT_1M = {"type": "result", "modelUsage": {
     "claude-opus-5-5": {"contextWindow": 1_000_000, "maxOutputTokens": 128_000}}}
 
 
-def _row(model: str) -> "sl.JobHandle":
-    """The handle the runners bind, on a disabled app: with no painter its
-    posts run at once, so `snapshot()` reads each event's effect."""
-    job = sl.StatusApp(enabled=False).job(1)
-    job.update(model=model)
-    return job
-
-
-def test_a_job_shows_the_resolved_model_then_its_window():
-    job = _row("opus")
+def test_a_job_shows_the_resolved_model_then_its_window(status_row):
+    job = status_row("opus")
     assert job.snapshot().model_label() == "opus"   # before the stream says more
 
     job.observe_claude_event(_INIT_OPUS)
@@ -2180,10 +2172,10 @@ def test_a_job_shows_the_resolved_model_then_its_window():
     assert job.snapshot().model_label() == "claude-opus-5-5 · 1M"
 
 
-def test_a_tagged_id_finds_its_bare_usage_entry_and_does_not_repeat_it():
+def test_a_tagged_id_finds_its_bare_usage_entry_and_does_not_repeat_it(status_row):
     """`opus[1m]` resolves to `claude-opus-5-5[1m]`, but `modelUsage` keys it
     bare; the tag already says the window, so it is not printed twice."""
-    job = _row("opus[1m]")
+    job = status_row("opus[1m]")
     job.observe_claude_event(dict(_INIT_OPUS, model="claude-opus-5-5[1m]"))
     job.observe_claude_event(_RESULT_1M)
 
@@ -2191,8 +2183,8 @@ def test_a_tagged_id_finds_its_bare_usage_entry_and_does_not_repeat_it():
     assert job.snapshot().model_label() == "claude-opus-5-5[1m]"
 
 
-def test_a_new_iteration_forgets_the_resolved_model():
-    job = _row("opus")
+def test_a_new_iteration_forgets_the_resolved_model(status_row):
+    job = status_row("opus")
     job.observe_claude_event(_INIT_OPUS)
     job.observe_claude_event(_RESULT_1M)
 
@@ -2200,16 +2192,17 @@ def test_a_new_iteration_forgets_the_resolved_model():
     assert job.snapshot().model_label() == "opus"
 
 
-def test_a_malformed_init_model_is_ignored_and_the_row_still_paints():
-    job = _row("opus")
+def test_a_malformed_init_model_is_ignored_and_the_row_still_paints(status_row):
+    job = status_row("opus")
     job.observe_claude_event(dict(_INIT_OPUS, model=42))
     assert job.snapshot().model_label() == "opus"
 
 
-def test_selecting_the_next_step_forgets_the_last_turn_even_on_the_same_selector():
+def test_selecting_the_next_step_forgets_the_last_turn_even_on_the_same_selector(
+        status_row):
     """A claude step then a codex step, both on the CLI default (""): the idle
     header between them must not read `codex/claude-opus-5-5 · 1M`."""
-    job = _row("")
+    job = status_row("")
     job.observe_claude_event(_INIT_OPUS)
     job.observe_claude_event(_RESULT_1M)
 
@@ -2224,9 +2217,9 @@ def test_token_counts_read_at_a_glance(tokens, text):
     assert sl.format_token_count(tokens) == text
 
 
-def test_an_unbound_thread_or_a_malformed_event_changes_nothing():
+def test_an_unbound_thread_or_a_malformed_event_changes_nothing(status_row):
     sl.observe_claude_event(_INIT_OPUS)           # no Job bound: a no-op
-    job = _row("opus")
+    job = status_row("opus")
     with sl.describing(job):
         sl.observe_claude_event({"type": "result", "modelUsage": "garbage"})
         sl.observe_claude_event({"type": "system", "subtype": "init"})

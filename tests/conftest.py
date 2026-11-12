@@ -177,6 +177,46 @@ def pytest_collection_modifyitems(items):
             f"arguments: " + "; ".join(missing[:3]))
 
 
+@pytest.fixture
+def status_row(monkeypatch):
+    """Factory of the handle the runners bind (`StatusApp.job`), on a disabled
+    app: with no painter its posts run at once, so `snapshot()` reads each
+    call's effect. `model`, when given, is the row's selector (`update`).
+
+    Strict where the app is lenient: `Painter.apply_state` records a raising
+    state call and goes on, so a mutator that raised would leave the row as it
+    was and a "nothing changed" assertion green. Here that record fails the
+    call (and, if a runner swallowed it, the test at teardown). Watched through
+    `statusline`'s own `diaglog` name, so a test that patches `diaglog.record`
+    itself still sees every record.
+    """
+    from llm_loop import diaglog, statusline
+
+    raised = []
+
+    class _StrictDiaglog:
+        def __getattr__(self, name):
+            return getattr(diaglog, name)
+
+        def record(self, where, *args, **kwargs):
+            diaglog.record(where, *args, **kwargs)
+            if where == "Painter state call raised":
+                raised.append((args, kwargs.get("exc")))
+                raise AssertionError(f"a status-row state call raised: {args}"
+                                     ) from kwargs.get("exc")
+
+    monkeypatch.setattr(statusline, "diaglog", _StrictDiaglog())
+
+    def make(model=None):
+        job = statusline.StatusApp(enabled=False).job(1)
+        if model is not None:
+            job.update(model=model)
+        return job
+
+    yield make
+    assert not raised, f"status-row state call(s) raised: {raised}"
+
+
 @pytest.fixture(autouse=True)
 def isolate_process_policies(monkeypatch):
     """Each test settles its own accounts' policies (`limits.process_policy`)."""

@@ -177,16 +177,15 @@ def test_initial_answer_precedes_wait_and_last_message_is_answer():
 
 
 @pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
-def test_progress_is_immediate_in_row_output_and_log(monkeypatch, tmp_path, capsys, runner):
+def test_progress_is_immediate_in_row_output_and_log(monkeypatch, tmp_path, capsys,
+                                                    status_row, runner):
     from llm_loop import diaglog
     records = []
-    monkeypatch.setattr(diaglog, "record", lambda *args: records.append(args))
+    monkeypatch.setattr(diaglog, "record", lambda *args, **kwargs: records.append(args))
     with isolated_run(monkeypatch, tmp_path):
         server = Server("completed")
         proc = providers._CodexAppProcess(server, [], "root", "first")
-        # The handle the runners bind, on a disabled app: no painter, so its
-        # posts run at once and `snapshot()` reads them.
-        job = statusline.StatusApp(enabled=False).job(1)
+        job = status_row()
         job.start(item="work")
         original = server.take
         checked = False
@@ -341,7 +340,8 @@ def test_note_typed_during_wait_is_acknowledged(monkeypatch, accepted):
 
 
 @pytest.mark.parametrize("source", ["key", "file"])
-def test_bound_run_stop_is_seen_during_idle_poll(monkeypatch, tmp_path, source):
+def test_bound_run_stop_is_seen_during_idle_poll(monkeypatch, tmp_path, status_row,
+                                                source):
     from types import SimpleNamespace
     clock = [1.0]
     monkeypatch.setattr(appserver.time, "monotonic", lambda: clock[0])
@@ -358,7 +358,7 @@ def test_bound_run_stop_is_seen_during_idle_poll(monkeypatch, tmp_path, source):
             raise TimeoutError(what)
         return original(deadline, what)
     server.take = take
-    row = statusline.StatusApp(enabled=False).job(1)
+    row = status_row()
     with statusline.describing(row, app):
         proc = providers._CodexAppProcess(server, [], "root", "first")
         list(proc.stdout)
