@@ -184,7 +184,9 @@ def test_progress_is_immediate_in_row_output_and_log(monkeypatch, tmp_path, caps
     with isolated_run(monkeypatch, tmp_path):
         server = Server("completed")
         proc = providers._CodexAppProcess(server, [], "root", "first")
-        job = statusline.Job()
+        # The handle the runners bind, on a disabled app: no painter, so its
+        # posts run at once and `snapshot()` reads them.
+        job = statusline.StatusApp(enabled=False).job(1)
         job.start(item="work")
         original = server.take
         checked = False
@@ -356,7 +358,8 @@ def test_bound_run_stop_is_seen_during_idle_poll(monkeypatch, tmp_path, source):
             raise TimeoutError(what)
         return original(deadline, what)
     server.take = take
-    with statusline.describing(statusline.Job(), app):
+    row = statusline.StatusApp(enabled=False).job(1)
+    with statusline.describing(row, app):
         proc = providers._CodexAppProcess(server, [], "root", "first")
         list(proc.stdout)
     assert [c["method"] for c in server.calls] == ["turn/interrupt"]

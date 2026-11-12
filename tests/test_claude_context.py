@@ -24,8 +24,16 @@ def capacity():
                                   "contextWindow": 1_000_000}}}
 
 
+def row(model=""):
+    """The handle the runners bind, on a disabled app: with no painter its
+    posts run at once, so `snapshot()` reads each event's effect."""
+    job = sl.StatusApp(enabled=False).job(1)
+    job.update(model=model)
+    return job
+
+
 def job_with_usage():
-    job = sl.Job(model="opus")
+    job = row(model="opus")
     job.observe_claude_event({"type": "system", "subtype": "init",
                               "model": MODEL + "[1m]"})
     job.observe_claude_event(request())
@@ -34,29 +42,29 @@ def job_with_usage():
 
 def test_live_tokens_then_reported_capacity_and_duplicate_snapshots():
     job = job_with_usage()
-    assert job.context_label() == "ctx 40k"
-    assert job.context_window is None  # A routing tag is not a measurement.
+    assert job.snapshot().context_label() == "ctx 40k"
+    assert job.snapshot().context_window is None  # A routing tag is not a measurement.
     job.observe_claude_event(request())
-    assert job.context_tokens == 40_408
+    assert job.snapshot().context_tokens == 40_408
     job.observe_claude_event(capacity())
     assert job.snapshot().context_label() == "ctx 40k/1M (4%)"
-    assert job.model_label() == MODEL + "[1m]"
+    assert job.snapshot().model_label() == MODEL + "[1m]"
     job.observe_claude_event(request(2, 0, 9998))
-    assert job.context_label() == "ctx 10k/1M (1%)"
+    assert job.snapshot().context_label() == "ctx 10k/1M (1%)"
 
 
 def test_message_start_updates_but_output_deltas_do_not_change_occupancy():
-    job = sl.Job()
+    job = row()
     job.observe_claude_event({"type": "stream_event", "event": {
         "type": "message_start", "message": request()["message"]}})
-    assert job.context_tokens == 40_408
-    assert job.model_label() == MODEL
+    assert job.snapshot().context_tokens == 40_408
+    assert job.snapshot().model_label() == MODEL
     job.observe_claude_event({"type": "stream_event", "event": {
         "type": "message_delta", "usage": {"output_tokens": 900_000}}})
     event = request()
     event["message"]["usage"] = {"output_tokens": 900_000}
     job.observe_claude_event(event)
-    assert job.context_tokens == 40_408
+    assert job.snapshot().context_tokens == 40_408
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -70,9 +78,10 @@ def test_cli_synthetic_errors_do_not_replace_the_real_model_or_usage(streaming):
             "type": "message_start", "message": event["message"]}}
     job.observe_claude_event(event)
     job.observe_claude_event(capacity())
-    assert job.model_label() == MODEL + "[1m]"
-    assert job.context_tokens == 40_408
-    assert job.context_label() == "ctx 40k/1M (4%)"
+    seen = job.snapshot()
+    assert seen.model_label() == MODEL + "[1m]"
+    assert seen.context_tokens == 40_408
+    assert seen.context_label() == "ctx 40k/1M (4%)"
 
 
 @pytest.mark.parametrize("event", [
@@ -85,9 +94,10 @@ def test_cli_synthetic_errors_do_not_replace_the_real_model_or_usage(streaming):
 def test_subagent_events_cannot_change_the_main_context(event):
     job = job_with_usage()
     job.observe_claude_event(dict(event, parent_tool_use_id="child-tool"))
-    assert job.context_tokens == 40_408
-    assert job.context_window is None
-    assert job.resolved_model == MODEL + "[1m]"
+    seen = job.snapshot()
+    assert seen.context_tokens == 40_408
+    assert seen.context_window is None
+    assert seen.resolved_model == MODEL + "[1m]"
 
 
 @pytest.mark.parametrize("event", [
@@ -99,12 +109,12 @@ def test_compaction_clears_occupancy_until_next_request(event):
     job = job_with_usage()
     job.observe_claude_event(capacity())
     job.observe_claude_event(event)
-    assert job.context_label() == ""
+    assert job.snapshot().context_label() == ""
     job.observe_claude_event(capacity())
-    assert job.context_label() == ""
+    assert job.snapshot().context_label() == ""
     job.observe_claude_event(request(1000, 0, 0))
-    assert job.context_tokens == 1000
-    assert job.context_window == 1_000_000
+    assert job.snapshot().context_tokens == 1000
+    assert job.snapshot().context_window == 1_000_000
 
 
 @pytest.mark.parametrize("value", [None, True, -1, "2", 2.5])
@@ -115,7 +125,7 @@ def test_invalid_input_counters_do_not_invent_a_reading(field, value):
     event = request()
     event["message"]["usage"][field] = value
     job.observe_claude_event(event)
-    assert job.context_tokens is None
+    assert job.snapshot().context_tokens is None
 
 
 def test_missing_cache_fields_and_zero_input_are_supported():
@@ -124,7 +134,7 @@ def test_missing_cache_fields_and_zero_input_are_supported():
     event["message"]["usage"] = {"input_tokens": 0}
     job.observe_claude_event(event)
     job.observe_claude_event(capacity())
-    assert job.context_label() == "ctx 0/1M (0%)"
+    assert job.snapshot().context_label() == "ctx 0/1M (0%)"
 
 
 @pytest.mark.parametrize("event", [
@@ -135,9 +145,10 @@ def test_model_switch_forgets_previous_capacity(event):
     job = job_with_usage()
     job.observe_claude_event(capacity())
     job.observe_claude_event(event)
-    assert job.resolved_model == "new-model"
-    assert job.context_window is None
-    assert job.context_tokens == (1 if event["type"] == "assistant" else None)
+    seen = job.snapshot()
+    assert seen.resolved_model == "new-model"
+    assert seen.context_window is None
+    assert seen.context_tokens == (1 if event["type"] == "assistant" else None)
 
 
 @pytest.mark.parametrize("action", ["start", "select"])
@@ -145,8 +156,8 @@ def test_next_iteration_forgets_claude_context(action):
     job = job_with_usage()
     job.observe_claude_event(capacity())
     getattr(job, action)(model="next")
-    assert job.context_label() == ""
-    assert job.context_window is None
+    assert job.snapshot().context_label() == ""
+    assert job.snapshot().context_window is None
 
 
 def test_capacity_does_not_take_a_lone_auxiliary_model_or_ambiguous_match():
@@ -170,4 +181,4 @@ def test_capacity_does_not_take_a_lone_auxiliary_model_or_ambiguous_match():
 def test_malformed_events_leave_the_last_reading_alone(event):
     job = job_with_usage()
     job.observe_claude_event(event)
-    assert job.context_tokens == 40_408
+    assert job.snapshot().context_tokens == 40_408

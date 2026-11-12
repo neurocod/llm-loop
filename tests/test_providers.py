@@ -568,6 +568,14 @@ _CLAUDE_MODEL_STREAM = "".join(json.dumps(ev) + "\n" for ev in [
 ])
 
 
+def _row(model: str) -> "statusline.JobHandle":
+    """The handle the runners bind, on a disabled app: with no painter its
+    posts run at once, so `snapshot()` reads each event's effect."""
+    job = statusline.StatusApp(enabled=False).job(1)
+    job.update(model=model)
+    return job
+
+
 @pytest.mark.parametrize("runner", ["sequential", "parallel"])
 def test_both_renderers_tell_the_bound_job_what_the_cli_runs(
         monkeypatch, no_live_messages, capsys, runner):
@@ -576,7 +584,7 @@ def test_both_renderers_tell_the_bound_job_what_the_cli_runs(
     def fake_start(*args):
         return _FakeAgentProcess(has_stdin=False, stdout=_CLAUDE_MODEL_STREAM)
 
-    job = statusline.Job(model="opus")
+    job = _row("opus")
     with statusline.describing(job):
         if runner == "sequential":
             monkeypatch.setattr(streamrender, "start_agent_process", fake_start)
@@ -586,12 +594,12 @@ def test_both_renderers_tell_the_bound_job_what_the_cli_runs(
             monkeypatch.setattr(parallel, "start_agent_process", fake_start)
             assert parallel.run_job(1, AgentCommand("p", "opus", "j"))[0] == 0
 
-    assert job.model_label() == "claude-opus-5-5 · 1M"
+    assert job.snapshot().model_label() == "claude-opus-5-5 · 1M"
 
 
 @pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
 def test_claude_context_reaches_status_while_streaming(monkeypatch, runner):
-    job = statusline.Job(model="opus")
+    job = _row("opus")
 
     def source():
         yield json.dumps({"type": "stream_event", "event": {
@@ -599,7 +607,7 @@ def test_claude_context_reaches_status_while_streaming(monkeypatch, runner):
                 "model": "claude-opus-5-5", "usage": {"input_tokens": 2,
                     "cache_creation_input_tokens": 8246,
                     "cache_read_input_tokens": 32160}}}}) + "\n"
-        assert job.context_label() == "ctx 40k"
+        assert job.snapshot().context_label() == "ctx 40k"
         yield _CLAUDE_MODEL_STREAM.splitlines(keepends=True)[1]
         assert job.snapshot().context_label() == "ctx 40k/1M (4%)"
 
@@ -618,7 +626,7 @@ def test_claude_context_reaches_status_while_streaming(monkeypatch, runner):
 @pytest.mark.parametrize("runner", ["sequential", "raw", "parallel"])
 def test_codex_context_reaches_status_before_turn_ends(monkeypatch, runner):
     """Exercise app-server normalization and both real stream readers."""
-    job = statusline.Job(model="gpt-test")
+    job = _row("gpt-test")
 
     def usage(tokens, thread="root", turn="turn"):
         return json.dumps({"method": "thread/tokenUsage/updated", "params": {
@@ -652,7 +660,8 @@ def test_codex_context_reaches_status_before_turn_ends(monkeypatch, runner):
               "ctx 88k/258k (34%)")
         yield usage(240_000, thread="child", turn="child-turn")
         yield usage(240_000, turn="old-turn")
-        check(4, "foreign readings", lambda: job.context_tokens, 88_764)
+        check(4, "foreign readings", lambda: job.snapshot().context_tokens,
+              88_764)
         yield usage(20_000)
         check(5, "next root reading", lambda: job.snapshot().context_label(),
               "ctx 20k/258k (8%)")
@@ -717,26 +726,26 @@ class _Lockstep(appserver.Connection):
     (True, None, ""),
 ])
 def test_codex_context_unknowns_and_reset(tokens, window, expected):
-    job = statusline.Job(model="gpt-test")
+    job = _row("gpt-test")
     event = {"type": "thread.token_usage.updated", "tokenUsage": {
         "last": {"totalTokens": tokens}, "modelContextWindow": window}}
     job.observe_codex_event(event)
     assert job.snapshot().context_label() == expected
     job.start(model="next")
-    assert job.model_label() == "next"
-    assert job.context_label() == ""
+    assert job.snapshot().model_label() == "next"
+    assert job.snapshot().context_label() == ""
     job.observe_codex_event(event)
     job.select("other")
-    assert job.model_label() == "other"
-    assert job.context_label() == ""
+    assert job.snapshot().model_label() == "other"
+    assert job.snapshot().context_label() == ""
 
 
 def test_exec_cumulative_usage_is_not_displayed_as_context():
-    job = statusline.Job(model="gpt-test")
+    job = _row("gpt-test")
     job.observe_codex_event({"type": "turn.completed", "usage": {
         "input_tokens": 9_000_000, "output_tokens": 1234}})
-    assert job.model_label() == "gpt-test"
-    assert job.context_label() == ""
+    assert job.snapshot().model_label() == "gpt-test"
+    assert job.snapshot().context_label() == ""
 
 
 # --- the sequential runner owes its child an ending too --------------------------

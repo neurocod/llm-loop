@@ -41,8 +41,8 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple,
-                    Union)
+from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence,
+                    Tuple)
 
 from . import (cmdline, console, diaglog, gitpush, ownership, stopchannel,
                termio, textwidth, wire)
@@ -546,15 +546,9 @@ class Job:
         for name, value in fields.items():
             setattr(self, name, value)
 
-    def observe_claude_event(self, ev: dict) -> None:
-        """Take main-request occupancy and capacity from Claude's own stream."""
-        change = claude_status_change(ev)
-        if change is not None:
-            self.apply_claude_change(change)
-
     def apply_claude_change(self, change: "ClaudeChange") -> None:
-        """The stateful half of `observe_claude_event`: what the event says,
-        read against what this row already holds."""
+        """The stateful half of `JobHandle.observe_claude_event`: what the
+        event says, read against what this row already holds."""
         model = change.model
         if change.reading is not None:
             message_model, _tokens = change.reading
@@ -574,12 +568,6 @@ class Job:
             self.context_window = wire.result_context_window(
                 change.result, self.resolved_model or self.model)
 
-    def observe_codex_event(self, ev: dict) -> None:
-        """Replace context occupancy with the latest root-thread reading."""
-        reading = wire.codex_context_usage(ev)
-        if reading is not None:
-            self.apply_codex_reading(reading)
-
     def apply_codex_reading(self, reading: tuple) -> None:
         """`wire.codex_context_usage`'s (tokens, window): the latest wins whole."""
         self.context_tokens, self.context_window = reading
@@ -594,7 +582,8 @@ class Job:
 
 # The row that describes the stream THIS thread is reading: the runners bind
 # the `JobHandle` `StatusApp.job` gave them, whose methods post to the live
-# Job; a bare `Job` (a test's) is written in place. Both renderers
+# Job — tests bind one too, from a disabled app, so they pin the path the
+# runners take (with no painter the posts run at once). Both renderers
 # know only the stream, not the row: the sequential one is a module with one run
 # in flight, the parallel one is `run_job(job_id, command, mailbox)` on a worker
 # thread. The row travels by binding rather than by argument because two dozen
@@ -605,8 +594,9 @@ _stream_job = threading.local()
 
 
 @contextmanager
-def describing(job: Union["Job", "JobHandle"], app=None):
-    """Route `observe_claude_event` on this thread to `job` for the block."""
+def describing(job: "JobHandle", app=None):
+    """Route this thread's stream observers (`observe_claude_event`,
+    `observe_codex_event`, `stream_progress`) to `job` for the block."""
     previous = getattr(_stream_job, "job", None)
     previous_app = getattr(_stream_job, "app", None)
     _stream_job.job = job
@@ -632,7 +622,7 @@ def stream_progress(phase: str) -> None:
 
 
 def observe_claude_event(ev: dict) -> None:
-    """Feed one Claude stream event to the Job bound on this thread, if any.
+    """Feed one Claude stream event to the row bound on this thread, if any.
 
     Never raises: this is the status line's read of a stream the run needs, and
     a cosmetic feature must not be able to end it (see the module docstring).
@@ -647,7 +637,7 @@ def observe_claude_event(ev: dict) -> None:
 
 
 def observe_codex_event(ev: dict) -> None:
-    """Feed live Codex context to the bound Job without risking the run."""
+    """Feed live Codex context to the bound row without risking the run."""
     job = getattr(_stream_job, "job", None)
     if job is None:
         return
@@ -3169,7 +3159,8 @@ class JobHandle:
     # the unbounded state deque, whole, for as long as the stream runs.
 
     def observe_claude_event(self, ev: dict) -> None:
-        """`Job.observe_claude_event`, posted: nothing for an event the row does
+        """Main-request occupancy and capacity from Claude's own stream,
+        posted (`Job.apply_claude_change`): nothing for an event the row does
         not read, one pending call for a run of same-model readings."""
         change = claude_status_change(ev)
         if change is None:
@@ -3181,7 +3172,8 @@ class JobHandle:
             self._post(Job.apply_claude_change, change)
 
     def observe_codex_event(self, ev: dict) -> None:
-        """`Job.observe_codex_event`, posted the same way."""
+        """The latest root-thread Codex reading, posted the same way
+        (`Job.apply_codex_reading`)."""
         reading = wire.codex_context_usage(ev)
         if reading is not None:
             self._post_latest(("codex",), Job.apply_codex_reading, reading)
