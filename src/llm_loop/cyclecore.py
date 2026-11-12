@@ -493,6 +493,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     mailbox = None if dry_run else operator.Mailbox()
     app = runlifecycle.open_status(ctx, driver, job_count=1,
                                    messages=mailbox)
+    job = app.job(1)              # the sequential loop's one row, for the run
     # Only state-driven loops can name a breakpoint. Keep the collection local
     # to this invocation so a later runner call starts without old console input.
     from .breakpoints import Breakpoints
@@ -695,7 +696,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 stop_reason = stopchannel.RunStopReason.NO_WORK
                 break
 
-            app.job(1).select(command.model)
+            job.select(command.model)
             selected_provider = command.provider or ctx.provider
             if selected_provider != provider or provider not in usage_states:
                 if provider in usage_states:
@@ -747,13 +748,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # pending claim if the operator pauses or cancels a stop in this wait.
             if not dry_run and not ignore_usage_limits:
                 app.update(phase="waiting")
-                app.job(1).update(waiting_for_usage=True)
+                job.update(waiting_for_usage=True)
                 try:
                     paused, session_start = limit_policy.check_and_wait(
                         usage_source, session_start, should_stop=stop_pending,
                         report_status=iteration == 0)
                 finally:
-                    app.job(1).update(waiting_for_usage=False)
+                    job.update(waiting_for_usage=False)
                 statusline.push_quotas(app, usage_source, limit_policy)
                 app.update(phase="idle")
                 if paused:
@@ -794,8 +795,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # The Job bumps its own counter (no `iteration=`): the local counter
             # restarts with every runner call, and pinning the row to it is what
             # kept a periodic run's job rows at 1.
-            app.job(1).start(item=state_label, model=command.model,
-                             prompt=command.prompt, now=started_at)
+            job.start(item=state_label, model=command.model,
+                      prompt=command.prompt, now=started_at)
             # Read only by a row with no total (InvocationProgress.summary_fields).
             progress.note_iteration()
             counts = progress.record_counts(iteration, completed)
@@ -853,7 +854,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # reason returned here is latched and this turn still runs.
             handback.latch(driver.item_started(command))
 
-            with statusline.describing(app.job(1), app):
+            with statusline.describing(job, app):
                 if provider == "claude":
                     returncode = run_claude_streaming(
                         cmd, raw, partial=True, prompt=command.prompt,
@@ -862,7 +863,7 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                     returncode = run_agent_streaming(
                         cmd, provider, raw, partial=False, prompt=command.prompt,
                         mailbox=mailbox)
-            app.job(1).finish()
+            job.finish()
             # A turn Ctrl+C cut short is not an error to count or retry. One
             # that got through before the press is credited; the head ends it.
             if interrupt.requested and returncode != 0:
@@ -923,13 +924,13 @@ def run_loop(driver: Driver, args: argparse.Namespace,
                 # away from ending the run. The error itself is still counted and
                 # printed above — only the waiting is skipped.
                 app.update(phase="waiting")
-                app.job(1).update(waiting_for_usage=True)
+                job.update(waiting_for_usage=True)
                 try:
                     paused, session_start = limit_policy.check_and_wait(
                         usage_source, session_start, note=" (checked after error)",
                         should_stop=stop_pending, report_status=False)
                 finally:
-                    app.job(1).update(waiting_for_usage=False)
+                    job.update(waiting_for_usage=False)
                 statusline.push_quotas(app, usage_source, limit_policy)
                 app.update(phase="idle")
                 if paused:
