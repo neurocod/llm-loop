@@ -207,6 +207,7 @@ src/
                      (UsageSource) and the verdict the wire streams back
     codex_usage.py   the same figures for Codex, over its own app-server protocol
     limits.py        LimitPolicy + SessionLimit / DayNightLimit / WeeklyLimit rules
+    painter.py       terminal frames and ordered status data ownership
     statusline.py    the status area pinned under a run: its rows, and the keys
     termio.py        the terminal underneath: reserved region, window title, keys
     textwidth.py     how wide terminal text is, and how much a line may hold

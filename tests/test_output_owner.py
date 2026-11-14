@@ -24,7 +24,7 @@ import pytest
 
 from llm_loop import (console, ctrlc, gitpush, ownership, parallel, termio,
                       usage)
-from llm_loop import statusline as sl
+from llm_loop import painter as painting, statusline as sl
 from llm_loop.breakpoints import Breakpoints
 from llm_loop.limits import LimitPolicy, SessionLimit
 
@@ -1489,7 +1489,7 @@ def test_a_state_change_behind_a_stuck_frame_and_a_full_queue_is_kept(monkeypatc
     change waits outside the bounded queue and runs once the painter is back,
     and the poster does not wait for the stuck frame either.
     """
-    monkeypatch.setattr(sl, "PAINTER_QUEUE_MAXSIZE", 2)
+    monkeypatch.setattr(painting, "PAINTER_QUEUE_MAXSIZE", 2)
     terminal = _paint_log()
     app = sl.StatusApp(terminal=terminal, input_source=termio.NullInputSource(),
                        refresh=60)
@@ -1606,8 +1606,8 @@ def test_a_stuck_painter_with_a_full_queue_holds_neither_stop_nor_the_key_reader
     reader is what turns Ctrl+C into an interrupt.
     """
     monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
-    monkeypatch.setattr(sl, "POSTED_CALL_WAIT_SECONDS", 0.05)
-    monkeypatch.setattr(sl, "PAINTER_QUEUE_MAXSIZE", 3)  # "full" a few keys away
+    monkeypatch.setattr(painting, "POSTED_CALL_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(painting, "PAINTER_QUEUE_MAXSIZE", 3)  # "full" a few keys away
     terminal, keys = _paint_log(), KeysByHand()
     app = sl.StatusApp(terminal=terminal, input_source=keys, refresh=60)
     app.start()
@@ -1720,7 +1720,7 @@ def test_a_frozen_stderr_does_not_hold_start_after_its_first_frame_timed_out(
     run's main thread before `join_workers`, the one place that hears Ctrl+C.
     """
     monkeypatch.setattr(sl, "PAINTER_JOIN_SECONDS", 0.05)
-    monkeypatch.setattr(sl, "OPEN_WARNING_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(painting, "OPEN_WARNING_WAIT_SECONDS", 0.05)
     terminal = _paint_log()
     terminal.arm_stall(WAIT_S)                 # the first frame is stuck
     stderr = _FrozenStderr()
@@ -1743,16 +1743,16 @@ def test_a_frozen_stderr_does_not_hold_start_after_its_first_frame_timed_out(
         "the warning never landed once the console thawed"
 
 
-# The child below imports the statusline and exits after a 0.3 s join: the
+# The child below imports the painter and exits after a 0.3 s join: the
 # whole pin 0.82 s and 0.77 s, measured 2026-10-05; a crashing exit adds the
 # interpreter's ~1 s wait for the stderr lock. The bound is many times both.
 FROZEN_EXIT_S = 20.0
 
 _EXITS_WITH_A_STUCK_WARNING = textwrap.dedent("""
     import threading
-    from llm_loop import statusline as sl
+    from llm_loop import painter
     # Bigger than any pipe buffer: the write is stuck until the parent reads.
-    writer = threading.Thread(target=sl._stderr_writer("x" * (4 << 20)),
+    writer = threading.Thread(target=painter._stderr_writer("x" * (4 << 20)),
                               daemon=True)
     writer.start()
     writer.join(0.3)

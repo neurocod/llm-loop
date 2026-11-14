@@ -187,10 +187,10 @@ def status_row(monkeypatch):
     state call and goes on, so a mutator that raised would leave the row as it
     was and a "nothing changed" assertion green. Here that record fails the
     call (and, if a runner swallowed it, the test at teardown). Watched through
-    `statusline`'s own `diaglog` name, so a test that patches `diaglog.record`
+    `painter`'s own `diaglog` name, so a test that patches `diaglog.record`
     itself still sees every record.
     """
-    from llm_loop import diaglog, statusline
+    from llm_loop import diaglog, painter, statusline
 
     raised = []
 
@@ -205,7 +205,7 @@ def status_row(monkeypatch):
                 raise AssertionError(f"a status-row state call raised: {args}"
                                      ) from kwargs.get("exc")
 
-    monkeypatch.setattr(statusline, "diaglog", _StrictDiaglog())
+    monkeypatch.setattr(painter, "diaglog", _StrictDiaglog())
 
     def make(model=None):
         job = statusline.StatusApp(enabled=False).job(1)

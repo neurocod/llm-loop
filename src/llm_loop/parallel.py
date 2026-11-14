@@ -1161,7 +1161,7 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
     `source`/`policy` are None when --ignore-usage disables the session-limit
     gate. `app` is this run's status line; each worker feeds the row of its own
     number through a `statusline.JobHandle`, whose calls the painter runs (see
-    `Painter.post_state`). `progress`
+    `StateOwner.post`). `progress`
     carries the summary-row figures of the whole invocation.
     """
     # A disabled StatusApp is a Null object: no terminal, no threads, every call
