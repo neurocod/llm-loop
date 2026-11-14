@@ -13,7 +13,7 @@ mutable state left to guard.
 `start(first=)` / `close(final=)` for the calls that set the resource up and
 put it back, and an `idle` hook for the work an owner does on its own clock.
 What the resource IS lives with its user: `parallel` owns the console's worker
-lines with one of these, `statusline.Painter` the pinned rows.
+lines with one of these, `painter.Painter` the pinned rows.
 """
 
 import collections

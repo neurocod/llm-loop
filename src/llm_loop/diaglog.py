@@ -4,7 +4,7 @@ The status line is built to survive its own faults: a key reader that raises
 ends quietly (`termio.TerminalInput._guard`), a console write that raises marks
 the terminal failed and every later frame returns early (`termio.Terminal._write`),
 a frame that raises swaps the terminal for a NullTerminal for good
-(`statusline.Painter._disable`), a key the painter has no room for is dropped
+(`painter.Painter._disable`), a key the painter has no room for is dropped
 (`Painter.post_key`). Each is the right call for the RUN, and each leaves the
 operator looking at a screen that simply stops changing — the `m` editor
 freezing a few words into a note, reported more than once, with nothing on

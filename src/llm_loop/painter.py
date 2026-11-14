@@ -292,7 +292,7 @@ class Painter:
         self._app_tick = tick
         self._note = note
         self.state = StateOwner(
-            thread=lambda: self.thread, request_frame=self.request_frame,
+            thread=lambda: self.thread, request_frame=lambda: self.request_frame(),
             published=published)
         self._owner = ownership.OwnerThread(
             PAINTER_THREAD_NAME, maxsize=PAINTER_QUEUE_MAXSIZE,
