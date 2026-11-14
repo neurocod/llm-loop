@@ -84,6 +84,7 @@ __all__ = [
     "Setting",
     "SettingsRegistry",
     "StatusApp",
+    "StateOwner",
     "StopAction",
     "StopSegment",
     "colorize",
@@ -407,7 +408,7 @@ class ClaudeChange(NamedTuple):
 
     def is_reading(self) -> bool:
         """A pure occupancy reading: a later one of the same model leaves the
-        row exactly as applying both would (`Painter.post_latest`) — the first
+        row exactly as applying both would (`StateOwner.post_latest`) — the first
         can only set `resolved_model` to that model or leave a tagged ID of it
         (`…[1m]`) in place, which the second then compares the same way."""
         return (self.reading is not None and not self.model
@@ -444,8 +445,8 @@ class Job:
 
     No lock: `InvocationProgress`'s pool holds a Job across the runner's apps,
     and the app running at the time writes it, only by the state calls its
-    `Painter.post_state` runs — on the painter while one runs, else on the
-    caller under the painter's state lock. A runner never holds a live
+    `StateOwner.post` runs — on the painter while one runs, else on the
+    caller under the state owner's lock. A runner never holds a live
     Job: `StatusApp.job` hands it a `JobHandle`, whose methods post these
     mutators. The renderers read `snapshot()` copies, which the same owner takes.
     """
@@ -684,7 +685,7 @@ class LoopStatus:
     entry, not a new attribute plus a renderer edit.
 
     No lock, for the reason `Job` has none: an app's live LoopStatus is written
-    only by `Painter.post_state` calls, and everybody else reads the copy the
+    only by `StateOwner.post` calls, and everybody else reads the copy the
     owner publishes (`StatusApp.snapshot`). A LoopStatus nobody has handed to an
     app — a pin's fixture — is its creator's, like any object.
     """
@@ -2394,11 +2395,11 @@ def _call_name(call: Callable) -> str:
 
 
 class _LatestCall:
-    """A queued `Painter.post_latest` reading: `call(value)` with the value it
+    """A queued `StateOwner.post_latest` reading: `call(value)` with the value it
     holds when the owner runs it, which a later reading may have replaced."""
 
-    def __init__(self, painter: "Painter", group, kind, call: Callable, value):
-        self._painter = painter
+    def __init__(self, owner: "StateOwner", group, kind, call: Callable, value):
+        self._owner = owner
         self.group = group
         self.kind = kind
         self.call = call
@@ -2407,7 +2408,154 @@ class _LatestCall:
         self.__name__ = _call_name(getattr(call, "func", call))
 
     def __call__(self) -> None:
-        self.call(self._painter._take_latest(self))
+        self.call(self._owner._take_latest(self))
+
+
+class StateOwner:
+    """Ordered data changes, coalesced readings and publication between frames.
+
+    The terminal protocol supplies its current thread and a frame request;
+    data ownership also works synchronously while that thread is absent.
+    """
+
+    def __init__(self, *, thread: Callable[[], Optional[threading.Thread]],
+                 request_frame: Callable[[], None],
+                 published: Callable[[], None]):
+        self._thread = thread
+        self._request_frame = request_frame
+        self.published = published
+        # State calls posted and not yet run (see `post`). A deque of its
+        # own rather than the owner's queue: that one is bounded, and a state
+        # call refused for room would be a change lost — a row left saying
+        # "running" for the rest of the run — where a refused frame request
+        # costs nothing the next frame does not repaint.
+        self._state_calls: collections.deque = collections.deque()
+        # The `post_latest` reading still pending per group, and the lock that
+        # orders replacing its value against the owner taking it to run it.
+        self._latest: Dict[object, "_LatestCall"] = {}
+        self._latest_lock = threading.Lock()
+        # Orders whoever runs the state calls. While a painter runs that is the
+        # painter alone and the lock is never contended; it is there for the
+        # stretches with no painter — before `open()`, after `close()`, and a
+        # whole run with the status line off, whose workers each run their own
+        # posts on their own thread — and for the hand-over between the two.
+        # Held only across the state calls and `published`: no wait, no
+        # terminal write. Re-entrant for a state call that reads `snapshot`
+        # (`_applying` then answers it with the copy published so far).
+        self._state_lock = threading.RLock()
+        self._applying = False      # (state lock) a batch is running
+
+    @property
+    def pending(self) -> bool:
+        """Whether an idle pass needs to apply data and schedule a frame."""
+        return bool(self._state_calls)
+
+    def post(self, call: Callable, *args, frame: bool = True,
+             group=None) -> None:
+        """`call(*args)` changes the app's data: run it on the data's owner and
+        ask for a frame of the result — never waiting for the painter.
+
+        The data has the terminal's owner: on the painter itself, and with no
+        painter running, the call runs here and now (`apply`); from any
+        other thread it is queued and the frame request it rides (`request_frame`)
+        runs it on the painter, ahead of the frame. Queued calls keep the order
+        they were posted in, from every thread. A call is never dropped: one
+        whose frame request found the queue full runs on the painter's next
+        idle pass or frame, whichever comes first (`_on_idle`, `_draw`), or
+        at the next `apply` once the painter has handed back.
+
+        A failing call costs that call only (it is recorded, not raised): the
+        caller is a run that asked for a cosmetic change and has already gone on.
+
+        `frame=False` asks for no frame, for a caller whose next step draws one
+        anyway: `StatusApp.start`, whose change would otherwise be painted on
+        the caller just before the painter's first frame paints it again.
+
+        `group` names the data `call` changes when a `post_latest` reading
+        may change it too, so the reading keeps its place behind this call.
+        """
+        if group is not None:
+            with self._latest_lock:
+                self._end_latest(group)
+        self._state_calls.append((call, args))
+        self.apply()          # here only on the owner, or with none
+        if frame:
+            self._request_frame()
+
+    def post_latest(self, group, kind, call: Callable, value) -> None:
+        """`post(call, value)` for a reading whose latest value wins.
+
+        `group` names the data the reading changes (a Job row's id), `kind`
+        the reading. While the last call posted for `group` is a reading of
+        the same `kind` that has not run yet, `value` replaces its value
+        instead of queueing a second call: applying the two in a row would
+        leave the data exactly as applying the later one does. Order is kept
+        by `post(..., group=g)`: any other change to that data ends the
+        pending reading, so a reading posted after it is a new call behind it.
+        Calls for other groups do not touch this data and need no order
+        against it; a poster racing this one from another thread has none.
+
+        A replaced call has its frame request already asked for (or kept by
+        `_on_idle` / `_draw`), so a replacement asks for none.
+        """
+        with self._latest_lock:
+            pending = self._latest.get(group)
+            if (pending is not None and pending.kind == kind
+                    and not pending.taken):
+                pending.value = value
+                return
+            pending = _LatestCall(self, group, kind, call, value)
+            self._latest[group] = pending
+        self.post(pending)
+
+    def _end_latest(self, group, pending=None) -> None:
+        """No later reading of `group` folds into its pending one (`pending`
+        only: the one that ran). Under `_latest_lock`."""
+        if pending is None or self._latest.get(group) is pending:
+            self._latest.pop(group, None)
+
+    def _take_latest(self, pending: _LatestCall):
+        """(state call) `pending`'s value as it runs: no later reading folds
+        into it once read."""
+        with self._latest_lock:
+            pending.taken = True
+            self._end_latest(pending.group, pending)
+            return pending.value
+
+    def apply(self) -> bool:
+        """Run the state calls queued so far, then `published`, if this thread
+        is the data's owner — the painter, or any caller while there is none.
+        False, with nothing run, on any other thread: the painter runs them.
+
+        A caller with no painter takes the state lock for the batch, so callers
+        racing here (a parallel run with the status line off) run the calls one
+        at a time and in the order they were posted.
+        """
+        thread = self._thread()
+        if thread is not None and thread is not threading.current_thread():
+            return False
+        with self._state_lock:
+            # Asked again from inside a state call (one that reads `snapshot`):
+            # the batch already running is this thread's, and it runs the
+            # rest in order once that call returns.
+            if self._applying or not self._state_calls:
+                return True
+            self._applying = True
+            try:
+                while self._state_calls:
+                    call, args = self._state_calls.popleft()
+                    try:
+                        call(*args)
+                    except Exception as exc:
+                        diaglog.record("Painter state call raised",
+                                       _call_name(call), exc=exc)
+                try:
+                    self.published()
+                except Exception as exc:
+                    diaglog.record("Painter publish raised", exc=exc)
+            finally:
+                self._applying = False
+        return True
 
 
 class Painter:
@@ -2432,7 +2580,7 @@ class Painter:
       * a key the reader cannot post is dropped and counted, never waited for
         (`post_key`), and the count is named once the painter is back;
       * the app's DATA is the terminal owner's too: a change to it is a state
-        call (`post_state`) run by the owner before anything it paints reads
+        call (`StateOwner.post`) run by the owner before anything it paints reads
         the data, and the readers on other threads get the copy `published`
         took after the last batch (`StatusApp.snapshot`).
 
@@ -2460,27 +2608,9 @@ class Painter:
         self._row_count = row_count
         self._app_tick = tick
         self._note = note
-        self._published = published
-        # State calls posted and not yet run (see `post_state`). A deque of its
-        # own rather than the owner's queue: that one is bounded, and a state
-        # call refused for room would be a change lost — a row left saying
-        # "running" for the rest of the run — where a refused frame request
-        # costs nothing the next frame does not repaint.
-        self._state_calls: collections.deque = collections.deque()
-        # The `post_latest` reading still pending per group, and the lock that
-        # orders replacing its value against the owner taking it to run it.
-        self._latest: Dict[object, "_LatestCall"] = {}
-        self._latest_lock = threading.Lock()
-        # Orders whoever runs the state calls. While a painter runs that is the
-        # painter alone and the lock is never contended; it is there for the
-        # stretches with no painter — before `open()`, after `close()`, and a
-        # whole run with the status line off, whose workers each run their own
-        # posts on their own thread — and for the hand-over between the two.
-        # Held only across the state calls and `published`: no wait, no
-        # terminal write. Re-entrant for a state call that reads `snapshot`
-        # (`_applying` then answers it with the copy published so far).
-        self._state_lock = threading.RLock()
-        self._applying = False      # (state lock) a batch is running
+        self.state = StateOwner(
+            thread=lambda: self.thread, request_frame=self.request_frame,
+            published=published)
         self._owner = ownership.OwnerThread(
             PAINTER_THREAD_NAME, maxsize=PAINTER_QUEUE_MAXSIZE,
             idle=self._on_idle)
@@ -2665,113 +2795,6 @@ class Painter:
             # Queue full: the periodic frame draws this state instead.
             self._frame_posted = False
 
-    def post_state(self, call: Callable, *args, frame: bool = True,
-                   group=None) -> None:
-        """`call(*args)` changes the app's data: run it on the data's owner and
-        ask for a frame of the result — never waiting for the painter.
-
-        The data has the terminal's owner: on the painter itself, and with no
-        painter running, the call runs here and now (`apply_state`); from any
-        other thread it is queued and the frame request it rides (`request_frame`)
-        runs it on the painter, ahead of the frame. Queued calls keep the order
-        they were posted in, from every thread. A call is never dropped: one
-        whose frame request found the queue full runs on the painter's next
-        idle pass or frame, whichever comes first (`_on_idle`, `_draw`), or
-        at the next `apply_state` once the painter has handed back.
-
-        A failing call costs that call only (it is recorded, not raised): the
-        caller is a run that asked for a cosmetic change and has already gone on.
-
-        `frame=False` asks for no frame, for a caller whose next step draws one
-        anyway: `StatusApp.start`, whose change would otherwise be painted on
-        the caller just before the painter's first frame paints it again.
-
-        `group` names the data `call` changes when a `post_latest` reading
-        may change it too, so the reading keeps its place behind this call.
-        """
-        if group is not None:
-            with self._latest_lock:
-                self._end_latest(group)
-        self._state_calls.append((call, args))
-        self.apply_state()          # here only on the owner, or with none
-        if frame:
-            self.request_frame()
-
-    def post_latest(self, group, kind, call: Callable, value) -> None:
-        """`post_state(call, value)` for a reading whose latest value wins.
-
-        `group` names the data the reading changes (a Job row's id), `kind`
-        the reading. While the last call posted for `group` is a reading of
-        the same `kind` that has not run yet, `value` replaces its value
-        instead of queueing a second call: applying the two in a row would
-        leave the data exactly as applying the later one does. Order is kept
-        by `post_state(..., group=g)`: any other change to that data ends the
-        pending reading, so a reading posted after it is a new call behind it.
-        Calls for other groups do not touch this data and need no order
-        against it; a poster racing this one from another thread has none.
-
-        A replaced call has its frame request already asked for (or kept by
-        `_on_idle` / `_draw`), so a replacement asks for none.
-        """
-        with self._latest_lock:
-            pending = self._latest.get(group)
-            if (pending is not None and pending.kind == kind
-                    and not pending.taken):
-                pending.value = value
-                return
-            pending = _LatestCall(self, group, kind, call, value)
-            self._latest[group] = pending
-        self.post_state(pending)
-
-    def _end_latest(self, group, pending=None) -> None:
-        """No later reading of `group` folds into its pending one (`pending`
-        only: the one that ran). Under `_latest_lock`."""
-        if pending is None or self._latest.get(group) is pending:
-            self._latest.pop(group, None)
-
-    def _take_latest(self, pending: _LatestCall):
-        """(state call) `pending`'s value as it runs: no later reading folds
-        into it once read."""
-        with self._latest_lock:
-            pending.taken = True
-            self._end_latest(pending.group, pending)
-            return pending.value
-
-    def apply_state(self) -> bool:
-        """Run the state calls queued so far, then `published`, if this thread
-        is the data's owner — the painter, or any caller while there is none.
-        False, with nothing run, on any other thread: the painter runs them.
-
-        A caller with no painter takes the state lock for the batch, so callers
-        racing here (a parallel run with the status line off) run the calls one
-        at a time and in the order they were posted.
-        """
-        thread = self._owner.thread
-        if thread is not None and thread is not threading.current_thread():
-            return False
-        with self._state_lock:
-            # Asked again from inside a state call (one that reads `snapshot`):
-            # the batch already running is this thread's, and it runs the
-            # rest in order once that call returns.
-            if self._applying or not self._state_calls:
-                return True
-            self._applying = True
-            try:
-                while self._state_calls:
-                    call, args = self._state_calls.popleft()
-                    try:
-                        call(*args)
-                    except Exception as exc:
-                        diaglog.record("Painter state call raised",
-                                       _call_name(call), exc=exc)
-                try:
-                    self._published()
-                except Exception as exc:
-                    diaglog.record("Painter publish raised", exc=exc)
-            finally:
-                self._applying = False
-        return True
-
     # --- the terminal's owner only (the painter, or the caller with none) --
 
     # The public three check the caller (`_check_owner`); the painter's own
@@ -2843,10 +2866,10 @@ class Painter:
 
     def _take_frame_request(self) -> None:
         """A posted frame request, or with no painter the frame itself. The
-        state calls queued before it run first (see `post_state`)."""
+        state calls queued before it run first (see `StateOwner.post`)."""
         self._frame_posted = False
         if self._owner.owns_current_thread:
-            self.apply_state()
+            self.state.apply()
             self._schedule_frame()
         else:
             self._draw()
@@ -2862,7 +2885,7 @@ class Painter:
         caller when there is none (see `request_frame`). None once the region
         is closed (see `_REGION_CLOSED`). The state calls still queued run
         first, a closed region included: the data outlives the region."""
-        self.apply_state()
+        self.state.apply()
         self._frame_due = None
         if self._region == _REGION_CLOSED:
             return
@@ -2966,11 +2989,11 @@ class Painter:
         reopened painter's first idle pass, before `_open_region` has run,
         must not tick — and re-pin — the region the last close released.
 
-        State calls a full queue kept their frame request from (`post_state`)
+        State calls a full queue kept their frame request from (`StateOwner.post`)
         run here, once the queue has drained, rather than a `refresh` later.
         """
-        if self._state_calls:
-            self.apply_state()
+        if self.state.pending:
+            self.state.apply()
             self._schedule_frame()
         if self._region != _REGION_OPEN:
             return None
@@ -2992,8 +3015,8 @@ class Painter:
     def _tick(self) -> None:
         """(painter) The periodic frame and the checks that ride on it."""
         # The app's checks read the data: state calls a full queue left
-        # behind (see `post_state`) run before them, not only before the frame.
-        self.apply_state()
+        # behind (see `StateOwner.post`) run before them, not only before the frame.
+        self.state.apply()
         self._ticks += 1
         size = self.terminal.size()
         if size != self._last_size:
@@ -3099,7 +3122,7 @@ def _stderr_writer(line: str) -> Callable[[], None]:
 
 class JobHandle:
     """What `StatusApp.job` hands a runner instead of the live `Job`: the
-    row's mutators, each one a state call (`Painter.post_state`), so a worker
+    row's mutators, each one a state call (`StateOwner.post`), so a worker
     never waits for the terminal and never writes the data itself.
 
     The row is the Job the FIRST of the handle's calls finds or creates — on
@@ -3117,7 +3140,7 @@ class JobHandle:
         self.job_id = job_id
         self._app = app
         self._job: Optional[Job] = None     # (state calls) the resolved row
-        app.painter.post_state(self._resolve)
+        app.painter.state.post(self._resolve)
 
     def _resolve(self) -> Job:
         """(state call) The row, found or created by the handle's first call."""
@@ -3131,7 +3154,7 @@ class JobHandle:
         method(self._resolve(), *args, **kwargs)
 
     def _post(self, method: Callable[..., None], *args, **kwargs) -> None:
-        self._app.painter.post_state(
+        self._app.painter.state.post(
             functools.partial(self._call, method, *args, **kwargs),
             group=self.job_id)
 
@@ -3183,7 +3206,7 @@ class JobHandle:
         # Grouped by the row's id, not by this handle: `app.job(k)` hands out
         # a new handle per call, and a `finish` posted through another one
         # must still end a reading pending here.
-        self._app.painter.post_latest(
+        self._app.painter.state.post_latest(
             self.job_id, kind, functools.partial(self._call, method), value)
 
     def snapshot(self) -> Optional[Job]:
@@ -3212,7 +3235,7 @@ class StatusApp:
     internal detail that a later wave extends by registering something.
 
     The LoopStatus is the painter's, like the terminal: every change to it is a
-    state call (`Painter.post_state`) — `update`, `note`, a `JobHandle`'s
+    state call (`StateOwner.post`) — `update`, `note`, a `JobHandle`'s
     methods, the stop and pause keys, the sentinel poll — and every reader,
     the renderers included, reads the copy published after the last batch
     (`snapshot`). Two things are read without waiting for the painter, and
@@ -3230,7 +3253,7 @@ class StatusApp:
                  default_actions: bool = True,
                  flag_aliases: Optional[Dict[str, cmdline.Flag]] = None):
         # The live data: touched only by state calls and the publication
-        # (see `Painter.post_state`), so only under the painter's state lock.
+        # (see `StateOwner.post`), so only under the state owner's lock.
         self._status = status or LoopStatus()
         # The copy every reader gets (`snapshot`), replaced after each batch of
         # state calls and never changed in place.
@@ -3322,7 +3345,7 @@ class StatusApp:
         self._started = True
         try:
             # No frame: the painter's first one (`open`) paints it.
-            self.painter.post_state(self._sync_stop_pending, frame=False)
+            self.painter.state.post(self._sync_stop_pending, frame=False)
             if isinstance(self.terminal, termio.NullTerminal):
                 return self   # disabled: no region to pin, no keys to read
             # Before the region is asked for, so a signal from here on finds
@@ -3492,12 +3515,12 @@ class StatusApp:
         The one way to read it, renderers included. Shared by every reader and
         replaced, never changed, by the next batch: treat it as read-only. With
         no painter running the calls still queued run first, here (see
-        `Painter.apply_state`), so a caller reads its own changes at once.
+        `StateOwner.apply`), so a caller reads its own changes at once.
         While a painter runs, a change posted from another thread shows up once
         the painter has run it — a pin that reads straight after one drains the
         painter first (`painter.drain()`).
         """
-        self.painter.apply_state()
+        self.painter.state.apply()
         return self._snapshot
 
     def _publish(self) -> None:
@@ -3505,7 +3528,7 @@ class StatusApp:
         self._snapshot = self._status.snapshot()
 
     def update(self, **fields) -> None:
-        self.painter.post_state(functools.partial(self._status.update, **fields))
+        self.painter.state.post(functools.partial(self._status.update, **fields))
 
     def note(self, text: str) -> None:
         """Show `text` on the note row until NOTE_TTL passes or another note
@@ -3527,12 +3550,12 @@ class StatusApp:
 
     def mark_run_started(self, now: Optional[float] = None) -> None:
         # The clock is read here, not when the painter runs the call.
-        self.painter.post_state(self._status.mark_run_started,
+        self.painter.state.post(self._status.mark_run_started,
                                 time.time() if now is None else now)
 
     def refresh_quota_policy(self, rule) -> None:
         """Redraw an edited ceiling (`LoopStatus.refresh_quota_policy`)."""
-        self.painter.post_state(self._status.refresh_quota_policy, rule)
+        self.painter.state.post(self._status.refresh_quota_policy, rule)
 
     @property
     def stop_file(self) -> str:
@@ -3565,14 +3588,14 @@ class StatusApp:
         """Ask this run to stop. Sets the flag only — no file is written, so a
         cancel before the loop notices leaves no trace, an abrupt kill leaves no
         sentinel to clean up, and the loop next door keeps running."""
-        self.painter.post_state(self._set_stop_request, True)
+        self.painter.state.post(self._set_stop_request, True)
         self.note("stop requested — this run halts at the next iteration "
                   "boundary (other runs are unaffected)")
 
     def cancel_stop(self) -> None:
         """Withdraw this run's own request. A stop file is left alone: it is not
         ours to remove, and the run stays pending on it."""
-        self.painter.post_state(self._set_stop_request, False)
+        self.painter.state.post(self._set_stop_request, False)
         self.note("stop request cancelled")
 
     def _set_stop_request(self, asked: bool) -> None:
@@ -3742,7 +3765,7 @@ class StatusApp:
             note, noted_at = self._note_stamp = (shown, time.time())
         if note and time.time() - noted_at > NOTE_TTL:
             self._note_stamp = ("", 0.0)
-            self.painter.post_state(self._expire_note, note)
+            self.painter.state.post(self._expire_note, note)
         if count % 4 == 0:
             # Catches a sentinel created by hand (`touch stop`) or by a
             # neighbouring run. It never touches `_requested_stop`: the key's
@@ -3751,7 +3774,7 @@ class StatusApp:
             # answer publishes nothing. The state call asks again rather than
             # taking this answer: a key change queued ahead of it runs first.
             if self._stop_pending_now() != self.snapshot().stop_pending:
-                self.painter.post_state(self._sync_stop_pending)
+                self.painter.state.post(self._sync_stop_pending)
 
     def _expire_note(self, note: str) -> None:
         """(state call) Clear the note row — if it still shows `note`: a newer

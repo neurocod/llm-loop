@@ -1541,14 +1541,14 @@ def test_a_stream_behind_a_stuck_frame_keeps_its_latest_reading_not_every_event(
         assert app.painter.drain(WAIT_S)
         _hold_a_frame(app, terminal)
         try:
-            before = len(app.painter._state_calls)
+            before = len(app.painter.state._state_calls)
             for n in range(500):
                 claude.observe_claude_event({"type": "stream_event", "event": {
                     "type": "content_block_delta", "delta": {"text": "x"}}})
                 claude.observe_claude_event(_claude_reading(1000 + n))
                 codex.observe_codex_event({"type": "item.started"})
                 codex.observe_codex_event(_codex_reading(2000 + n))
-            queued = len(app.painter._state_calls) - before
+            queued = len(app.painter.state._state_calls) - before
             # A start between two readings: the later reading runs after it.
             claude.start(item="c.md", model="opus")
             claude.observe_claude_event(_claude_reading(7777))

@@ -183,7 +183,7 @@ def status_row(monkeypatch):
     app: with no painter its posts run at once, so `snapshot()` reads each
     call's effect. `model`, when given, is the row's selector (`update`).
 
-    Strict where the app is lenient: `Painter.apply_state` records a raising
+    Strict where the app is lenient: `StateOwner.apply` records a raising
     state call and goes on, so a mutator that raised would leave the row as it
     was and a "nothing changed" assertion green. Here that record fails the
     call (and, if a runner swallowed it, the test at teardown). Watched through
