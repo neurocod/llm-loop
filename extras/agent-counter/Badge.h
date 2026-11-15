@@ -33,8 +33,9 @@ public:
 	// is no hover and no tooltip, and colour is the only channel left to tell
 	// "an agent is working" from "an agent has been stuck since this morning".
 	//
-	// `cores`, when shown, adds one block after the providers: "CPU" in the
-	// icon slot and "leased/total" in the count column. Its colour is the
+	// `cores`, when shown, adds one block after the providers: the text "CPU"
+	// in the icon slot, on the baseline of "leased/total" in the count column
+	// (CoreSummary::shown says when it is shown). Its colour is the
 	// broker's state, not an age: slate while every request is served, amber
 	// while anyone waits, red once forced grants put the leases over the
 	// machine (CoreBroker::settle).

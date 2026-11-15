@@ -15,6 +15,10 @@ constexpr int kBlockWidth = 68;
 constexpr int kColumnLeft = 28;  // from the block's left; the icon ends at 27
 constexpr int kColumnWidth = 36; // ends 4 px inside the 8 px rounded corner
 constexpr int kGap = 4;
+// The cores block's "CPU" label: the icon's place (x 3..27 of the block).
+constexpr int kLabelLeft = 3;
+constexpr int kLabelWidth = 24;
+constexpr int kLabelInk = 8;  // cap height of "CPU", logical px
 constexpr int kFillAlpha = 190;   // enough to read white digits, still see-through
 
 // The count's pixel size when it is the block's only line.
@@ -264,14 +268,34 @@ void Badge::paintEvent(QPaintEvent*) {
 		painter.setBrush(fill);
 		painter.setPen(Qt::NoPen);
 		painter.drawRoundedRect(block.adjusted(1, 1, -1, -1), 8, 8);
-		QFont numerals = font();
-		numerals.setBold(true);
 		painter.setPen(Qt::white);
-		// The label sits where a provider's icon would, at the week line's
-		// ink height; the figure fills the count column like a count does.
-		drawInkFitted(painter, numerals, QRect(x + 3, 10, 24, 10), QStringLiteral("CPU"));
-		drawInkFitted(painter, numerals,
-		              QRect(x + kColumnLeft, (kHeight - kTwoLineInk) / 2, kColumnWidth, kTwoLineInk),
-		              coresText(m_cores));
+		// The figure fills the count column like a count does, centred by its
+		// ink; the label "CPU" is TEXT on the figure's own baseline, where a
+		// provider's icon would sit. Centring each by its own ink put the label
+		// visibly lower (user, 2026-11-15): the figure's "/" reaches below the
+		// baseline, so its centred ink lifts the digits, and the capitals of a
+		// separately centred label do not follow.
+		QFont figureFont = font();
+		figureFont.setBold(true);
+		const QString figure = coresText(m_cores);
+		const QRect column(x + kColumnLeft, (kHeight - kTwoLineInk) / 2, kColumnWidth, kTwoLineInk);
+		const QRect figureInk = fitInk(figureFont, figure, column.height(), column.width());
+		const double baseline =
+		    column.top() + (column.height() - figureInk.height()) / 2.0 - figureInk.top();
+		painter.setFont(figureFont);
+		painter.drawText(QPointF(column.left() + (column.width() - figureInk.width()) / 2.0
+		                             - figureInk.left(),
+		                         baseline),
+		                 figure);
+		QFont labelFont = font();
+		labelFont.setBold(true);
+		const QString label = QStringLiteral("CPU");
+		// Smaller than the figure (a caption, not a number), and 2 px short of
+		// its box so it does not touch a wide figure ("12/16").
+		const QRect labelInk = fitInk(labelFont, label, kLabelInk, kLabelWidth - 2);
+		painter.setFont(labelFont);
+		painter.drawText(QPointF(x + kLabelLeft + (kLabelWidth - labelInk.width()) / 2.0 - labelInk.left(),
+		                         baseline),
+		                 label);
 	}
 }

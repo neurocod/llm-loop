@@ -6,6 +6,7 @@
 #include <QFontMetrics>
 #include <QPainter>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace {
@@ -57,6 +58,41 @@ bool isOneLine(const QImage& image) {
 bool fillsTheBlock(const QImage& image) {
 	const QVector<bool> rows = inkRows(image);
 	return inkIn(rows, 0, 5) && inkIn(rows, kBlockHeight - 5, kBlockHeight);
+}
+
+bool white(const QColor& c) {
+	return c.alpha() > 200 && c.red() > 200 && c.green() > 200 && c.blue() > 200;
+}
+
+// The lowest device row with white ink among columns [left, right) (device
+// px), or -1.
+int lowestInk(const QImage& image, int left, int right) {
+	for (int y = image.height() - 1; y >= 0; --y)
+		for (int x = left; x < right; ++x)
+			if (white(image.pixelColor(x, y)))
+				return y;
+	return -1;
+}
+
+// The cores block's "CPU" label and the figure's LAST digit end on one row:
+// both are text on one baseline. The last digit, not the whole figure: the
+// figure's "/" reaches below the baseline.
+bool labelOnFigureBaseline(const QImage& image) {
+	const double dpr = image.devicePixelRatio();
+	const int columnLeft = qRound(28 * dpr);
+	const int columnRight = qMin(image.width(), qRound(64 * dpr));
+	int rightmost = -1;
+	for (int x = columnRight - 1; x >= columnLeft && rightmost < 0; --x)
+		for (int y = 0; y < image.height(); ++y)
+			if (white(image.pixelColor(x, y))) {
+				rightmost = x;
+				break;
+			}
+	if (rightmost < 0)
+		return false;
+	const int digit = lowestInk(image, rightmost - qRound(3 * dpr), rightmost + 1);
+	const int label = lowestInk(image, qRound(3 * dpr), qRound(27 * dpr));
+	return digit >= 0 && label >= 0 && std::abs(digit - label) <= qMax(1, qRound(dpr / 2));
 }
 
 AgentGroup group(const char* type, int count, std::optional<int> weekLeft) {
@@ -157,6 +193,10 @@ int runBadgeSelfTest(const QString& previewPath) {
 	const QImage cores = badge.grab().toImage();
 	check(coresText(CoreSummary{true, 12, 16, 0}) == QStringLiteral("12/16"),
 	      "the cores block reads leased/total");
+	check(labelOnFigureBaseline(cores), "\"CPU\" is text on the figure's baseline (12/16)");
+	badge.setState({}, CoreSummary{true, 0, 16, 0});
+	const QImage coresEnded = badge.grab().toImage();
+	check(labelOnFigureBaseline(coresEnded), "and on it at 0/16 too");
 	badge.setState({}, CoreSummary{true, 12, 16, 1});
 	const QImage coresQueued = badge.grab().toImage();
 	badge.setState({}, CoreSummary{true, 18, 16, 0});
@@ -174,7 +214,7 @@ int runBadgeSelfTest(const QString& previewPath) {
 		// Render the real widget at 3x on both desktop backgrounds; do not
 		// duplicate its paint logic in a mock-up that could hide layout defects.
 		const QVector<QImage> samples{claude, codex, mixed, crowded, unknown, low, lowCodex, lowMixed,
-		                              agentsAndCores, coresQueued};
+		                              agentsAndCores, coresQueued, coresEnded};
 		// Columns fit two 68 px blocks and their gap at 3x (420 px) plus margins.
 		constexpr int kSheetColumn = 460;
 		QImage sheet(2 * kSheetColumn, 25 + 125 * static_cast<int>(samples.size()),
