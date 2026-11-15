@@ -40,7 +40,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 from . import host_policy
 
@@ -53,7 +53,7 @@ from . import host_policy
 # of the old name stops seeing new clients until it is rebuilt and restarted,
 # exactly as a version bump would. An exe built before the change is caught
 # before it is started (`_listens_elsewhere`).
-PIPE_PREFIX = "llm-agents.v1."
+PIPE_PREFIX = "llm-agents.v2."
 
 # Set to 0 to keep the counter out of the way (the test suite does exactly that:
 # a gate run must not put a window on the operator's screen).
@@ -316,7 +316,10 @@ def _listens_elsewhere(exe: Path) -> Optional[str]:
     return named if named and pipe_path() != "\\\\.\\pipe\\" + named else None
 
 
-def _open_or_start() -> Optional[object]:
+def _open_or_start(complain: Callable[[str], None] = _complain) -> Optional[object]:
+    """Connect, starting the counter first if nobody listens; None with one
+    `complain(reason)` when it cannot be had. The core lease (`cores`) passes
+    its own sink: its one line names the fallback it takes, not the badge."""
     handle = _connect()
     if handle is not None:
         return handle
@@ -324,18 +327,18 @@ def _open_or_start() -> Optional[object]:
     if exe is None:
         override = os.environ.get(EXE_ENV)
         named = host_policy.counter_paths()
-        _complain(f"{EXE_ENV}={override} is not a file" if override else
-                  f"{named[0].name} is not built" if named else
-                  "no counter executable (the host policy names none)")
+        complain(f"{EXE_ENV}={override} is not a file" if override else
+                 f"{named[0].name} is not built" if named else
+                 "no counter executable (the host policy names none)")
         return None
     stale = _listens_elsewhere(exe)
     if stale:
-        _complain(f"{exe} listens on {stale}, not {pipe_path()}; rebuild it")
+        complain(f"{exe} listens on {stale}, not {pipe_path()}; rebuild it")
         return None
     try:
         _spawn(exe)
     except OSError as exc:
-        _complain(f"cannot start {exe}: {exc}")
+        complain(f"cannot start {exe}: {exc}")
         return None
     deadline = time.monotonic() + SPAWN_WAIT_S
     while time.monotonic() < deadline:
@@ -343,7 +346,7 @@ def _open_or_start() -> Optional[object]:
         handle = _connect()
         if handle is not None:
             return handle
-    _complain(f"started {exe.name} but could not reach it on {pipe_path()}")
+    complain(f"started {exe.name} but could not reach it on {pipe_path()}")
     return None
 
 

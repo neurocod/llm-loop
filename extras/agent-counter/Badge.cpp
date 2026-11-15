@@ -140,6 +140,10 @@ bool showsWeekLeft(const AgentGroup& group) {
 	return group.weekLeft.has_value();
 }
 
+QString coresText(const CoreSummary& cores) {
+	return QStringLiteral("%1/%2").arg(cores.leased).arg(cores.total);
+}
+
 QString weekFigureText(const QString& agentType, int weekLeft) {
 	if (agentType == QLatin1String("claude"))
 		return QStringLiteral("↑%1%").arg(100 - weekLeft);
@@ -173,16 +177,18 @@ Badge::Badge()
 	reposition();
 }
 
-void Badge::setState(const QVector<AgentGroup>& groups) {
+void Badge::setState(const QVector<AgentGroup>& groups, const CoreSummary& cores) {
 	m_groups.clear();
 	for (const AgentGroup& group : groups)
 		if (group.count > 0)
 			m_groups.append(group);
-	if (m_groups.isEmpty()) {
+	m_cores = cores;
+	const int blocks = static_cast<int>(m_groups.size()) + (m_cores.shown ? 1 : 0);
+	if (blocks == 0) {
 		hide();
 		return;
 	}
-	setFixedSize(static_cast<int>(m_groups.size()) * (kBlockWidth + kGap) - kGap, kHeight);
+	setFixedSize(blocks * (kBlockWidth + kGap) - kGap, kHeight);
 	// Re-aimed on every change rather than wired to screen signals: the badge
 	// only matters while it is visible, and this covers a resolution change, a
 	// taskbar that moved and a different primary monitor with one call.
@@ -248,5 +254,24 @@ void Badge::paintEvent(QPaintEvent*) {
 			painter.drawText(column, Qt::AlignCenter, text);
 		}
 		x += kBlockWidth + kGap;
+	}
+	if (m_cores.shown) {
+		const QRect block(x, 0, kBlockWidth, kHeight);
+		QColor fill = m_cores.leased > m_cores.total ? QColor(198, 40, 40)
+		              : m_cores.queued > 0           ? QColor(249, 168, 37)
+		                                             : QColor(69, 90, 100);
+		fill.setAlpha(kFillAlpha);
+		painter.setBrush(fill);
+		painter.setPen(Qt::NoPen);
+		painter.drawRoundedRect(block.adjusted(1, 1, -1, -1), 8, 8);
+		QFont numerals = font();
+		numerals.setBold(true);
+		painter.setPen(Qt::white);
+		// The label sits where a provider's icon would, at the week line's
+		// ink height; the figure fills the count column like a count does.
+		drawInkFitted(painter, numerals, QRect(x + 3, 10, 24, 10), QStringLiteral("CPU"));
+		drawInkFitted(painter, numerals,
+		              QRect(x + kColumnLeft, (kHeight - kTwoLineInk) / 2, kColumnWidth, kTwoLineInk),
+		              coresText(m_cores));
 	}
 }

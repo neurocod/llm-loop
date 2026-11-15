@@ -1,10 +1,12 @@
 // ---------------------------------------------------------------------------
-// AgentCounter — how many background agents are running, as a badge on screen.
+// AgentCounter — how many background agents are running, as a badge on screen,
+// and the broker that leases CPU cores to heavy runs (CoreBroker.h).
 //
 // Started by `src/llm_agents/agent_counter.py` when no instance is listening; every
 // agent then holds one open pipe connection for the whole of its turn, so the
 // count is the number of live connections and needs neither pids nor polling.
 // Whole design, including what was rejected: the beacon's module docstring.
+// A core lease is the same kind of connection (`src/llm_agents/cores.py`).
 //
 // Modes:
 //   (none)      become the counter, or exit quietly if one already runs
@@ -107,6 +109,32 @@ int runClient(bool wantStatus, bool jsonStatus = false) {
 		       agent.value(QStringLiteral("label")).toString().toUtf8().constData(),
 		       humanAge(agent.value(QStringLiteral("age_s")).toInt()).toUtf8().constData());
 	}
+	// The core broker after the agents, so `head -1` and the agent lines
+	// read as they always did.
+	const QJsonObject cores = answer.value(QStringLiteral("cores")).toObject();
+	if (!cores.isEmpty()) {
+		printf("cores %d/%d leased, %d free, %.1f foreign\n",
+		       cores.value(QStringLiteral("leased")).toInt(),
+		       cores.value(QStringLiteral("total")).toInt(),
+		       cores.value(QStringLiteral("free")).toInt(),
+		       cores.value(QStringLiteral("foreign")).toDouble());
+		for (const QJsonValue& value : cores.value(QStringLiteral("leases")).toArray()) {
+			const QJsonObject lease = value.toObject();
+			printf("lease %s  %d%s  %s\n",
+			       lease.value(QStringLiteral("label")).toString().toUtf8().constData(),
+			       lease.value(QStringLiteral("cores")).toInt(),
+			       lease.value(QStringLiteral("forced")).toBool() ? " forced" : "",
+			       humanAge(lease.value(QStringLiteral("age_s")).toInt()).toUtf8().constData());
+		}
+		for (const QJsonValue& value : cores.value(QStringLiteral("queued")).toArray()) {
+			const QJsonObject request = value.toObject();
+			printf("queued %s  %d..%d  %s\n",
+			       request.value(QStringLiteral("label")).toString().toUtf8().constData(),
+			       request.value(QStringLiteral("min")).toInt(),
+			       request.value(QStringLiteral("want")).toInt(),
+			       humanAge(request.value(QStringLiteral("age_s")).toInt()).toUtf8().constData());
+		}
+	}
 	return 0;
 }
 
@@ -159,8 +187,8 @@ int main(int argc, char* argv[]) {
 	idle.setInterval(kIdleQuitMs);
 
 	QObject::connect(&registry, &Registry::changed, &app, [&] {
-		badge.setState(registry.groups());
-		if (registry.count() == 0)
+		badge.setState(registry.groups(), registry.cores());
+		if (registry.idle())
 			idle.start();
 		else
 			idle.stop();

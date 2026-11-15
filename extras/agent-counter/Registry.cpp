@@ -30,6 +30,28 @@ constexpr int kMaxLabelChars = 120;
 // that never said hello, so there is one timer, not two.
 constexpr int kTickMs = 1000;
 
+// The meter's sample interval: CoreBroker::kWindowSamples of these make its
+// window. GetSystemTimes deltas are exact whatever the timer's jitter.
+constexpr int kMeterMs = 1000;
+
+// A lease request that names no `wait_s` waits this long for its `min`
+// before it is granted `min` forced (CoreBroker::settle). The Python client
+// always names one (`llm_agents.cores`, DEFAULT_WAIT_S, the same figure);
+// the cap keeps a typo from parking a request for a year.
+constexpr double kDefaultWaitS = 300.0;
+constexpr double kMaxWaitS = 24 * 3600.0;
+
+// A lease field that must be a whole number >= 1, or nullopt.
+std::optional<int> positiveInt(const QJsonValue& value) {
+	if (!value.isDouble())
+		return std::nullopt;
+	const double number = value.toDouble();
+	if (!std::isfinite(number) || number < 1.0 || number != std::floor(number)
+	    || number > 1e6)
+		return std::nullopt;
+	return static_cast<int>(number);
+}
+
 QString normalizedAgentType(const QString& type) {
 	if (type == QLatin1String("claude") || type == QLatin1String("codex"))
 		return type;
@@ -98,13 +120,24 @@ QString agentPipeName() {
 	// The version is part of the NAME, and that is the whole upgrade story: a
 	// new client simply does not find an old running instance, starts its own,
 	// and two protocol versions never half-understand each other.
-	return QStringLiteral("llm-agents.v1.") + foldedUser();
+	//
+	// v2: the `lease` op and the first replies on a hello-only channel, and
+	// unknown ops refused by name instead of a silent drop.
+	return QStringLiteral("llm-agents.v2.") + foldedUser();
 }
 
 Registry::Registry(QObject* parent) : QObject(parent) {
 	connect(&m_server, &QLocalServer::newConnection, this, &Registry::onNewConnection);
 	m_tick.setInterval(kTickMs);
 	connect(&m_tick, &QTimer::timeout, this, &Registry::onTick);
+	m_meterTick.setInterval(kMeterMs);
+	connect(&m_meterTick, &QTimer::timeout, this, &Registry::onMeterTick);
+}
+
+void Registry::useFakeMeter(int total) {
+	m_fakeMeter = true;
+	m_meterTick.stop();
+	m_broker = CoreBroker(total);
 }
 
 Registry::~Registry() {
@@ -171,8 +204,13 @@ bool Registry::start(const QString& name) {
 	// dies with its process, so there is never a stale one to clear — and the
 	// call would delete a LIVE instance's name.
 	m_server.setSocketOptions(QLocalServer::UserAccessOption);
-	if (m_server.listen(name))
+	if (m_server.listen(name)) {
+		if (!m_fakeMeter) {
+			m_meter.sample();  // the baseline the first interval is measured from
+			m_meterTick.start();
+		}
 		return true;
+	}
 	releaseClaim();
 	return false;
 }
@@ -198,6 +236,19 @@ QVector<AgentEntry> Registry::entries() const {
 
 QVector<AgentGroup> Registry::groups() const {
 	return groupAgents(entries(), QDateTime::currentDateTime());
+}
+
+CoreSummary Registry::cores() const {
+	CoreSummary summary;
+	summary.leased = m_broker.leased();
+	summary.total = m_broker.total();
+	summary.queued = static_cast<int>(m_broker.queue().size());
+	summary.shown = !m_broker.leases().isEmpty() || summary.queued > 0;
+	return summary;
+}
+
+bool Registry::idle() const {
+	return count() == 0 && m_broker.leases().isEmpty() && m_broker.queue().isEmpty();
 }
 
 bool Registry::retireIfIdle() {
@@ -251,10 +302,18 @@ void Registry::onSocketClosed(QLocalSocket* socket) {
 	if (it == m_clients.end())
 		return;  // both signals fired; the first one already took it
 	const bool counted = it->registered;
+	const quint64 leaseId = it->leaseId;
 	m_clients.erase(it);
 	socket->deleteLater();
 	updateTicker();
-	if (counted)
+	// The return of a lease is this and nothing else: the kernel closing a
+	// dead client's handle lands here exactly as a polite exit does.
+	if (leaseId != 0) {
+		m_leaseSockets.remove(leaseId);
+		m_broker.release(leaseId);
+		settleLeases();
+	}
+	if (counted || leaseId != 0)
 		emit changed();
 }
 
@@ -266,6 +325,10 @@ void Registry::dropClient(QLocalSocket* socket) {
 void Registry::readFrom(QLocalSocket* socket) {
 	if (!m_clients.contains(socket))
 		return;
+	if (m_clients[socket].closing) {
+		socket->readAll();
+		return;
+	}
 	m_clients[socket].buffer += socket->readAll();
 	if (m_clients[socket].buffer.size() > kMaxLineBytes) {
 		dropClient(socket);
@@ -276,7 +339,7 @@ void Registry::readFrom(QLocalSocket* socket) {
 	// iterator would then be read back.
 	for (;;) {
 		const auto it = m_clients.find(socket);
-		if (it == m_clients.end())
+		if (it == m_clients.end() || it->closing)
 			return;
 		const int cut = it->buffer.indexOf('\n');
 		if (cut < 0)
@@ -324,11 +387,151 @@ void Registry::handleLine(QLocalSocket* socket, const QByteArray& line) {
 		// become one of the things it counts.
 		sendStatus(socket);
 		socket->disconnectFromServer();
+	} else if (op == QLatin1String("lease")) {
+		handleLease(socket, obj);
 	} else if (op == QLatin1String("quit")) {
 		emit quitRequested();
 	} else {
-		dropClient(socket);
+		// Refused BY NAME: a newer client asking for an op this build lacks
+		// learns that it was this op, and can fall back instead of reading a
+		// cut pipe as a crash. A v2 beacon never reads, so its pipe merely
+		// holds a line nobody collects; nothing of the old behaviour is lost
+		// but the silence.
+		refuse(socket, QStringLiteral("unknown-op"), {{QStringLiteral("got"), op}});
 	}
+}
+
+// The lease, on the wire:
+//   -> {"op":"lease","want":8,"min":2,"label":"npm test","wait_s":300}
+//   <- {"op":"queued","ahead":1,"free":1,"total":16}   only when it must wait
+//   <- {"op":"grant","cores":8,"total":16,"free":11,"foreign":2.5,
+//       "forced":false,"waited_s":0.0}
+// `want` is required, `min` defaults to 1, `wait_s` to kDefaultWaitS; both
+// counts are clamped to the machine (a min above it could never be served).
+// The lease lasts as long as the connection: there is no "release" op, so
+// no client can forget one.
+void Registry::handleLease(QLocalSocket* socket, const QJsonObject& obj) {
+	Client& client = m_clients[socket];
+	if (client.leaseId != 0) {
+		// Not refused-and-closed: closing would return the lease it holds.
+		reply(socket, {{QStringLiteral("op"), QStringLiteral("error")},
+		               {QStringLiteral("error"), QStringLiteral("lease-held")}});
+		return;
+	}
+	const std::optional<int> want = positiveInt(obj.value(QStringLiteral("want")));
+	const QJsonValue minValue = obj.value(QStringLiteral("min"));
+	const std::optional<int> min =
+	    minValue.isUndefined() ? std::optional<int>(1) : positiveInt(minValue);
+	const QJsonValue waitValue = obj.value(QStringLiteral("wait_s"));
+	const double waitS = waitValue.isUndefined() ? kDefaultWaitS : waitValue.toDouble(-1.0);
+	if (!want || !min || *min > *want || (!waitValue.isUndefined() && !waitValue.isDouble())
+	    || !std::isfinite(waitS) || waitS < 0.0) {
+		refuse(socket, QStringLiteral("bad-lease"),
+		       {{QStringLiteral("detail"),
+		         QStringLiteral("want and min are whole numbers >= 1 with min <= want; "
+		                        "wait_s is a number >= 0")}});
+		return;
+	}
+	CoreRequest request;
+	request.id = m_nextLeaseId++;
+	request.label = obj.value(QStringLiteral("label")).toString().left(kMaxLabelChars);
+	if (request.label.isEmpty())
+		request.label = QStringLiteral("lease");
+	request.want = std::min(*want, m_broker.total());
+	request.min = std::min(*min, m_broker.total());
+	request.asked = QDateTime::currentDateTime();
+	request.waitMs = static_cast<qint64>(std::min(waitS, kMaxWaitS) * 1000.0);
+	client.leaseId = request.id;
+	m_leaseSockets.insert(request.id, socket);
+	m_broker.request(request);
+	const int free = m_broker.freeCores();
+	settleLeases();
+	for (qsizetype i = 0; i < m_broker.queue().size(); ++i) {
+		if (m_broker.queue()[i].id != request.id)
+			continue;
+		reply(socket, {{QStringLiteral("op"), QStringLiteral("queued")},
+		               {QStringLiteral("ahead"), static_cast<int>(i)},
+		               {QStringLiteral("free"), free},
+		               {QStringLiteral("total"), m_broker.total()}});
+		break;
+	}
+	emit changed();
+}
+
+void Registry::reply(QLocalSocket* socket, const QJsonObject& message) {
+	socket->write(QJsonDocument(message).toJson(QJsonDocument::Compact) + '\n');
+	socket->flush();
+}
+
+void Registry::refuse(QLocalSocket* socket, const QString& error, const QJsonObject& detail) {
+	const auto it = m_clients.find(socket);
+	if (it == m_clients.end())
+		return;
+	QJsonObject message = detail;
+	message.insert(QStringLiteral("op"), QStringLiteral("error"));
+	message.insert(QStringLiteral("error"), error);
+	reply(socket, message);
+	// Out of every count NOW, closed once the reply is written: the
+	// `disconnected` signal then erases the entry (onSocketClosed).
+	const bool counted = it->registered;
+	const quint64 leaseId = it->leaseId;
+	it->registered = false;
+	it->leaseId = 0;
+	it->closing = true;
+	if (leaseId != 0) {
+		m_leaseSockets.remove(leaseId);
+		m_broker.release(leaseId);
+		settleLeases();
+	}
+	socket->disconnectFromServer();
+	if (counted || leaseId != 0)
+		emit changed();
+}
+
+void Registry::settleLeases() {
+	const QVector<CoreGrant> grants = m_broker.settle(QDateTime::currentDateTime());
+	for (const CoreGrant& grant : grants) {
+		QLocalSocket* socket = m_leaseSockets.value(grant.id);
+		if (socket == nullptr)
+			continue;
+		reply(socket, {{QStringLiteral("op"), QStringLiteral("grant")},
+		               {QStringLiteral("cores"), grant.cores},
+		               {QStringLiteral("total"), m_broker.total()},
+		               {QStringLiteral("free"), grant.freeBefore},
+		               {QStringLiteral("foreign"), std::round(m_broker.foreignCores() * 10) / 10},
+		               {QStringLiteral("forced"), grant.forced},
+		               {QStringLiteral("waited_s"), grant.waitedMs / 1000.0}});
+	}
+	if (!grants.isEmpty())
+		emit changed();
+}
+
+QJsonObject Registry::coreStatus() const {
+	const QDateTime now = QDateTime::currentDateTime();
+	QJsonArray leases;
+	for (const CoreLease& lease : m_broker.leases())
+		leases.append(QJsonObject{{QStringLiteral("label"), lease.label},
+		                          {QStringLiteral("cores"), lease.cores},
+		                          {QStringLiteral("forced"), lease.forced},
+		                          {QStringLiteral("age_s"),
+		                           static_cast<double>(lease.granted.secsTo(now))}});
+	QJsonArray queued;
+	for (const CoreRequest& request : m_broker.queue())
+		queued.append(QJsonObject{{QStringLiteral("label"), request.label},
+		                          {QStringLiteral("want"), request.want},
+		                          {QStringLiteral("min"), request.min},
+		                          {QStringLiteral("age_s"),
+		                           static_cast<double>(request.asked.secsTo(now))}});
+	return QJsonObject{
+	    {QStringLiteral("total"), m_broker.total()},
+	    {QStringLiteral("leased"), m_broker.leased()},
+	    {QStringLiteral("free"), m_broker.freeCores()},
+	    {QStringLiteral("measured"), m_broker.measured()},
+	    {QStringLiteral("idle"), std::round(m_broker.idleCores() * 10) / 10},
+	    {QStringLiteral("foreign"), std::round(m_broker.foreignCores() * 10) / 10},
+	    {QStringLiteral("leases"), leases},
+	    {QStringLiteral("queued"), queued},
+	};
 }
 
 void Registry::sendStatus(QLocalSocket* socket) {
@@ -345,12 +548,12 @@ void Registry::sendStatus(QLocalSocket* socket) {
 			agent.insert(QStringLiteral("week_left"), *entry.weekLeft);
 		agents.append(agent);
 	}
-	const QJsonObject reply{
+	reply(socket, {
 	    {QStringLiteral("count"), count()},
 	    {QStringLiteral("agents"), agents},
-	};
-	socket->write(QJsonDocument(reply).toJson(QJsonDocument::Compact) + '\n');
-	socket->flush();
+	    // Additive: v1 readers of `count`/`agents` see what they always saw.
+	    {QStringLiteral("cores"), coreStatus()},
+	});
 }
 
 void Registry::onTick() {
@@ -358,13 +561,23 @@ void Registry::onTick() {
 	const QList<QLocalSocket*> sockets = m_clients.keys();
 	for (QLocalSocket* socket : sockets) {
 		const auto it = m_clients.find(socket);
-		if (it == m_clients.end() || it->registered)
+		if (it == m_clients.end() || it->registered || it->leaseId != 0)
 			continue;
 		if (it->connected.msecsTo(now) >= m_helloTimeoutMs)
 			dropClient(socket);
 	}
 	if (count() > 0)
 		emit changed();
+}
+
+void Registry::onMeterTick() {
+	const double idle = m_meter.sample();
+	if (idle >= 0.0)
+		m_broker.addIdleSample(idle);
+	// Every second, not only on arrivals and departures: free cores also
+	// appear when foreign load ends, and a waiter's patience runs out on the
+	// clock (CoreBroker::settle).
+	settleLeases();
 }
 
 void Registry::updateTicker() {

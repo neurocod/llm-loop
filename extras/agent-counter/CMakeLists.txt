@@ -37,11 +37,13 @@ qt_add_executable(AgentCounter WIN32
     main.cpp
     Badge.cpp
     BadgeTest.cpp
+    CoreBroker.cpp
     Registry.cpp
     SelfTest.cpp
     # Headers listed as sources so AUTOMOC discovers Q_OBJECT classes.
     Badge.h
     BadgeTest.h
+    CoreBroker.h
     Registry.h
     SelfTest.h
 )

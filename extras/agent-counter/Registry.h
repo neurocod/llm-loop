@@ -17,6 +17,9 @@
 
 #include <optional>
 
+#include "CoreBroker.h"
+
+class QJsonObject;
 class QJsonValue;
 class QLocalSocket;
 
@@ -38,6 +41,16 @@ struct AgentGroup {
 	// The weekly limit is the ACCOUNT's, so one figure per provider: the
 	// freshest any of its agents reported. Empty = the badge's plain look.
 	std::optional<int> weekLeft;
+};
+
+// What the badge shows of the core broker: leased / total, plus how many wait.
+// `shown` only while anything is leased or queued — an agent's hello holds no
+// cores, so the plain agent badge looks exactly as it did before leases.
+struct CoreSummary {
+	bool shown = false;
+	int leased = 0;
+	int total = 0;
+	int queued = 0;
 };
 
 // Explicit wire types only: labels remain opaque, including legacy labels.
@@ -78,6 +91,9 @@ public:
 	int count() const;
 	QVector<AgentEntry> entries() const;
 	QVector<AgentGroup> groups() const;
+	CoreSummary cores() const;
+	// Nothing to serve: no agent counted, no lease held, nobody queued.
+	bool idle() const;
 
 	// Stop listening and answer whether the process may exit now.
 	//
@@ -103,12 +119,22 @@ private:
 	// client's OS connection: on Windows those are separate events. Keep this
 	// synchronization hook out of the public registry API.
 	friend int runSelfTest();
+	// The lease half of the gate (SelfTest.cpp): it fakes the machine
+	// (`useFakeMeter`) and feeds the broker's samples itself.
+	friend void selfTestLeases(const QString& base);
 
 	struct Client {
 		QByteArray buffer;
 		QDateTime connected;
 		bool registered = false;
 		AgentEntry entry;
+		// Nonzero once the client asked for cores (queued or granted). A
+		// lease is a connection of its own kind: it is not an agent (it does
+		// not raise `count`), and it is exempt from the hello reaper.
+		quint64 leaseId = 0;
+		// Refused by name and closing: the reply is on its way out, so the
+		// connection is no longer read, counted or leased.
+		bool closing = false;
 	};
 
 	// The exclusive half of `start`, and the only reason two counters cannot
@@ -129,14 +155,38 @@ private:
 	void dropClient(QLocalSocket* socket);
 	void readFrom(QLocalSocket* socket);
 	void handleLine(QLocalSocket* socket, const QByteArray& line);
+	void handleLease(QLocalSocket* socket, const QJsonObject& obj);
+	// Answer `{"op":"error","error":<error>,...}` and close once it is
+	// written — the reply to an op this build does not know or a lease it
+	// cannot take. Not `dropClient`: a client that asked something and was
+	// cut off without a word cannot tell "refused" from "crashed", and a
+	// newer client meeting this build must be able to say WHICH.
+	void refuse(QLocalSocket* socket, const QString& error, const QJsonObject& detail);
+	void reply(QLocalSocket* socket, const QJsonObject& message);
+	// Run the broker's decisions and tell each granted client its cores.
+	void settleLeases();
 	void sendStatus(QLocalSocket* socket);
+	QJsonObject coreStatus() const;
 	void onTick();
+	void onMeterTick();
 	void updateTicker();
+	// The selftest's machine: `total` cores and no real meter, so samples
+	// come only from the test (`m_broker.addIdleSample`).
+	void useFakeMeter(int total);
 
 	QLocalServer m_server;
 	QString m_name;
 	QHash<QLocalSocket*, Client> m_clients;
 	QTimer m_tick;
 	int m_helloTimeoutMs = 2000;
+	CoreBroker m_broker{logicalCoreCount()};
+	CpuMeter m_meter;
+	// Always running while the process lives, unlike `m_tick`: the meter's
+	// window must already hold samples when the first lease arrives, and a
+	// sample a second costs one system call.
+	QTimer m_meterTick;
+	bool m_fakeMeter = false;
+	quint64 m_nextLeaseId = 1;
+	QHash<quint64, QLocalSocket*> m_leaseSockets;
 	void* m_claim = nullptr;  // HANDLE, kept opaque so windows.h stays out of here
 };

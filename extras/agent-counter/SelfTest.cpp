@@ -86,7 +86,246 @@ void say(QLocalSocket* socket, const QByteArray& line) {
 	socket->flush();
 }
 
+// One line of a conversation that may carry several (a lease's "queued" and
+// later its "grant"): what follows the first newline stays in `pending` for
+// the next call, which `readReply` would have thrown away.
+QJsonObject readLine(QLocalSocket* socket, QByteArray& pending, const char* what) {
+	check(waitFor([&] {
+		pending += socket->readAll();
+		return pending.contains('\n');
+	}), what);
+	const int cut = pending.indexOf('\n');
+	if (cut < 0)
+		return {};
+	const QByteArray line = pending.left(cut);
+	pending.remove(0, cut + 1);
+	return QJsonDocument::fromJson(line).object();
+}
+
+CoreRequest coreRequest(quint64 id, int want, int min, const QDateTime& asked,
+                        qint64 waitMs = 60'000) {
+	CoreRequest request;
+	request.id = id;
+	request.label = QStringLiteral("r%1").arg(id);
+	request.want = want;
+	request.min = min;
+	request.asked = asked;
+	request.waitMs = waitMs;
+	return request;
+}
+
+// The broker's rules on made-up machines: no clock, no meter, no wire.
+void brokerRules() {
+	const QDateTime t0 = QDateTime::fromSecsSinceEpoch(1'700'000'000);
+	{
+		CoreBroker broker(16);
+		broker.request(coreRequest(1, 8, 2, t0));
+		check(broker.settle(t0).isEmpty() && broker.queue().size() == 1,
+		      "an unmeasured broker grants nothing: there is no load to subtract yet");
+		broker.addIdleSample(1.0);
+		QVector<CoreGrant> grants = broker.settle(t0);
+		check(grants.size() == 1 && grants[0].id == 1 && grants[0].cores == 8 && !grants[0].forced,
+		      "an idle machine grants the whole want");
+		broker.request(coreRequest(2, 16, 2, t0));
+		grants = broker.settle(t0);
+		check(grants.size() == 1 && grants[0].cores == 8 && broker.freeCores() == 0,
+		      "total - leased bounds an idle meter: a just-granted child is not burning yet");
+		broker.request(coreRequest(3, 4, 2, t0));
+		check(broker.settle(t0).isEmpty() && broker.queue().size() == 1,
+		      "below its min a request waits");
+		broker.release(1);
+		grants = broker.settle(t0);
+		check(grants.size() == 1 && grants[0].id == 3 && grants[0].cores == 4,
+		      "a returned lease serves the queue");
+		check(broker.leases().size() == 2 && broker.leases()[0].id == 2
+		          && broker.leases()[0].cores == 8,
+		      "a running lease is neither shrunk nor grown by others coming and going");
+		broker.release(3);
+		broker.release(2);
+		check(broker.leased() == 0 && broker.leases().isEmpty(), "release takes the lease away");
+	}
+	{
+		CoreBroker broker(16);
+		broker.addIdleSample(0.5);
+		check(broker.freeCores() == 8 && broker.foreignCores() == 8.0,
+		      "unregistered load is subtracted from the free cores");
+		broker.request(coreRequest(1, 12, 2, t0));
+		const QVector<CoreGrant> grants = broker.settle(t0);
+		check(grants.size() == 1 && grants[0].cores == 8 && grants[0].freeBefore == 8,
+		      "and a grant gets only what the meter saw idle");
+	}
+	{
+		CoreBroker broker(10);
+		for (int i = 0; i < CoreBroker::kWindowSamples; ++i)
+			broker.addIdleSample(0.0);
+		check(broker.freeCores() == 0, "a busy window frees nothing");
+		for (int i = 0; i < CoreBroker::kWindowSamples - 1; ++i)
+			broker.addIdleSample(1.0);
+		check(broker.freeCores() == 8, "the window is a mean of its samples");
+		broker.addIdleSample(1.0);
+		check(broker.freeCores() == 10, "and a sample past the window pushes the oldest out");
+		broker.addIdleSample(1.7);
+		broker.addIdleSample(-0.5);
+		check(broker.idleCores() <= 10.0 && broker.freeCores() == 8,
+		      "a meter outside [0, 1] is clamped, never minting cores");
+	}
+	{
+		CoreBroker broker(16);
+		broker.addIdleSample(1.0);
+		broker.request(coreRequest(1, 13, 13, t0));
+		broker.settle(t0);
+		broker.request(coreRequest(2, 8, 6, t0));
+		broker.request(coreRequest(3, 1, 1, t0));
+		check(broker.settle(t0).isEmpty() && broker.queue().size() == 2,
+		      "a small request does not overtake a waiting large one");
+	}
+	{
+		CoreBroker broker(4);
+		broker.addIdleSample(1.0);
+		broker.request(coreRequest(1, 4, 4, t0));
+		broker.settle(t0);
+		broker.request(coreRequest(2, 3, 2, t0, 1000));
+		check(broker.settle(t0.addMSecs(999)).isEmpty(), "a waiter inside its patience waits");
+		const QVector<CoreGrant> grants = broker.settle(t0.addMSecs(1000));
+		check(grants.size() == 1 && grants[0].cores == 2 && grants[0].forced
+		          && grants[0].waitedMs == 1000 && broker.leased() == 6,
+		      "past its patience it runs with its min, forced, over the machine");
+	}
+	{
+		CoreBroker broker(4);
+		broker.request(coreRequest(1, 2, 1, t0, 0));
+		const QVector<CoreGrant> grants = broker.settle(t0);
+		check(grants.size() == 1 && grants[0].forced && grants[0].cores == 1,
+		      "even an unmeasured broker lets patience run out");
+		CoreBroker measured(4);
+		measured.addIdleSample(1.0);
+		measured.request(coreRequest(1, 2, 1, t0, 0));
+		const QVector<CoreGrant> fits = measured.settle(t0);
+		check(fits.size() == 1 && !fits[0].forced && fits[0].cores == 2,
+		      "a request that fits is served, never forced for asking no wait");
+	}
+	{
+		CpuMeter meter;
+		check(meter.sample() < 0.0, "the meter's first sample has no interval: no figure");
+		pumpFor(200);
+		const double idle = meter.sample();
+		check(idle >= 0.0 && idle <= 1.0, "the real meter reads an idle fraction in [0, 1]");
+		check(logicalCoreCount() >= 1, "the machine has at least one core");
+	}
+}
+
 }  // namespace
+
+// Leases over the pipe, on a registry with a made-up 8-core machine. Outside
+// the anonymous namespace because Registry befriends it by name.
+void selfTestLeases(const QString& base) {
+	const QString name = base + QStringLiteral(".cores");
+	Registry registry;
+	registry.useFakeMeter(8);
+	registry.setHelloTimeoutMs(300);
+	check(registry.start(name), "the lease test takes its own isolated name");
+	registry.m_broker.addIdleSample(1.0);
+
+	QByteArray firstLines, secondLines;
+	auto first = connectClient(name);
+	say(first.get(), R"({"op":"lease","want":6,"min":2,"label":"suite"})");
+	QJsonObject answer = readLine(first.get(), firstLines, "a lease is answered");
+	check(answer.value(QStringLiteral("op")).toString() == QLatin1String("grant")
+	          && answer.value(QStringLiteral("cores")).toInt() == 6
+	          && answer.value(QStringLiteral("total")).toInt() == 8
+	          && !answer.value(QStringLiteral("forced")).toBool(),
+	      "the grant names its cores and the machine");
+	check(registry.count() == 0, "a lease is not an agent");
+
+	auto second = connectClient(name);
+	say(second.get(), R"({"op":"lease","want":4,"min":3,"label":"waiter","wait_s":60})");
+	answer = readLine(second.get(), secondLines, "a waiting lease is answered at once");
+	check(answer.value(QStringLiteral("op")).toString() == QLatin1String("queued")
+	          && answer.value(QStringLiteral("ahead")).toInt() == 0
+	          && answer.value(QStringLiteral("free")).toInt() == 2,
+	      "below its min it is told it waits, and why");
+
+	first->abort();
+	answer = readLine(second.get(), secondLines, "the waiter hears again");
+	check(answer.value(QStringLiteral("op")).toString() == QLatin1String("grant")
+	          && answer.value(QStringLiteral("cores")).toInt() == 4,
+	      "a client killed mid-lease returns its cores, and the waiter is served");
+
+	// Past the 300 ms hello deadline AND two of the reaper's 1 s ticks
+	// (Registry.cpp, kTickMs): the deadline alone is checked only on a tick.
+	pumpFor(2200);
+	check(second->state() == QLocalSocket::ConnectedState && registry.cores().leased == 4,
+	      "a lease outlives the hello reaper's patience");
+
+	auto agent = connectClient(name);
+	say(agent.get(), R"({"op":"hello","label":"agent","agent_type":"claude"})");
+	checkCount(registry, 1, "an agent registers beside a lease");
+	check(registry.cores().leased == 4, "and its hello holds no cores");
+
+	auto probe = connectClient(name);
+	say(probe.get(), R"({"op":"status"})");
+	const QJsonObject status = readReply(probe.get(), "status answers with leases");
+	const QJsonObject cores = status.value(QStringLiteral("cores")).toObject();
+	const QJsonArray leases = cores.value(QStringLiteral("leases")).toArray();
+	check(status.value(QStringLiteral("count")).toInt() == 1
+	          && cores.value(QStringLiteral("total")).toInt() == 8
+	          && cores.value(QStringLiteral("leased")).toInt() == 4 && leases.size() == 1
+	          && leases.first().toObject().value(QStringLiteral("label")).toString()
+	                 == QLatin1String("waiter"),
+	      "status lists the leases beside the agents");
+
+	say(second.get(), R"({"op":"lease","want":2})");
+	answer = readLine(second.get(), secondLines, "a second lease on one connection is answered");
+	check(answer.value(QStringLiteral("error")).toString() == QLatin1String("lease-held")
+	          && registry.cores().leased == 4 && second->state() == QLocalSocket::ConnectedState,
+	      "one lease per connection, and asking twice keeps the first");
+
+	{
+		QByteArray lines;
+		auto newer = connectClient(name);
+		say(newer.get(), R"({"op":"frobnicate"})");
+		answer = readLine(newer.get(), lines, "an unknown op is answered");
+		check(answer.value(QStringLiteral("op")).toString() == QLatin1String("error")
+		          && answer.value(QStringLiteral("error")).toString() == QLatin1String("unknown-op")
+		          && answer.value(QStringLiteral("got")).toString() == QLatin1String("frobnicate"),
+		      "an unknown op is refused BY NAME, not cut off");
+		check(waitFor([&] { return newer->state() != QLocalSocket::ConnectedState; }),
+		      "and the refused connection is closed");
+	}
+	for (const QByteArray& bad : {QByteArray(R"({"op":"lease","want":2,"min":3})"),
+	                              QByteArray(R"({"op":"lease","want":0})"),
+	                              QByteArray(R"({"op":"lease","want":2.5})"),
+	                              QByteArray(R"({"op":"lease"})"),
+	                              QByteArray(R"({"op":"lease","want":2,"wait_s":"soon"})")}) {
+		QByteArray lines;
+		auto client = connectClient(name);
+		say(client.get(), bad);
+		answer = readLine(client.get(), lines, "a malformed lease is answered");
+		check(answer.value(QStringLiteral("error")).toString() == QLatin1String("bad-lease")
+		          && registry.cores().leased == 4 && registry.m_broker.queue().isEmpty(),
+		      "a malformed lease is refused and takes nothing");
+	}
+
+	{
+		QByteArray lines;
+		auto hasty = connectClient(name);
+		say(hasty.get(), R"({"op":"lease","want":50,"min":50,"label":"hasty","wait_s":0})");
+		answer = readLine(hasty.get(), lines, "an impatient lease is answered");
+		check(answer.value(QStringLiteral("op")).toString() == QLatin1String("grant")
+		          && answer.value(QStringLiteral("forced")).toBool()
+		          && answer.value(QStringLiteral("cores")).toInt() == 8,
+		      "a min above the machine is clamped to it, and no patience means forced at once");
+		check(registry.cores().leased == 12 && registry.cores().leased > registry.cores().total,
+		      "the badge sees the over-commitment");
+		hasty->abort();
+		check(waitFor([&] { return registry.cores().leased == 4; }), "and its return");
+	}
+
+	second->disconnectFromServer();
+	agent->abort();
+	check(waitFor([&] { return registry.idle(); }),
+	      "with the last lease and agent gone the registry is idle");
+}
 
 int runSelfTest() {
 	const QString name = agentPipeName() + QStringLiteral(".selftest");
@@ -337,6 +576,9 @@ int runSelfTest() {
 		      "a garbage line closes the connection");
 		check(registry.count() == 0, "and counts nothing");
 	}
+
+	brokerRules();
+	selfTestLeases(name);
 
 	check(registry.retireIfIdle(), "an idle registry agrees to retire");
 	{

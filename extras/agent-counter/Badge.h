@@ -21,6 +21,9 @@ bool showsWeekLeft(const AgentGroup& group);
 // (`week_left`); an untyped sender gets the bare remainder, no arrow.
 QString weekFigureText(const QString& agentType, int weekLeft);
 
+// The cores block's count column: "leased/total".
+QString coresText(const CoreSummary& cores);
+
 class Badge : public QWidget {
 	Q_OBJECT
 public:
@@ -29,7 +32,13 @@ public:
 	// `oldestSeconds` is not decoration: the window is click-through, so there
 	// is no hover and no tooltip, and colour is the only channel left to tell
 	// "an agent is working" from "an agent has been stuck since this morning".
-	void setState(const QVector<AgentGroup>& groups);
+	//
+	// `cores`, when shown, adds one block after the providers: "CPU" in the
+	// icon slot and "leased/total" in the count column. Its colour is the
+	// broker's state, not an age: slate while every request is served, amber
+	// while anyone waits, red once forced grants put the leases over the
+	// machine (CoreBroker::settle).
+	void setState(const QVector<AgentGroup>& groups, const CoreSummary& cores = {});
 
 protected:
 	void paintEvent(QPaintEvent* event) override;
@@ -38,6 +47,7 @@ private:
 	void reposition();
 
 	QVector<AgentGroup> m_groups;
+	CoreSummary m_cores;
 	QPixmap m_claudeIcon;
 	QPixmap m_codexIcon;
 };

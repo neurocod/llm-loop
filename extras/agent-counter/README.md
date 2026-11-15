@@ -25,6 +25,13 @@ or name it in a host policy (`HostPolicy.counter_exes`). `AgentCounter.exe
 --selftest` runs the registry checks without a window; `--status` prints the
 current count. Set `AGENT_COUNTER_ENABLED=0` to keep the badge off the screen.
 
+**Core leases.** The same process brokers CPU cores between heavy runs
+(rules: `CoreBroker.h`). `python -m llm_agents.cores run --want 8 --min 2 --
+<command>` starts the command with the granted count in `LLM_CORES`;
+`python -m llm_agents.cores status` prints the leases, the queue and the
+measured load. Without the counter the command runs as it would have, with
+one line on stderr.
+
 **Icons.** No provider logo ships here: by default the badge paints neutral
 marks of its own (a disc with a letter). To show real icons, configure with
 `-DAGENT_COUNTER_ICON_DIR=<dir>` naming a directory with `claude.png` and

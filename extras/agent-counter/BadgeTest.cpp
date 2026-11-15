@@ -91,7 +91,7 @@ int runBadgeSelfTest(const QString& previewPath) {
 	badge.setAttribute(Qt::WA_DontShowOnScreen);
 	const QFontMetrics metrics(badge.font());
 	bool hasGlyphs = true;
-	for (const QChar glyph : QStringLiteral("0123456789+?%↑↓"))
+	for (const QChar glyph : QStringLiteral("0123456789+?%↑↓/CPU"))
 		hasGlyphs = hasGlyphs && metrics.inFont(glyph);
 	check(hasGlyphs, "the platform font contains every badge glyph");
 	badge.setState({{QStringLiteral("claude"), 1, 0}});
@@ -148,13 +148,37 @@ int runBadgeSelfTest(const QString& previewPath) {
 	      "a two-line block and a plain one keep both block widths");
 	badge.setState({});
 
+	// --- the core broker's block
+	badge.setState({}, CoreSummary{false, 0, 16, 0});
+	check(badge.isHidden(), "a core summary that is not shown keeps an idle badge hidden");
+	badge.setState({}, CoreSummary{true, 12, 16, 0});
+	check(!badge.isHidden() && badge.width() == singleWidth,
+	      "leases alone show one block, as wide as a provider's");
+	const QImage cores = badge.grab().toImage();
+	check(coresText(CoreSummary{true, 12, 16, 0}) == QStringLiteral("12/16"),
+	      "the cores block reads leased/total");
+	badge.setState({}, CoreSummary{true, 12, 16, 1});
+	const QImage coresQueued = badge.grab().toImage();
+	badge.setState({}, CoreSummary{true, 18, 16, 0});
+	const QImage coresOver = badge.grab().toImage();
+	check(cores != coresQueued && coresQueued != coresOver && cores != coresOver,
+	      "served, waiting and over-committed brokers paint three different blocks");
+	badge.setState({group("claude", 2, std::nullopt)}, CoreSummary{true, 12, 16, 0});
+	const QImage agentsAndCores = badge.grab().toImage();
+	check(badge.width() == 2 * singleWidth + 4, "agents and leases sit side by side");
+	badge.setState({group("claude", 2, std::nullopt)});
+	check(badge.width() == singleWidth, "a hello holds no cores: agents alone keep their old badge");
+	badge.setState({});
+
 	if (!previewPath.isEmpty()) {
 		// Render the real widget at 3x on both desktop backgrounds; do not
 		// duplicate its paint logic in a mock-up that could hide layout defects.
-		const QVector<QImage> samples{claude, codex, mixed, crowded, unknown, low, lowCodex, lowMixed};
+		const QVector<QImage> samples{claude, codex, mixed, crowded, unknown, low, lowCodex, lowMixed,
+		                              agentsAndCores, coresQueued};
 		// Columns fit two 68 px blocks and their gap at 3x (420 px) plus margins.
 		constexpr int kSheetColumn = 460;
-		QImage sheet(2 * kSheetColumn, 1025, QImage::Format_ARGB32_Premultiplied);
+		QImage sheet(2 * kSheetColumn, 25 + 125 * static_cast<int>(samples.size()),
+		             QImage::Format_ARGB32_Premultiplied);
 		sheet.fill(QColor(35, 35, 35));
 		QPainter painter(&sheet);
 		painter.fillRect(kSheetColumn, 0, kSheetColumn, sheet.height(), QColor(240, 240, 240));
