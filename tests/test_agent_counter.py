@@ -220,3 +220,43 @@ def test_an_exe_listening_elsewhere_is_never_started(tmp_path, monkeypatch, caps
     assert len(spawned) == 3 * spawns
     lines = _unavailable_lines(capsys)
     assert len(lines) == 1 and ("old-name.v1." in lines[0]) == (spawns == 0), lines
+
+
+def test_a_rebuilt_exe_is_asked_its_pipe_name_again(tmp_path, monkeypatch):
+    """The answer is cached per process, so a long-lived host would refuse a
+    stale exe for ever after it was rebuilt; the exe's mtime is in the key."""
+    exe = tmp_path / "Counter.exe"
+    exe.write_bytes(b"")
+    monkeypatch.setattr(agent_counter, "_exe_pipe_names", {})
+    user = agent_counter.pipe_path().rsplit(agent_counter.PIPE_PREFIX, 1)[1]
+    answers = iter([f"old-name.v1.{user}\n", f"{agent_counter.PIPE_PREFIX}{user}\n"])
+    asked = []
+
+    def run(argv, **kwargs):
+        asked.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=next(answers), stderr="")
+
+    monkeypatch.setattr(agent_counter.subprocess, "run", run)
+    assert agent_counter._listens_elsewhere(exe) == f"old-name.v1.{user}"
+    assert agent_counter._listens_elsewhere(exe) == f"old-name.v1.{user}"
+    stamp = exe.stat().st_mtime_ns + 1_000_000_000
+    os.utime(exe, ns=(stamp, stamp))
+    assert agent_counter._listens_elsewhere(exe) is None
+    assert len(asked) == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="job objects are Windows'")
+def test_the_counter_is_spawned_out_of_a_leased_runs_job(monkeypatch, tmp_path):
+    """Started from inside `cores run` (a kill-on-close job), the counter must
+    break away, or it dies with that run; a job forbidding that still starts it."""
+    flags = []
+
+    def popen(argv, creationflags=0, **kwargs):
+        flags.append(creationflags)
+        if creationflags & agent_counter.CREATE_BREAKAWAY_FROM_JOB and len(flags) == 1:
+            raise PermissionError("breakaway refused")
+
+    monkeypatch.setattr(agent_counter.subprocess, "Popen", popen)
+    agent_counter._spawn(tmp_path / "Counter.exe")
+    assert flags[0] & agent_counter.CREATE_BREAKAWAY_FROM_JOB
+    assert len(flags) == 2 and not flags[1] & agent_counter.CREATE_BREAKAWAY_FROM_JOB

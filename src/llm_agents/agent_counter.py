@@ -97,6 +97,9 @@ MAX_LABEL_CHARS = 120
 # `Registry::handleLine` / `weekLeftFrom` in extras/agent-counter/Registry.cpp.
 WEEK_LEFT_FIELD = "week_left"
 
+# Windows' CreateProcess flag; `subprocess` does not name it.
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
 _complained = False
 # Provider types already told "no weekly figure" in this process: a worker
 # runs turn after turn, and a field the provider dropped for good would
@@ -106,8 +109,10 @@ _week_complained: set[str] = set()
 # stream's thread (`Beacon.report_week_used`) while the turn's own thread
 # announces, and an unlocked check-then-set can print the line twice.
 _once_lock = threading.Lock()
-# What each exe answered to `--pipe-name` in this process (None: no answer).
-_exe_pipe_names: dict[str, Optional[str]] = {}
+# What each exe answered to `--pipe-name` in this process (None: no answer),
+# keyed by path AND modification time: a long-lived host must ask again once
+# the stale exe it was refusing has been rebuilt.
+_exe_pipe_names: dict[tuple[str, Optional[int]], Optional[str]] = {}
 
 
 def _fold_user(raw: str) -> str:
@@ -290,9 +295,19 @@ def _spawn(exe: Path) -> None:
     flags = 0
     if os.name == "nt":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
-    subprocess.Popen([str(exe)], creationflags=flags, close_fds=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL)
+    options = dict(close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
+    if os.name == "nt":
+        # Out of any job this process runs in: started from inside a leased
+        # run (`cores.Job`, kill-on-close), the counter would otherwise die
+        # with that run and take every other lease and agent with it. A job
+        # that forbids breaking away refuses the flag; then it starts inside.
+        try:
+            subprocess.Popen([str(exe)], creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **options)
+            return
+        except OSError:
+            pass
+    subprocess.Popen([str(exe)], creationflags=flags, **options)
 
 
 def _listens_elsewhere(exe: Path) -> Optional[str]:
@@ -303,11 +318,15 @@ def _listens_elsewhere(exe: Path) -> Optional[str]:
     line and no spawn. No answer (an exe older than `--pipe-name`, a crash, a
     timeout) is not a mismatch: the spawn goes ahead as it always did.
     """
-    key = str(exe)
+    try:
+        mtime: Optional[int] = exe.stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    key = (str(exe), mtime)
     if key not in _exe_pipe_names:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
-            done = subprocess.run([key, "--pipe-name"], capture_output=True, text=True,
+            done = subprocess.run([str(exe), "--pipe-name"], capture_output=True, text=True,
                                   timeout=PIPE_NAME_TIMEOUT_S, creationflags=flags)
             _exe_pipe_names[key] = done.stdout.strip() if done.returncode == 0 else None
         except (OSError, subprocess.SubprocessError):

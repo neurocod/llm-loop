@@ -16,7 +16,17 @@ The lease is the CONNECTION, exactly as an agent's registration is
 (`agent_counter`'s docstring): it is held for the child's whole life and
 returned when this process exits, however it exits — a `taskkill /F` of this
 wrapper closes the handle in the kernel, and the broker hands the cores to
-the next waiter. There is no "release" message to forget.
+the next waiter. There is no "release" message to forget. And the child goes
+with it: `run` puts it in a kill-on-close job object (`Job`), so a wrapper
+killed without `/T` does not leave a child burning K cores nobody holds.
+
+Nested runs do not lease again: an inner `run` (one whose environment already
+carries `LEASE_ENV`) takes min(want, outer K) of the OUTER lease. Several
+inner runs started side by side therefore SHARE those K cores — the caller
+that starts them in parallel divides K among them, as it would have divided
+the machine. Leasing them from the broker under the outer budget would need
+the outer wrapper to serve a sub-broker of its own while it waits on its
+child, for a pattern no caller has.
 
 Nothing here may fail the run it wraps. Without a broker — the counter not
 built, `AGENT_COUNTER_ENABLED=0`, not Windows, a counter that refuses or
@@ -34,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence
@@ -59,6 +70,121 @@ ANSWER_SLACK_S = 15.0
 POLL_S = 0.05
 
 WIN_ERROR_BROKEN_PIPE = 109
+
+# The exit code of a run interrupted (Ctrl+C) before its child started: the
+# shell convention for SIGINT, 128 + 2.
+INTERRUPTED_EXIT = 130
+
+CREATE_SUSPENDED = 0x00000004
+
+
+class Job:
+    """A Windows job object holding the leased child and its descendants.
+
+    Two jobs in one: KILL_ON_JOB_CLOSE ends the child when the last handle
+    goes — this wrapper's, and the broker's, which opens the job by `name`
+    (sent in the lease) to read its CPU time and so tell the lease's own load
+    from foreign load (`CoreBroker::addSample`). BREAKAWAY_OK lets a process
+    meant to outlive the run leave it (`agent_counter._spawn`: a counter
+    started from inside a leased run must not die with it).
+
+    The child is started SUSPENDED and resumed once it is in the job, so no
+    grandchild can be spawned outside it in between.
+    """
+
+    _KILL_ON_JOB_CLOSE = 0x00002000
+    _BREAKAWAY_OK = 0x00000800
+    _EXTENDED_LIMIT_INFORMATION = 9
+
+    def __init__(self, name: str, handle: int) -> None:
+        self.name = name
+        self._handle = handle
+
+    @staticmethod
+    def _kernel32():
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        return k32
+
+    @classmethod
+    def create(cls) -> "Job":
+        """A new named job; OSError when Windows will not make one."""
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", Basic),
+                        ("IoInfo", ctypes.c_ulonglong * 6),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = cls._kernel32()
+        # Session-local and unguessable enough: the broker runs as the same
+        # user in the same session, and only ever opens it for a query.
+        name = f"Local\\llm-cores-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        handle = k32.CreateJobObjectW(None, name)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        info = Extended()
+        info.BasicLimitInformation.LimitFlags = cls._KILL_ON_JOB_CLOSE | cls._BREAKAWAY_OK
+        if not k32.SetInformationJobObject(handle, cls._EXTENDED_LIMIT_INFORMATION,
+                                           ctypes.byref(info), ctypes.sizeof(info)):
+            error = ctypes.get_last_error()
+            k32.CloseHandle(handle)
+            raise ctypes.WinError(error)
+        return cls(name, handle)
+
+    def start(self, argv: Sequence[str], env: dict, popen=subprocess.Popen):
+        """Start `argv` inside the job. OSError from the start itself; a child
+        that cannot be put in the job is killed and the error raised, so the
+        caller can start it plainly instead."""
+        import ctypes
+
+        child = popen(argv, env=env, creationflags=CREATE_SUSPENDED)
+        k32 = self._kernel32()
+        handle = int(child._handle)
+        if not k32.AssignProcessToJobObject(self._handle, handle):
+            error = ctypes.get_last_error()
+            child.kill()
+            child.wait()
+            raise ctypes.WinError(error)
+        # NtResumeProcess: the one call that resumes a whole process from its
+        # handle (Popen keeps no thread handle to ResumeThread).
+        if ctypes.WinDLL("ntdll").NtResumeProcess(ctypes.c_void_p(handle)) != 0:
+            child.kill()
+            child.wait()
+            raise OSError("cannot resume the child after putting it in the job")
+        return child
+
+    def terminate(self, code: int = INTERRUPTED_EXIT) -> None:
+        self._kernel32().TerminateJobObject(self._handle, code)
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32().CloseHandle(self._handle)
+            self._handle = 0
 
 
 class Closed(Exception):
@@ -130,14 +256,18 @@ def _machine_cores() -> int:
 
 
 def negotiate(transport, want: int, minimum: int, label: str, wait_s: float, *,
+              job: Optional[str] = None,
               say: Callable[[str], None] = _say,
               clock: Callable[[], float] = time.monotonic,
               sleep: Callable[[float], None] = time.sleep) -> tuple[Optional[int], str]:
     """Ask for the lease and wait for its answer: (K, line) on a grant,
     (None, reason) when there is no lease to be had. A "queued" notice is
-    said at once — the run is about to sit silent for up to `wait_s`."""
-    transport.send({"op": "lease", "want": want, "min": minimum,
-                    "label": label, "wait_s": wait_s})
+    said at once — the run is about to sit silent for up to `wait_s`.
+    `job`: the name of the job object the child will run in (`Job`)."""
+    request = {"op": "lease", "want": want, "min": minimum, "label": label, "wait_s": wait_s}
+    if job is not None:
+        request["job"] = job
+    transport.send(request)
     deadline = clock() + wait_s + ANSWER_SLACK_S
     while True:
         try:
@@ -161,11 +291,17 @@ def negotiate(transport, want: int, minimum: int, label: str, wait_s: float, *,
         if op != "grant" or not isinstance(cores, int) or isinstance(cores, bool) or cores < 1:
             return None, f"unexpected answer from the counter: {message!r}"
         total = message.get("total")
+        # The broker forces only a head whose min does not fit (`settle`), so
+        # a forced grant is always over the FREE cores — not necessarily over
+        # the machine: the shortfall may be someone else's load.
+        unmeasured = ("; its load is not measured (the counter could not open its job)"
+                      if job is not None and message.get("measured") is False else "")
         if message.get("forced"):
             return cores, (f"waited {message.get('waited_s', 0):.0f} s; {label} runs with its "
-                           f"min {cores} anyway, over the {total}-core machine")
+                           f"min {cores} anyway, over the {message.get('free')} free of "
+                           f"{total}{unmeasured}")
         return cores, (f"{cores} of {total} for {label} (asked {want}, min {minimum}; "
-                       f"free {message.get('free')}, foreign {message.get('foreign')})")
+                       f"free {message.get('free')}, foreign {message.get('foreign')}){unmeasured}")
 
 
 def _inherited() -> Optional[int]:
@@ -175,6 +311,7 @@ def _inherited() -> Optional[int]:
 
 @contextmanager
 def lease(want: int, minimum: int = 1, label: str = "", wait_s: float = DEFAULT_WAIT_S, *,
+          job: Optional[str] = None,
           say: Callable[[str], None] = _say,
           connect: Optional[Callable[[Callable[[str], None]], Optional[object]]] = None,
           transport_of: Callable[[object], object] = PipeTransport) -> Iterator[Optional[int]]:
@@ -183,7 +320,13 @@ def lease(want: int, minimum: int = 1, label: str = "", wait_s: float = DEFAULT_
 
     Inside a lease already (`LEASE_ENV` set by an outer `run`), no new one is
     asked: the outer lease already counts these cores, and a second would
-    count them twice. The inner run takes min(want, outer).
+    count them twice. The inner run takes min(want, outer) — of the outer's
+    K, shared with any inner run beside it (the module docstring).
+
+    `job`: the job object the block's work runs in (`Job.name`), so the
+    broker measures its load; without one the lease is assumed to burn all
+    it holds. A Ctrl+C while waiting for the grant returns nothing and
+    propagates: there is no lease, and nothing has started.
 
     `connect(complain)` returns the counter's handle or None after one
     complaint (default: `agent_counter._open_or_start`, which starts the
@@ -193,7 +336,8 @@ def lease(want: int, minimum: int = 1, label: str = "", wait_s: float = DEFAULT_
     outer = _inherited()
     if outer is not None:
         cores = min(want, outer)
-        say(f"inside a lease of {outer}: {label} takes {cores} without a new one")
+        say(f"inside a lease of {outer}: {label} takes {cores} of it without a new one "
+            f"(inner runs side by side share it)")
         yield cores
         return
 
@@ -218,11 +362,21 @@ def lease(want: int, minimum: int = 1, label: str = "", wait_s: float = DEFAULT_
             say(fallback(reasons[0] if reasons else "no counter"))
         else:
             transport = transport_of(handle)
-            cores, line = negotiate(transport, want, minimum, label, wait_s, say=say)
+            cores, line = negotiate(transport, want, minimum, label, wait_s, job=job, say=say)
             say(line if cores is not None else fallback(line))
+    except KeyboardInterrupt:
+        if transport is not None:
+            transport.close()
+        raise
     except Exception as exc:  # noqa: BLE001 - see the docstring: the run goes on
         cores = None
         say(fallback(f"{type(exc).__name__}: {exc}"))
+    if cores is None and transport is not None:
+        # No grant, so nothing to hold — and a request the broker still
+        # queues would be granted LATE, holding cores for a run that is
+        # already going on without them.
+        transport.close()
+        transport = None
     try:
         yield cores
     finally:
@@ -231,30 +385,82 @@ def lease(want: int, minimum: int = 1, label: str = "", wait_s: float = DEFAULT_
             transport.close()
 
 
-def run(command: Sequence[str], want: int, minimum: int = 1, label: str = "",
-        wait_s: float = DEFAULT_WAIT_S, **lease_options) -> int:
-    """Run `command` under a lease; return its exit code unchanged."""
-    label = label or " ".join(command)
-    with lease(want, minimum, label, wait_s, **lease_options) as cores:
-        env = dict(os.environ)
-        if cores is not None:
-            env[LEASE_ENV] = str(cores)
-        # `npm` is `npm.cmd` on Windows: CreateProcess needs the full name.
-        argv = [shutil.which(command[0]) or command[0], *command[1:]]
-        # The child must NOT inherit the pipe handle (Python's handles are
-        # non-inheritable, PEP 446, and nothing here passes it on): a child
-        # holding it would keep the lease alive after this wrapper is killed.
-        try:
-            child = subprocess.Popen(argv, env=env)
-        except OSError as exc:
-            _say(f"cannot start {command[0]}: {exc}")
-            return 127
+def _create_job(say: Callable[[str], None]) -> Optional[Job]:
+    """The run's job, or None (one line) when Windows will not make one."""
+    if os.name != "nt" or _inherited() is not None:
+        return None  # nested: the child is in the outer run's job already
+    try:
+        return Job.create()
+    except OSError as exc:
+        say(f"no job object for the child ({exc}): it is not killed with this wrapper, "
+            f"and the broker cannot measure its load")
+        return None
+
+
+def _wait(child, job: Optional[Job], say: Callable[[str], None]) -> int:
+    """The child's exit code, through any number of Ctrl+C. The first is the
+    child's to answer (the console delivered it there too); a second ends it
+    — the whole job — and the wait goes on until it has been reaped, because
+    returning first would release the lease under a child still running."""
+    interrupts = 0
+    while True:
         try:
             return child.wait()
         except KeyboardInterrupt:
-            # The console delivered Ctrl+C to the child too; its own exit
-            # code is still the answer, and the lease is held until it has.
-            return child.wait()
+            interrupts += 1
+            if interrupts == 1:
+                say("interrupted: waiting for the child to stop (Ctrl+C again ends it)")
+                continue
+            if interrupts == 2:
+                say("interrupted again: ending the child")
+                if job is not None:
+                    job.terminate()
+                else:
+                    child.kill()
+
+
+def run(command: Sequence[str], want: int, minimum: int = 1, label: str = "",
+        wait_s: float = DEFAULT_WAIT_S, *, popen=subprocess.Popen,
+        make_job: Optional[Callable[[Callable[[str], None]], Optional[Job]]] = None,
+        **lease_options) -> int:
+    """Run `command` under a lease; return its exit code unchanged, or
+    INTERRUPTED_EXIT for a Ctrl+C before it started. `popen`/`make_job`
+    exist for tests."""
+    label = label or " ".join(command)
+    say = lease_options.get("say", _say)
+    job = (make_job or _create_job)(say)
+    try:
+        try:
+            with lease(want, minimum, label, wait_s, job=job.name if job else None,
+                       **lease_options) as cores:
+                env = dict(os.environ)
+                if cores is not None:
+                    env[LEASE_ENV] = str(cores)
+                # `npm` is `npm.cmd` on Windows: CreateProcess needs the full name.
+                argv = [shutil.which(command[0]) or command[0], *command[1:]]
+                # The child must NOT inherit the pipe handle (Python's handles
+                # are non-inheritable, PEP 446, and nothing here passes it on):
+                # a child holding it would keep the lease alive after this
+                # wrapper is killed.
+                child = None
+                if job is not None and cores is not None:
+                    try:
+                        child = job.start(argv, env, popen)
+                    except OSError as exc:
+                        say(f"cannot put {command[0]} in a job ({exc}); started plainly")
+                if child is None:
+                    try:
+                        child = popen(argv, env=env)
+                    except OSError as exc:
+                        say(f"cannot start {command[0]}: {exc}")
+                        return 127
+                return _wait(child, job if cores is not None else None, say)
+        except KeyboardInterrupt:
+            say(f"interrupted while waiting for cores; {label} did not start")
+            return INTERRUPTED_EXIT
+    finally:
+        if job is not None:
+            job.close()
 
 
 def status() -> int:

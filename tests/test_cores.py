@@ -77,9 +77,46 @@ def test_a_grant_reaches_the_child_and_its_exit_code_comes_back(wire, tmp_path):
                      want=8, minimum=2, label="suite", wait_s=30, **wire["options"](counter))
     assert code == 7
     assert seen.read_text() == "6"
+    job = counter.sent[0].pop("job")
+    assert job.startswith("Local\\llm-cores-"), "the lease names the job the child runs in"
     assert counter.sent == [{"op": "lease", "want": 8, "min": 2, "label": "suite", "wait_s": 30}]
     assert counter.closed, "the lease is returned once the child is done"
     assert wire["lines"] == ["6 of 16 for suite (asked 8, min 2; free 6, foreign 0.0)"]
+
+
+_IN_JOB = """
+import ctypes, sys
+from ctypes import wintypes
+k32 = ctypes.WinDLL("kernel32")
+k32.OpenJobObjectW.restype = wintypes.HANDLE
+k32.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+job = k32.OpenJobObjectW(0x0004, False, sys.argv[1])
+inside = wintypes.BOOL(False)
+k32.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+k32.IsProcessInJob(wintypes.HANDLE(-1), job, ctypes.byref(inside))
+sys.exit(0 if job and inside.value else 9)
+"""
+
+
+@windows_only
+def test_the_child_runs_inside_the_named_job(wire):
+    """The job is what the broker measures and what kills the child with the
+    wrapper; a child started outside it gets neither."""
+    job = cores.Job.create()
+    counter = FakeCounter(_grant(2))
+    code = cores.run([sys.executable, "-c", _IN_JOB, job.name], want=2, make_job=lambda say: job,
+                     **wire["options"](counter))
+    assert code == 0, "the child did not find itself in the job"
+    assert counter.sent[0]["job"] == job.name
+
+
+@windows_only
+def test_a_job_the_counter_cannot_open_is_said(wire):
+    counter = FakeCounter(_grant(2, measured=False))
+    with cores.lease(2, 1, "blind", job="Local\\x", **wire["options"](counter)) as granted:
+        assert granted == 2
+    assert wire["lines"] == ["2 of 16 for blind (asked 2, min 1; free 2, foreign 0.0); its load is "
+                             "not measured (the counter could not open its job)"]
 
 
 @windows_only
@@ -101,11 +138,80 @@ def test_a_queued_lease_says_it_waits_then_takes_the_grant(wire):
 
 
 @windows_only
-def test_a_forced_grant_says_it_runs_over_the_machine(wire):
-    counter = FakeCounter(_grant(2, total=8, forced=True, waited_s=300.2))
+def test_a_forced_grant_says_it_runs_over_the_free_cores(wire):
+    """Over the FREE cores, not "the machine": 2 forced beside 1 free on 8 is
+    an over-commit of the budget, which another run's load may explain."""
+    counter = FakeCounter(_grant(2, total=8, free=1, forced=True, waited_s=300.2))
     with cores.lease(8, 2, "late", **wire["options"](counter)) as granted:
         assert granted == 2
-    assert wire["lines"] == ["waited 300 s; late runs with its min 2 anyway, over the 8-core machine"]
+    assert wire["lines"] == ["waited 300 s; late runs with its min 2 anyway, over the 1 free of 8"]
+
+
+@windows_only
+def test_a_failed_negotiation_closes_the_pipe_before_the_child_runs(wire):
+    """A request the counter still queues would otherwise be granted LATE,
+    holding cores for a run already going on without them."""
+    counter = FakeCounter({"op": "error", "error": "bad-lease"})
+    closed_at_start = []
+
+    def popen(argv, **kwargs):
+        closed_at_start.append(counter.closed)
+        return _Child([0])
+
+    assert cores.run(["x"], want=2, popen=popen, make_job=lambda say: None,
+                     **wire["options"](counter)) == 0
+    assert closed_at_start == [True]
+
+
+class _Child:
+    """A child whose `wait` raises or returns from a script, one per call."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.killed = 0
+
+    def wait(self):
+        step = self.script.pop(0)
+        if step is KeyboardInterrupt:
+            raise KeyboardInterrupt
+        return step
+
+    def kill(self):
+        self.killed += 1
+
+
+@windows_only
+def test_ctrl_c_while_queued_starts_nothing_and_holds_nothing(wire):
+    class Interrupting(FakeCounter):
+        def poll(self):
+            raise KeyboardInterrupt
+
+    counter = Interrupting()
+    started = []
+    code = cores.run(["x"], want=2, popen=lambda *a, **k: started.append(a),
+                     make_job=lambda say: None, **wire["options"](counter))
+    assert code == cores.INTERRUPTED_EXIT and not started and counter.closed
+    assert wire["lines"][-1] == "interrupted while waiting for cores; x did not start"
+
+
+@windows_only
+def test_repeated_ctrl_c_ends_the_child_before_the_lease_goes(wire):
+    """The first Ctrl+C is the child's; the second ends it; the wait goes on
+    through a third, and the lease is returned only once the child is reaped."""
+    counter = FakeCounter(_grant(2))
+    child = _Child([KeyboardInterrupt, KeyboardInterrupt, KeyboardInterrupt, 1])
+    open_while_waiting = []
+    original_wait = child.wait
+
+    def wait():
+        open_while_waiting.append(not counter.closed)
+        return original_wait()
+
+    child.wait = wait
+    code = cores.run(["x"], want=2, popen=lambda *a, **k: child, make_job=lambda say: None,
+                     **wire["options"](counter))
+    assert code == 1 and child.killed == 1
+    assert open_while_waiting == [True] * 4 and counter.closed
 
 
 @windows_only
@@ -181,7 +287,12 @@ def test_a_nested_run_takes_the_outer_lease_without_a_new_one(monkeypatch):
     lines = []
     with cores.lease(8, 1, "inner", say=lines.append, connect=explode) as granted:
         assert granted == 3
-    assert lines == ["inside a lease of 3: inner takes 3 without a new one"]
+    assert lines == ["inside a lease of 3: inner takes 3 of it without a new one "
+                     "(inner runs side by side share it)"]
+    # Side by side, each inner run is offered the same outer K: sharing it is
+    # the caller's division (module docstring), and the line says so.
+    with cores.lease(2, 1, "small", say=lines.append, connect=explode) as granted:
+        assert granted == 2
 
 
 @windows_only
