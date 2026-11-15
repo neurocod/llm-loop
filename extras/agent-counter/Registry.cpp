@@ -5,6 +5,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocalSocket>
+#include <QPointer>
 
 #include <algorithm>
 #include <cmath>
@@ -19,6 +20,15 @@ namespace {
 // A line longer than this is not a hello from anything of ours. Bounded so a
 // peer that never sends a newline cannot grow the buffer without limit.
 constexpr int kMaxLineBytes = 64 * 1024;
+
+// Replies written but not yet read by the client (Registry::reply). Ours read
+// every line as it comes, and a whole conversation is a few hundred bytes, so
+// a backlog this size means a client that writes and never reads.
+constexpr qint64 kMaxUnsentReplyBytes = 64 * 1024;
+
+// A job name on the wire is a kernel object name: Windows caps those at
+// MAX_PATH, and nothing of ours names one longer than ~40 characters.
+constexpr int kMaxJobNameChars = 260;
 
 // Labels appear in the badge's `--status` listing, not on screen; a cap
 // keeps one buggy caller from making that output unreadable.
@@ -132,6 +142,10 @@ Registry::Registry(QObject* parent) : QObject(parent) {
 	connect(&m_tick, &QTimer::timeout, this, &Registry::onTick);
 	m_meterTick.setInterval(kMeterMs);
 	connect(&m_meterTick, &QTimer::timeout, this, &Registry::onMeterTick);
+	m_clock.start();
+	m_coresHold.setSingleShot(true);
+	m_coresHold.setInterval(kCoresHoldMs);
+	connect(&m_coresHold, &QTimer::timeout, this, &Registry::changed);
 }
 
 void Registry::useFakeMeter(int total) {
@@ -148,6 +162,8 @@ Registry::~Registry() {
 	// routed to this one would write its hello into a server about to vanish.
 	m_server.close();
 	releaseClaim();
+	for (const LeaseUse& use : std::as_const(m_leaseUse))
+		closeJob(use.job);
 }
 
 bool Registry::claimName(const QString& name) {
@@ -243,7 +259,7 @@ CoreSummary Registry::cores() const {
 	summary.leased = m_broker.leased();
 	summary.total = m_broker.total();
 	summary.queued = static_cast<int>(m_broker.queue().size());
-	summary.shown = !m_broker.leases().isEmpty() || summary.queued > 0;
+	summary.shown = !m_broker.leases().isEmpty() || summary.queued > 0 || m_coresHold.isActive();
 	return summary;
 }
 
@@ -308,13 +324,48 @@ void Registry::onSocketClosed(QLocalSocket* socket) {
 	updateTicker();
 	// The return of a lease is this and nothing else: the kernel closing a
 	// dead client's handle lands here exactly as a polite exit does.
-	if (leaseId != 0) {
-		m_leaseSockets.remove(leaseId);
-		m_broker.release(leaseId);
-		settleLeases();
-	}
+	if (leaseId != 0)
+		releaseLease(leaseId);
 	if (counted || leaseId != 0)
 		emit changed();
+}
+
+void Registry::releaseLease(quint64 leaseId) {
+	m_leaseSockets.remove(leaseId);
+	const auto use = m_leaseUse.find(leaseId);
+	if (use != m_leaseUse.end()) {
+		// Its stretch since the last meter step, by the wall clock (capped
+		// at one interval: longer is the timer having stalled, and the
+		// machine's next sample covers no more than one).
+		const double stretchS =
+		    std::clamp((m_clock.elapsed() - use->accountedMs) / 1000.0, 0.0, kMeterMs / 1000.0);
+		for (const CoreLease& lease : m_broker.leases())
+			if (lease.id == leaseId)
+				m_departedSeconds += accountLease(leaseId, lease.cores, stretchS);
+		// After the last reading: this handle may be the job's last, and a
+		// kill-on-close job ends whatever the dead client left running.
+		closeJob(use->job);
+		m_leaseUse.erase(use);
+	}
+	m_broker.release(leaseId);
+	settleLeases();
+	if (m_broker.leases().isEmpty() && m_broker.queue().isEmpty())
+		m_coresHold.start();
+	else
+		m_coresHold.stop();
+}
+
+double Registry::accountLease(quint64 id, int cores, double stretchS) {
+	LeaseUse& use = m_leaseUse[id];
+	use.accountedMs = m_clock.elapsed();
+	const double cap = cores * stretchS;
+	const double total = jobCpuSeconds(use.job);
+	if (total < 0.0)
+		return cap;  // no job: assumed to burn all it holds
+	const double used = std::max(0.0, total - use.jobSeconds);
+	use.jobSeconds = total;
+	use.lastCores = stretchS > 0.0 ? used / stretchS : 0.0;
+	return std::min(used, cap);
 }
 
 void Registry::dropClient(QLocalSocket* socket) {
@@ -330,10 +381,6 @@ void Registry::readFrom(QLocalSocket* socket) {
 		return;
 	}
 	m_clients[socket].buffer += socket->readAll();
-	if (m_clients[socket].buffer.size() > kMaxLineBytes) {
-		dropClient(socket);
-		return;
-	}
 	// The entry is looked up afresh every round rather than held across the
 	// loop: `handleLine` can close the connection and erase it, and the stale
 	// iterator would then be read back.
@@ -342,8 +389,14 @@ void Registry::readFrom(QLocalSocket* socket) {
 		if (it == m_clients.end() || it->closing)
 			return;
 		const int cut = it->buffer.indexOf('\n');
-		if (cut < 0)
+		if (cut < 0) {
+			// The bound is on the unfinished LINE, checked after the whole
+			// ones are taken: a burst of many short lines in one read is not
+			// a line too long.
+			if (it->buffer.size() > kMaxLineBytes)
+				dropClient(socket);
 			return;
+		}
 		const QByteArray line = it->buffer.left(cut);
 		it->buffer.remove(0, cut + 1);
 		handleLine(socket, line);
@@ -353,7 +406,12 @@ void Registry::readFrom(QLocalSocket* socket) {
 void Registry::handleLine(QLocalSocket* socket, const QByteArray& line) {
 	const QJsonDocument doc = QJsonDocument::fromJson(line.trimmed());
 	if (!doc.isObject()) {
-		dropClient(socket);
+		// A leasing connection keeps its cores over one bad line (`refuse`);
+		// anything else that sends garbage is not ours and goes at once.
+		if (m_clients[socket].leaseId != 0)
+			refuse(socket, QStringLiteral("bad-json"), {});
+		else
+			dropClient(socket);
 		return;
 	}
 	const QJsonObject obj = doc.object();
@@ -369,11 +427,11 @@ void Registry::handleLine(QLocalSocket* socket, const QByteArray& line) {
 		client.entry.agentType = normalizedAgentType(
 		    obj.value(QStringLiteral("agent_type")).toString());
 		// Additive v1 field too, and the reason the weekly figure rides on a
-		// repeated hello instead of an op of its own: a counter built before it
-		// drops a client on an unknown op, so a new beacon talking to an old
-		// running badge would lose its registration; an unknown FIELD is
-		// ignored. Each hello is the sender's whole state, so one without the
-		// field clears the figure.
+		// repeated hello instead of an op of its own: a v1 counter dropped a
+		// client on an unknown op (v2 refuses it by name and closes), so a
+		// beacon sending a new op would lose its registration either way; an
+		// unknown FIELD is ignored. Each hello is the sender's whole state, so
+		// one without the field clears the figure.
 		client.entry.weekLeft = weekLeftFrom(obj.value(QStringLiteral("week_left")));
 		client.entry.weekLeftAt =
 		    client.entry.weekLeft ? QDateTime::currentDateTime() : QDateTime();
@@ -406,16 +464,18 @@ void Registry::handleLine(QLocalSocket* socket, const QByteArray& line) {
 //   <- {"op":"queued","ahead":1,"free":1,"total":16}   only when it must wait
 //   <- {"op":"grant","cores":8,"total":16,"free":11,"foreign":2.5,
 //       "forced":false,"waited_s":0.0}
+//       "forced":false,"waited_s":0.0,"measured":true}
 // `want` is required, `min` defaults to 1, `wait_s` to kDefaultWaitS; both
 // counts are clamped to the machine (a min above it could never be served).
+// `job` (optional) names the client's job object holding the leased child:
+// the broker reads that job's CPU time to tell the lease's own load from
+// foreign load (`meterStep`); `measured` in the grant says whether it opened.
 // The lease lasts as long as the connection: there is no "release" op, so
 // no client can forget one.
 void Registry::handleLease(QLocalSocket* socket, const QJsonObject& obj) {
-	Client& client = m_clients[socket];
-	if (client.leaseId != 0) {
-		// Not refused-and-closed: closing would return the lease it holds.
-		reply(socket, {{QStringLiteral("op"), QStringLiteral("error")},
-		               {QStringLiteral("error"), QStringLiteral("lease-held")}});
+	if (m_clients[socket].leaseId != 0) {
+		// Answered, and the connection kept (`refuse`): it holds the first.
+		refuse(socket, QStringLiteral("lease-held"), {});
 		return;
 	}
 	const std::optional<int> want = positiveInt(obj.value(QStringLiteral("want")));
@@ -424,14 +484,19 @@ void Registry::handleLease(QLocalSocket* socket, const QJsonObject& obj) {
 	    minValue.isUndefined() ? std::optional<int>(1) : positiveInt(minValue);
 	const QJsonValue waitValue = obj.value(QStringLiteral("wait_s"));
 	const double waitS = waitValue.isUndefined() ? kDefaultWaitS : waitValue.toDouble(-1.0);
+	const QJsonValue jobValue = obj.value(QStringLiteral("job"));
 	if (!want || !min || *min > *want || (!waitValue.isUndefined() && !waitValue.isDouble())
-	    || !std::isfinite(waitS) || waitS < 0.0) {
+	    || !std::isfinite(waitS) || waitS < 0.0
+	    || (!jobValue.isUndefined()
+	        && (!jobValue.isString() || jobValue.toString().isEmpty()
+	            || jobValue.toString().size() > kMaxJobNameChars))) {
 		refuse(socket, QStringLiteral("bad-lease"),
 		       {{QStringLiteral("detail"),
 		         QStringLiteral("want and min are whole numbers >= 1 with min <= want; "
-		                        "wait_s is a number >= 0")}});
+		                        "wait_s is a number >= 0; job is a non-empty object name")}});
 		return;
 	}
+	Client& client = m_clients[socket];
 	CoreRequest request;
 	request.id = m_nextLeaseId++;
 	request.label = obj.value(QStringLiteral("label")).toString().left(kMaxLabelChars);
@@ -443,6 +508,9 @@ void Registry::handleLease(QLocalSocket* socket, const QJsonObject& obj) {
 	request.waitMs = static_cast<qint64>(std::min(waitS, kMaxWaitS) * 1000.0);
 	client.leaseId = request.id;
 	m_leaseSockets.insert(request.id, socket);
+	LeaseUse use;
+	use.job = openJob(jobValue.toString());
+	m_leaseUse.insert(request.id, use);
 	m_broker.request(request);
 	const int free = m_broker.freeCores();
 	settleLeases();
@@ -459,8 +527,19 @@ void Registry::handleLease(QLocalSocket* socket, const QJsonObject& obj) {
 }
 
 void Registry::reply(QLocalSocket* socket, const QJsonObject& message) {
+	const auto it = m_clients.find(socket);
+	if (it == m_clients.end() || it->closing)
+		return;
 	socket->write(QJsonDocument(message).toJson(QJsonDocument::Compact) + '\n');
 	socket->flush();
+	if (socket->bytesToWrite() <= kMaxUnsentReplyBytes)
+		return;
+	it->closing = true;  // read and answered no more from here on
+	const QPointer<QLocalSocket> guard(socket);
+	QMetaObject::invokeMethod(this, [this, guard] {
+		if (guard && m_clients.contains(guard.data()))
+			dropClient(guard.data());
+	}, Qt::QueuedConnection);
 }
 
 void Registry::refuse(QLocalSocket* socket, const QString& error, const QJsonObject& detail) {
@@ -470,27 +549,28 @@ void Registry::refuse(QLocalSocket* socket, const QString& error, const QJsonObj
 	QJsonObject message = detail;
 	message.insert(QStringLiteral("op"), QStringLiteral("error"));
 	message.insert(QStringLiteral("error"), error);
-	reply(socket, message);
+	const bool leasing = it->leaseId != 0;
+	reply(socket, message);  // `it` stays valid: a drop from `reply` is queued
+	if (leasing)
+		return;
 	// Out of every count NOW, closed once the reply is written: the
 	// `disconnected` signal then erases the entry (onSocketClosed).
 	const bool counted = it->registered;
-	const quint64 leaseId = it->leaseId;
 	it->registered = false;
-	it->leaseId = 0;
 	it->closing = true;
-	if (leaseId != 0) {
-		m_leaseSockets.remove(leaseId);
-		m_broker.release(leaseId);
-		settleLeases();
-	}
 	socket->disconnectFromServer();
-	if (counted || leaseId != 0)
+	if (counted)
 		emit changed();
 }
 
 void Registry::settleLeases() {
 	const QVector<CoreGrant> grants = m_broker.settle(QDateTime::currentDateTime());
+	const qint64 nowMs = m_clock.elapsed();
 	for (const CoreGrant& grant : grants) {
+		LeaseUse& use = m_leaseUse[grant.id];
+		use.granted = true;
+		use.accountedMs = nowMs;
+		use.jobSeconds = std::max(0.0, jobCpuSeconds(use.job));
 		QLocalSocket* socket = m_leaseSockets.value(grant.id);
 		if (socket == nullptr)
 			continue;
@@ -500,7 +580,8 @@ void Registry::settleLeases() {
 		               {QStringLiteral("free"), grant.freeBefore},
 		               {QStringLiteral("foreign"), std::round(m_broker.foreignCores() * 10) / 10},
 		               {QStringLiteral("forced"), grant.forced},
-		               {QStringLiteral("waited_s"), grant.waitedMs / 1000.0}});
+		               {QStringLiteral("waited_s"), grant.waitedMs / 1000.0},
+		               {QStringLiteral("measured"), use.job != nullptr}});
 	}
 	if (!grants.isEmpty())
 		emit changed();
@@ -509,12 +590,20 @@ void Registry::settleLeases() {
 QJsonObject Registry::coreStatus() const {
 	const QDateTime now = QDateTime::currentDateTime();
 	QJsonArray leases;
-	for (const CoreLease& lease : m_broker.leases())
-		leases.append(QJsonObject{{QStringLiteral("label"), lease.label},
-		                          {QStringLiteral("cores"), lease.cores},
-		                          {QStringLiteral("forced"), lease.forced},
-		                          {QStringLiteral("age_s"),
-		                           static_cast<double>(lease.granted.secsTo(now))}});
+	for (const CoreLease& lease : m_broker.leases()) {
+		const LeaseUse use = m_leaseUse.value(lease.id);
+		QJsonObject entry{{QStringLiteral("label"), lease.label},
+		                  {QStringLiteral("cores"), lease.cores},
+		                  {QStringLiteral("forced"), lease.forced},
+		                  {QStringLiteral("measured"), use.job != nullptr},
+		                  {QStringLiteral("age_s"),
+		                   static_cast<double>(lease.granted.secsTo(now))}};
+		// Present only once measured: a lease without a job has no figure,
+		// and 0 would read as "idle".
+		if (use.lastCores >= 0.0)
+			entry.insert(QStringLiteral("used"), std::round(use.lastCores * 10) / 10);
+		leases.append(entry);
+	}
 	QJsonArray queued;
 	for (const CoreRequest& request : m_broker.queue())
 		queued.append(QJsonObject{{QStringLiteral("label"), request.label},
@@ -572,11 +661,33 @@ void Registry::onTick() {
 
 void Registry::onMeterTick() {
 	const double idle = m_meter.sample();
-	if (idle >= 0.0)
-		m_broker.addIdleSample(idle);
+	if (idle >= 0.0) {
+		meterStep(idle, m_meter.intervalSeconds());
+		return;
+	}
 	// Every second, not only on arrivals and departures: free cores also
 	// appear when foreign load ends, and a waiter's patience runs out on the
 	// clock (CoreBroker::settle).
+	settleLeases();
+}
+
+void Registry::meterStep(double idleFraction, double intervalS) {
+	if (!(intervalS > 0.0)) {
+		m_broker.addIdleSample(idleFraction);
+		settleLeases();
+		return;
+	}
+	// A live lease is credited over the whole interval, even one granted
+	// half-way through it: a lease without a job is then assumed busy for a
+	// half second it was not, which over-states its own use (and so
+	// under-states foreign load) by at most its size for one sample of five
+	// — the price of not keeping a second clock beside the meter's.
+	double ownSeconds = m_departedSeconds;
+	m_departedSeconds = 0.0;
+	for (const CoreLease& lease : m_broker.leases())
+		ownSeconds += accountLease(lease.id, lease.cores, intervalS);
+	const double own = ownSeconds / intervalS;
+	m_broker.addSample(idleFraction, own);
 	settleLeases();
 }
 

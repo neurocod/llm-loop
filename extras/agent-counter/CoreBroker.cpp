@@ -11,26 +11,36 @@
 
 CoreBroker::CoreBroker(int totalCores) : m_total(std::max(1, totalCores)) {}
 
-void CoreBroker::addIdleSample(double idleFraction) {
-	m_samples.append(std::clamp(idleFraction, 0.0, 1.0));
-	while (m_samples.size() > kWindowSamples)
-		m_samples.removeFirst();
+namespace {
+
+double mean(const QVector<double>& values) {
+	if (values.isEmpty())
+		return 0.0;
+	double sum = 0.0;
+	for (const double value : values)
+		sum += value;
+	return sum / values.size();
+}
+
+}  // namespace
+
+void CoreBroker::addSample(double idleFraction, double ownCores) {
+	const double idle = std::clamp(idleFraction, 0.0, 1.0);
+	const double busy = m_total * (1.0 - idle);
+	m_idle.append(idle);
+	m_foreign.append(std::clamp(busy - ownCores, 0.0, static_cast<double>(m_total)));
+	while (m_idle.size() > kWindowSamples) {
+		m_idle.removeFirst();
+		m_foreign.removeFirst();
+	}
 }
 
 double CoreBroker::idleCores() const {
-	if (m_samples.isEmpty())
-		return 0.0;
-	double sum = 0.0;
-	for (const double idle : m_samples)
-		sum += idle;
-	return m_total * sum / m_samples.size();
+	return m_total * mean(m_idle);
 }
 
 double CoreBroker::foreignCores() const {
-	if (!measured())
-		return 0.0;
-	const double busy = m_total - idleCores();
-	return std::max(0.0, busy - leased());
+	return mean(m_foreign);
 }
 
 int CoreBroker::leased() const {
@@ -43,10 +53,10 @@ int CoreBroker::leased() const {
 int CoreBroker::freeCores() const {
 	if (!measured())
 		return 0;
-	// A hair of float noise (a window of 1.0 samples times 16 = 15.999...)
+	// A hair of float noise (a mean of five 0.2-core samples = 0.2000...1)
 	// must not cost a whole core, hence the epsilon before the floor.
-	const double idle = std::floor(idleCores() + 1e-6);
-	return std::max(0, static_cast<int>(std::min<double>(m_total - leased(), idle)));
+	const double free = std::floor(m_total - leased() - foreignCores() + 1e-6);
+	return std::max(0, static_cast<int>(free));
 }
 
 void CoreBroker::request(const CoreRequest& request) {
@@ -69,51 +79,47 @@ QVector<CoreGrant> CoreBroker::settle(const QDateTime& now) {
 		grants.append({request.id, cores, forced, request.asked.msecsTo(now), freeBefore});
 	};
 
-	// Strictly first come, first served, from the head only. The head gets
-	// min(want, free) — greedy, not a proportional share: a share would need
-	// SHRINKING running leases when a newcomer arrives, and a lease is a
-	// number already baked into a child's command line (`-j 8`), which no
-	// message can take back. So no running lease is ever shrunk, and the
-	// queue is never overtaken: a small request behind a large one waits,
-	// because letting smalls pass would starve a large `min` for as long as
-	// smalls keep coming. Nothing is granted unmeasured (`measured`).
-	auto serveHead = [&] {
-		while (measured() && !m_queue.isEmpty()) {
-			const int free = freeCores();
-			const CoreRequest& head = m_queue.first();
-			if (free < head.min)
-				break;
-			const CoreRequest taken = head;
+	// Strictly first come, first served, and ONLY the head is ever decided;
+	// the next request is looked at once the head has left the queue.
+	//
+	// The head gets min(want, free) — greedy, not a proportional share: a
+	// share would need SHRINKING running leases when a newcomer arrives, and a
+	// lease is a number already baked into a child's command line (`-j 8`),
+	// which no message can take back. Nothing is granted on free cores while
+	// unmeasured (`measured`).
+	//
+	// A head that does not fit waits until its own patience runs out and
+	// then runs with its `min`, over the free cores, and says so (forced; the
+	// badge turns red). The alternative — waiting on — wedges a gate behind a
+	// neighbour's long run, and failing it turns load into a red that means
+	// nothing; both are worse than one honestly over-committed run. Forced
+	// even while unmeasured: a meter that never produced a sample must not
+	// hold anyone forever either. A request that fits is never forced, however
+	// little patience it asked for: the fit is tried first.
+	//
+	// Nobody behind the head is decided — not even one whose own patience
+	// ran out (it was forced past a waiting head before, and the head's
+	// order meant nothing), and not one that would fit (no backfill). The
+	// cost is named: cores stay idle while a head too large for them waits,
+	// for at most that head's `wait`. Backfill would use them, but it is safe
+	// only when a backfilled run can be shown to end before the head could
+	// start, and a lease carries no duration: a small run let past the head
+	// that outlives the blocker turns the head's clean grant into a forced
+	// over-commit — and as long as smalls keep coming (gates are frequent,
+	// large mins rare) the large head would be forced EVERY time.
+	while (!m_queue.isEmpty()) {
+		const CoreRequest head = m_queue.first();
+		const int free = freeCores();
+		if (measured() && free >= head.min) {
 			m_queue.removeFirst();
-			grant(taken, std::min(taken.want, free), false, free);
-		}
-	};
-	serveHead();
-
-	// Then the expired, wherever they stand: a waiter whose patience ran out
-	// runs with its `min` now, over the budget, and says so (the grant is
-	// marked forced and the badge turns red). The alternative — waiting on —
-	// wedges a gate behind a neighbour's long run, and failing it turns load
-	// into a red that means nothing; both are worse than one honestly
-	// over-committed run. Granted even while unmeasured: a meter that never
-	// produced a sample must not hold anyone forever either. After the head
-	// pass, so a request that fits is never forced just because it asked for
-	// no wait at all.
-	bool expired = false;
-	for (qsizetype i = 0; i < m_queue.size();) {
-		if (m_queue[i].asked.msecsTo(now) >= m_queue[i].waitMs) {
-			const CoreRequest taken = m_queue[i];
-			m_queue.removeAt(i);
-			grant(taken, taken.min, true, freeCores());
-			expired = true;
+			grant(head, std::min(head.want, free), false, free);
+		} else if (head.asked.msecsTo(now) >= head.waitMs) {
+			m_queue.removeFirst();
+			grant(head, head.min, true, free);
 		} else {
-			++i;
+			break;
 		}
 	}
-	// An expired head leaving can unblock the one behind it only if that one
-	// fits what is left; forced grants took cores, so usually it does not.
-	if (expired)
-		serveHead();
 	return grants;
 }
 
@@ -146,8 +152,46 @@ double CpuMeter::sample() {
 	m_total = total;
 	if (!primed || totalDelta == 0)
 		return -1.0;
+	// 100 ns ticks summed over every core: per core, that is wall time.
+	m_intervalS = static_cast<double>(totalDelta) / 1e7 / logicalCoreCount();
 	return static_cast<double>(idleDelta) / static_cast<double>(totalDelta);
 #else
+	return -1.0;
+#endif
+}
+
+void* openJob(const QString& name) {
+#ifdef Q_OS_WIN
+	if (name.isEmpty())
+		return nullptr;
+	return OpenJobObjectW(JOB_OBJECT_QUERY, FALSE, reinterpret_cast<const wchar_t*>(name.utf16()));
+#else
+	Q_UNUSED(name);
+	return nullptr;
+#endif
+}
+
+void closeJob(void* job) {
+#ifdef Q_OS_WIN
+	if (job != nullptr)
+		CloseHandle(static_cast<HANDLE>(job));
+#else
+	Q_UNUSED(job);
+#endif
+}
+
+double jobCpuSeconds(void* job) {
+#ifdef Q_OS_WIN
+	JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info{};
+	if (job == nullptr
+	    || !QueryInformationJobObject(static_cast<HANDLE>(job), JobObjectBasicAccountingInformation,
+	                                  &info, sizeof info, nullptr))
+		return -1.0;
+	// Processes that already exited stay in these totals: a test runner's
+	// short-lived workers are counted, not lost between two samples.
+	return static_cast<double>(info.TotalUserTime.QuadPart + info.TotalKernelTime.QuadPart) / 1e7;
+#else
+	Q_UNUSED(job);
 	return -1.0;
 #endif
 }
