@@ -2,8 +2,7 @@
 
 The wire is replaced (`connect`/`transport_of`), so nothing here needs the
 optional `extras/agent-counter` executable; the round trips against a built
-one are the host's (MultiSkill: tools/agent_host/tests/test_cores_counter.py)
-and `AgentCounter.exe --selftest`'s.
+one belong to whoever builds it, and to `AgentCounter.exe --selftest`.
 """
 
 import os
