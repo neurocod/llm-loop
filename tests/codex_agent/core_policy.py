@@ -11,7 +11,6 @@ from functools import partial
 
 from llm_agents.codex.command_arguments import _args_refusal
 from llm_agents.codex.command_commit import _commit
-from llm_agents.codex.command_rebase import _git
 from llm_agents.codex.command_dispatch import Shape, argv_refusal
 from llm_agents.codex.command_node import NpmScript, _node, _npm, _npx
 from llm_agents.codex.command_python import Entrypoint, _checks, _edits, _python, _try_patch_refusal
@@ -41,7 +40,6 @@ COMMANDS = WorkerCommands(
         Shape(("python", "python3", "py"), "`python -m pytest …`, `python <entry>`",
               partial(_python, entries=PYTHON_ENTRIES, declined=PYTHON_DECLINED,
                       table=PYTHON_TABLE)),
-        Shape(("git",), "`git -C <slot> rebase trunk`", _git),
     ),
     shapes_name="the core test shapes",
     npm_scripts=NPM_SCRIPTS,

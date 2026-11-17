@@ -1,12 +1,18 @@
-"""The slot rebase grant (`command_rebase._git`) under the core's test host,
-whose main branch is `trunk` (`core_policy.CORE_POLICY`): the shapes a
-worker in a pool slot may escalate to bring its own slot up to the main
-branch and resolve a conflict, the ones refused, and two real conflicts run
-through the granted commands with the environment the judge hands them."""
+"""The rebase broker (`llm_agents.git.rebase`) and its judge
+(`command_rebase._rebase_broker`) under the core's test host, whose main
+branch is `trunk` (`core_policy.CORE_POLICY`).
+
+The judge tests ask the escalation judge; the effect tests run the granted
+command the way production does — the bridge's environment plus what the
+judge hands every escalated command (`ask.environment`), the broker file of
+this checkout — and assert what happened in the repository: hooks did not
+run, other branches did not move, a resumed rebase ran no exec line."""
 
 from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401 — see no_badge's docstring
+import json
 import os
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,14 +20,18 @@ import pytest
 
 from llm_agents import host_policy
 from llm_agents.codex import sandbox
+from llm_agents.codex.command_rebase import BROKER
 from llm_agents.codex.registry import AgentRecord
-from core_judge_support import commit_judge, git_in, pool_slot, slot_with_submodule
+from llm_agents.git import rebase as broker
+from core_judge_support import commit_judge, git_in, junction, pool_slot, slot_with_submodule
 from core_policy import CORE_POLICY
 
-# A rebase of a two-commit fixture: well under a second when measured
-# (2026-11-18); the bound only keeps an editor that did open from holding
-# the suite.
-_GIT_TIMEOUT_S = 60.0
+# A broker step on a two-commit fixture: under 2 s measured 2026-11-18 (a
+# Python start plus a few git calls); the bound only keeps a hung git or an
+# editor that did open from holding the suite.
+_TIMEOUT_S = 120.0
+RUN = f"python {BROKER}"
+windows = pytest.mark.skipif(os.name != "nt", reason="Windows junctions")
 
 
 def _declined(ask, command, reason, **where):
@@ -35,192 +45,362 @@ def _granted(ask, command, **where):
     assert verdict and verdict.reason == "a worker command shape", (command, verdict.reason)
 
 
-def _with_trunk(tmp_path):
+def _broker(ask, slot: Path, *args: str, environment=None) -> subprocess.CompletedProcess:
+    """The granted `python <BROKER> <args>` as the escalation runs it: the
+    bridge's environment plus the judge's, from the slot."""
+    env = {**os.environ, **(environment or ask.environment)}
+    return subprocess.run([sys.executable, str(BROKER), *args], cwd=slot, env=env,
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=_TIMEOUT_S)
+
+
+def _plain_git(slot: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(slot), *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=_TIMEOUT_S,
+                          env={**os.environ, "GIT_EDITOR": "true"})
+
+
+def _with_trunk(tmp_path, *, branch: bool = False):
     """A clean pool slot (its fixture deletion committed) and its main
-    repository with a `trunk` branch at the slot's base."""
+    repository with an identity and a `trunk` branch at the slot's base;
+    with `branch`, the slot on a branch of its own (`wt1`)."""
     slot = pool_slot(tmp_path)
+    main = tmp_path / "main"
+    git_in(main, "config", "user.name", "t")
+    git_in(main, "config", "user.email", "t@example.invalid")
+    git_in(main, "branch", "trunk")
+    if branch:
+        git_in(slot, "switch", "--quiet", "-c", "wt1")
     git_in(slot, "commit", "--quiet", "-m", "fixture deletion")
-    git_in(tmp_path / "main", "branch", "trunk")
     return slot
 
 
-def _run(slot: Path, *args: str, environment=None) -> subprocess.CompletedProcess:
-    """A granted command as the escalation would run it: git in the slot
-    with the judge's environment, an identity for the commits it replays."""
-    env = {key: value for key, value in os.environ.items()
-           if key not in ("GIT_EDITOR", "GIT_SEQUENCE_EDITOR")}
-    env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
-               **(environment or {}))
-    return subprocess.run(["git", "-C", str(slot), *args], env=env,
-                          capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=_GIT_TIMEOUT_S)
-
-
-def _conflict(tmp_path, *, delete: bool):
-    """A slot whose commit and trunk's disagree on one file, mid-rebase: an
-    edit against an edit, or (`delete`) the slot's edit against trunk's
-    delete. The slot's commit also adds `src/new.ts`, so it stays non-empty
-    whichever side the worker keeps. The main repository's `core.editor` is
-    `false`: `--continue` succeeds only when the judge's GIT_EDITOR wins."""
-    slot = _with_trunk(tmp_path)
+def _trunk_commit(tmp_path, change) -> None:
+    """One commit on trunk, made in the main checkout by `change(main)`."""
     main = tmp_path / "main"
-    git_in(main, "config", "core.editor", "false")
+    git_in(main, "checkout", "--quiet", "trunk")
+    change(main)
+    git_in(main, "commit", "--quiet", "-am", "trunk work")
+
+
+def _conflict(tmp_path, monkeypatch, *, delete: bool):
+    """(slot, ask) mid-rebase started by the broker: the slot's edit of
+    app/src/b.ts against trunk's edit or (`delete`) trunk's delete. The
+    slot's commit also adds src/new.ts, so it stays non-empty whichever
+    side is kept. The main repository's `core.editor` is `false`: a
+    `continue` that opened an editor would fail."""
+    slot = _with_trunk(tmp_path)
+    git_in(tmp_path / "main", "config", "core.editor", "false")
     (slot / "app/src/b.ts").write_text("slot\n", encoding="utf-8")
     (slot / "src/new.ts").write_text("new\n", encoding="utf-8")
     git_in(slot, "add", "app/src/b.ts", "src/new.ts")
     git_in(slot, "commit", "--quiet", "-m", "slot work")
-    git_in(main, "checkout", "--quiet", "trunk")
-    if delete:
-        git_in(main, "rm", "--quiet", "app/src/b.ts")
-    else:
-        (main / "app/src/b.ts").write_text("trunk\n", encoding="utf-8")
-        git_in(main, "add", "app/src/b.ts")
-    git_in(main, "commit", "--quiet", "-m", "trunk work")
-    started = _run(slot, "rebase", "trunk")
+
+    def change(main):
+        if delete:
+            git_in(main, "rm", "--quiet", "app/src/b.ts")
+        else:
+            (main / "app/src/b.ts").write_text("trunk\n", encoding="utf-8")
+    _trunk_commit(tmp_path, change)
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    _granted(ask, f"{RUN} start")
+    started = _broker(ask, slot, "start")
     assert started.returncode != 0 and "CONFLICT" in started.stdout + started.stderr, (
         started.stdout + started.stderr)
-    return slot
+    return slot, ask
 
 
-def test_a_worker_rebases_its_own_slot_onto_the_main_branch(tmp_path, monkeypatch):
+# --- the judge ---------------------------------------------------------------
+
+def test_a_slot_worker_may_run_the_broker_and_not_git(tmp_path, monkeypatch):
     slot = _with_trunk(tmp_path)
     ask = commit_judge(tmp_path, monkeypatch, slot)
-    for command in [f"git -C {slot} rebase trunk", "git rebase trunk",
-                    f"git -C {slot} rebase --continue", f"git -C {slot} rebase --abort",
-                    f"git -C {slot} rebase --skip", f"git -C {slot} status --short",
-                    f"git -C {slot} diff --name-only --diff-filter=U",
-                    f"git -C {slot} ls-files -u", f"git.exe -C {slot} rebase trunk"]:
+    for command in [f"{RUN} start", f"{RUN} status", f"{RUN} diff --name-only",
+                    f"{RUN} unmerged", f"python -I {BROKER} status"]:
         _granted(ask, command)
-    _granted(ask, "git -C .. rebase trunk", cwd=slot / "src")
-    assert ask.environment["GIT_EDITOR"] == "true"
-
-
-def test_rebase_shapes_beyond_the_grant_are_declined(tmp_path, monkeypatch):
-    slot = _with_trunk(tmp_path)
-    sibling = pool_slot(tmp_path, "main-wt2")
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    ask = commit_judge(tmp_path, monkeypatch, slot, writable=[str(tmp_path)])
+    _granted(ask, f"{RUN} status", cwd=slot / "src")
+    grant = broker.Grant.from_env(ask.environment[broker.ENV])
+    assert grant.workspace == slot.resolve() and grant.main == "trunk"
+    assert grant.git.is_absolute() and grant.git.is_file()
+    assert grant.hooks.is_dir() and not any(grant.hooks.iterdir())
+    for root in (slot, tmp_path / "scratch"):
+        assert root.resolve() not in grant.hooks.parents
     for command, reason in {
-        f"git -C {slot} rebase master": "only `rebase trunk`",
-        f"git -C {slot} rebase -i trunk": "only `rebase trunk`",
-        f"git -C {slot} rebase --interactive trunk": "only `rebase trunk`",
-        f"git -C {slot} rebase --onto trunk HEAD": "only `rebase trunk`",
-        f"git -C {slot} rebase --exec x trunk": "only `rebase trunk`",
-        f"git -C {slot} rebase -x x trunk": "only `rebase trunk`",
-        f"git -C {slot} rebase -X ours trunk": "only `rebase trunk`",
-        f"git -C {slot} rebase --autostash trunk": "only `rebase trunk`",
-        f"git -C {slot} rebase": "only `rebase trunk`",
-        f"git -C {slot} rebase --continue --no-verify": "only `rebase trunk`",
-        f"git -c core.editor=x -C {slot} rebase --continue": "no global options",
-        f"git -C {slot} -c sequence.editor=x rebase trunk": "no global options",
-        f"git -C {sibling} rebase trunk": "another slot's tree",
-        f"git -C {tmp_path / 'main'} rebase trunk": "the main checkout",
-        f"git -C {elsewhere} rebase trunk": "outside your own slot",
-        f"git -C {slot / 'src'} rebase trunk": "name your slot's root",
-        f"git -C {slot} push": "escalates only `git rebase`",
-        f"git -C {slot} commit -m x": "escalates only `git rebase`",
-        f"git -C {slot} reset --hard trunk": "escalates only `git rebase`",
-        f"git -C {slot} add src/a.ts": "only to resolve a conflict",
-        f"git -C {slot} rm src/a.ts": "only to resolve a conflict",
-        f"git -C {slot} diff --output=x": "only --cached",
-        f"git -C {slot} diff --ext-diff": "only --cached",
-        f"git -C {slot} status ../elsewhere": "not in your slot",
-        "git -C": "with no value",
+        f"git -C {slot} rebase trunk": "`git` is not a worker command shape",
+        "git status": "`git` is not a worker command shape",
+        f"{RUN} rebase": "no operation 'rebase'",
+        f"{RUN}": "with no operation",
+        f"{RUN} start trunk": "start takes nothing",
+        f"{RUN} start -i": "start takes nothing",
+        f"{RUN} continue": "no rebase in progress",
+        f"{RUN} abort": "no rebase in progress",
+        f"{RUN} add src/a.ts": "only to resolve a conflict",
+        f"{RUN} rm src/a.ts": "only to resolve a conflict",
+        f"{RUN} diff --output=x": "only --cached",
+        f"{RUN} diff --ext-diff": "only --cached",
+        f"{RUN} status x": "status takes nothing",
     }.items():
         _declined(ask, command, reason)
     (slot / "src/a.ts").write_text("dirty\n", encoding="utf-8")
-    _declined(ask, f"git -C {slot} rebase trunk", "uncommitted changes in src/a.ts")
+    _declined(ask, f"{RUN} start", "uncommitted changes in src/a.ts")
 
 
-def test_rebase_is_declined_outside_a_pool_slot(tmp_path, monkeypatch):
+def test_the_broker_is_declined_outside_a_pool_slot(tmp_path, monkeypatch):
     work = pool_slot(tmp_path, "review-tree")
     ask = commit_judge(tmp_path, monkeypatch, work)
-    _declined(ask, f"git -C {work} rebase trunk", "only its own pool slot")
+    _declined(ask, f"{RUN} start", "only its own pool slot")
+    assert broker.ENV not in ask.environment
 
 
-def test_rebase_needs_a_host_that_names_its_main_branch(tmp_path, monkeypatch):
+def test_the_broker_needs_a_host_that_names_its_main_branch(tmp_path, monkeypatch):
     slot = _with_trunk(tmp_path)
     with host_policy.installed(replace(CORE_POLICY, main_branch="")):
         ask = commit_judge(tmp_path, monkeypatch, slot)
-        _declined(ask, f"git -C {slot} rebase trunk", "names no main branch")
-        record = AgentRecord(name="w", cwd=str(slot), sandbox="workspace-write",
-                             role="worker")
-        assert "rebase trunk" not in sandbox._worktree_fact(slot, [tmp_path / "scratch"])
-        assert sandbox.commit_briefed(record)
+        _declined(ask, f"{RUN} start", "names no main branch")
+        assert broker.ENV not in ask.environment
+        assert "start` with escalated" not in sandbox._worktree_fact(
+            slot, [tmp_path / "scratch"])
 
 
-def test_rebase_inside_a_submodule_is_declined(tmp_path, monkeypatch):
-    """A slot's submodule sits on the gitlink's commit and its main branch is
-    not the pool's; the orchestrator moves it (`_target_refusal`)."""
-    slot, sub, _ = slot_with_submodule(tmp_path)
+def test_a_git_inside_the_writable_roots_is_never_the_trusted_one(tmp_path, monkeypatch):
+    """The bridge pins git from its own PATH (`rebase.trusted_git`): absolute
+    entries only, `git.exe` only on Windows, and never one inside the
+    worker's roots — the judge then grants no broker at all."""
+    slot = _with_trunk(tmp_path)
+    name = "git.exe" if os.name == "nt" else "git"
+    (slot / name).write_text("", encoding="utf-8")
+    (slot / "git.cmd").write_text("", encoding="utf-8")
+    real = Path(broker.trusted_git(())[0]).parent
+    assert broker.trusted_git((slot.resolve(),), f"{slot}{os.pathsep}{real}")[0] is None
+    assert broker.trusted_git((), f".{os.pathsep}{real}")[0] == real / name
+    if os.name == "nt":
+        shim = tmp_path / "shim"
+        shim.mkdir()
+        (shim / "git.cmd").write_text("", encoding="utf-8")
+        assert broker.trusted_git((), f"{shim}{os.pathsep}{real}")[0] == real / name
+    monkeypatch.setenv("PATH", f"{slot}{os.pathsep}{os.environ['PATH']}")
     ask = commit_judge(tmp_path, monkeypatch, slot)
-    _declined(ask, f"git -C {sub} rebase trunk", "a submodule")
-    _declined(ask, "git rebase trunk", "a submodule", cwd=sub)
+    _declined(ask, f"{RUN} start", "lies in a writable root")
 
 
-def test_a_worker_resolves_an_edit_conflict_with_add(tmp_path, monkeypatch):
-    slot = _conflict(tmp_path, delete=False)
-    ask = commit_judge(tmp_path, monkeypatch, slot)
-    for command, reason in {
-        f"git -C {slot} add src/a.ts": "not an unmerged path",
-        f"git -C {slot} add src/new.ts": "not an unmerged path",
-        f"git -C {slot} add app/src": "not an unmerged path",
-        f"git -C {slot} add .": "the whole tree",
-        f"git -C {slot} add -A": "no options",
-        f"git -C {slot} add -f app/src/b.ts": "no options",
-        f"git -C {slot} add 'app/src/*.ts'": "wildcard",
-        f"git -C {slot} add lib/vendor": "submodule",
-        f"git -C {slot} rm -r app/src/b.ts": "no options but --cached",
-        f"git -C {slot} add": "with no paths",
-    }.items():
-        _declined(ask, command, reason)
-    _granted(ask, f"git -C {slot} add app/src/b.ts")
-    _granted(ask, f"git -C {slot} add -- app/src/b.ts")
-    _granted(ask, "git add b.ts", cwd=slot / "app/src")
-    (slot / "app/src/b.ts").write_text("resolved\n", encoding="utf-8")
-    assert _run(slot, "add", "app/src/b.ts", environment=ask.environment).returncode == 0
-    refused = _run(slot, "rebase", "--continue")
-    assert refused.returncode != 0, "core.editor=false should fail without the judge's env"
-    done = _run(slot, "rebase", "--continue", environment=ask.environment)
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert (slot / "app/src/b.ts").read_text(encoding="utf-8") == "resolved\n"
-    _declined(ask, f"git -C {slot} add app/src/b.ts", "only to resolve a conflict")
-
-
-def test_a_worker_resolves_a_modify_delete_conflict_with_rm(tmp_path, monkeypatch):
-    slot = _conflict(tmp_path, delete=True)
-    ask = commit_judge(tmp_path, monkeypatch, slot)
-    _declined(ask, f"git -C {slot} rm src/a.ts", "not an unmerged path")
-    _granted(ask, f"git -C {slot} rm app/src/b.ts")
-    _granted(ask, f"git -C {slot} rm --cached app/src/b.ts")
-    removed = _run(slot, "rm", "--quiet", "app/src/b.ts", environment=ask.environment)
-    assert removed.returncode == 0, removed.stdout + removed.stderr
-    done = _run(slot, "rebase", "--continue", environment=ask.environment)
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert not (slot / "app/src/b.ts").exists() and (slot / "src/new.ts").is_file()
-
-
-def test_a_slot_worker_is_told_the_rebase_shapes(tmp_path, monkeypatch):
+def test_a_slot_worker_is_told_the_broker_operations(tmp_path, monkeypatch):
     slot = _with_trunk(tmp_path)
     monkeypatch.setattr(sandbox, "scratch_dir", lambda name: tmp_path / "scratch")
     told = sandbox.thread_params(AgentRecord(
         name="w", cwd=str(slot), sandbox="workspace-write",
         role="worker"))["developerInstructions"]
-    spelled = slot.resolve().as_posix()
-    assert f"`git -C {spelled} rebase trunk`" in told
-    assert f"`git -C {spelled} rm <paths>` for a modify/delete conflict" in told
-    assert "rebase --continue` (no editor opens)" in told
-    assert "no `-i`, `--onto`, `--exec`, `-c`" in told
+    run = f"python {BROKER.as_posix()}"
+    for step in ("start", "unmerged", "add <paths>", "rm <paths>", "continue",
+                 "abort", "skip"):
+        assert f"`{run} {step}`" in told, step
+    assert "`git rebase` itself is declined" in told
     reviewer = sandbox.thread_params(AgentRecord(
         name="r", cwd=str(slot), sandbox="read-only",
         role="reviewer"))["developerInstructions"]
-    assert "rebase trunk" not in reviewer
+    assert run not in reviewer
 
 
-@pytest.mark.parametrize("step", ["--continue", "--abort", "--skip"])
-def test_rebase_steps_take_nothing_more(tmp_path, monkeypatch, step):
-    slot = _with_trunk(tmp_path)
+# --- effects -----------------------------------------------------------------
+
+def _hook_fixture(tmp_path):
+    """A slot one commit behind trunk whose repository runs `.githooks` (a
+    hooks folder inside the tree), with untracked hooks the worker planted: each
+    appends its name to `marker`."""
+    slot = _with_trunk(tmp_path, branch=True)
+    (slot / "src/new.ts").write_text("new\n", encoding="utf-8")
+    git_in(slot, "add", "src/new.ts")
+    git_in(slot, "commit", "--quiet", "-m", "slot work")
+    _trunk_commit(tmp_path, lambda main: (main / "src/a.ts").write_text("t\n", encoding="utf-8"))
+    git_in(tmp_path / "main", "config", "core.hooksPath", ".githooks")
+    marker = tmp_path / "marker.txt"
+    for hook in ("pre-rebase", "post-checkout", "post-rewrite", "post-commit"):
+        path = slot / ".githooks" / hook
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(f"#!/bin/sh\necho {hook} >> '{marker.as_posix()}'\n",
+                        encoding="utf-8", newline="\n")
+        path.chmod(0o755)
+    return slot, marker
+
+
+def test_the_broker_runs_no_hook_the_worker_planted(tmp_path, monkeypatch):
+    slot, marker = _hook_fixture(tmp_path)
     ask = commit_judge(tmp_path, monkeypatch, slot)
-    _declined(ask, f"git -C {slot} rebase {step} trunk", "only `rebase trunk`")
+    done = _broker(ask, slot, "start")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (slot / "src/a.ts").read_text(encoding="utf-8") == "t\n"
+    assert not marker.exists(), marker.read_text(encoding="utf-8")
+    # The control: the same hooks DO run under a plain git in this fixture.
+    _plain_git(slot, "checkout", "--quiet", "--detach")
+    assert "post-checkout" in marker.read_text(encoding="utf-8")
+
+
+def test_the_broker_runs_the_pinned_git_not_one_from_the_cwd(tmp_path, monkeypatch):
+    """`git.cmd`/`git.bat` in the slot (the cwd) never run, and the git the
+    broker starts is the grant's: a recording wrapper named there is the one
+    that runs."""
+    slot, _ = _hook_fixture(tmp_path)
+    planted = tmp_path / "planted.txt"
+    for name in ("git.cmd", "git.bat"):
+        (slot / name).write_text(f"@echo planted>>\"{planted}\"\n", encoding="utf-8")
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    assert _broker(ask, slot, "status").returncode == 0
+    assert not planted.exists()
+    if os.name != "nt":
+        return
+    grant = broker.Grant.from_env(ask.environment[broker.ENV])
+    log = tmp_path / "pinned.txt"
+    wrapper = tmp_path / "pinned-git.cmd"
+    wrapper.write_text(f"@echo %*>>\"{log}\"\n@\"{grant.git}\" %*\n", encoding="utf-8")
+    pinned = {broker.ENV: replace(grant, git=wrapper).to_env()}
+    done = _broker(ask, slot, "status", environment=pinned)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "core.hooksPath=" in log.read_text(encoding="utf-8")
+
+
+def test_the_broker_ignores_update_refs_and_autostash_config(tmp_path, monkeypatch):
+    slot, _ = _hook_fixture(tmp_path)
+    git_in(slot, "branch", "side")
+    main = tmp_path / "main"
+    git_in(main, "config", "rebase.updateRefs", "true")
+    git_in(main, "config", "rebase.autoStash", "true")
+    side = git_in(slot, "rev-parse", "side").stdout
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    (slot / "src/a.ts").write_text("dirty\n", encoding="utf-8")
+    refused = _broker(ask, slot, "start")
+    assert refused.returncode == 1 and "uncommitted changes" in refused.stderr
+    assert (slot / "src/a.ts").read_text(encoding="utf-8") == "dirty\n"
+    git_in(slot, "checkout", "--", "src/a.ts")
+    done = _broker(ask, slot, "start")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert git_in(slot, "rev-parse", "side").stdout == side
+    # The control: plain git with that config moves `side`.
+    git_in(slot, "reset", "--quiet", "--hard", "ORIG_HEAD")
+    assert _plain_git(slot, "rebase", "trunk").returncode == 0
+    assert git_in(slot, "rev-parse", "side").stdout != side
+
+
+def test_continue_resumes_only_a_plain_rebase_the_broker_started(tmp_path, monkeypatch):
+    slot, ask = _conflict(tmp_path, monkeypatch, delete=False)
+    state = Path(git_in(slot, "rev-parse", "--path-format=absolute",
+                        "--git-path", "rebase-merge").stdout.strip())
+    marker = tmp_path / "exec.txt"
+    todo = state / "git-rebase-todo"
+    original = todo.read_text(encoding="utf-8")
+    todo.write_text(original + f"exec echo x > '{marker.as_posix()}'\n", encoding="utf-8")
+    _declined(ask, f"{RUN} continue", "only picks resume here")
+    _declined(ask, f"{RUN} add app/src/b.ts", "only picks resume here")
+    assert _broker(ask, slot, "continue").returncode == 1 and not marker.exists()
+    todo.write_text(original, encoding="utf-8")
+    (state / broker.MARKER).unlink()
+    _declined(ask, f"{RUN} continue", "not started by this broker")
+    _declined(ask, f"{RUN} skip", "not started by this broker")
+    _granted(ask, f"{RUN} abort")
+    assert _broker(ask, slot, "abort").returncode == 0
+    assert not state.exists()
+
+
+def test_a_worker_resolves_an_edit_conflict_with_add(tmp_path, monkeypatch):
+    slot, ask = _conflict(tmp_path, monkeypatch, delete=False)
+    for command, reason in {
+        f"{RUN} add src/a.ts": "not an unmerged path",
+        f"{RUN} add src/new.ts": "not an unmerged path",
+        f"{RUN} add app/src": "not an unmerged path",
+        f"{RUN} add .": "relative to the slot root",
+        f"{RUN} add {slot / 'app/src/b.ts'}": "relative to the slot root",
+        f"{RUN} add ./app/src/b.ts": "relative to the slot root",
+        f"{RUN} add 'app/src/*.ts'": "a wildcard",
+        f"{RUN} add -A": "not an unmerged path",
+        f"{RUN} rm -r app/src/b.ts": "not an unmerged path",
+        f"{RUN} add": "with no paths",
+    }.items():
+        _declined(ask, command, reason)
+    _granted(ask, f"{RUN} add app/src/b.ts")
+    _granted(ask, f"{RUN} add app\\src\\b.ts")
+    (slot / "app/src/b.ts").write_text("resolved\n", encoding="utf-8")
+    added = _broker(ask, slot, "add", "app/src/b.ts")
+    assert added.returncode == 0, added.stdout + added.stderr
+    done = _broker(ask, slot, "continue")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (slot / "app/src/b.ts").read_text(encoding="utf-8") == "resolved\n"
+    assert git_in(slot, "log", "-1", "--format=%s").stdout.strip() == "slot work"
+    _declined(ask, f"{RUN} add app/src/b.ts", "only to resolve a conflict")
+
+
+def test_a_worker_resolves_a_modify_delete_conflict_with_rm(tmp_path, monkeypatch):
+    slot, ask = _conflict(tmp_path, monkeypatch, delete=True)
+    _declined(ask, f"{RUN} rm src/a.ts", "not an unmerged path")
+    _granted(ask, f"{RUN} rm app/src/b.ts")
+    _granted(ask, f"{RUN} rm --cached app/src/b.ts")
+    removed = _broker(ask, slot, "rm", "app/src/b.ts")
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    done = _broker(ask, slot, "continue")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not (slot / "app/src/b.ts").exists() and (slot / "src/new.ts").is_file()
+
+
+def test_a_symlink_alias_of_an_unmerged_file_is_refused(tmp_path, monkeypatch):
+    """The judge compares the literal index name: an alias that RESOLVES to
+    the unmerged file is not it (git would stage the link)."""
+    slot, ask = _conflict(tmp_path, monkeypatch, delete=False)
+    try:
+        os.symlink(slot / "app/src/b.ts", slot / "app/src/alias.ts")
+    except OSError:
+        pytest.skip("no symlink privilege")
+    _declined(ask, f"{RUN} add app/src/alias.ts", "not an unmerged path")
+    (slot / "app/src/b.ts").unlink()
+    os.symlink(slot / "src/a.ts", slot / "app/src/b.ts")
+    _declined(ask, f"{RUN} add app/src/b.ts", "is a link or junction")
+
+
+@windows
+def test_an_unmerged_path_behind_a_junction_is_refused(tmp_path, monkeypatch):
+    slot, ask = _conflict(tmp_path, monkeypatch, delete=False)
+    elsewhere = tmp_path / "elsewhere"
+    (slot / "app/src").rename(elsewhere)
+    junction(slot / "app/src", elsewhere)
+    _declined(ask, f"{RUN} add app/src/b.ts", "is a link or junction")
+    assert _broker(ask, slot, "add", "app/src/b.ts").returncode == 1
+
+
+def test_an_unmerged_path_replaced_by_a_folder_is_refused(tmp_path, monkeypatch):
+    slot, ask = _conflict(tmp_path, monkeypatch, delete=False)
+    (slot / "app/src/b.ts").unlink()
+    (slot / "app/src/b.ts").mkdir()
+    (slot / "app/src/b.ts/inner.ts").write_text("", encoding="utf-8")
+    _declined(ask, f"{RUN} add app/src/b.ts", "not a regular file")
+    _declined(ask, f"{RUN} add app/src/b.ts/inner.ts", "not an unmerged path")
+
+
+def test_a_gitlink_conflict_is_refused_whatever_gitmodules_says(tmp_path, monkeypatch):
+    """Both sides move the submodule's pointer to diverging commits: the
+    unmerged entry has mode 160000, refused even after the worker deletes
+    the `.gitmodules` stanza (`rebase._path_refusal`)."""
+    slot, sub, _ = slot_with_submodule(tmp_path)
+    main = tmp_path / "main"
+    git_in(main, "config", "user.name", "t")
+    git_in(main, "config", "user.email", "t@example.invalid")
+    git_in(slot, "commit", "--quiet", "-am", "submodule")
+    git_in(main, "branch", "trunk", git_in(slot, "rev-parse", "HEAD").stdout.strip())
+    base = git_in(sub, "rev-parse", "HEAD").stdout.strip()
+    tips = []
+    for text in ("one\n", "two\n"):
+        git_in(sub, "checkout", "--quiet", "--detach", base)
+        (sub / "work.txt").write_text(text, encoding="utf-8")
+        git_in(sub, "commit", "--quiet", "-am", text.strip())
+        tips.append(git_in(sub, "rev-parse", "HEAD").stdout.strip())
+    gitlink = "lib/vendor"
+    git_in(slot, "update-index", "--cacheinfo", f"160000,{tips[0]},{gitlink}")
+    git_in(slot, "commit", "--quiet", "-m", "slot pointer")
+    git_in(main, "checkout", "--quiet", "trunk")
+    git_in(main, "update-index", "--cacheinfo", f"160000,{tips[1]},{gitlink}")
+    git_in(main, "commit", "--quiet", "-m", "trunk pointer")
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    started = _broker(ask, slot, "start")
+    assert started.returncode != 0, started.stdout + started.stderr
+    modes = git_in(slot, "ls-files", "-u", "--", gitlink).stdout
+    assert modes.startswith("160000"), modes
+    _declined(ask, f"{RUN} add {gitlink}", "submodule's pointer")
+    (slot / ".gitmodules").write_text("", encoding="utf-8")
+    _declined(ask, f"{RUN} add {gitlink}", "submodule's pointer")
+    environment = json.loads(ask.environment[broker.ENV])
+    assert Path(environment["workspace"]) == slot.resolve()

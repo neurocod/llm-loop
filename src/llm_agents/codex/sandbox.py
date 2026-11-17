@@ -20,7 +20,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from .commands import (  # noqa: F401 — split_shell/unwrap_shell re-exported
     CommandContext, path_refusal, pool_slot, resolve_path, shapes_text,
-    split_shell, unwrap_shell, worker_command_refusal,
+    split_shell, unwrap_shell, within, worker_command_refusal,
 )
 from .file_renewal import renew_file  # re-exported for edit-judge callers
 from .gates import escalate_pattern
@@ -28,7 +28,8 @@ from .paths import host_root, scratch_dir
 from .registry import AgentRecord
 from .roles import role_briefing
 from .command_commit import _git_admin
-from .command_rebase import REBASE_ENVIRONMENT
+from .command_rebase import BROKER
+from ..git import rebase as rebase_broker
 from ..git.commit_identity import ENV as COMMIT_APPROVAL_ENV
 from ..host_policy import EMPTY as EMPTY_POLICY
 from ..host_policy import active as host_policy
@@ -332,25 +333,25 @@ def _worktree_fact(workspace: Path,
 
 def _rebase_fact(workspace: Path, main: str) -> str:
     """Told beside the commit grant when the host names its main branch: the
-    rebase shapes `command_rebase._git` grants, so the worker neither asks
-    the orchestrator nor reaches for a shape the judge declines (the decline's
-    reason never reaches the agent: Codex reports only "rejected")."""
+    rebase broker's operations (`command_rebase._rebase_broker` grants them),
+    so the worker neither asks the orchestrator nor types a `git rebase` the
+    judge declines (the decline's reason never reaches the agent: Codex
+    reports only "rejected")."""
     if not main:
         return ""
-    slot = workspace.as_posix()
+    run = f"python {BROKER.as_posix()}"
     return (
-        f" To bring your slot up to {main}, run `git -C {slot} rebase {main}` "
-        f"with escalated permissions, on a clean tree (commit first; no "
-        f"autostash). On a conflict, edit the files to resolve it, then "
-        f"`git -C {slot} add <paths>` — or `git -C {slot} rm <paths>` for a "
-        f"modify/delete conflict — (granted only while the rebase is in "
-        f"progress, and only for the files `git -C {slot} ls-files -u` lists "
-        f"as unmerged; `git -C {slot} status` and `diff` are granted too) and "
-        f"`git -C {slot} rebase "
-        f"--continue` (no editor opens), or `git -C {slot} rebase --abort` to "
-        f"give up, `--skip` to drop the conflicting commit. Nothing else of "
-        f"git is granted: no `-i`, `--onto`, `--exec`, `-c`, no other branch, "
-        f"slot or submodule — submodule checkouts stay as they are, the "
+        f" To bring your slot up to {main}, run `{run} start` with escalated "
+        f"permissions (`git rebase` itself is declined: the broker runs git "
+        f"with hooks off), on a clean tree (commit first; no autostash). On a "
+        f"conflict, `{run} unmerged` lists the conflicting files; edit them, "
+        f"then `{run} add <paths>` — or `{run} rm <paths>` for a "
+        f"modify/delete conflict — naming each file exactly as `unmerged` "
+        f"prints it (only those files, only while the rebase is in progress), "
+        f"and `{run} continue` (no editor opens), or `{run} abort` to give "
+        f"up, `{run} skip` to drop the conflicting commit; `{run} status` and "
+        f"`{run} diff` read the state. It acts on your slot only, never on a "
+        f"submodule: submodule checkouts and pointers stay as they are, the "
         f"orchestrator moves them.")
 
 
@@ -404,7 +405,7 @@ def _worker_escalation_briefing(record: AgentRecord, extra: str) -> str:
         f"{protected}; a chain of granted commands with `;` or `&&`, `2>&1`, "
         f"`> <file in your roots>` and a pipe into `Select-Object -Last N` or "
         f"`Select-String` are read through. It declines everything else: git "
-        f"(but a shape above) and every cmdlet (`Set-Content`, `Copy-Item`, `Remove-Item`"
+        f"and every cmdlet (`Set-Content`, `Copy-Item`, `Remove-Item`"
         + (f" but your own {', '.join(sorted(CLEANUP_DIRS))}" if _automatic() else "")
         + f"), `node -e`, `python -c`, "
         f"{policy.commands.reserved.text(record)}, and any `$`, backtick, `&`, "
@@ -724,11 +725,14 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
                                                dir=_git_admin(workspace))
                     if worker and pool_slot(workspace) else None)
     policy = host_policy()
+    grant, grant_refusal, broker_store = _rebase_grant(
+        workspace, roots, policy.main_branch if commit_store else "")
     context = CommandContext(
         workspace=workspace, roots=roots,
         scratch=scratch.resolve() if scratch is not None else None,
         allow_online_probes=record.allow_online_probes,
         commit_approvals=Path(commit_store.name) if commit_store else None,
+        rebase=grant, rebase_refusal=grant_refusal,
         policy=policy, host_flags=policy.commands.flags(roots))
     decline_tail = worker_decline_tail()
     automatic = _automatic()
@@ -758,13 +762,39 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
         return Verdict(False, f"does not match the escalate rule /{escalate}/")
 
     if commit_store is not None:
-        # REBASE_ENVIRONMENT: the slot's `git rebase --continue`
-        # (`command_rebase._git`) must not wait on an editor; the judge
-        # cannot add `-c core.editor` to a command it only reads.
-        judge.environment = {**REBASE_ENVIRONMENT, COMMIT_APPROVAL_ENV: json.dumps({
+        judge.environment = {COMMIT_APPROVAL_ENV: json.dumps({
             "workspace": str(workspace), "directory": commit_store.name})}
-        judge.close = commit_store.cleanup
+        if grant is not None:
+            judge.environment[rebase_broker.ENV] = grant.to_env()
+
+        def close() -> None:
+            commit_store.cleanup()
+            if broker_store is not None:
+                broker_store.cleanup()
+        judge.close = close
     return judge
+
+
+def _rebase_grant(workspace: Path, roots: tuple[Path, ...], main: str):
+    """(grant, why not, its store) of the rebase broker for a worker in a pool
+    slot on a host naming `main`: the git the bridge's own PATH names
+    (`rebase.trusted_git`, never one inside the worker's roots) and an empty
+    hooks folder in a store under the slot's git admin directory — outside
+    every writable root, so the worker can plant no hook in it. The broker's
+    file itself must lie outside the roots too (`command_rebase`)."""
+    if not main:
+        return None, "the host names no main branch to rebase onto", None
+    if within(BROKER, roots):
+        return None, (f"the bridge's broker {BROKER} lies in your writable "
+                      f"roots"), None
+    git, why = rebase_broker.trusted_git(roots)
+    if git is None:
+        return None, why, None
+    store = tempfile.TemporaryDirectory(prefix="rebase-broker-",
+                                        dir=_git_admin(workspace))
+    hooks = Path(store.name) / "no-hooks"
+    hooks.mkdir()
+    return rebase_broker.Grant(workspace, git, hooks, main), "", store
 
 
 def worker_decline_tail() -> str:

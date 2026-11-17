@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from typing import Optional
+from ..git.rebase import Grant
 from ..host_policy import EMPTY, HostPolicy
 from .command_paths import (
     _DRIVE,
@@ -33,6 +34,10 @@ class CommandContext:
     # How many `npm run` bodies deep the command being judged sits.
     npm_depth: int = 0
     commit_approvals: Optional[Path] = None
+    # The rebase broker's facts for this worker (`sandbox.escalation_judge`),
+    # or None and why not (`command_rebase._rebase_broker`).
+    rebase: Optional[Grant] = None
+    rebase_refusal: str = ""
     policy: HostPolicy = EMPTY
     host_flags: frozenset[str] = frozenset()
 

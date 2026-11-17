@@ -2,9 +2,10 @@
 
 The shapes themselves — which programs, judged how — are the host's
 (`HostPolicy.commands.shapes`, read off `CommandContext.policy`); the judges a
-host builds them from are command_node.py, command_python.py,
-command_commit.py and command_rebase.py, each handed `argv_refusal` for the
-commands it runs in turn.
+host builds them from are command_node.py, command_python.py and
+command_commit.py, each handed `argv_refusal` for the commands it runs in turn
+(command_python.py also judges the bridge's own rebase broker,
+command_rebase.py).
 """
 
 from __future__ import annotations
