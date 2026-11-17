@@ -28,6 +28,7 @@ from .paths import host_root, scratch_dir
 from .registry import AgentRecord
 from .roles import role_briefing
 from .command_commit import _git_admin
+from .command_rebase import REBASE_ENVIRONMENT
 from ..git.commit_identity import ENV as COMMIT_APPROVAL_ENV
 from ..host_policy import EMPTY as EMPTY_POLICY
 from ..host_policy import active as host_policy
@@ -325,7 +326,32 @@ def _worktree_fact(workspace: Path,
     if writable:
         where += (" or a --writable directory ("
                   + ", ".join(str(root) for root in writable) + ")")
-    return head + host_policy().commit_briefing(where, model)
+    return (head + host_policy().commit_briefing(where, model)
+            + _rebase_fact(workspace, host_policy().main_branch))
+
+
+def _rebase_fact(workspace: Path, main: str) -> str:
+    """Told beside the commit grant when the host names its main branch: the
+    rebase shapes `command_rebase._git` grants, so the worker neither asks
+    the orchestrator nor reaches for a shape the judge declines (the decline's
+    reason never reaches the agent: Codex reports only "rejected")."""
+    if not main:
+        return ""
+    slot = workspace.as_posix()
+    return (
+        f" To bring your slot up to {main}, run `git -C {slot} rebase {main}` "
+        f"with escalated permissions, on a clean tree (commit first; no "
+        f"autostash). On a conflict, edit the files to resolve it, then "
+        f"`git -C {slot} add <paths>` — or `git -C {slot} rm <paths>` for a "
+        f"modify/delete conflict — (granted only while the rebase is in "
+        f"progress, and only for the files `git -C {slot} ls-files -u` lists "
+        f"as unmerged; `git -C {slot} status` and `diff` are granted too) and "
+        f"`git -C {slot} rebase "
+        f"--continue` (no editor opens), or `git -C {slot} rebase --abort` to "
+        f"give up, `--skip` to drop the conflicting commit. Nothing else of "
+        f"git is granted: no `-i`, `--onto`, `--exec`, `-c`, no other branch, "
+        f"slot or submodule — submodule checkouts stay as they are, the "
+        f"orchestrator moves them.")
 
 
 def commit_briefed(record: AgentRecord) -> bool:
@@ -378,7 +404,7 @@ def _worker_escalation_briefing(record: AgentRecord, extra: str) -> str:
         f"{protected}; a chain of granted commands with `;` or `&&`, `2>&1`, "
         f"`> <file in your roots>` and a pipe into `Select-Object -Last N` or "
         f"`Select-String` are read through. It declines everything else: git "
-        f"and every cmdlet (`Set-Content`, `Copy-Item`, `Remove-Item`"
+        f"(but a shape above) and every cmdlet (`Set-Content`, `Copy-Item`, `Remove-Item`"
         + (f" but your own {', '.join(sorted(CLEANUP_DIRS))}" if _automatic() else "")
         + f"), `node -e`, `python -c`, "
         f"{policy.commands.reserved.text(record)}, and any `$`, backtick, `&`, "
@@ -732,7 +758,10 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
         return Verdict(False, f"does not match the escalate rule /{escalate}/")
 
     if commit_store is not None:
-        judge.environment = {COMMIT_APPROVAL_ENV: json.dumps({
+        # REBASE_ENVIRONMENT: the slot's `git rebase --continue`
+        # (`command_rebase._git`) must not wait on an editor; the judge
+        # cannot add `-c core.editor` to a command it only reads.
+        judge.environment = {**REBASE_ENVIRONMENT, COMMIT_APPROVAL_ENV: json.dumps({
             "workspace": str(workspace), "directory": commit_store.name})}
         judge.close = commit_store.cleanup
     return judge

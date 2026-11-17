@@ -161,7 +161,11 @@ first. Without it workers put those into the tree (measured 2026-09-13). A
 linked worktree's admin directory sits in the main checkout's `.git`, outside
 the working root, so `git add`/`git commit`/`git mv` from the sandbox fail; a
 worker in a pool slot commits by escalating the host's commit command (judge:
-`command_commit._commit`, briefing: `sandbox._worktree_fact`) and moves files
+`command_commit._commit`, briefing: `sandbox._worktree_fact`), rebases its own
+slot onto the host's `HostPolicy.main_branch` with `git -C <slot> rebase`,
+resolving a conflict by `git add` (or `git rm` for a modify/delete one) of
+the unmerged files + `rebase --continue`, or by `--abort` (judge:
+`command_rebase._git`, briefing: `sandbox._rebase_fact`), and moves files
 with `Move-Item`.
 
 ## One task, one agent
@@ -211,7 +215,8 @@ Deleting without a regex is granted to any agent only for
 judge's map: `command_shell.py` — shell and words; `command_paths.py` and
 `command_arguments.py` — paths, arguments and context; `command_node.py` —
 npm/node/npx; `command_python.py` — Python; `command_commit.py` — the commit
-script; `command_dispatch.py` — the dispatcher.
+script; `command_rebase.py` — a slot's own rebase; `command_dispatch.py` — the
+dispatcher.
 
 `workspace-write` breaks when a directory in the repository is owned by a
 `CodexSandbox*` user (the symptom: the agent silently cannot run ANY command —

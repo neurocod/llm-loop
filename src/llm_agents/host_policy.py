@@ -115,6 +115,10 @@ class HostPolicy:
     # kit's commit script and its worktree pool (`codex.command_commit`).
     commit_script: str = "commit.py"
     pool_script: str = "llm_agents.git.worktree"
+    # The pool's main branch (the git kit's `PoolHost.main_branch`, which the
+    # host hands over rather than copies): the one upstream a worker may
+    # rebase its own slot onto (`codex.command_rebase`). "": no rebase grant.
+    main_branch: str = ""
     # None: the review profile refuses to start (`llm_agents.claude.protocol`).
     review: Optional[ReviewProfile] = None
     # The on-screen counter's executable, relative to the root, most
