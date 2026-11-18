@@ -194,10 +194,6 @@ def pin(pinned: Pinned) -> None:
     os.environ.update(NO_CWD_LOOKUP)
 
 
-def _program() -> list[str]:
-    return ["git"] if _pinned is None else _pinned.argv([])
-
-
 def git(args: list[str], *, cwd: Union[str, Path, None] = None,
         check: bool = True, timeout: Optional[float] = None,
         capture_output: bool = True, text: bool = True,
@@ -205,6 +201,7 @@ def git(args: list[str], *, cwd: Union[str, Path, None] = None,
         terminal_prompt: Optional[bool] = None,
         failure: Literal["raise", "exit", "command"] = "raise",
         input: Optional[str] = None,
+        pinned: Optional[Pinned] = None,
         ) -> subprocess.CompletedProcess:
     """Run Git arguments (without the executable) and return CompletedProcess.
 
@@ -230,17 +227,23 @@ def git(args: list[str], *, cwd: Union[str, Path, None] = None,
     push can report a warning while keeping its local result. Capture can be
     disabled for commands whose output belongs directly on the console.
     `input` is written to git's stdin (`commit -F -`).
+
+    `pinned` runs this one call as that invocation instead of the process's
+    (`pin`): for a process that runs git both in its own trees and in a
+    worker's (the pool's commands, `llm_agents.git.worktree`).
     """
+    pinned = pinned or _pinned
     env = None if terminal_prompt is None else {
         **os.environ, "GIT_TERMINAL_PROMPT": "1" if terminal_prompt else "0",
     }
-    if _pinned is not None:
+    if pinned is not None:
         env = Pinned.environment()
         if terminal_prompt:
             env["GIT_TERMINAL_PROMPT"] = "1"
     try:
         proc = subprocess.run(
-            [*_program(), *args], cwd=str(cwd) if cwd else None, env=env,
+            [*(["git"] if pinned is None else pinned.argv([])), *args],
+            cwd=str(cwd) if cwd else None, env=env,
             capture_output=capture_output, text=text, encoding=encoding,
             errors=errors, timeout=timeout, input=input,
         )

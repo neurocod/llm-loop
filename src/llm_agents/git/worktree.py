@@ -50,8 +50,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
-from ..gitlib import Fail, PUSH_TIMEOUT_S, git
-from .slots import SLOT_NAME_RE, slot_dir_name, slot_name, slot_number
+from ..gitlib import (Fail, PUSH_TIMEOUT_S, SKIP_SUBMODULES, Pinned, Repository, git,
+                      trusted_git)
+from .slots import (SLOT_NAME_RE, git_admin, registered_admin, registered_submodule,
+                    slot_dir_name, slot_name, slot_number)
 
 # `terminal_prompt=False`: every command here may run from a hook with nobody at
 # the keyboard, so git must never ask for credentials (the automatic push in
@@ -266,14 +268,17 @@ def find_slot(spec: str) -> Slot:
     target = Path(spec)
     if not target.is_dir():
         raise Fail(f"{spec} is not a slot name (wtN) nor a directory")
-    top = git(["rev-parse", "--show-toplevel"], cwd=target).stdout.strip()
+    # By path, not by `git rev-parse --show-toplevel` there: git asked from a
+    # folder of a slot discovers the nearest `.git`, which in a submodule (or
+    # any folder the worker plants one in) is the worker's to point at a
+    # repository of its own (`slot_submodule`).
     for s in slots:
-        if norm(s.path) == norm(top):
+        if is_inside(target, s.path):
             return s
-    if norm(top) == norm(main_dir()):
-        raise Fail(f"{top} is the main checkout ({HOST.main_branch}), not a pool slot.\n"
+    if is_inside(target, main_dir()):
+        raise Fail(f"{target} is in the main checkout ({HOST.main_branch}), not a pool slot.\n"
                    + slots_hint(slots))
-    raise Fail(f"{top} is a worktree but not a pool slot ({main_dir().name}-wtN)")
+    raise Fail(f"{target} is in no pool slot ({main_dir().name}-wtN)")
 
 
 def slots_hint(slots: list[Slot]) -> str:
@@ -291,6 +296,13 @@ def slots_hint(slots: list[Slot]) -> str:
 def is_clean(path: Path) -> bool:
     # Edits or stray files INSIDE a submodule are that submodule's business, not
     # the slot's work; a gitlink pointing elsewhere than the main branch's is still reported.
+    # Run by discovery in the slot's top folder, unlike its submodules'
+    # (`slot_submodule`): a sandbox keeps the worker off that `.git` and the
+    # admin directory it names, so the configuration read is the main
+    # clone's; `.gitattributes` may name a filter, but only that
+    # configuration defines one. `=dirty` starts no git in a submodule (it
+    # reads the HEAD its `.git` names in-process; `gitlib.SKIP_SUBMODULES`)
+    # and on the command line beats an `ignore` in the worker's `.gitmodules`.
     out = git(["status", "--porcelain", "--ignore-submodules=dirty"], cwd=path).stdout
     return out.strip() == ""
 
@@ -317,10 +329,14 @@ class SlotState:
     unlanded: list[str]
     behind: int
     head: str
+    # "<sub>: <why>" per initialized submodule no git here may be bound to
+    # (`slot_submodule`): the commands that would move it refuse the slot.
+    foreign: list[str] = field(default_factory=list)
 
     @property
     def free(self) -> bool:
-        return self.exists and not self.detached and not self.locked and self.clean and not self.unlanded
+        return (self.exists and not self.detached and not self.locked and self.clean
+                and not self.unlanded and not self.foreign)
 
     def describe(self) -> str:
         if not self.exists:
@@ -336,6 +352,8 @@ class SlotState:
             parts.append(f"{len(self.unlanded)} unlanded commit(s)")
         if self.behind:
             parts.append(f"{self.behind} behind {HOST.main_branch}")
+        if self.foreign:
+            parts.append(f"submodule git not the slot's ({'; '.join(self.foreign)})")
         return ", ".join(parts) if parts else "free"
 
 
@@ -346,11 +364,17 @@ def slot_state(slot: Slot) -> SlotState:
     if usable:
         behind = int(git(["rev-list", "--count", f"{slot.branch}..{HOST.main_branch}"],
                          cwd=main_dir()).stdout.strip() or 0)
+    foreign = []
+    if exists:
+        for sub in initialized_submodules(slot.path):
+            why = slot_submodule(slot.path, sub)[1]
+            if why:
+                foreign.append(f"{sub}: {why}")
     return SlotState(
         exists=exists, detached=slot.detached, locked=slot.locked, lock_reason=slot.lock_reason,
         clean=is_clean(slot.path) if exists else True,
         unlanded=unlanded_branch(slot.branch) if usable else [],
-        behind=behind, head=slot.head)
+        behind=behind, head=slot.head, foreign=foreign)
 
 
 def describe(slot: Slot) -> str:
@@ -362,6 +386,10 @@ def refuse_unless_idle(slot: Slot, state: SlotState | None = None) -> None:
     state = state or slot_state(slot)
     if state.detached:
         raise Fail(f"{slot.name} is {state.describe()}")
+    if state.foreign:
+        raise Fail(f"{slot.name}: a submodule's git is not the one the slot registers "
+                   f"({'; '.join(state.foreign)}); no git here runs in it. Inspect the "
+                   f"submodule's .git by hand before anything else does")
     if state.locked:
         raise Fail(f"{slot.name} is locked ({state.lock_reason or 'no reason'}): an agent may still be "
                    f"running there. If it is gone: {HOST.command} release {slot.name}")
@@ -406,10 +434,12 @@ def init_submodules(slot: Slot, which: list[str]) -> None:
     its own gitdir under .git/worktrees/<slot>/modules/), so clone with
     `--reference` to the main copy for speed and `--dissociate` so a `gc` in
     the main checkout cannot prune objects the slot still needs."""
+    # The fresh clones below are git's own `submodule update --init` in a slot
+    # `new` has just made, before any worker had it; an initialized one may
+    # be older than that and is moved bound (`update_submodules`).
+    update_submodules(slot, [sub for sub in which if (slot.path / sub / ".git").exists()])
     for sub in which:
         if (slot.path / sub / ".git").exists():
-            fetch_unpushed_gitlinks(slot.path, [sub])
-            git(["submodule", "update", "--", sub], cwd=slot.path)
             continue
         args = ["submodule", "update", "--init"]
         if (main_dir() / sub / ".git").exists():
@@ -427,15 +457,94 @@ def all_submodules() -> list[str]:
     whole (splitting the plain `key value` line on whitespace cut it). Exit 1 is
     git's "no such key", i.e. no submodules -- not an error.
     """
+    return list(declared_submodules().values())
+
+
+def declared_submodules() -> dict[str, str]:
+    """{name: path} of the submodules the MAIN checkout's .gitmodules declares
+    (never a slot's: the worker writes that one)."""
     if not (main_dir() / ".gitmodules").is_file():
-        return []
+        return {}
     proc = git(["config", "-z", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
                cwd=main_dir(), check=False)
     if proc.returncode == 1:
-        return []
+        return {}
     if proc.returncode != 0:
         raise Fail(f"cannot read submodule paths from .gitmodules:\n{proc.stdout}{proc.stderr}".rstrip())
-    return [entry.partition("\n")[2] for entry in proc.stdout.split("\0") if entry]
+    pairs = (entry.partition("\n") for entry in proc.stdout.split("\0") if entry)
+    return {key[len("submodule."):-len(".path")]: path for key, _, path in pairs}
+
+
+def initialized_submodules(path: Path) -> list[str]:
+    return [sub for sub in all_submodules() if (path / sub / ".git").exists()]
+
+
+# The hooks folder of every bound git here (`slot_submodule`): empty, and
+# under the main clone's .git, where no slot's worker writes.
+NO_HOOKS_DIR = "wt-pool-no-hooks"
+
+
+def slot_submodule(slot_path: Path, sub: str) -> tuple[Optional[Pinned], str]:
+    """The git to run in the slot's initialized submodule `sub`, or None and why.
+
+    Never git by discovery there: `<slot>/<sub>/.git` is the worker's to
+    point at a repository of its own (a sandbox protects only the slot's
+    top `.git`, `gitlib.Repository`), whose config names an fsmonitor or a
+    clean filter for `status`, a hook for `fetch`/`checkout`, an
+    `uploadpack` for its `origin` -- all run with the orchestrator's rights,
+    outside any sandbox. So the submodule's repository is the admin
+    directory the MAIN clone registers for the slot
+    (`slots.registered_submodule`, the name from the main checkout's
+    .gitmodules), named to git explicitly, run by the absolute git of this
+    process's PATH (`gitlib.trusted_git`) with `gitlib.FORCED` and an empty
+    hooks folder. The `.git` file is read only to refuse: one naming
+    another repository leaves the slot's own git and this one disagreeing
+    about what the submodule is. A link along `<slot>/<sub>` would carry a
+    checkout out of the slot, so it is a refusal too."""
+    name = next((n for n, path in declared_submodules().items() if path == sub), None)
+    if name is None:
+        return None, "not declared in the main checkout's .gitmodules"
+    folder = slot_path / sub
+    while norm(folder) != norm(slot_path) and folder != folder.parent:
+        if is_link(folder):
+            return None, f"{folder} is a link"
+        folder = folder.parent
+    slot_admin, why = registered_admin(slot_path)
+    if slot_admin is None:
+        return None, why
+    admin, why = registered_submodule(slot_admin, slot_path, sub, name)
+    if admin is None:
+        return None, why
+    named = git_admin(slot_path / sub)
+    if named is None or norm(named) != norm(admin):
+        return None, f"its .git names {named}, the slot registers {admin}"
+    executable, why = trusted_git((slot_path.resolve(),))
+    if executable is None:
+        return None, why
+    hooks = git_dir() / NO_HOOKS_DIR
+    hooks.mkdir(exist_ok=True)
+    return Pinned(executable, hooks, Repository(admin, slot_path / sub)), ""
+
+
+def bound_git(pinned: Pinned, args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """`git` as `pinned` (`slot_submodule`), in its work tree."""
+    return git(args, cwd=pinned.repository.work_tree, pinned=pinned, **kwargs)
+
+
+def bound_submodules(slot: Slot, subs: list[str], *, strict: bool) -> dict[str, Pinned]:
+    """{sub: its bound git} for each of `subs` (`slot_submodule`); one that
+    cannot be bound is a Fail when `strict`, else a warning, and is left out."""
+    bound: dict[str, Pinned] = {}
+    for sub in subs:
+        pinned, why = slot_submodule(slot.path, sub)
+        if pinned is not None:
+            bound[sub] = pinned
+            continue
+        message = f"{slot.name}'s {sub} is left where it is: {why}; no git here runs in it"
+        if strict:
+            raise Fail(message)
+        print(f"warning: {message}", file=sys.stderr)
+    return bound
 
 
 # ------------------------------------------------------------ main branch
@@ -625,8 +734,11 @@ def gitlink(rev: str, sub: str, repo: Path | None = None) -> str:
     return out[2] if len(out) >= 3 and out[1] == "commit" else ""
 
 
-def has_commit(repo: Path, sha: str) -> bool:
-    return git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo, check=False).returncode == 0
+def has_commit(repo: Path, sha: str, pinned: Optional[Pinned] = None) -> bool:
+    """`pinned`: the bound git of a slot's submodule (`slot_submodule`);
+    without it, git by discovery in `repo` -- the main checkout's trees only."""
+    return git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo, check=False,
+               pinned=pinned).returncode == 0
 
 
 def one_line(text: str) -> str:
@@ -635,7 +747,7 @@ def one_line(text: str) -> str:
 
 
 def fetch_commit(repo: Path, sha: str, sources: list[str],
-                 failures: Optional[list[str]] = None) -> bool:
+                 failures: Optional[list[str]] = None, pinned: Optional[Pinned] = None) -> bool:
     """Bring `sha` into `repo` from the first source that has it; True when present.
 
     The slot's own clone goes first: a gitlink bumped in a slot points at a
@@ -643,22 +755,25 @@ def fetch_commit(repo: Path, sha: str, sources: list[str],
     step). A failing or timed-out fetch is only a miss -- the land already
     happened, so nothing here may abort it -- but not a silent one: each is
     appended to `failures` as "<source>: <why>" for the caller's warning.
+    `pinned` as for `has_commit`; a source that is a slot's submodule is its
+    registered admin directory, never `<slot>/<sub>` (whose `.git` git would
+    follow to start `upload-pack` there).
     """
     for source in sources:
-        if has_commit(repo, sha):
+        if has_commit(repo, sha, pinned):
             return True
         try:
             proc = git(["fetch", "--quiet", "--no-tags", source, sha], cwd=repo, check=False,
-                       timeout=PUSH_TIMEOUT_S)
+                       timeout=PUSH_TIMEOUT_S, pinned=pinned)
             why = (one_line(proc.stderr) or f"exit {proc.returncode}") if proc.returncode else ""
         except Fail as error:      # the timeout
             why = one_line(str(error))
         if why and failures is not None:
             failures.append(f"{source}: {why}")
-    return has_commit(repo, sha)
+    return has_commit(repo, sha, pinned)
 
 
-def fetch_unpushed_gitlinks(path: Path, subs: list[str]) -> None:
+def fetch_unpushed_gitlinks(path: Path, bound: Mapping[str, Pinned]) -> None:
     """Bring each gitlink commit `path`'s HEAD records into its submodule clone
     from the MAIN checkout's clone, where `git submodule update` cannot get it.
 
@@ -672,18 +787,20 @@ def fetch_unpushed_gitlinks(path: Path, subs: list[str]) -> None:
     clone lacks too is left to the clone's own origin, which `submodule
     update` and `follow_gitlinks` fetch from. A fetch that fails although the
     main clone has the commit is one warning line naming the submodule, the
-    commit and the commands that fix it by hand.
+    commit and the commands that fix it by hand. `bound`: {sub: its bound
+    git} (`bound_submodules`), the submodules to look at.
     """
-    for sub in subs:
+    for sub, pinned in bound.items():
         repo = path / sub
         source = main_dir() / sub
-        if norm(path) == norm(main_dir()) or not (repo / ".git").exists():
+        if norm(path) == norm(main_dir()):
             continue
         sha = gitlink("HEAD", sub, repo=path)
-        if not sha or has_commit(repo, sha) or not (source / ".git").exists() or not has_commit(source, sha):
+        if (not sha or has_commit(repo, sha, pinned) or not (source / ".git").exists()
+                or not has_commit(source, sha)):
             continue
         failures: list[str] = []
-        if fetch_commit(repo, sha, [str(source)], failures):
+        if fetch_commit(repo, sha, [str(source)], failures, pinned):
             print(f"{sub}: fetched {sha[:9]} from the main checkout's clone (not on its origin yet)")
             continue
         why = "; ".join(failures) or "the fetch reported success, yet the commit is missing"
@@ -707,12 +824,12 @@ def follow_gitlinks(slot: Slot) -> None:
     fetched, a move git refuses, e.g. over an untracked file the gitlink's
     commit adds) is a warning naming the submodule and the command.
     """
-    initialized = [sub for sub in all_submodules() if (slot.path / sub / ".git").exists()]
-    fetch_unpushed_gitlinks(slot.path, initialized)
-    for sub in initialized:
+    bound = bound_submodules(slot, initialized_submodules(slot.path), strict=False)
+    fetch_unpushed_gitlinks(slot.path, bound)
+    for sub, pinned in bound.items():
         repo = slot.path / sub
         wanted = gitlink("HEAD", sub, repo=slot.path)
-        head = git(["rev-parse", "HEAD"], cwd=repo, check=False).stdout.strip()
+        head = bound_git(pinned, ["rev-parse", "HEAD"], check=False).stdout.strip()
         if not wanted or head == wanted:
             continue
 
@@ -724,20 +841,58 @@ def follow_gitlinks(slot: Slot) -> None:
         # Still missing after the main clone's turn: the clone's own origin may
         # have it, which is where `submodule update` would have looked.
         failures: list[str] = []
-        if not fetch_commit(repo, wanted, ["origin"], failures):
+        if not fetch_commit(repo, wanted, ["origin"], failures, pinned):
             warn(f"{wanted[:9]} is not in its clone, and origin does not give it either "
                  f"({'; '.join(failures) or 'no error'})")
             continue
-        dirty = git(["status", "--porcelain", "--untracked-files=no"], cwd=repo, check=False).stdout.strip()
-        forward = git(["merge-base", "--is-ancestor", head, wanted], cwd=repo, check=False).returncode == 0
+        dirty = bound_git(pinned, ["status", "--porcelain", "--untracked-files=no", SKIP_SUBMODULES],
+                          check=False).stdout.strip()
+        forward = bound_git(pinned, ["merge-base", "--is-ancestor", head, wanted],
+                            check=False).returncode == 0
         if dirty or not forward:
             warn("it has uncommitted changes" if dirty else "its HEAD is not an ancestor of the gitlink")
             continue
-        moved = git(["submodule", "update", "--", sub], cwd=slot.path, check=False)
-        if moved.returncode != 0:
-            warn(f"submodule update failed: {one_line(moved.stdout + moved.stderr)}")
+        why = check_out_gitlink(pinned, wanted)
+        if why:
+            warn(why)
             continue
         print(f"{slot.name}'s {sub}: {head[:9]} -> {wanted[:9]} (follows the slot's gitlink)")
+
+
+def check_out_gitlink(pinned: Pinned, wanted: str) -> str:
+    """What `git submodule update` does to one initialized submodule
+    (a detached checkout of the gitlink), with the bound git
+    (`slot_submodule`) instead of the one `submodule update` would find
+    through the submodule's `.git`; '' when done, else why not."""
+    moved = bound_git(pinned, ["checkout", "--quiet", "--detach", wanted], check=False)
+    return "" if moved.returncode == 0 else (
+        f"the checkout of the gitlink failed: {one_line(moved.stdout + moved.stderr)}")
+
+
+def update_submodules(slot: Slot, subs: list[str], *, strict: bool = True) -> None:
+    """Each initialized submodule of `subs` := the gitlink the slot's HEAD
+    records (`git submodule update` without its discovery: `slot_submodule`),
+    the commit fetched from the main clone or else from the clone's origin.
+    `strict=False`: a miss is a warning, not an abort."""
+    bound = bound_submodules(slot, subs, strict=strict)
+    fetch_unpushed_gitlinks(slot.path, bound)
+    for sub, pinned in bound.items():
+        wanted = gitlink("HEAD", sub, repo=slot.path)
+        head = bound_git(pinned, ["rev-parse", "HEAD"], check=False).stdout.strip()
+        if not wanted or head == wanted:
+            continue
+        failures: list[str] = []
+        why = "" if fetch_commit(slot.path / sub, wanted, ["origin"], failures, pinned) else (
+            f"{wanted[:9]} is not in its clone, and origin does not give it either "
+            f"({'; '.join(failures) or 'no error'})")
+        why = why or check_out_gitlink(pinned, wanted)
+        if not why:
+            continue
+        message = (f"{slot.name}'s {sub} was not updated: {why}. When that is resolved: "
+                   f'git -C "{slot.path}" submodule update -- "{sub}"')
+        if strict:
+            raise Fail(message)
+        print(f"warning: {message}", file=sys.stderr)
 
 
 def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True) -> None:
@@ -747,15 +902,10 @@ def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True) -> N
     `strict=False` (the hooks): a failed submodule update is a warning, not an
     abort, for the reason `follow_gitlinks` gives.
     """
-    git(["reset", "--hard", HOST.main_branch], cwd=slot.path)
-    initialized = [sub for sub in all_submodules() if (slot.path / sub / ".git").exists()]
-    if initialized:
-        fetch_unpushed_gitlinks(slot.path, initialized)
-        updated = git(["submodule", "update", "--", *initialized], cwd=slot.path, check=strict)
-        if updated.returncode != 0:
-            print(f"warning: {slot.name}'s submodules were not updated: "
-                  f"{one_line(updated.stdout + updated.stderr)}. When that is resolved: "
-                  f'git -C "{slot.path}" submodule update', file=sys.stderr)
+    # Discovery in the slot's top folder, as in `is_clean`; no recursion
+    # into submodules whatever a configuration says (`update_submodules`).
+    git(["reset", "--hard", "--no-recurse-submodules", HOST.main_branch], cwd=slot.path)
+    update_submodules(slot, initialized_submodules(slot.path), strict=strict)
     # Keep legacy slots with their own local copies. Missing directories and
     # existing shared links use the main checkout, even with --no-install.
     share_dirs(slot.path, keep_local=True)
@@ -817,8 +967,17 @@ def sync_main_submodules(old_main: str, slot: Slot) -> None:
         if dirty:
             warn("it has uncommitted changes")
             continue
-        sources = [str(slot.path / sub)] if (slot.path / sub / ".git").exists() else []
+        # The main checkout's own submodule is asked by discovery (its `.git`
+        # is no worker's); the slot's is a source only through its
+        # registered admin directory (`fetch_commit`).
+        sources: list[str] = []
         failures: list[str] = []
+        if (slot.path / sub / ".git").exists():
+            pinned, why = slot_submodule(slot.path, sub)
+            if pinned is not None:
+                sources.append(str(pinned.repository.git_dir))
+            else:
+                failures.append(f"{slot.name}: not asked, {why}")
         if not fetch_commit(repo, new, [*sources, "origin"], failures):
             warn(f"{new[:9]} is neither in its clone nor fetchable from {slot.name} or origin"
                  + (f" ({'; '.join(failures)})" if failures else ""))
@@ -1010,9 +1169,11 @@ def cmd_drop(args: argparse.Namespace) -> int:
         refuse_unless_idle(slot)
         # Before deinit too: it empties a submodule's tree the same way.
         detach_outside_links(slot.path)
-        for sub in all_submodules():
-            if (slot.path / sub / ".git").exists():
-                git(["submodule", "deinit", "-f", "--", sub], cwd=slot.path)
+        # git's own `deinit` follows each submodule's `.git`; `refuse_unless_idle`
+        # has just checked every one names the admin the slot registers, and
+        # the slot is unlocked, so no worker is there to repoint it since.
+        for sub in initialized_submodules(slot.path):
+            git(["submodule", "deinit", "-f", "--", sub], cwd=slot.path)
         # --force: git refuses a worktree whose index holds a gitlink even after
         # deinit (measured 2026-09-06); the checks above are what make it safe.
         git(["worktree", "remove", "--force", str(slot.path)], cwd=main_dir())
@@ -1126,7 +1287,7 @@ def cmd_hook_remove(args: argparse.Namespace) -> int:
         return 0
     with contextlib.redirect_stdout(sys.stderr):
         state = slot_state(slot)
-        if state.detached or not state.clean or state.unlanded:
+        if state.detached or not state.clean or state.unlanded or state.foreign:
             print(f"worktree hook remove: {slot.name} is {state.describe()}; keeping it as is")
             return 0
         unclaim(slot)

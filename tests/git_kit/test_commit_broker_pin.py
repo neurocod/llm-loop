@@ -105,6 +105,21 @@ def test_a_bound_git_never_discovers_the_worker_s_git_file(repo, tmp_path, quest
     assert Path(where).resolve() == trusted.git_dir.resolve()
 
 
+def test_a_per_call_pin_binds_that_call_alone(repo, tmp_path):
+    """`gitlib.git(..., pinned=)`: the pool's commands run git both in their
+    own trees and in a worker's submodule (item 2442), one pin per call."""
+    work, marker = repo
+    trusted = _hijacked(work, tmp_path, marker)
+    hooks = tmp_path / "no-hooks"
+    hooks.mkdir()
+    pinned = gitlib.Pinned(gitlib.trusted_git(())[0], hooks, trusted)
+    done = gitlib.git(["status", "--porcelain"], cwd=work, pinned=pinned)
+    assert not marker.exists()
+    assert "a.txt" in done.stdout
+    gitlib.git(["status", "--porcelain"], cwd=work, check=False)
+    assert marker.exists()  # the next call unpinned: the control
+
+
 def test_the_repository_s_editor_is_not_the_editor(repo, tmp_path):
     """`git var GIT_EDITOR` is what a commit that opens an editor starts."""
     work, marker = repo

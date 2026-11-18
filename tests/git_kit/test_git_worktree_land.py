@@ -8,6 +8,7 @@ way a slot's submodule commit sits before its push).
 """
 
 import io
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -428,7 +429,7 @@ def test_a_follow_git_refuses_warns_and_the_hook_still_starts_the_agent(repos, m
     """`next` records its assignment and the create hook claims the slot
     before the submodule follow: an abort there stranded both and the agent
     never started. Here the gitlink's commit adds a file the slot's clone has
-    untracked, so `submodule update` refuses to overwrite it."""
+    untracked, so the checkout refuses to overwrite it."""
     main, slot, base = repos
     landed = commit_file(main / "sub", "new.txt", "landed")
     run(main, "add", "sub")
@@ -439,7 +440,7 @@ def test_a_follow_git_refuses_warns_and_the_hook_still_starts_the_agent(repos, m
 
     assert command("next", "wt2") == 0
     err = capsys.readouterr().err
-    assert "submodule update failed" in err and landed[:9] in err
+    assert "the checkout of the gitlink failed" in err and landed[:9] in err
     assert (main / ".git" / worktree.NEXT_FILE).read_text() == "wt2"
 
     pool_slot = worktree.Slot(2, slot, "wt2", "", False)
@@ -451,6 +452,133 @@ def test_a_follow_git_refuses_warns_and_the_hook_still_starts_the_agent(repos, m
     monkeypatch.setattr(worktree.sys, "__stdout__", printed)
     assert command("hook-create") == 0
     assert printed.getvalue().strip() == str(slot)
-    assert "submodule update failed" in capsys.readouterr().err
+    assert "the checkout of the gitlink failed" in capsys.readouterr().err
     assert (slot / "sub" / "new.txt").read_text(encoding="utf-8") == "mine, untracked\n"
     run(main, "worktree", "unlock", str(slot))
+
+
+# ------------------------------- the worker's own git in a slot's submodule
+
+def plant(slot, tmp_path):
+    """What a sandboxed worker may do to its slot's submodule (item 2442): point
+    `<slot>/sub/.git` at a repository of its own whose config names a program
+    (`marker`'s) as fsmonitor and as clean filter for every file. Returns the
+    marker file the program appends to."""
+    marker = tmp_path / "marker.txt"
+    script = tmp_path / "planted.sh"
+    script.write_text(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n",
+                      encoding="utf-8", newline="\n")
+    planted = tmp_path / "planted.git"
+    run(tmp_path, "init", "-q", "--bare", str(planted))
+    for key, value in (("core.bare", "false"), ("core.fsmonitor", script.as_posix()),
+                       ("filter.evil.clean", script.as_posix())):
+        run(tmp_path, "config", "--file", str(planted / "config"), key, value)
+    (slot / "sub" / ".git").unlink()  # git for Windows makes it hidden: no overwrite in place
+    (slot / "sub" / ".git").write_text(f"gitdir: {planted}\n", encoding="utf-8")
+    (slot / "sub" / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
+    # The control: git by discovery there runs the worker's program.
+    subprocess.run(["git", "status", "--porcelain"], cwd=slot / "sub", capture_output=True)
+    assert marker.exists()
+    marker.unlink()
+    return marker
+
+
+def test_next_leaves_a_repointed_submodule_alone(repos, tmp_path, capsys):
+    main, slot, base = repos
+    bump_in_main(main)
+    commit_file(slot, "work.txt", "task")
+    run(slot, "rebase", "-q", "main")
+    marker = plant(slot, tmp_path)
+    assert command("next", "wt2") == 0
+    assert not marker.exists()
+    err = capsys.readouterr().err
+    assert "wt2's sub is left where it is: its .git names" in err
+    assert "no git here runs in it" in err
+
+
+def test_equalize_drop_and_the_pool_listing_refuse_a_repointed_submodule(repos, tmp_path, capsys,
+                                                                          monkeypatch):
+    main, slot, base = repos
+    bump_in_main(main)
+    marker = plant(slot, tmp_path)
+    monkeypatch.setattr(worktree, "list_slots", lambda: [worktree.Slot(2, slot, "wt2", "", False)])
+    for operation in ("equalize", "drop"):
+        with pytest.raises(worktree.Fail, match="a submodule's git is not the one the slot registers"):
+            command(operation, "wt2", *(["--no-push", "--no-install"] if operation == "equalize" else []))
+    assert command("status") == 0
+    assert "submodule git not the slot's (sub: its .git names" in capsys.readouterr().out
+    assert not marker.exists()
+    assert slot.is_dir()
+
+
+def test_land_does_not_fetch_through_a_repointed_slot_submodule(repos, tmp_path, capsys):
+    main, slot, base = repos
+    bump_in_slot(slot)
+    plant(slot, tmp_path)
+    land()
+    assert run(main / "sub", "rev-parse", "HEAD") == base
+    assert "wt2: not asked, its .git names" in capsys.readouterr().err
+
+
+def test_every_git_in_a_slot_s_submodule_is_bound_to_its_registered_admin(repos, monkeypatch, capsys):
+    """Each git `next` and `equalize`'s reset run in the slot's submodule
+    names the admin directory the main clone registers (`--git-dir`), not
+    what its `.git` says, with the forced settings and no hooks."""
+    main, slot, base = repos
+    admin = (main / ".git" / "worktrees" / "main-wt2" / "modules" / "sub").resolve()
+    real = worktree.git
+    seen = []
+
+    def recording(args, **kwargs):
+        cwd = kwargs.get("cwd")
+        if cwd is not None and worktree.is_inside(cwd, slot / "sub"):
+            seen.append((args, kwargs.get("pinned")))
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(worktree, "git", recording)
+    landed = bump_in_main(main)
+    commit_file(slot, "work.txt", "task")
+    run(slot, "rebase", "-q", "main")
+    assert command("next", "wt2") == 0
+    run(slot / "sub", "checkout", "-q", "--detach", base)
+    worktree.reset_to_main_branch(worktree.Slot(2, slot, "wt2", "", False), install=False)
+    assert run(slot / "sub", "rev-parse", "HEAD") == landed
+    assert {args[0] for args, _ in seen} >= {"rev-parse", "status", "checkout", "cat-file"}
+    for args, pinned in seen:
+        assert pinned is not None, args
+        argv = pinned.argv(args)
+        assert argv[argv.index("--git-dir") + 1] == str(admin), args
+        assert "core.fsmonitor=false" in argv and f"core.hooksPath={main / '.git' / worktree.NO_HOOKS_DIR}" in argv
+
+
+def test_a_submodule_reached_through_a_link_is_not_bound(repos, tmp_path):
+    """A bound checkout writes the work tree it names: a link along
+    `<slot>/sub` would carry it out of the slot."""
+    main, slot, base = repos
+    assert worktree.slot_submodule(slot, "sub")[0] is not None
+    moved = tmp_path / "elsewhere"
+    (slot / "sub").rename(moved)
+    if sys.platform == "win32":
+        import _winapi
+        _winapi.CreateJunction(str(moved), str(slot / "sub"))
+    else:
+        (slot / "sub").symlink_to(moved, target_is_directory=True)
+    pinned, why = worktree.slot_submodule(slot, "sub")
+    assert pinned is None and why.endswith("is a link")
+    os.rmdir(slot / "sub") if sys.platform == "win32" else (slot / "sub").unlink()
+
+
+def test_find_slot_by_directory_asks_no_git(repos, tmp_path, monkeypatch):
+    main, slot, base = repos
+    monkeypatch.undo()
+    monkeypatch.setattr(worktree, "HOST", worktree.EMPTY)
+    monkeypatch.setattr(worktree, "main_dir", lambda: main)
+    pool_slot = worktree.Slot(2, slot, "wt2", "", False)
+    monkeypatch.setattr(worktree, "list_slots", lambda: [pool_slot])
+    monkeypatch.setattr(worktree, "describe", lambda s: "free")
+    monkeypatch.setattr(worktree, "git", lambda *a, **k: pytest.fail(f"git asked: {a}"))
+    assert worktree.find_slot(str(slot / "sub")) is pool_slot
+    with pytest.raises(worktree.Fail, match="in the main checkout"):
+        worktree.find_slot(str(main / "sub"))
+    with pytest.raises(worktree.Fail, match="in no pool slot"):
+        worktree.find_slot(str(tmp_path))
