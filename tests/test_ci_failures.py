@@ -406,6 +406,11 @@ def test_quiet_outcome_line_right_after_the_blocks_is_the_outcome():
     assert outcomes == ["1 failed, 3 passed in 0.50s"]
 
 
+def test_quiet_outcome_line_ending_the_log_is_the_outcome():
+    lines = ["=== FAILURES ===", "___ t ___", "assert 0", "1 failed in 0.10s"]
+    assert cf.parse_pytest(lines) == ([("t", ["assert 0"])], [], ["1 failed in 0.10s"], 3)
+
+
 def test_stopping_after_line_does_not_join_the_last_summary_entry():
     lines = ["=== short test summary info ===", "FAILED tests/x.py::t - boom", "  more of boom",
              "!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!",
@@ -413,6 +418,36 @@ def test_stopping_after_line_does_not_join_the_last_summary_entry():
     units, outcomes = cf.failure_units(lines, 10)
     assert [(u["headline"], u["block"]) for u in units] == [("FAILED tests/x.py::t - boom", ["  more of boom"])]
     assert outcomes == ["1 failed in 0.20s"]
+
+
+def test_a_runner_line_ends_the_summary():
+    lines = ["=== short test summary info ===", "FAILED tests/x.py::t - boom",
+             "##[error]Process completed with exit code 1.", "Post job cleanup."]
+    assert cf.parse_pytest(lines) == ([], [["FAILED tests/x.py::t - boom"]], [], 1)
+
+
+def test_pytests_last_line_is_its_last_section_banner_not_a_printed_one():
+    lines = ["=== FAILURES ===", "___ t ___", "assert 0", "=== warnings summary ===", "w: DeprecationWarning",
+             "=== made up ===", "##[error]Process completed with exit code 1."]
+    assert cf.parse_pytest(lines) == ([("t", ["assert 0"])], [], [], 3)
+
+
+def test_an_outcome_printed_in_a_block_before_another_section_stays_in_the_block():
+    # Only the last line before the runner's counts as the `-q` outcome; a
+    # section banner in between makes the printed one a test's output for good.
+    lines = ["=== FAILURES ===", "___ t ___", "1 failed in 0.10s", "=== warnings summary ===", "=== ERRORS ===",
+             "##[error]Process completed with exit code 1."]
+    assert cf.parse_pytest(lines) == ([("t", ["1 failed in 0.10s"])], [], [], 4)
+
+
+def test_captured_output_of_one_block_does_not_open_the_next():
+    # A session banner past `b`'s own lines (it has no captured output) ends the section.
+    lines = ["=== FAILURES ===", "___ a ___", "--- Captured stdout call ---", "out", "___ b ___", "assert 0",
+             "=== test session starts ===", "=== short test summary info ===", "FAILED x.py::b - boom",
+             "1 failed in 0.10s"]
+    blocks, _, outcomes, _ = cf.parse_pytest(lines)
+    assert blocks == [("a", ["--- Captured stdout call ---", "out"]), ("b", ["assert 0"])]
+    assert outcomes == ["1 failed in 0.10s"]
 
 
 # Made up: a red pytest step, then a later step that failed too.

@@ -657,78 +657,120 @@ def parse_pytest(lines: list) -> tuple[list, list, list, int]:
     output stays in the block whole (`child_session_end`). An entry is a
     `short test summary info` line with its continuation lines: a multi-line
     message goes on unprefixed. Several pytest runs in one job simply add up."""
-    blocks, entries, outcomes = [], [], []
-    section, end, pending = None, -1, None
-    captured, skip_to = False, -1
+    return _PytestScan(lines).run()
 
-    def close_blocks():
-        # The unbannered `-q` outcome line is the last of the last block.
-        if pending is not None and blocks:
-            body = blocks[-1][1]
+
+class _PytestScan:
+    """`parse_pytest`'s state machine. A state is the method reading the next
+    line: `outside` (between sections, or in one that holds nothing kept),
+    `in_blocks` (FAILURES/ERRORS) or `in_summary` (`short test summary
+    info`). Every state but `in_blocks` reads outcome lines, banners, STOP_RE
+    and runner `##[` lines alike (`on_boundary`); `in_blocks` takes every
+    other line, a child session included, into its block, and leaves only at
+    a runner line (`on_runner_line`) or a section banner (`on_boundary`)."""
+
+    def __init__(self, lines: list):
+        self.lines = lines
+        self.blocks, self.entries, self.outcomes = [], [], []
+        self.end = -1             # the index of pytest's last line so far
+        self.state = self.outside
+        # The index of an outcome-looking line inside the blocks: the `-q`
+        # outcome when a runner line follows it, else a test's output.
+        self.pending = None
+        self.captured = False     # the last block has passed its `--- Captured ... ---` header
+        self.skip_to = -1         # a child session taken whole ends here
+
+    def run(self) -> tuple[list, list, list, int]:
+        for i, line in enumerate(self.lines):
+            if i <= self.skip_to:
+                continue
+            banner = BANNER_RE.match(line)
+            self.state(i, line, banner.group(1).strip() if banner else None)
+        if self.state == self.in_blocks:
+            self.close_blocks()
+        for _, body in self.blocks:
             drop_trailing_blanks(body)
-            if body and body[-1] == lines[pending]:
-                body.pop()
-                outcomes.append(lines[pending].strip("= "))
+            while body and not body[0].strip():
+                body.pop(0)
+        return self.blocks, self.entries, self.outcomes, self.end
 
-    for i, line in enumerate(lines):
-        if i <= skip_to:
-            continue
-        banner = BANNER_RE.match(line)
-        name = banner.group(1).strip() if banner else ""
-        if section == "blocks":
-            if line.startswith("##["):
-                close_blocks()
-                pending, section = None, None
-                continue
-            if captured and blocks and name == SESSION_START:
-                # Never the outer run's banner here; without its close, just a line.
-                close = child_session_end(lines, i, blocks[-1][0])
-                close = i if close is None else close
-                blocks[-1][1].extend(lines[i:close + 1])
-                skip_to = end = close
-                continue
-            if not (banner and is_section_banner(line, name)):
-                head = BLOCK_RE.match(line)
-                if head and not re.fullmatch(r"[_ ]+", head.group(1)):
-                    blocks.append((head.group(1), []))
-                    captured = False
-                elif blocks:
-                    captured = captured or bool(CAPTURED_RE.match(line))
-                    blocks[-1][1].append(line)
-                    if OUTCOME_RE.match(line):
-                        pending = i
-                end = i
-                continue
-            pending = None
+    def on_boundary(self, i: int, line: str, banner: str | None) -> bool:
+        """An outcome line, a banner, STOP_RE or a runner line: the state it
+        leads to, True. False for any other line."""
         if OUTCOME_RE.match(line):
-            outcomes.append(line.strip("= "))
-            section, end = None, i
-            continue
-        if banner:
-            section = ("blocks" if name in ("FAILURES", "ERRORS")
-                       else "summary" if name == "short test summary info" else None)
-            if is_section_banner(line, name):
-                end = i
-            continue
-        if STOP_RE.match(line):
-            section, end = None, i
-            continue
+            self.outcomes.append(line.strip("= "))
+            self.state, self.end = self.outside, i
+        elif banner is not None:
+            self.on_banner(i, line, banner)
+        elif STOP_RE.match(line):
+            self.state, self.end = self.outside, i
+        elif line.startswith("##["):
+            self.state = self.outside
+        else:
+            return False
+        return True
+
+    def on_banner(self, i: int, line: str, name: str) -> None:
+        self.state = (self.in_blocks if name in ("FAILURES", "ERRORS")
+                      else self.in_summary if name == "short test summary info" else self.outside)
+        if is_section_banner(line, name):
+            self.end = i
+
+    def outside(self, i: int, line: str, banner: str | None) -> None:
+        self.on_boundary(i, line, banner)
+
+    def in_summary(self, i: int, line: str, banner: str | None) -> None:
+        if self.on_boundary(i, line, banner):
+            return
+        if ENTRY_RE.match(line):
+            self.entries.append([line])
+        elif self.entries:
+            self.entries[-1].append(line)
+        self.end = i
+
+    def in_blocks(self, i: int, line: str, banner: str | None) -> None:
         if line.startswith("##["):
-            section = None
-            continue
-        if section == "summary":
-            if ENTRY_RE.match(line):
-                entries.append([line])
-            elif entries:
-                entries[-1].append(line)
-            end = i
-    if section == "blocks":
-        close_blocks()
-    for _, body in blocks:
-        drop_trailing_blanks(body)
-        while body and not body[0].strip():
-            body.pop(0)
-    return blocks, entries, outcomes, end
+            self.on_runner_line()
+        elif self.captured and self.blocks and banner == SESSION_START:
+            self.take_child_session(i)
+        elif banner is not None and is_section_banner(line, banner):
+            self.pending = None
+            self.on_boundary(i, line, banner)
+        else:
+            self.take_block_line(i, line)
+
+    def on_runner_line(self) -> None:
+        """The step's end closes the blocks, with the `-q` outcome line if it was their last."""
+        self.close_blocks()
+        self.pending, self.state = None, self.outside
+
+    def take_child_session(self, i: int) -> None:
+        # Never the outer run's banner here; without its close, just a line.
+        close = child_session_end(self.lines, i, self.blocks[-1][0])
+        close = i if close is None else close
+        self.blocks[-1][1].extend(self.lines[i:close + 1])
+        self.skip_to = self.end = close
+
+    def take_block_line(self, i: int, line: str) -> None:
+        head = BLOCK_RE.match(line)
+        if head and not re.fullmatch(r"[_ ]+", head.group(1)):
+            self.blocks.append((head.group(1), []))
+            self.captured = False
+        elif self.blocks:
+            self.captured = self.captured or bool(CAPTURED_RE.match(line))
+            self.blocks[-1][1].append(line)
+            if OUTCOME_RE.match(line):
+                self.pending = i
+        self.end = i
+
+    def close_blocks(self) -> None:
+        # The unbannered `-q` outcome line is the last of the last block.
+        if self.pending is not None and self.blocks:
+            body = self.blocks[-1][1]
+            drop_trailing_blanks(body)
+            if body and body[-1] == self.lines[self.pending]:
+                body.pop()
+                self.outcomes.append(self.lines[self.pending].strip("= "))
 
 
 def entry_parts(entry_line: str) -> tuple[str, str] | None:
