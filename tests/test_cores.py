@@ -5,7 +5,9 @@ optional `extras/agent-counter` executable; the round trips against a built
 one belong to whoever builds it, and to `AgentCounter.exe --selftest`.
 """
 
+import io
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -441,10 +443,64 @@ def test_a_body_exception_propagates_and_still_returns_the_lease(wire):
     assert counter.closed
 
 
+class _Stdin:
+    """A parent's end of the pipe: `read` records what holds at that moment,
+    then reports end of file (or raises `error`)."""
+
+    def __init__(self, counter, error=None):
+        self.counter = counter
+        self.error = error
+        self.seen = []
+
+    def read(self):
+        self.seen.append({"open": not self.counter.closed,
+                          "sigint_ignored": signal.getsignal(signal.SIGINT) is signal.SIG_IGN})
+        if self.error is not None:
+            raise self.error
+        return b""
+
+
+@windows_only
+@pytest.mark.parametrize("error", [None, OSError("the parent's end broke")], ids=["eof", "broken pipe"])
+def test_hold_answers_the_grant_and_keeps_it_until_stdin_ends(wire, error):
+    counter = FakeCounter(_grant(3))
+    stdin, stdout = _Stdin(counter, error), io.StringIO()
+    before = signal.getsignal(signal.SIGINT)
+    assert cores.hold(3, 2, "probe x", 60, stdin=stdin, stdout=stdout, **wire["options"](counter)) == 0
+    assert stdout.getvalue() == f"{cores.LEASE_ENV}=3\n"
+    assert counter.sent == [{"op": "lease", "want": 3, "min": 2, "label": "probe x", "wait_s": 60}]
+    # Held through the read with Ctrl+C ignored; returned once stdin ended.
+    assert stdin.seen == [{"open": True, "sigint_ignored": True}]
+    assert counter.closed
+    assert signal.getsignal(signal.SIGINT) is before
+    assert wire["lines"] == ["3 of 16 for probe x (asked 3, min 2; free 3, foreign 0.0)"]
+
+
+@windows_only
+def test_hold_without_a_grant_answers_empty_and_still_waits_for_the_parent(wire):
+    counter = FakeCounter({"op": "error", "error": "bad-lease"})
+    stdin, stdout = _Stdin(counter), io.StringIO()
+    assert cores.hold(2, 1, "p", 0, stdin=stdin, stdout=stdout, **wire["options"](counter)) == 0
+    assert stdout.getvalue() == f"{cores.LEASE_ENV}=\n"
+    assert len(stdin.seen) == 1
+    assert wire["lines"][0].startswith("no core broker (the counter refused the lease (bad-lease))")
+
+
+def test_the_command_line_hands_hold_its_ask(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cores, "hold", lambda *a, **k: seen.append(a) or 0)
+    assert cores.main(["hold", "--want", "3"]) == 0
+    assert cores.main(["hold", "--want", "3", "--min", "2", "--wait", "50", "--label", "probe x"]) == 0
+    assert seen == [(3, 1, "hold", cores.DEFAULT_WAIT_S), (3, 2, "probe x", 50.0)]
+
+
 @pytest.mark.parametrize("argv", [
     ["run", "--want", "0", "--", "x"],
     ["run", "--want", "2", "--min", "3", "--", "x"],
     ["run", "--want", "2"],
+    ["hold", "--want", "0"],
+    ["hold", "--want", "2", "--min", "3"],
+    ["hold", "--want", "2", "--wait", "-1"],
 ])
 def test_the_command_line_refuses_an_impossible_lease(argv, capsys):
     with pytest.raises(SystemExit) as exit_:

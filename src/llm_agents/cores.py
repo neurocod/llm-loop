@@ -2,6 +2,7 @@
 
     python -m llm_agents.cores run --want 8 --min 2 -- npm test
     python -m llm_agents.cores status
+    python -m llm_agents.cores hold --want 3 [--min M] [--wait S] [--label L]
 
 A test suite, a compiler and a probe batch started side by side each take
 every core, none knowing of the others, and a timeout under that load stops
@@ -44,6 +45,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -424,6 +426,40 @@ def run(command: Sequence[str], want: int, minimum: int = 1, label: str = "",
             job.close()
 
 
+def hold(want: int, minimum: int = 1, label: str = "hold", wait_s: float = DEFAULT_WAIT_S, *,
+         stdin=None, stdout=None, **lease_options) -> int:
+    """Hold a lease until `stdin` reaches end of file, for a client that is not
+    Python and cannot keep the broker's pipe itself (a node script): the lease
+    is taken in THIS process, ONE stdout line `LLM_CORES=<K>` answers it
+    (`LLM_CORES=` without a lease; the `cores: ...` line on stderr says why),
+    and it is held until the parent closes the other end of the pipe — which
+    is the parent's exit, however it exits. No job object: the work is the
+    parent's, not this process's, so the broker counts the lease as burning
+    all it holds.
+
+    From the answer on, SIGINT is ignored: the lease's end is the parent's
+    (stdin's EOF), not the console's — a Ctrl+C reaches this process too, and
+    returning the lease on it would hand the cores away while the parent still
+    tears down. A Ctrl+C while still waiting for the grant propagates, as in
+    `lease`. `stdin` (bytes) / `stdout` default to this process's own;
+    `lease_options` go to `lease` (tests)."""
+    stdin = sys.stdin.buffer if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    previous = None
+    try:
+        with lease(want, minimum, label, wait_s, **lease_options) as granted:
+            print(f"{LEASE_ENV}={granted or ''}", file=stdout, flush=True)
+            previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                stdin.read()
+            except OSError:
+                pass
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
+    return 0
+
+
 def status() -> int:
     """Print the counter's core figures as JSON; never starts a counter."""
     if os.name != "nt":
@@ -467,6 +503,13 @@ def _parser() -> argparse.ArgumentParser:
                          "(MSBuild nodes, mspdbsrv) is kept, not killed with the job")
     go.add_argument("command", nargs=argparse.REMAINDER, help="-- then the command")
     sub.add_parser("status", help="print the broker's leases, queue and load as JSON")
+    keep = sub.add_parser("hold", help="hold a core lease for a non-Python parent until stdin closes")
+    keep.add_argument("--want", type=int, required=True, help="cores the parent can use")
+    keep.add_argument("--min", type=int, default=1, dest="minimum",
+                      help="fewer than this is not worth running with: wait for it (default 1)")
+    keep.add_argument("--label", default="hold", help="the name the badge's status shows")
+    keep.add_argument("--wait", type=float, default=DEFAULT_WAIT_S, dest="wait_s",
+                      help=f"seconds to wait for --min before holding it anyway (default {DEFAULT_WAIT_S:.0f})")
     return parser
 
 
@@ -480,6 +523,10 @@ def main(argv: Optional[Sequence[str]] = None, *, policy: Optional[host_policy.H
     with host_policy.installed(policy or host_policy.EMPTY, root):
         if args.action == "status":
             return status()
+        if args.action == "hold":
+            if args.want < 1 or not 1 <= args.minimum <= args.want or args.wait_s < 0:
+                parser.error("hold: need --want >= 1, 1 <= --min <= --want, --wait >= 0")
+            return hold(args.want, args.minimum, args.label, args.wait_s)
         command = list(args.command)
         if command and command[0] == "--":
             command = command[1:]

@@ -29,7 +29,9 @@ current count. Set `AGENT_COUNTER_ENABLED=0` to keep the badge off the screen.
 (rules: `CoreBroker.h`). `python -m llm_agents.cores run --want 8 --min 2 --
 <command>` starts the command with the granted count in `LLM_CORES`;
 `python -m llm_agents.cores status` prints the leases, the queue and the
-measured load. Without the counter the command runs as it would have, with
+measured load; `python -m llm_agents.cores hold --want 3` answers one line
+`LLM_CORES=<K>` and holds the lease until its stdin closes, for a parent
+that is not Python. Without the counter the command runs as it would have, with
 one line on stderr.
 
 **Icons.** No provider logo ships here: by default the badge paints neutral
