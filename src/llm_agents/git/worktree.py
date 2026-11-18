@@ -180,8 +180,11 @@ class Slot:
         return not self.branch
 
     def admin_dir(self) -> Path:
-        out = git(["rev-parse", "--path-format=absolute", "--git-dir"], cwd=self.path).stdout.strip()
-        return Path(out)
+        # Read off the main clone, not asked of git in the slot (`slot_top`).
+        admin, why = registered_admin(self.path)
+        if admin is None:
+            raise Fail(f"{self.name}: {why}")
+        return admin
 
 
 def slot_path(number: int) -> Path:
@@ -293,18 +296,20 @@ def slots_hint(slots: list[Slot]) -> str:
 
 # ------------------------------------------------------------------ state
 
-def is_clean(path: Path) -> bool:
+def is_clean(path: Path, top: Optional[Pinned] = None) -> bool:
     # Edits or stray files INSIDE a submodule are that submodule's business, not
     # the slot's work; a gitlink pointing elsewhere than the main branch's is still reported.
-    # Run by discovery in the slot's top folder, unlike its submodules'
-    # (`slot_submodule`): a sandbox keeps the worker off that `.git` and the
-    # admin directory it names, so the configuration read is the main
-    # clone's; `.gitattributes` may name a filter, but only that
-    # configuration defines one. `=dirty` starts no git in a submodule (it
-    # reads the HEAD its `.git` names in-process; `gitlib.SKIP_SUBMODULES`)
-    # and on the command line beats an `ignore` in the worker's `.gitmodules`.
-    out = git(["status", "--porcelain", "--ignore-submodules=dirty"], cwd=path).stdout
-    return out.strip() == ""
+    # `top`: a slot's bound git (`slot_top`); without it, git by discovery --
+    # the main checkout only. `.gitattributes` is the worker's and may name
+    # any filter driver that system, global or the main clone's config
+    # defines (`lfs` is one: `slot_top` names its endpoint), and a failing
+    # filter fails the status -- read as dirty, never as clean. `=dirty`
+    # starts no git in a submodule (it reads the HEAD its `.git` names
+    # in-process; `gitlib.SKIP_SUBMODULES`) and on the command line beats an
+    # `ignore` in the worker's `.gitmodules`.
+    proc = git(["status", "--porcelain", "--ignore-submodules=dirty"], cwd=path, check=False,
+               pinned=top)
+    return proc.returncode == 0 and proc.stdout.strip() == ""
 
 
 def unlanded_branch(branch: str) -> list[str]:
@@ -353,7 +358,7 @@ class SlotState:
         if self.behind:
             parts.append(f"{self.behind} behind {HOST.main_branch}")
         if self.foreign:
-            parts.append(f"submodule git not the slot's ({'; '.join(self.foreign)})")
+            parts.append(f"git not the slot's ({'; '.join(self.foreign)})")
         return ", ".join(parts) if parts else "free"
 
 
@@ -365,14 +370,18 @@ def slot_state(slot: Slot) -> SlotState:
         behind = int(git(["rev-list", "--count", f"{slot.branch}..{HOST.main_branch}"],
                          cwd=main_dir()).stdout.strip() or 0)
     foreign = []
+    top: Optional[Pinned] = None
     if exists:
+        top, why = slot_top(slot.path)
+        if top is None:
+            foreign.append(f"the slot itself: {why}")
         for sub in initialized_submodules(slot.path):
             why = slot_submodule(slot.path, sub)[1]
             if why:
                 foreign.append(f"{sub}: {why}")
     return SlotState(
         exists=exists, detached=slot.detached, locked=slot.locked, lock_reason=slot.lock_reason,
-        clean=is_clean(slot.path) if exists else True,
+        clean=(top is not None and is_clean(slot.path, top)) if exists else True,
         unlanded=unlanded_branch(slot.branch) if usable else [],
         behind=behind, head=slot.head, foreign=foreign)
 
@@ -382,22 +391,42 @@ def describe(slot: Slot) -> str:
 
 
 def refuse_unless_idle(slot: Slot, state: SlotState | None = None) -> None:
-    """Refuse a slot that is busy or holds work: `equalize` and `drop` both need this."""
+    """Refuse a slot that is busy or holds work: `equalize` and `drop` both need this.
+
+    Every pool operation on a slot (`equalize`, `drop`, `next` and the create
+    hook handing it out, `land`) assumes the slot's worker has ENDED: the
+    checks here and in `slot_state` look at the tree once, and the git that
+    follows acts on it later -- a live worker could swap `<slot>/<sub>` for a
+    junction between `slot_submodule`'s check and a bound checkout, or turn
+    `<sub>/.git` into a directory before `drop`'s `submodule deinit`. The
+    lock (`claim`) is the only liveness record checked: the Codex bridge
+    keeps none per slot (its registry lives under the root of whichever
+    entry point spawned the agent, and a turn's liveness is inferred from
+    its log's age), so stopping a Codex worker before these commands is the
+    orchestrator's job."""
     state = state or slot_state(slot)
     if state.detached:
         raise Fail(f"{slot.name} is {state.describe()}")
-    if state.foreign:
-        raise Fail(f"{slot.name}: a submodule's git is not the one the slot registers "
-                   f"({'; '.join(state.foreign)}); no git here runs in it. Inspect the "
-                   f"submodule's .git by hand before anything else does")
+    refuse_foreign(slot, state)
     if state.locked:
         raise Fail(f"{slot.name} is locked ({state.lock_reason or 'no reason'}): an agent may still be "
                    f"running there. If it is gone: {HOST.command} release {slot.name}")
     if not state.clean:
-        status = git(["status", "--short", "--ignore-submodules=dirty"], cwd=slot.path).stdout.rstrip()
+        proc = top_git(slot.path, ["status", "--short", "--ignore-submodules=dirty"], check=False)
+        status = (proc.stdout + proc.stderr).rstrip()
         raise Fail(f"{slot.name} has uncommitted changes; commit or discard them first:\n{status}")
     if state.unlanded:
         raise unlanded_refusal(slot.name, state.unlanded, slot.path)
+
+
+def refuse_foreign(slot: Slot, state: SlotState | None = None) -> None:
+    """Refuse a slot some git of which cannot be bound (`SlotState.foreign`).
+    No `--force`: nothing here may run in it, so the slot is repaired by hand."""
+    state = state or slot_state(slot)
+    if state.foreign:
+        raise Fail(f"{slot.name}: a git in it is not the one the slot registers "
+                   f"({'; '.join(state.foreign)}); no git here runs there. Inspect the "
+                   f".git named by hand before anything else does")
 
 
 def unlanded_refusal(name: str, pending: list[str], path: Path) -> Fail:
@@ -447,7 +476,7 @@ def init_submodules(slot: Slot, which: list[str]) -> None:
             args += ["--reference", str(main_dir() / sub), "--dissociate"]
         else:
             print(f"initializing submodule {sub} (not initialized in the main checkout: full clone)")
-        git([*args, "--", sub], cwd=slot.path)
+        top_git(slot.path, [*args, "--", sub])
 
 
 def all_submodules() -> list[str]:
@@ -479,9 +508,82 @@ def initialized_submodules(path: Path) -> list[str]:
     return [sub for sub in all_submodules() if (path / sub / ".git").exists()]
 
 
-# The hooks folder of every bound git here (`slot_submodule`): empty, and
-# under the main clone's .git, where no slot's worker writes.
+# The hooks folder of every bound git here (`slot_top`, `slot_submodule`):
+# empty, and under the main clone's .git, where no slot's worker writes.
 NO_HOOKS_DIR = "wt-pool-no-hooks"
+
+
+def no_hooks() -> Path:
+    hooks = git_dir() / NO_HOOKS_DIR
+    hooks.mkdir(exist_ok=True)
+    return hooks
+
+
+# Git LFS off, for a repository whose trusted counterpart names no LFS
+# endpoint (`lfs_settings`): an empty driver is no driver to git, and a
+# missing one must not fail the command.
+LFS_OFF = ("filter.lfs.process=", "filter.lfs.smudge=", "filter.lfs.clean=",
+           "filter.lfs.required=false")
+
+
+@functools.lru_cache(maxsize=None)
+def _lfs_endpoint(trusted: str) -> str:
+    proc = git(["lfs", "env"], cwd=trusted, check=False)
+    if proc.returncode != 0:
+        return ""
+    line = next((line for line in proc.stdout.splitlines() if line.startswith("Endpoint=")), "")
+    return line[len("Endpoint="):].split(" (auth=")[0].strip()
+
+
+def lfs_settings(trusted: Optional[Path]) -> tuple[str, ...]:
+    """The Git LFS settings of a bound git whose work tree mirrors `trusted`
+    (the main checkout, or its clone of the same submodule; None: none).
+
+    System and global config define `filter.lfs.*` (`required=true`), so a
+    worker's `.gitattributes` makes `status`, `reset` and `checkout` run
+    git-lfs, which reads the tree's `.lfsconfig` -- the worker's, choosing
+    the URL git-lfs downloads a missing object from and asks credentials
+    for. A command-line `lfs.url` beats every `.lfsconfig` key that names an
+    endpoint (measured 2026-11-18, git-lfs 3.7.1), so it is forced to the
+    endpoint `trusted` resolves. LFS is not simply switched off: MultiSkill
+    tracks 507 files through it, and git-lfs's own `--skip` smudge writes a
+    pointer even for an object the shared `lfs/objects` holds (measured the
+    same day) -- a reset would turn every one of them into a pointer. Off
+    (`LFS_OFF`) only where `trusted` resolves no endpoint (git-lfs missing,
+    or no such counterpart)."""
+    endpoint = _lfs_endpoint(str(trusted)) if trusted is not None else ""
+    return (f"lfs.url={endpoint}",) if endpoint else LFS_OFF
+
+
+def slot_top(slot_path: Path) -> tuple[Optional[Pinned], str]:
+    """The git to run in the slot's own (top-level) tree, or None and why.
+
+    Not git by discovery there, although a sandbox write-protects the slot's
+    `.git` and the admin directory it names: the main clone's
+    `core.hooksPath` is `.githooks`, RELATIVE, so a discovered git in the
+    slot runs `<slot>/.githooks/*` -- the worker's files, tracked or not
+    (review of 2442 ran an untracked `reference-transaction` on `reset
+    --hard` and a `post-index-change` on `status`'s index refresh). So the
+    same shape as `slot_submodule`: the admin directory the main clone
+    registers for the slot, named to git, the absolute git of this
+    process's PATH, `gitlib.FORCED`, the empty hooks folder, and
+    `lfs_settings` of the main checkout."""
+    admin, why = registered_admin(slot_path)
+    if admin is None:
+        return None, why
+    executable, why = trusted_git((slot_path.resolve(),))
+    if executable is None:
+        return None, why
+    return Pinned(executable, no_hooks(), Repository(admin, slot_path),
+                  lfs_settings(main_dir())), ""
+
+
+def top_git(slot_path: Path, args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """`git` in a slot's top-level tree as `slot_top` binds it; a Fail when it cannot be bound."""
+    pinned, why = slot_top(slot_path)
+    if pinned is None:
+        raise Fail(f"no git runs in {slot_path}: {why}")
+    return git(args, cwd=slot_path, pinned=pinned, **kwargs)
 
 
 def slot_submodule(slot_path: Path, sub: str) -> tuple[Optional[Pinned], str]:
@@ -496,8 +598,9 @@ def slot_submodule(slot_path: Path, sub: str) -> tuple[Optional[Pinned], str]:
     directory the MAIN clone registers for the slot
     (`slots.registered_submodule`, the name from the main checkout's
     .gitmodules), named to git explicitly, run by the absolute git of this
-    process's PATH (`gitlib.trusted_git`) with `gitlib.FORCED` and an empty
-    hooks folder. The `.git` file is read only to refuse: one naming
+    process's PATH (`gitlib.trusted_git`) with `gitlib.FORCED`, an empty
+    hooks folder and `lfs_settings` of the main checkout's clone of `sub`.
+    The `.git` file is read only to refuse: one naming
     another repository leaves the slot's own git and this one disagreeing
     about what the submodule is. A link along `<slot>/<sub>` would carry a
     checkout out of the slot, so it is a refusal too."""
@@ -521,9 +624,9 @@ def slot_submodule(slot_path: Path, sub: str) -> tuple[Optional[Pinned], str]:
     executable, why = trusted_git((slot_path.resolve(),))
     if executable is None:
         return None, why
-    hooks = git_dir() / NO_HOOKS_DIR
-    hooks.mkdir(exist_ok=True)
-    return Pinned(executable, hooks, Repository(admin, slot_path / sub)), ""
+    trusted = main_dir() / sub
+    return Pinned(executable, no_hooks(), Repository(admin, slot_path / sub),
+                  lfs_settings(trusted if (trusted / ".git").exists() else None)), ""
 
 
 def bound_git(pinned: Pinned, args: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -727,10 +830,14 @@ def detach_outside_links(path: Path) -> None:
 
 # ------------------------------------------------------------- submodules
 
-def gitlink(rev: str, sub: str, repo: Path | None = None) -> str:
-    """The submodule commit `rev` records at `sub` in `repo` (default: the main
-    checkout); '' if `rev` has no gitlink there."""
-    out = git(["ls-tree", rev, "--", sub], cwd=repo or main_dir(), check=False).stdout.split()
+def gitlink(rev: str, sub: str, slot: Path | None = None) -> str:
+    """The submodule commit `rev` records at `sub` in the slot `slot` (its
+    bound git, `slot_top`) or else the main checkout; '' if `rev` has no
+    gitlink there."""
+    args = ["ls-tree", rev, "--", sub]
+    proc = (top_git(slot, args, check=False) if slot is not None
+            else git(args, cwd=main_dir(), check=False))
+    out = proc.stdout.split()
     return out[2] if len(out) >= 3 and out[1] == "commit" else ""
 
 
@@ -795,7 +902,7 @@ def fetch_unpushed_gitlinks(path: Path, bound: Mapping[str, Pinned]) -> None:
         source = main_dir() / sub
         if norm(path) == norm(main_dir()):
             continue
-        sha = gitlink("HEAD", sub, repo=path)
+        sha = gitlink("HEAD", sub, slot=path)
         if (not sha or has_commit(repo, sha, pinned) or not (source / ".git").exists()
                 or not has_commit(source, sha)):
             continue
@@ -828,7 +935,7 @@ def follow_gitlinks(slot: Slot) -> None:
     fetch_unpushed_gitlinks(slot.path, bound)
     for sub, pinned in bound.items():
         repo = slot.path / sub
-        wanted = gitlink("HEAD", sub, repo=slot.path)
+        wanted = gitlink("HEAD", sub, slot=slot.path)
         head = bound_git(pinned, ["rev-parse", "HEAD"], check=False).stdout.strip()
         if not wanted or head == wanted:
             continue
@@ -877,7 +984,7 @@ def update_submodules(slot: Slot, subs: list[str], *, strict: bool = True) -> No
     bound = bound_submodules(slot, subs, strict=strict)
     fetch_unpushed_gitlinks(slot.path, bound)
     for sub, pinned in bound.items():
-        wanted = gitlink("HEAD", sub, repo=slot.path)
+        wanted = gitlink("HEAD", sub, slot=slot.path)
         head = bound_git(pinned, ["rev-parse", "HEAD"], check=False).stdout.strip()
         if not wanted or head == wanted:
             continue
@@ -902,14 +1009,14 @@ def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True) -> N
     `strict=False` (the hooks): a failed submodule update is a warning, not an
     abort, for the reason `follow_gitlinks` gives.
     """
-    # Discovery in the slot's top folder, as in `is_clean`; no recursion
-    # into submodules whatever a configuration says (`update_submodules`).
-    git(["reset", "--hard", "--no-recurse-submodules", HOST.main_branch], cwd=slot.path)
+    # Bound (`slot_top`); no recursion into submodules whatever a
+    # configuration says (`update_submodules`).
+    top_git(slot.path, ["reset", "--hard", "--no-recurse-submodules", HOST.main_branch])
     update_submodules(slot, initialized_submodules(slot.path), strict=strict)
     # Keep legacy slots with their own local copies. Missing directories and
     # existing shared links use the main checkout, even with --no-install.
     share_dirs(slot.path, keep_local=True)
-    print(f"{slot.name} is at {git(['rev-parse', '--short', 'HEAD'], cwd=slot.path).stdout.strip()} "
+    print(f"{slot.name} is at {top_git(slot.path, ['rev-parse', '--short', 'HEAD']).stdout.strip()} "
           f"(= {HOST.main_branch})")
     if install:
         HOST.install(slot.path, slot.admin_dir())
@@ -1147,6 +1254,7 @@ def cmd_push(args: argparse.Namespace) -> int:
 
 def cmd_next(args: argparse.Namespace) -> int:
     slot = find_slot(slot_named(args))
+    refuse_foreign(slot)
     (git_dir() / NEXT_FILE).write_text(slot.name)
     follow_gitlinks(slot)
     print(f"next WorktreeCreate -> {slot.name} ({describe(slot)})")
@@ -1171,9 +1279,9 @@ def cmd_drop(args: argparse.Namespace) -> int:
         detach_outside_links(slot.path)
         # git's own `deinit` follows each submodule's `.git`; `refuse_unless_idle`
         # has just checked every one names the admin the slot registers, and
-        # the slot is unlocked, so no worker is there to repoint it since.
+        # its worker has ended (the assumption named there).
         for sub in initialized_submodules(slot.path):
-            git(["submodule", "deinit", "-f", "--", sub], cwd=slot.path)
+            top_git(slot.path, ["submodule", "deinit", "-f", "--", sub])
         # --force: git refuses a worktree whose index holds a gitlink even after
         # deinit (measured 2026-09-06); the checks above are what make it safe.
         git(["worktree", "remove", "--force", str(slot.path)], cwd=main_dir())
@@ -1219,7 +1327,9 @@ def choose_slot(name: str, reason: str) -> tuple[Slot, bool, str]:
     A slot missing from `additionalDirectories` (`is_permitted`) is never the
     first free one -- handing it out would park the agent on a permission prompt
     -- and an assignment or a request by name gets it with a warning, because
-    somebody chose it on purpose.
+    somebody chose it on purpose. A slot with a git that cannot be bound
+    (`refuse_foreign`) is handed out by no policy: the hook fails, and the
+    harness starts no agent.
     """
     slots = list_slots()
     wanted = take_next_assignment()
@@ -1228,6 +1338,8 @@ def choose_slot(name: str, reason: str) -> tuple[Slot, bool, str]:
         if slot is None:
             print(f"worktree hook: `next` named {wanted}, which does not exist; ignoring", file=sys.stderr)
         else:
+            # `next` refused it already, but the slot may have changed since.
+            refuse_foreign(slot)
             if not slot.locked:
                 claim(slot, reason)
             if not is_permitted(slot.path):

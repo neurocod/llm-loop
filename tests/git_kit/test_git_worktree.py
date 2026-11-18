@@ -224,6 +224,7 @@ def test_equalize_links_missing_shared_dirs_without_an_install(shared_tree, monk
     monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(
         shared=(SHARED,), install=lambda *a: installed.append(a)))
     monkeypatch.setattr(worktree, "git", lambda *args, **kwargs: SimpleNamespace(stdout="head"))
+    monkeypatch.setattr(worktree, "top_git", lambda *args, **kwargs: SimpleNamespace(stdout="head"))
     monkeypatch.setattr(worktree, "all_submodules", lambda: [])
     slot = worktree.Slot(2, slot_path, "wt2", "head", False)
     worktree.reset_to_main_branch(slot, install=False)

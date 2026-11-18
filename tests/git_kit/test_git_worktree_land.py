@@ -483,17 +483,30 @@ def plant(slot, tmp_path):
     return marker
 
 
-def test_next_leaves_a_repointed_submodule_alone(repos, tmp_path, capsys):
+def test_next_and_the_create_hook_refuse_a_repointed_submodule(repos, tmp_path, monkeypatch):
+    """Neither `next` nor the create hook it arms hands out a slot whose
+    submodule git cannot be bound: an agent started there would work beside
+    a `.git` nobody may touch (review of 2442)."""
     main, slot, base = repos
     bump_in_main(main)
     commit_file(slot, "work.txt", "task")
     run(slot, "rebase", "-q", "main")
     marker = plant(slot, tmp_path)
-    assert command("next", "wt2") == 0
+    with pytest.raises(worktree.Fail, match="sub: its .git names"):
+        command("next", "wt2")
+    assert not (main / ".git" / worktree.NEXT_FILE).exists()
+    # Armed before the slot went bad: the hook refuses it all the same.
+    (main / ".git" / worktree.NEXT_FILE).write_text("wt2")
+    monkeypatch.setattr(worktree, "list_slots", lambda: [worktree.Slot(2, slot, "wt2", "", False)])
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    monkeypatch.setattr(worktree.sys, "stdin", io.StringIO('{"name": "agent", "session_id": "s"}'))
+    printed = io.StringIO()
+    monkeypatch.setattr(worktree.sys, "__stdout__", printed)
+    with pytest.raises(worktree.Fail, match="a git in it is not the one the slot registers"):
+        command("hook-create")
+    assert printed.getvalue() == ""
+    assert "locked" not in run(main, "worktree", "list", "--porcelain")
     assert not marker.exists()
-    err = capsys.readouterr().err
-    assert "wt2's sub is left where it is: its .git names" in err
-    assert "no git here runs in it" in err
 
 
 def test_equalize_drop_and_the_pool_listing_refuse_a_repointed_submodule(repos, tmp_path, capsys,
@@ -503,10 +516,10 @@ def test_equalize_drop_and_the_pool_listing_refuse_a_repointed_submodule(repos, 
     marker = plant(slot, tmp_path)
     monkeypatch.setattr(worktree, "list_slots", lambda: [worktree.Slot(2, slot, "wt2", "", False)])
     for operation in ("equalize", "drop"):
-        with pytest.raises(worktree.Fail, match="a submodule's git is not the one the slot registers"):
+        with pytest.raises(worktree.Fail, match="a git in it is not the one the slot registers"):
             command(operation, "wt2", *(["--no-push", "--no-install"] if operation == "equalize" else []))
     assert command("status") == 0
-    assert "submodule git not the slot's (sub: its .git names" in capsys.readouterr().out
+    assert "git not the slot's (sub: its .git names" in capsys.readouterr().out
     assert not marker.exists()
     assert slot.is_dir()
 
@@ -549,6 +562,83 @@ def test_every_git_in_a_slot_s_submodule_is_bound_to_its_registered_admin(repos,
         argv = pinned.argv(args)
         assert argv[argv.index("--git-dir") + 1] == str(admin), args
         assert "core.fsmonitor=false" in argv and f"core.hooksPath={main / '.git' / worktree.NO_HOOKS_DIR}" in argv
+
+
+def plant_hooks(main, slot, tmp_path):
+    """The main clone's `core.hooksPath` is MultiSkill's relative `.githooks`,
+    so git by discovery in a slot runs `<slot>/.githooks/*`; the worker plants
+    two there, ignored by a `.gitignore` of their own so the slot stays clean.
+    Returns the marker file they append to."""
+    run(main, "config", "core.hooksPath", ".githooks")
+    marker = tmp_path / "hooks-ran.txt"
+    hooks = slot / ".githooks"
+    hooks.mkdir()
+    (hooks / ".gitignore").write_text("*\n", encoding="utf-8")
+    for name in ("post-index-change", "reference-transaction"):
+        (hooks / name).write_text(f"#!/bin/sh\necho {name} >> '{marker.as_posix()}'\n",
+                                  encoding="utf-8", newline="\n")
+    # The control: git by discovery there runs both.
+    os.utime(slot / "readme.txt")
+    subprocess.run(["git", "status", "--porcelain"], cwd=slot, capture_output=True)
+    subprocess.run(["git", "reset", "-q", "--hard", "--no-recurse-submodules", "HEAD"], cwd=slot,
+                   capture_output=True)
+    assert set(marker.read_text(encoding="utf-8").split()) == {"post-index-change",
+                                                               "reference-transaction"}
+    marker.unlink()
+    return marker
+
+
+def test_status_and_equalize_run_no_hook_of_the_slot(repos, tmp_path, capsys):
+    main, slot, base = repos
+    landed = bump_in_main(main)
+    marker = plant_hooks(main, slot, tmp_path)
+    os.utime(slot / "readme.txt")
+    assert command("status") == 0
+    assert "wt2" in capsys.readouterr().out
+    os.utime(slot / "readme.txt")
+    assert command("equalize", "wt2", "--no-push", "--no-install") == 0
+    assert run(slot / "sub", "rev-parse", "HEAD") == landed
+    assert not marker.exists()
+
+
+def test_a_new_slot_s_submodules_are_cloned_by_the_bound_git(repos, tmp_path, monkeypatch):
+    main, slot, base = repos
+    # The bound git drops the fixture's GIT_CONFIG_* (`Pinned.environment`),
+    # and the submodule's clone reads no config of the superproject.
+    strip = worktree.Pinned.environment
+    monkeypatch.setattr(worktree.Pinned, "environment", staticmethod(lambda base=None: {
+        **strip(base), "GIT_CONFIG_PARAMETERS": "'protocol.file.allow'='always'"}))
+    run(main, "config", "core.hooksPath", ".githooks")
+    monkeypatch.setattr(worktree, "slot_path", lambda number: tmp_path / f"main-wt{number}")
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    seen = []
+    real = worktree.git
+
+    def recording(args, **kwargs):
+        if args[0] == "submodule":
+            seen.append(kwargs.get("pinned"))
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(worktree, "git", recording)
+    assert command("new", "3", "--submodules", "all", "--no-install", "--no-push") == 0
+    assert (tmp_path / "main-wt3" / "sub" / "a.txt").read_text(encoding="utf-8") == "one"
+    assert seen and all(p is not None and "--git-dir" in p.argv([]) for p in seen)
+
+
+def test_a_bound_git_takes_the_main_checkout_s_lfs_endpoint(repos, tmp_path):
+    """A worker's `.lfsconfig` names the URL git-lfs downloads from; the
+    bound git's `lfs.url` (the main checkout's endpoint) beats it."""
+    main, slot, base = repos
+    if subprocess.run(["git", "lfs", "version"], capture_output=True).returncode != 0:
+        pytest.skip("git-lfs is not installed")
+    run(main, "remote", "add", "origin", "https://main.invalid/project.git")
+    (slot / ".lfsconfig").write_text("[lfs]\n\turl = https://worker.invalid/lfs\n", encoding="utf-8")
+    pinned, why = worktree.slot_top(slot)
+    assert pinned is not None, why
+    shown = subprocess.run(pinned.argv(["lfs", "env"]), cwd=slot, capture_output=True, text=True,
+                           env=worktree.Pinned.environment()).stdout
+    endpoint = next(line for line in shown.splitlines() if line.startswith("Endpoint="))
+    assert endpoint.startswith("Endpoint=https://main.invalid/project.git/info/lfs"), shown
 
 
 def test_a_submodule_reached_through_a_link_is_not_bound(repos, tmp_path):
