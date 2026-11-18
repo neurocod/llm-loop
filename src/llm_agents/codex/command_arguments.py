@@ -34,6 +34,11 @@ class CommandContext:
     allow_online_probes: bool = False
     # How many `npm run` bodies deep the command being judged sits.
     npm_depth: int = 0
+    # The program word of the command being judged AS TYPED (`argv_refusal`
+    # hands its shape the name with `.exe`/`.cmd`/`.bat`/`.ps1` dropped):
+    # what a broker launch judges, since `python.cmd` is a script the shell
+    # finds, not the interpreter `trusted_python` pinned.
+    program_word: str = ""
     commit_approvals: Optional[Path] = None
     # The rebase broker's facts for this worker (`sandbox.escalation_judge`),
     # or None and why not (`command_rebase._rebase_broker`).

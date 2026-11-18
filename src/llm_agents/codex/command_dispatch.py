@@ -12,7 +12,7 @@ command_commit.py).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 from ..host_policy import HostPolicy, active as active_policy
@@ -58,7 +58,7 @@ def argv_refusal(argv: list[str], cwd: Path, ctx: CommandContext) -> str:
                   if program in shape.names), None)
     if shape is None:
         return f"`{argv[0]}` is not a worker command shape"
-    return shape.judge([program, *argv[1:]], cwd, ctx)
+    return shape.judge([program, *argv[1:]], cwd, replace(ctx, program_word=argv[0]))
 
 
 _PROGRAM_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1")

@@ -71,6 +71,15 @@ def broker_spelling_refusal(word: str, broker: Broker) -> str:
     return ""
 
 
+def _linked(path: Path) -> Optional[Path]:
+    """The first of `path` and its parents, AS SPELLED (nothing resolved),
+    that is a symlink or junction, or None."""
+    for folder in (path, *path.parents):
+        if folder.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(folder):
+            return folder
+    return None
+
+
 def _program_names(name: str) -> tuple[str, ...]:
     """The file names a shell's lookup of `name` may open in one PATH folder:
     on Windows each PATHEXT extension and PowerShell's `.ps1`, on POSIX the
@@ -107,7 +116,18 @@ def trusted_python(name: str, roots: tuple[Path, ...],
         if not os.path.isabs(folder):
             return None, (f"PATH entry {raw!r} is relative: the shell would look "
                           f"`{name}` up in the working directory")
-        if within(Path(folder).resolve(), roots):
+        # Judged as SPELLED, not only resolved: the shell walks this text
+        # after the grant, so a junction along it (`C:\slot\python-link` ->
+        # the real Python) resolves clean at the judge and is the worker's
+        # to swap before PowerShell looks `name` up (review of 2432).
+        if _dotted(folder.rstrip("\\/")):
+            return None, (f"PATH entry {folder} has `.`/`..` segments or doubled "
+                          f"separators: what it names depends on the links along it")
+        link = _linked(Path(folder))
+        if link is not None:
+            return None, (f"PATH entry {folder} passes through the link or junction "
+                          f"{link}: it may be swapped after the grant")
+        if within(Path(folder), roots) or within(Path(folder).resolve(), roots):
             return None, (f"PATH entry {folder} lies in your writable roots: a "
                           f"`{name}` planted there would run")
         if found is not None:
@@ -132,26 +152,29 @@ def trusted_python(name: str, roots: tuple[Path, ...],
 def broker_launch_refusal(program: str, switches: list[str], ctx: CommandContext,
                           broker: Broker) -> str:
     """Why `<program> <switches> <broker>` may not start the broker, or "":
-    `program` is `python`/`python3` that `trusted_python` pins (not `py`: the
-    launcher picks an interpreter by its own rules — registry, py.ini,
-    PY_PYTHON — after the grant); `-I` is required (isolated mode: no
+    `program`, as typed (`CommandContext.program_word`), is `python`/`python3`
+    that `trusted_python` pins (not `py`: the launcher picks an interpreter by
+    its own rules — registry, py.ini, PY_PYTHON — after the grant; not
+    `python.cmd`/`.bat`/`.ps1`, a script the shell finds wherever it lies, nor
+    `python.exe`, which `trusted_python` does not judge); `-I` is required (isolated mode: no
     PYTHON* variables, no user site, no script folder from the cwd — a
     `sitecustomize.py` on an inherited PYTHONPATH runs before any check of
     the broker's); and no folder along the broker's path may be a link or
     junction or lie in a writable root: its literal spelling must name the
     file it names now and after the grant."""
-    if program not in ("python", "python3"):
+    if program.lower() not in ("python", "python3"):
         return (f"{broker.what} starts as `python -I {broker.path} ...`, not "
                 f"through `{program}`")
-    _, why = trusted_python(program, ctx.roots)
+    _, why = trusted_python(program.lower(), ctx.roots)
     if why:
         return f"{broker.what}: {why}"
     if "-I" not in switches:
         return (f"{broker.what} starts only isolated: `python -I {broker.path} "
                 f"...` (an inherited PYTHONPATH could plant code before it runs)")
+    link = _linked(broker.path)
+    if link is not None:
+        return f"{broker.what}'s path holds a link or junction at {link}"
     for folder in (broker.path, *broker.path.parents):
-        if folder.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(folder):
-            return f"{broker.what}'s path holds a link or junction at {folder}"
         if within(folder, ctx.roots):
             return f"{broker.what} {broker.path} lies in your writable roots"
     return ""

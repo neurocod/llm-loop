@@ -774,6 +774,12 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
                    if worker else "")
         if worker and not refusal:
             return Verdict(True, "a worker command shape")
+        # Final for a worker, over the escalate rule and the cleanup grant
+        # below: those read the command unwrapped, and cmd would still look
+        # its program up in the worker's cwd first (`npm test` under
+        # `cmd /c` -> a planted npm.cmd; review of 2432).
+        if worker and split_shell(command)[0] == "cmd":
+            return Verdict(False, f"{refusal}; {decline_tail}")
         if pattern is not None and pattern.search(unwrap_shell(command)):
             return Verdict(True, "matches the escalate rule")
         if automatic and cleanup_targets(command, cwd, workspace):

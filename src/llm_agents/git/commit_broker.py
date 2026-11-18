@@ -20,7 +20,8 @@ runs the kit's `commit.main` with:
 
 - git pinned for the whole process (`gitlib.pin`): the absolute git the
   bridge resolved (`rebase.trusted_git`), `_FORCED` over the repository's
-  own configuration, no `GIT_*` from the environment;
+  own configuration, no `GIT_*` from the environment, and no program
+  looked up in the current directory anywhere below (`NO_CWD_LOOKUP`);
 - the hooks the grant names: the host's folder in its MAIN checkout
   (`HostPolicy.commit_hooks`: the house rules a commit must pass) for the
   slot's own tree, an empty folder for a commit inside a submodule (which
@@ -57,6 +58,15 @@ ENV = "LLM_AGENTS_COMMIT_BROKER"
 # during a commit — an fsmonitor, an external diff, an editor.
 _FORCED = ("core.hooksPath={hooks}", "core.fsmonitor=false", "diff.external=",
            "core.editor=true")
+
+# Set for the broker's whole process tree — git, the hooks it runs and what
+# they start. On Windows a program started by bare name (CreateProcess,
+# cmd, Node's libuv: a hook's `execFileSync("git")`) is looked up in the
+# current directory before the PATH unless this variable is set; a hook's
+# cwd is the committed tree's root, the worker's to write (review of 2432
+# reproduced a planted git.exe running from a real pre-commit hook). Ignored
+# elsewhere. A belt, not the pin: a host's hooks still start git by path.
+NO_CWD_LOOKUP = {"NoDefaultCurrentDirectoryInExePath": "1"}
 
 
 @dataclass(frozen=True)
@@ -115,6 +125,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except (ValueError, KeyError, TypeError) as error:
         print(f"commit broker: unreadable {ENV}: {error}", file=sys.stderr)
         return 2
+    os.environ.update(NO_CWD_LOOKUP)
     # No hooks until the ticket says whose tree this is; rev-parse runs none.
     _pin(grant, grant.no_hooks)
     from llm_agents.git import commit

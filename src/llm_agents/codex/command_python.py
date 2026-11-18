@@ -76,7 +76,8 @@ def _python(argv: list[str], cwd: Path, ctx: CommandContext, *,
             return why
         if broker_script(words[at], broker):
             # The bridge's own file, outside the roots by design.
-            return (broker_launch_refusal(argv[0], words[:at], ctx, broker)
+            return (broker_launch_refusal(ctx.program_word or argv[0], words[:at],
+                                          ctx, broker)
                     or broker.judge(words[at + 1:], cwd, ctx))
     script, why = _existing_file(words[at], cwd, ctx, "script")
     if why:

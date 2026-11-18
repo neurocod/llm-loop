@@ -20,7 +20,7 @@ import pytest
 from llm_agents import host_policy
 from llm_agents.codex import command_brokers, sandbox
 from llm_agents.codex.command_commit import BROKER
-from llm_agents.codex.testing import PS
+from llm_agents.codex.testing import PS, junction
 from llm_agents.git import commit_broker
 from llm_agents.git.commit_identity import ENV as APPROVALS
 from core_judge_support import commit_judge, git_in, pool_slot, slot_with_submodule, worker_judge
@@ -153,6 +153,33 @@ def test_a_cmd_wrapped_escalation_is_refused(tmp_path, monkeypatch):
     assert ask("python -m pytest")
 
 
+def test_the_cmd_refusal_is_final_over_the_escalate_rule(tmp_path, monkeypatch):
+    """The escalate regex reads the command unwrapped: without the final
+    refusal it would grant `cmd /c "npm test"`, and cmd would run an npm.cmd
+    planted in the cwd (review of 2432). PowerShell's spelling still passes."""
+    _, ask = worker_judge(tmp_path, monkeypatch, escalate=r"^npm test$")
+    for command in ('C:\\WINDOWS\\system32\\cmd.exe /d /s /c "npm test"',
+                    'cmd.exe /c "npm test"'):
+        verdict = ask(command, wrap=False)
+        assert not verdict and "wrapped in cmd" in verdict.reason, verdict.reason
+    verdict = ask("npm test")
+    assert verdict and verdict.reason == "matches the escalate rule", verdict.reason
+
+
+def test_the_broker_starts_only_as_python_typed_plainly(tmp_path, monkeypatch):
+    """`argv_refusal` drops a program suffix to find the shape; the broker
+    launch judges the word as typed: `python.cmd` is a script PowerShell
+    finds on the PATH, not the interpreter `trusted_python` pinned."""
+    slot, _ = _slot(tmp_path)
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    message = tmp_path / "scratch" / "msg.txt"
+    for program in ("python.cmd", "python.bat", "python.ps1", "python.exe",
+                    "python3.cmd"):
+        _declined(ask, f"{program} -I {BROKER} -F {message} src/a.ts",
+                  f"not through `{program}`")
+    _granted(ask, f"Python -I {BROKER} -F {message} src/a.ts")
+
+
 def test_python_is_pinned_on_the_path(tmp_path):
     """`trusted_python`: any relative PATH entry or entry inside a writable
     root refuses, wherever it stands; the first hit is the interpreter."""
@@ -169,6 +196,28 @@ def test_python_is_pinned_on_the_path(tmp_path):
                          (str(tmp_path / "nothing"), f"no `{name}`")):
         found, why = command_brokers.trusted_python(name, (root,), path)
         assert found is None and reason in why, (path, why)
+
+
+@windows
+def test_a_python_path_entry_through_a_junction_is_not_pinned(tmp_path):
+    """A junction resolves to the real Python at the judge and is the
+    worker's to swap before PowerShell walks the PATH: the entry is judged
+    as spelled (review of 2432). Outside the writable roots too — the link
+    itself is the risk — and through a parent folder as well as the entry."""
+    real = Path(sys.executable).parent
+    link = tmp_path / "python-link"
+    junction(link, real)
+    parent = tmp_path / "parent-link"
+    junction(parent, real.parent)
+    for path in (str(link), str(parent / real.name)):
+        found, why = command_brokers.trusted_python("python", (), path)
+        assert found is None and "link or junction" in why, (path, why)
+    dotted = f"{real}{os.sep}..{os.sep}{real.name}"
+    found, why = command_brokers.trusted_python("python", (), dotted)
+    assert found is None and "`.`/`..` segments" in why, why
+    # The control: the same folder, spelled plainly (a trailing separator too).
+    for path in (str(real), f"{real}{os.sep}"):
+        assert command_brokers.trusted_python("python", (), path)[0] is not None, path
 
 
 @windows
@@ -209,6 +258,28 @@ def test_the_commit_runs_the_host_s_hooks_not_the_planted_ones(tmp_path, monkeyp
     # The control: the same planted hooks DO run under a plain commit here.
     git_in(slot, "commit", "--quiet", "--allow-empty", "-m", "control")
     assert "pre-commit" in marker.read_text(encoding="utf-8")
+
+
+def test_the_hooks_run_without_a_cwd_program_lookup(tmp_path, monkeypatch):
+    """`commit_broker.NO_CWD_LOOKUP` reaches the hooks even when the bridge's
+    environment lacks it: on Windows a hook's bare-name start (Node's
+    `execFileSync("git")`) would otherwise try the slot root first."""
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    slot, _ = _slot(tmp_path)
+    seen = tmp_path / "seen.txt"
+    # Windows names are case-blind and Python's os.environ upper-cases them;
+    # the hook's sh is case-sensitive, so it reads both spellings.
+    with _host(tmp_path, commit_hooks="hooks"):
+        _hook(tmp_path / "host" / "hooks", "pre-commit",
+              'echo "[$NoDefaultCurrentDirectoryInExePath$NODEFAULTCURRENTDIRECTORYINEXEPATH]"'
+              f" > '{seen.as_posix()}'")
+        ask = commit_judge(tmp_path, monkeypatch, slot)
+    (slot / "src/a.ts").write_text("work\n", encoding="utf-8")
+    message = _message(tmp_path)
+    _granted(ask, f"{RUN} -F {message} src/a.ts")
+    done = _commit(ask, slot, "-F", str(message), "src/a.ts")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert seen.read_text(encoding="utf-8").strip() == "[1]"
 
 
 def test_a_submodule_commit_runs_no_hooks(tmp_path, monkeypatch):
