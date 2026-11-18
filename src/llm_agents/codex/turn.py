@@ -508,25 +508,35 @@ class TurnRunner:
 JOB_END_WAIT_S = 10.0
 
 
+def worker_roots(record: AgentRecord) -> list[Path]:
+    """Every directory the worker starts in or may write, once: its cwd, the
+    sandbox's writable roots (workspace, scratch, `--writable`) and the temp
+    folders Codex lets it write beside them (`sandbox.sandbox_temp_dirs`: an
+    inherited TEMP of `C:\\g` would cover every slot). The guard, the record
+    and the overlap check all take this set, so none can miss a root another
+    one counts."""
+    roots = [Path(record.cwd or host_root()), *map(Path, record.writable),
+             *sandbox.writable_roots(record), *sandbox.sandbox_temp_dirs(record)]
+    return list(dict.fromkeys(roots))
+
+
 @contextmanager
 def _contained(record: AgentRecord):
     """The turn's worker job and live record (`live_workers`), which keep the
     worktree pool off the worker's tree while anything of it runs: (record,
     job). Refused before anything starts when the worker could write the
     live-worker folder, when no job can be made, or when a pool command holds
-    the tree. The roots are the directories the sandbox starts in or may
-    write."""
-    live_workers.refuse_overlap([*sandbox.writable_roots(record),
-                                 *sandbox.sandbox_temp_dirs(record)])
+    the tree. One root set serves all three: `worker_roots`."""
+    roots = worker_roots(record)
+    live_workers.refuse_overlap(roots)
     try:
         job = live_workers.WorkerJob.create()
     except OSError as error:
         raise SystemExit(f"cannot create the job object the worker would run in ({error}); "
                          f"a worker that cannot be contained is not started") from error
     try:
-        with live_workers.recorded(
-                record.name, [Path(record.cwd or host_root()), *map(Path, record.writable)],
-                job=job, ended=lambda: job.end(JOB_END_WAIT_S)) as live:
+        with live_workers.recorded(record.name, roots, job=job,
+                                   ended=lambda: job.end(JOB_END_WAIT_S)) as live:
             yield live, job
     finally:
         job.close()

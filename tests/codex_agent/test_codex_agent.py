@@ -3719,13 +3719,42 @@ def test_a_turn_holds_a_live_record_naming_its_tree_and_server(tmp_path, monkeyp
     server, found = seen[0]
     assert [w.name for w in found] == ["w", "w"]
     assert [pid for w in found for pid, _ in w.processes] == [os.getpid(), server]
-    assert found[0].roots == [live_workers.canonical(tmp_path / "tree"),
-                              live_workers.canonical(tmp_path / "extra")]
+    wanted = {live_workers.canonical(tmp_path / "tree"), live_workers.canonical(tmp_path / "extra")}
+    wanted |= {live_workers.canonical(p) for p in sandbox.sandbox_temp_dirs(
+        AgentRecord(name="w", sandbox="workspace-write"))}
+    assert wanted <= set(found[0].roots)
     if sys.platform == "win32":
         # The server runs in the turn's job, which the record names.
         assert found[0].job and found[0].job == found[1].job
         assert active[0] >= 1
     assert live_workers.live_workers(tmp_path / "tree") == []
+
+
+def test_a_temp_folder_the_worker_may_write_is_one_of_its_roots(tmp_path, monkeypatch):
+    """Review of c390e64: Codex lets a `workspace-write` worker write its TEMP
+    beside the workspace, so a TEMP above a slot must hold that slot."""
+    from llm_agents.git import live_workers
+    shared = tmp_path / "shared"
+    (shared / "repo-wt1").mkdir(parents=True)
+    (tmp_path / "tree").mkdir()
+    name = "TEMP" if sys.platform == "win32" else "TMPDIR"
+    monkeypatch.setenv(name, str(shared))
+    if sys.platform == "win32":
+        monkeypatch.setenv("TMP", str(shared))
+    refused = []
+    add = live_workers.LiveRecord.add_process
+
+    def spy(record, pid):
+        add(record, pid)
+        try:
+            live_workers.pool_guard(shared / "repo-wt1").release()
+        except live_workers.Busy:
+            refused.append(pid)
+
+    monkeypatch.setattr(live_workers.LiveRecord, "add_process", spy)
+    wire.run_fake_turn(tmp_path, monkeypatch, "plain", cwd=tmp_path / "tree",
+                       sandbox="workspace-write")
+    assert len(refused) == 1
 
 
 def test_a_turn_is_refused_while_a_pool_command_holds_its_tree(tmp_path, monkeypatch):

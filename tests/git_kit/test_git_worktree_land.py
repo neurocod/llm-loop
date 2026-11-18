@@ -809,6 +809,55 @@ def test_a_queued_assignment_is_asked_again_unless_next_overrode(locked_slot, mo
                 worktree.choose_slot("agent", "r")
 
 
+def worker_finishing_before_the_guard(monkeypatch, change):
+    """`worker_excluded` that first lets a worker do `change` and end: what a
+    turn completing between an inspection and the guard leaves behind."""
+    real = worktree.worker_excluded
+
+    def late(slot, ignore=False):
+        change()
+        return real(slot, ignore)
+
+    monkeypatch.setattr(worktree, "worker_excluded", late)
+
+
+def test_the_create_hook_reads_the_free_verdict_under_the_guard(repos, monkeypatch):
+    """Review of c390e64: a verdict read before the guard described a tree a
+    worker had changed since, and the hook reset it as free."""
+    main, slot, base = repos
+    free = worktree.Slot(2, slot, "wt2", "", False)
+    monkeypatch.setattr(worktree, "list_slots", lambda: [free])
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    monkeypatch.setattr(worktree, "take_next_assignment", lambda: "")
+    worker_finishing_before_the_guard(
+        monkeypatch, lambda: (slot / "readme.txt").write_text("worker's edit", encoding="utf-8"))
+    with pytest.raises(worktree.Fail, match="no free slot.*dirty"):
+        worktree.choose_slot("agent", "r")
+    assert "locked" not in run(main, "worktree", "list", "--porcelain")
+
+
+def test_the_create_hook_checks_an_assignment_s_git_under_the_guard(repos, tmp_path,
+                                                                    monkeypatch):
+    main, slot, base = repos
+    monkeypatch.setattr(worktree, "list_slots", lambda: [worktree.Slot(2, slot, "wt2", "", False)])
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    monkeypatch.setattr(worktree, "take_next_assignment", lambda: "wt2")
+    worker_finishing_before_the_guard(monkeypatch, lambda: plant(slot, tmp_path))
+    with pytest.raises(worktree.Fail, match="a git in it is not the one the slot registers"):
+        worktree.choose_slot("agent", "r")
+
+
+def test_the_remove_hook_reads_the_slot_under_the_guard(repos, monkeypatch, capsys):
+    main, slot, base = repos
+    monkeypatch.setattr(worktree, "list_slots", lambda: [worktree.Slot(2, slot, "wt2", "", False)])
+    monkeypatch.setattr(worktree.sys, "stdin", io.StringIO(json.dumps({"path": str(slot)})))
+    worker_finishing_before_the_guard(
+        monkeypatch, lambda: (slot / "readme.txt").write_text("worker's edit", encoding="utf-8"))
+    assert command("hook-remove") == 0
+    assert "keeping it as is" in capsys.readouterr().err
+    assert (slot / "readme.txt").read_text(encoding="utf-8") == "worker's edit"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows'")
 def test_a_worker_rooted_at_an_alias_of_the_slot_refuses_it(locked_slot, tmp_path):
     import _winapi

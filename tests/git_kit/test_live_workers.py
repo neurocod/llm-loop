@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from pathlib import Path
 
 import pytest
 
@@ -163,6 +164,32 @@ def test_a_short_name_is_the_folder_it_names(tmp_path):
     if buffer.value.lower() == str(slot).lower():
         pytest.skip("8.3 names are off on this volume")
     assert live_workers.canonical(buffer.value) == live_workers.canonical(slot)
+
+
+EXTENDED = "\\\\?\\"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="extended-length paths are Windows'")
+def test_an_extended_length_spelling_is_the_same_folder(tmp_path, monkeypatch):
+    """`realpath` keeps a `\\\\?\\` it is given, and one checkout was read back
+    both ways (review of c390e64): exclusion and overlap must not miss it."""
+    slot = tmp_path / "repo-wt1"
+    slot.mkdir()
+    assert live_workers.canonical(EXTENDED + str(slot)) == live_workers.canonical(slot)
+    assert (live_workers._plain_dos("\\\\?\\UNC\\host\\share\\x")
+            == live_workers._plain_dos("\\\\host\\share\\x") == "\\\\host\\share\\x")
+    with live_workers.worker_guard([EXTENDED + str(slot)]):
+        with pytest.raises(live_workers.Busy):
+            live_workers.pool_guard(slot)
+    with live_workers.worker_guard([slot]):
+        with pytest.raises(live_workers.Busy):
+            live_workers.pool_guard(Path(EXTENDED + str(slot)))
+    monkeypatch.setenv(live_workers.LIVE_DIR_ENV, EXTENDED + str(tmp_path / "work" / "registry"))
+    with pytest.raises(SystemExit, match="overlaps"):
+        live_workers.refuse_overlap([tmp_path / "work"])
+    monkeypatch.setenv(live_workers.LIVE_DIR_ENV, str(tmp_path / "work" / "registry"))
+    with pytest.raises(SystemExit, match="overlaps"):
+        live_workers.refuse_overlap([Path(EXTENDED + str(tmp_path / "work"))])
 
 
 def test_a_worker_that_could_write_the_folder_is_refused(tmp_path, monkeypatch):

@@ -73,11 +73,29 @@ def live_dir() -> Path:
     return base / "llm_agents" / "live-workers"
 
 
+def _plain_dos(path: str) -> str:
+    """`path` without Windows' extended-length prefix: `\\\\?\\C:\\x` is `C:\\x`
+    and `\\\\?\\UNC\\host\\share` is `\\\\host\\share`. `realpath` keeps a prefix
+    it was given (measured 2026-11-18: one checkout read back both as
+    `c:\\work\\repo-wt1` and as `\\\\?\\c:\\work\\repo-wt1`), so two
+    spellings of one folder would hash to two lock keys."""
+    if os.name != "nt":
+        return path
+    spelled = path.replace("/", "\\")
+    if spelled[:8].upper() == "\\\\?\\UNC\\":
+        return "\\\\" + spelled[8:]
+    if spelled.startswith("\\\\?\\") or spelled.startswith("\\\\.\\"):
+        return spelled[4:]
+    return path
+
+
 def canonical(path: str | os.PathLike) -> str:
-    """The one spelling of `path` both sides compare: absolute, every link,
-    junction and 8.3 short name resolved (`realpath` asks the file system for
-    the final path of what exists), case-folded where the file system folds."""
-    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    """The one spelling of `path` both sides compare: absolute, without an
+    extended-length prefix (`_plain_dos`), every link, junction and 8.3 short
+    name resolved (`realpath` asks the file system for the final path of what
+    exists), case-folded where the file system folds."""
+    plain = _plain_dos(os.path.abspath(_plain_dos(os.fspath(path))))
+    return os.path.normcase(_plain_dos(os.path.realpath(plain)))
 
 
 def is_inside(path: str, root: str) -> bool:

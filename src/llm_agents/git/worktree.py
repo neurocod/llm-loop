@@ -1405,9 +1405,11 @@ def _choose_slot(name: str, reason: str, hold: contextlib.ExitStack) -> tuple[Sl
         if slot is None:
             print(f"worktree hook: `next` named {wanted}, which does not exist; ignoring", file=sys.stderr)
         else:
+            # Excluded first, then inspected: a worker that ran between an
+            # earlier look and the guard would have left the look stale.
+            hold.enter_context(worker_excluded(slot, ignore=override == IGNORE_LIVE_FLAG))
             # `next` refused it already, but the slot may have changed since.
             refuse_foreign(slot)
-            hold.enter_context(worker_excluded(slot, ignore=override == IGNORE_LIVE_FLAG))
             if not slot.locked:
                 claim(slot, reason)
             if not is_permitted(slot.path):
@@ -1423,16 +1425,20 @@ def _choose_slot(name: str, reason: str, hold: contextlib.ExitStack) -> tuple[Sl
             else:
                 states.append(f"{slot.name}: not in additionalDirectories")
                 continue
-        state = slot_state(slot)
-        states.append(f"{slot.name}: {state.describe()}")
-        if state.free and claim(slot, reason):
+        with contextlib.ExitStack() as candidate:
+            # Excluded before the verdict, which is then read under the guard
+            # and held to the end of the hook: a verdict read first could
+            # describe a tree a worker changed before the guard was taken.
             try:
-                hold.enter_context(worker_excluded(slot))
+                candidate.enter_context(worker_excluded(slot))
             except Fail as busy:
-                unclaim(slot)
-                states[-1] = f"{slot.name}: {busy}"
+                states.append(f"{slot.name}: {busy}")
                 continue
-            return slot, True, "by name" if slot.name == name else "first free"
+            state = slot_state(slot)
+            states.append(f"{slot.name}: {state.describe()}")
+            if state.free and claim(slot, reason):
+                hold.enter_context(candidate.pop_all())
+                return slot, True, "by name" if slot.name == name else "first free"
     unlisted = any(not is_permitted(s.path) for s in candidates)
     remedy = (f" A slot skipped as not in additionalDirectories is free once its path is added to "
               f"{PERMISSION_FILES[0].as_posix()} (or hand it out on purpose: `next <slot>`)." if unlisted else "")
@@ -1473,14 +1479,15 @@ def cmd_hook_remove(args: argparse.Namespace) -> int:
         print("worktree hook remove: not a pool slot, nothing to do", file=sys.stderr)
         return 0
     with contextlib.redirect_stdout(sys.stderr), contextlib.ExitStack() as hold:
-        state = slot_state(slot)
-        if state.detached or not state.clean or state.unlanded or state.foreign or state.live:
-            print(f"worktree hook remove: {slot.name} is {state.describe()}; keeping it as is")
-            return 0
+        # Excluded first, then inspected, then reset, all under one guard.
         try:
             hold.enter_context(worker_excluded(slot))
         except Fail as busy:
             print(f"worktree hook remove: {busy}; keeping it as is")
+            return 0
+        state = slot_state(slot)
+        if state.detached or not state.clean or state.unlanded or state.foreign or state.live:
+            print(f"worktree hook remove: {slot.name} is {state.describe()}; keeping it as is")
             return 0
         unclaim(slot)
         reset_to_main_branch(slot, install=False, strict=False)
