@@ -3702,7 +3702,11 @@ def test_a_turn_holds_a_live_record_naming_its_tree_and_server(tmp_path, monkeyp
 
     def spy(record, pid):
         add(record, pid)
-        seen.append((pid, live_workers.live_workers(tmp_path / "tree" / "sub", prune=False)))
+        found = live_workers.live_workers(tmp_path / "tree" / "sub", prune=False)
+        seen.append((pid, found))
+        active.append(live_workers.job_active_processes(found[0].job) if found else None)
+
+    active = []
 
     monkeypatch.setattr(live_workers.LiveRecord, "add_process", spy)
     monkeypatch.setattr(wire, "AgentRecord", lambda **kw: AgentRecord(
@@ -3713,10 +3717,32 @@ def test_a_turn_holds_a_live_record_naming_its_tree_and_server(tmp_path, monkeyp
                        sandbox="workspace-write")
     assert len(seen) == 1
     server, found = seen[0]
-    assert [w.name for w in found] == ["w"]
-    assert [pid for pid, _ in found[0].processes] == [os.getpid(), server]
-    assert found[0].roots == [str(tmp_path / "tree"), str(tmp_path / "extra")]
+    assert [w.name for w in found] == ["w", "w"]
+    assert [pid for w in found for pid, _ in w.processes] == [os.getpid(), server]
+    assert found[0].roots == [live_workers.canonical(tmp_path / "tree"),
+                              live_workers.canonical(tmp_path / "extra")]
+    if sys.platform == "win32":
+        # The server runs in the turn's job, which the record names.
+        assert found[0].job and found[0].job == found[1].job
+        assert active[0] >= 1
     assert live_workers.live_workers(tmp_path / "tree") == []
+
+
+def test_a_turn_is_refused_while_a_pool_command_holds_its_tree(tmp_path, monkeypatch):
+    from llm_agents.git import live_workers
+    (tmp_path / "tree").mkdir()
+    with live_workers.pool_guard(tmp_path / "tree"):
+        with pytest.raises(SystemExit, match="a worktree pool command is acting"):
+            wire.run_fake_turn(tmp_path, monkeypatch, "plain", cwd=tmp_path / "tree")
+
+
+def test_a_turn_that_could_write_the_live_worker_folder_is_refused(tmp_path, monkeypatch):
+    from llm_agents.git import live_workers
+    (tmp_path / "tree").mkdir()
+    monkeypatch.setenv(live_workers.LIVE_DIR_ENV, str(tmp_path / "tree" / "registry"))
+    with pytest.raises(SystemExit, match="overlaps the live-worker folder"):
+        wire.run_fake_turn(tmp_path, monkeypatch, "plain", cwd=tmp_path / "tree",
+                           sandbox="workspace-write")
 
 
 def test_a_wire_that_breaks_mid_announcement_is_swallowed(monkeypatch):

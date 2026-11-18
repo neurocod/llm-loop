@@ -186,7 +186,10 @@ class AppServer:
 
     def __init__(self, cwd: Path, log: Optional[Callable[[dict], None]] = None,
                  approve: Optional[Callable[[dict], bool]] = None,
-                 approve_files: Optional[Callable[[list[str]], bool]] = None):
+                 approve_files: Optional[Callable[[list[str]], bool]] = None,
+                 job=None):
+        """`job`: a `live_workers.WorkerJob` the server and every process it
+        starts run in, so none outlives the wrapper."""
         self._log = log or (lambda _msg: None)
         # The exceptions to "refuse everything": a judge for command
         # approvals, given the request's params, saying whether THIS command
@@ -201,10 +204,14 @@ class AppServer:
         # One entry per fileChange approval answered, as logged — the turn
         # summary reads the declined ones (`turn._run_turn_logged`).
         self.file_decisions: list[dict] = []
-        self._connection = appserver.Connection(appserver.spawn(
+        proc = appserver.spawn(
             _server_argv(), cwd=str(cwd),
             env={**os.environ, **getattr(approve, "environment", {})},
-        ), first_id=1)
+            **({"creationflags": job.creationflags} if job is not None and job.creationflags
+               else {}))
+        if job is not None:
+            job.adopt(proc)
+        self._connection = appserver.Connection(proc, first_id=1)
 
     @property
     def pid(self) -> int:

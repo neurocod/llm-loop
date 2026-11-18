@@ -158,12 +158,14 @@ _SUITE_FIXTURES = ("isolate_process_policies", "isolate_launch_decision",
 
 
 @pytest.fixture(autouse=True)
-def isolate_live_workers(tmp_path, monkeypatch):
-    """Each test's live-worker records (`llm_agents.git.live_workers`) in its
-    own folder: a turn the suite runs writes one, and the pool tests read
-    them; neither may meet the user's real folder."""
+def isolate_live_workers(tmp_path_factory, monkeypatch):
+    """Each test's live-worker records and locks (`llm_agents.git.live_workers`)
+    in its own folder: a turn the suite runs writes them, and the pool tests
+    read them; neither may meet the user's real folder. Beside `tmp_path`,
+    not in it: a turn whose workspace is `tmp_path` must not cover the folder
+    (`live_workers.refuse_overlap`)."""
     from llm_agents.git import live_workers
-    monkeypatch.setenv(live_workers.LIVE_DIR_ENV, str(tmp_path / "live-workers"))
+    monkeypatch.setenv(live_workers.LIVE_DIR_ENV, str(tmp_path_factory.mktemp("live-workers")))
 
 
 @pytest.hookimpl(trylast=True)

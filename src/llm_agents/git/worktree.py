@@ -397,26 +397,23 @@ def describe(slot: Slot) -> str:
     return slot_state(slot).describe()
 
 
-def refuse_unless_idle(slot: Slot, state: SlotState | None = None, *,
-                       ignore_live: bool = False) -> None:
+def refuse_unless_idle(slot: Slot, state: SlotState | None = None) -> None:
     """Refuse a slot that is busy or holds work: `equalize` and `drop` both need this.
 
     Every pool operation on a slot (`equalize`, `drop`, `next` and the create
-    hook handing it out, `land`, `release`) assumes the slot's worker has
-    ENDED: the checks here and in `slot_state` look at the tree once, and the
-    git that follows acts on it later -- a live worker could swap
-    `<slot>/<sub>` for a junction between `slot_submodule`'s check and a bound
-    checkout, or turn `<sub>/.git` into a directory before `drop`'s `submodule
-    deinit`. Two records say a worker may still be there: the lock (`claim`),
-    a task's, and a live-worker record (`live_workers`), a process's, which
-    the Codex bridge holds while its wrapper or app-server runs. A worker no
-    bridge records (a Claude agent, a shell) leaves only the lock."""
+    hook handing it out, `land`, `release`, `new`'s install) assumes the
+    slot's worker has ENDED: the checks here and in `slot_state` look at the
+    tree once, and the git that follows acts on it later -- a live worker
+    could swap `<slot>/<sub>` for a junction between `slot_submodule`'s check
+    and a bound checkout, or turn `<sub>/.git` into a directory before
+    `drop`'s `submodule deinit`. For a worker the Codex bridge runs, that is
+    enforced, not assumed: each of those commands holds `worker_excluded`
+    for its whole run. A worker no bridge records (a Claude agent, a shell)
+    leaves only the lock (`claim`)."""
     state = state or slot_state(slot)
     if state.detached:
         raise Fail(f"{slot.name} is {state.describe()}")
     refuse_foreign(slot, state)
-    if not ignore_live:
-        refuse_live_worker(slot, state.live)
     if state.locked:
         raise Fail(f"{slot.name} is locked ({state.lock_reason or 'no reason'}): an agent may still be "
                    f"running there. If it is gone: {HOST.command} release {slot.name}")
@@ -432,18 +429,47 @@ IGNORE_LIVE_FLAG = "--ignore-live-worker"
 
 
 def live_worker_lines(slot: Slot) -> list[str]:
-    return [worker.describe() for worker in live_workers.live_workers(slot.path)]
+    """One line per live-worker record naming the slot; a records folder
+    that cannot be listed is one line too, so the slot is not free."""
+    try:
+        return [worker.describe() for worker in live_workers.live_workers(slot.path)]
+    except OSError as error:
+        return [f"live-worker records unreadable ({error})"]
 
 
-def refuse_live_worker(slot: Slot, live: list[str] | None = None) -> None:
-    """Refuse a slot a live-worker record names; `live`: the lines
-    `slot_state` already read, else read now. The override is
-    `IGNORE_LIVE_FLAG`, for a worker known to be hung or not the slot's."""
-    live = live_worker_lines(slot) if live is None else live
+def worker_excluded(slot: Slot, ignore: bool = False) -> contextlib.AbstractContextManager:
+    """What a command that acts on the slot's tree holds for its whole run:
+    the pool's side of `live_workers.pool_guard`, so no worker turn can start
+    in the slot meanwhile, after checking that none runs there now (a turn's
+    guard, or a record whose job still has processes). `ignore`
+    (`IGNORE_LIVE_FLAG`): neither, for a worker known to be hung or not the
+    slot's."""
+    if ignore:
+        return contextlib.nullcontext()
+    remedy = (f"Stop it first: the pool's checks assume the slot's worker has ended. If it "
+              f"is hung or not this slot's: rerun with {IGNORE_LIVE_FLAG}")
+    try:
+        guard = live_workers.pool_guard(slot.path)
+    except live_workers.Busy as busy:
+        raise Fail(f"{slot.name}: a worker is running there ({busy}). {remedy}") from busy
+    live = live_worker_lines(slot)
     if live:
-        raise Fail(f"{slot.name}: a worker is still alive there ({'; '.join(live)}). Stop it "
-                   f"first: the pool's checks assume the slot's worker has ended. If it is hung "
-                   f"or not this slot's: rerun with {IGNORE_LIVE_FLAG}")
+        guard.release()
+        raise Fail(f"{slot.name}: a worker is still alive there ({'; '.join(live)}). {remedy}")
+    return guard
+
+
+def excluding_worker(default: str | None = None):
+    """Run a slot command as `command(args, slot)` inside `worker_excluded`
+    for the slot it names (`slot_named`, `default`)."""
+    def wrap(command):
+        @functools.wraps(command)
+        def run(args: argparse.Namespace) -> int:
+            slot = find_slot(slot_named(args, default=default))
+            with worker_excluded(slot, args.ignore_live_worker):
+                return command(args, slot)
+        return run
+    return wrap
 
 
 def refuse_foreign(slot: Slot, state: SlotState | None = None) -> None:
@@ -1029,10 +1055,9 @@ def update_submodules(slot: Slot, subs: list[str], *, strict: bool = True) -> No
         print(f"warning: {message}", file=sys.stderr)
 
 
-def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True,
-                         ignore_live: bool = False) -> None:
+def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True) -> None:
     """The slot's branch := the main branch, dependencies refreshed. Caller has
-    checked it is safe.
+    checked it is safe and holds `worker_excluded` for the slot.
 
     `strict=False` (the hooks): a failed submodule update is a warning, not an
     abort, for the reason `follow_gitlinks` gives.
@@ -1047,10 +1072,6 @@ def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True,
     print(f"{slot.name} is at {top_git(slot.path, ['rev-parse', '--short', 'HEAD']).stdout.strip()} "
           f"(= {HOST.main_branch})")
     if install:
-        # Asked again right before the install: the host's step (an npm run)
-        # reads files a worker could plant, and the reset took time.
-        if not ignore_live:
-            refuse_live_worker(slot)
         HOST.install(slot.path, slot.admin_dir())
 
 
@@ -1196,7 +1217,9 @@ def cmd_new(args: argparse.Namespace) -> int:
     share_dirs(path)
     init_submodules(slot, all_submodules() if args.submodules == "all" else list(HOST.default_submodules))
     if not args.no_install:
-        HOST.install(path, slot.admin_dir())
+        # A new slot has no worker yet, but a turn may already name its path.
+        with worker_excluded(slot):
+            HOST.install(path, slot.admin_dir())
     code = finish(args)
     for note in HOST.new_notes:
         print(note)
@@ -1226,10 +1249,10 @@ def slot_named(args: argparse.Namespace, *, default: str | None = None) -> str:
     return given
 
 
-def cmd_equalize(args: argparse.Namespace) -> int:
-    slot = find_slot(slot_named(args, default="."))
-    refuse_unless_idle(slot, ignore_live=args.ignore_live_worker)
-    reset_to_main_branch(slot, install=not args.no_install, ignore_live=args.ignore_live_worker)
+@excluding_worker(default=".")
+def cmd_equalize(args: argparse.Namespace, slot: Slot) -> int:
+    refuse_unless_idle(slot)
+    reset_to_main_branch(slot, install=not args.no_install)
     return finish(args)
 
 
@@ -1239,13 +1262,11 @@ def cmd_share(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_land(args: argparse.Namespace) -> int:
-    slot = find_slot(slot_named(args))
+@excluding_worker()
+def cmd_land(args: argparse.Namespace, slot: Slot) -> int:
     state = slot_state(slot)
     if state.detached:
         raise Fail(f"{slot.name} is {state.describe()}")
-    if not args.ignore_live_worker:
-        refuse_live_worker(slot, state.live)
     if not state.clean:
         print(f"warning: {slot.name} has uncommitted changes; they stay behind, only commits land",
               file=sys.stderr)
@@ -1286,33 +1307,32 @@ def cmd_push(args: argparse.Namespace) -> int:
     return 0 if push_main_branch() else 2
 
 
-def cmd_next(args: argparse.Namespace) -> int:
-    slot = find_slot(slot_named(args))
+@excluding_worker()
+def cmd_next(args: argparse.Namespace, slot: Slot) -> int:
     refuse_foreign(slot)
-    if not args.ignore_live_worker:
-        refuse_live_worker(slot)
-    (git_dir() / NEXT_FILE).write_text(slot.name)
+    # The override travels with the assignment, so the create hook asks
+    # again unless this call was told not to (`choose_slot`).
+    (git_dir() / NEXT_FILE).write_text(
+        f"{slot.name} {IGNORE_LIVE_FLAG}" if args.ignore_live_worker else slot.name)
     follow_gitlinks(slot)
     print(f"next WorktreeCreate -> {slot.name} ({describe(slot)})")
     return 0
 
 
-def cmd_release(args: argparse.Namespace) -> int:
-    slot = find_slot(slot_named(args))
+@excluding_worker()
+def cmd_release(args: argparse.Namespace, slot: Slot) -> int:
     if not slot.locked:
         print(f"{slot.name} is not locked")
         return 0
-    if not args.ignore_live_worker:
-        refuse_live_worker(slot)
     unclaim(slot)
     print(f"{slot.name} unlocked (was: {slot.lock_reason or 'no reason'})")
     return 0
 
 
-def cmd_drop(args: argparse.Namespace) -> int:
-    slot = find_slot(slot_named(args))
+@excluding_worker()
+def cmd_drop(args: argparse.Namespace, slot: Slot) -> int:
     if slot.path.is_dir():
-        refuse_unless_idle(slot, ignore_live=args.ignore_live_worker)
+        refuse_unless_idle(slot)
         # Before deinit too: it empties a submodule's tree the same way.
         detach_outside_links(slot.path)
         # git's own `deinit` follows each submodule's `.git`; `refuse_unless_idle`
@@ -1355,7 +1375,8 @@ def take_next_assignment() -> str:
     return wanted
 
 
-def choose_slot(name: str, reason: str) -> tuple[Slot, bool, str]:
+def choose_slot(name: str, reason: str,
+                hold: Optional[contextlib.ExitStack] = None) -> tuple[Slot, bool, str]:
     """Pick and claim the slot for a create hook: (slot, needs_reset, how).
 
     Three policies in order: an explicit `next` assignment (the reviewer/fixer
@@ -1367,12 +1388,18 @@ def choose_slot(name: str, reason: str) -> tuple[Slot, bool, str]:
     -- and an assignment or a request by name gets it with a warning, because
     somebody chose it on purpose. A slot with a git that cannot be bound
     (`refuse_foreign`) is handed out by no policy: the hook fails, and the
-    harness starts no agent. A slot a live-worker record names is never free;
-    an assignment is not asked again, since `next` refused it or was told
-    `IGNORE_LIVE_FLAG`, which a hook cannot be.
+    harness starts no agent. A slot a worker runs in (`worker_excluded`) is
+    never free, and an assignment is refused for it too unless its `next` was
+    told `IGNORE_LIVE_FLAG`. The exclusion is entered into `hold`, which the
+    caller keeps until the slot is ready (without one, until this returns).
     """
+    with contextlib.ExitStack() as own:
+        return _choose_slot(name, reason, hold if hold is not None else own)
+
+
+def _choose_slot(name: str, reason: str, hold: contextlib.ExitStack) -> tuple[Slot, bool, str]:
     slots = list_slots()
-    wanted = take_next_assignment()
+    wanted, _, override = take_next_assignment().partition(" ")
     if wanted:
         slot = next((s for s in slots if s.name == wanted), None)
         if slot is None:
@@ -1380,6 +1407,7 @@ def choose_slot(name: str, reason: str) -> tuple[Slot, bool, str]:
         else:
             # `next` refused it already, but the slot may have changed since.
             refuse_foreign(slot)
+            hold.enter_context(worker_excluded(slot, ignore=override == IGNORE_LIVE_FLAG))
             if not slot.locked:
                 claim(slot, reason)
             if not is_permitted(slot.path):
@@ -1398,6 +1426,12 @@ def choose_slot(name: str, reason: str) -> tuple[Slot, bool, str]:
         state = slot_state(slot)
         states.append(f"{slot.name}: {state.describe()}")
         if state.free and claim(slot, reason):
+            try:
+                hold.enter_context(worker_excluded(slot))
+            except Fail as busy:
+                unclaim(slot)
+                states[-1] = f"{slot.name}: {busy}"
+                continue
             return slot, True, "by name" if slot.name == name else "first free"
     unlisted = any(not is_permitted(s.path) for s in candidates)
     remedy = (f" A slot skipped as not in additionalDirectories is free once its path is added to "
@@ -1411,8 +1445,9 @@ def cmd_hook_create(args: argparse.Namespace) -> int:
     name = str(data.get("name", ""))
     session = str(data.get("session_id", ""))[:8]
     # Everything but the path goes to stderr: the harness reads stdout as the directory.
-    with contextlib.redirect_stdout(sys.stderr):
-        slot, needs_reset, how = choose_slot(name, f"{name or 'unnamed'} session {session or '?'}")
+    with contextlib.redirect_stdout(sys.stderr), contextlib.ExitStack() as hold:
+        slot, needs_reset, how = choose_slot(name, f"{name or 'unnamed'} session {session or '?'}",
+                                             hold)
         if needs_reset:
             # A free slot may still lag behind the main branch; bring it up
             # before the agent starts.
@@ -1437,10 +1472,15 @@ def cmd_hook_remove(args: argparse.Namespace) -> int:
     if slot is None:
         print("worktree hook remove: not a pool slot, nothing to do", file=sys.stderr)
         return 0
-    with contextlib.redirect_stdout(sys.stderr):
+    with contextlib.redirect_stdout(sys.stderr), contextlib.ExitStack() as hold:
         state = slot_state(slot)
         if state.detached or not state.clean or state.unlanded or state.foreign or state.live:
             print(f"worktree hook remove: {slot.name} is {state.describe()}; keeping it as is")
+            return 0
+        try:
+            hold.enter_context(worker_excluded(slot))
+        except Fail as busy:
+            print(f"worktree hook remove: {busy}; keeping it as is")
             return 0
         unclaim(slot)
         reset_to_main_branch(slot, install=False, strict=False)

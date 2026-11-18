@@ -28,9 +28,10 @@ bridge says so on stderr and runs with the empty policy: nothing leaves the
 sandbox unless that same call asked for it (`--escalate`,
 `--gates-from-prompt`).
 
-While a turn runs, the bridge also holds a live-worker record outside every
-checkout (`llm_agents.git.live_workers`); the worktree pool refuses the
-agent's slot by it.
+While a turn runs, the bridge holds the worker's side of the worktree pool's
+exclusion (`llm_agents.git.live_workers`): a guard on its roots, a job
+object its servers run in, and a record; a turn is refused while a pool
+command acts on its tree.
 
 ## A second opinion from the other model
 
