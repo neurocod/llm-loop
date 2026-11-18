@@ -46,6 +46,7 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from llm_agents.gitlib import SKIP_SUBMODULES, Pinned, Repository  # noqa: E402
+from llm_agents.links import is_link  # noqa: E402
 
 # The bridge's facts, as JSON: {"workspace", "admin", "git", "hooks", "main"}.
 ENV = "LLM_AGENTS_REBASE_BROKER"
@@ -192,7 +193,7 @@ def _path_refusal(grant: Grant, raw: str, unmerged: dict[str, set[str]],
     folder = grant.workspace
     for part in parts:
         folder = folder / part
-        if folder.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(folder):
+        if is_link(folder):
             return f"{raw}: {folder} is a link or junction"
         if folder != grant.workspace / name and (folder / ".git").exists():
             return f"{raw}: {folder} is a nested repository"

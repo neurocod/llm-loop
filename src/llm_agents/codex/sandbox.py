@@ -36,6 +36,7 @@ from ..git import rebase as rebase_broker
 from ..git.commit_identity import ENV as COMMIT_APPROVAL_ENV
 from ..git.slots import registered_admin
 from ..gitlib import trusted_git
+from ..links import is_link
 from ..host_policy import EMPTY as EMPTY_POLICY
 from ..host_policy import active as host_policy
 from ..host_policy import explicit as explicit_grants
@@ -652,7 +653,7 @@ def _holds_link(folder: Path) -> bool:
                                         onerror=_raise):
             for name in (*dirs, *files):
                 entry = os.path.join(top, name)
-                if os.path.islink(entry) or os.path.isjunction(entry):
+                if is_link(entry):
                     return True
     except OSError:
         return True
