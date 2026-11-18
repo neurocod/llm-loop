@@ -98,6 +98,26 @@ def test_follow_file_quiet_grep_streams_the_matches_and_then_the_tail(tmp_path):
                                         "FAIL two", "VERDICT pass"]
 
 
+def test_follow_file_grep_prints_a_marker_that_needs_its_newline(tmp_path):
+    """Review of 9b35798: the end pattern is matched over the accumulated
+    text, newline included; a per-line check without it missed `pass\\n`."""
+    log = tmp_path / "probe.log"
+    log.write_bytes(_PROBE_LOG.encode("utf-8"))
+    done = _run("follow_file.py", str(log), "--until", "VERDICT pass\\n", "--grep", "^FAIL",
+                "--poll", "0.05", "--timeout", "30")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.splitlines() == ["FAIL one", "FAIL two", "VERDICT pass"]
+
+
+def test_follow_file_grep_prints_every_line_of_a_multi_line_marker(tmp_path):
+    log = tmp_path / "probe.log"
+    log.write_bytes(_PROBE_LOG.encode("utf-8"))
+    done = _run("follow_file.py", str(log), "--until", "^step 2\\nFAIL two\\nVERDICT",
+                "--grep", "^boot", "--poll", "0.05", "--timeout", "30")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.splitlines() == ["boot", "step 2", "FAIL two", "VERDICT pass"]
+
+
 def test_follow_file_refuses_an_invalid_grep_regex(tmp_path):
     done = _run("follow_file.py", str(tmp_path / "x"), "--grep", "(", "--timeout", "30")
     assert done.returncode == 2

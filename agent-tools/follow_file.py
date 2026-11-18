@@ -92,8 +92,8 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=None,
                     help="give up after this many seconds (exit 1)")
     ap.add_argument("--grep", action="append", default=[], metavar="REGEX",
-                    help="stream only the lines matching this regex (repeatable), plus each "
-                         "line an end pattern matches; the --tail lines still print "
+                    help="stream only the lines matching this regex (repeatable), plus the "
+                         "lines the end match spans; the --tail lines still print "
                          "unfiltered at exit. Do not pipe into grep -- use --grep")
     ap.add_argument("--quiet", action="store_true",
                     help="do not stream lines; print only the last --tail lines at the end "
@@ -125,11 +125,25 @@ def main() -> int:
         except re.error as exc:
             ap.error(f"--grep: invalid regex {pattern!r}: {exc}")
 
-    def shown(line: str) -> bool:
-        """A line --grep keeps: one it matches, or one an end pattern matches
-        (the marker the wait ended on must never be filtered away)."""
-        text = line.rstrip("\r\n")
-        return any(p.search(text) for p in (*greps, *patterns))
+    def marker_lines(text: str) -> list[int]:
+        """Start offsets of the lines the end match spans in `text` -- the
+        very match that ends the wait, read over the accumulated text, so a
+        marker needing its newline (`pass\\n`) or spanning lines is printed
+        whole. Empty while no end pattern matches."""
+        match = next((m for m in (p.search(text) for p in patterns) if m), None)
+        if match is None:
+            return []
+        start = text.rfind("\n", 0, match.start()) + 1
+        end = max(match.end(), match.start() + 1)
+        lines = []
+        while start < end and start < len(text):
+            lines.append(start)
+            start = text.find("\n", start) + 1
+            if start == 0:
+                break
+        return lines
+
+    printed: set[int] = set()  # start offsets of the lines --grep has printed
 
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -146,12 +160,23 @@ def main() -> int:
         while True:
             chunk, offset = read_from(path, offset)
             if chunk:
+                base = len(seen)
                 seen += chunk
-                # A kept line goes out with a bare "\n": its own "\r\n" would
-                # print as "\r\r\n" through Windows' text-mode stdout.
-                out = ("".join(line.rstrip("\r\n") + "\n"
-                               for line in chunk.splitlines(keepends=True) if shown(line))
-                       if greps else "" if args.quiet else chunk)
+                if greps:
+                    keep = set()
+                    at = base
+                    for line in chunk.splitlines(keepends=True):
+                        if any(g.search(line.rstrip("\r\n")) for g in greps):
+                            keep.add(at)
+                        at += len(line)
+                    keep.update(marker_lines(seen))
+                    # A kept line goes out with a bare "\n": its own "\r\n"
+                    # would print as "\r\r\n" through Windows' text-mode stdout.
+                    out = "".join(seen[at:seen.index("\n", at)].rstrip("\r") + "\n"
+                                  for at in sorted(keep - printed))
+                    printed |= keep
+                else:
+                    out = "" if args.quiet else chunk
                 if out:
                     sys.stdout.write(out)
                     sys.stdout.flush()
