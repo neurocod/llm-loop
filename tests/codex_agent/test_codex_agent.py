@@ -3691,6 +3691,34 @@ def test_an_absent_counter_costs_the_turn_nothing(monkeypatch, tmp_path):
     assert spawned == []
 
 
+def test_a_turn_holds_a_live_record_naming_its_tree_and_server(tmp_path, monkeypatch):
+    """The worktree pool refuses a slot a live record names
+    (`llm_agents.git.live_workers`): the record must exist for the whole turn,
+    name the agent's cwd and its writable roots, count the app-server too
+    (a wrapper killed alone leaves it running), and be gone afterwards."""
+    from llm_agents.git import live_workers
+    seen = []
+    add = live_workers.LiveRecord.add_process
+
+    def spy(record, pid):
+        add(record, pid)
+        seen.append((pid, live_workers.live_workers(tmp_path / "tree" / "sub", prune=False)))
+
+    monkeypatch.setattr(live_workers.LiveRecord, "add_process", spy)
+    monkeypatch.setattr(wire, "AgentRecord", lambda **kw: AgentRecord(
+        **kw, writable=[str(tmp_path / "extra")]))
+    (tmp_path / "tree").mkdir()
+    (tmp_path / "extra").mkdir()
+    wire.run_fake_turn(tmp_path, monkeypatch, "plain", cwd=tmp_path / "tree",
+                       sandbox="workspace-write")
+    assert len(seen) == 1
+    server, found = seen[0]
+    assert [w.name for w in found] == ["w"]
+    assert [pid for pid, _ in found[0].processes] == [os.getpid(), server]
+    assert found[0].roots == [str(tmp_path / "tree"), str(tmp_path / "extra")]
+    assert live_workers.live_workers(tmp_path / "tree") == []
+
+
 def test_a_wire_that_breaks_mid_announcement_is_swallowed(monkeypatch):
     """Every OSError on this path is one the turn must survive: the counter can
     be killed between the connect and the hello."""

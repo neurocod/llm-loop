@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 
 from llm_loop.wire import codex_app_event_thread, codex_app_from_sub_agent
 from .. import host_policy
+from ..git import live_workers
 from ..answer_contract import (
     EXPECT_FOLLOWUP_PROMPT, FINISH_TASK_CLAUSE, expect_follow_up, expect_verdict,
     follow_up_failed, join_answers, needs_expect_follow_up,
@@ -240,15 +241,20 @@ class TurnRunner:
     """
 
     def __init__(self, earlier: Optional["TurnRunner"] = None, *,
-                 week_used: Optional[Callable[..., None]] = None) -> None:
+                 week_used: Optional[Callable[..., None]] = None,
+                 on_server: Optional[Callable[[int], None]] = None) -> None:
         """`earlier`: the attempt this one follows within the same caller
         turn (a service-drop resend or a follow-up), whose token readings
         this one inherits — see `_totals`.
 
         `week_used(percent, why)`: where the account's weekly utilisation
         goes (`agent_counter.Beacon.report_week_used`). Inherited from
-        `earlier` too, so a resent attempt keeps feeding the badge."""
+        `earlier` too, so a resent attempt keeps feeding the badge.
+
+        `on_server(pid)`: told the pid of every app-server this attempt
+        starts (`live_workers.LiveRecord.add_process`); inherited likewise."""
         self.outcome = TurnOutcome()
+        self.on_server = on_server or (earlier.on_server if earlier else None)
         self.network = NetworkWait(earlier.outcome.network_wait_s if earlier else 0.0)
         self.network.child_s = earlier.network.child_s if earlier else 0.0
         self.network_log: Callable[[dict], None] = lambda _message: None
@@ -523,7 +529,13 @@ def run_turn(*, record: AgentRecord, prompt: str, resume: bool,
     # programmatically is as visible as one started from the command line — the
     # invisibility this fixes belongs to the TURN, not to the way it was asked
     # for. The label names the checkout too: one badge serves every clone.
-    with announce(f"{record.name}@{host_root().name}") as counter, \
+    # The live record is what keeps the worktree pool off this worker's tree
+    # while it runs (`live_workers`): its roots are the directories the
+    # sandbox starts in or may write.
+    with live_workers.recorded(record.name,
+                               [Path(record.cwd or host_root()),
+                                *map(Path, record.writable)]) as live, \
+            announce(f"{record.name}@{host_root().name}") as counter, \
             store.event_log() as log:
         log({"_meta": TURN_META, "name": record.name, "resume": resume,
              "prompt": prompt, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -531,7 +543,8 @@ def run_turn(*, record: AgentRecord, prompt: str, resume: bool,
         # The attempts of THIS turn, oldest first: a service drop is resent
         # (`_retry_service_drops` appends), and the last entry is always the
         # one that was running — including when an exception escapes.
-        attempts = [TurnRunner(week_used=counter.report_week_used)]
+        attempts = [TurnRunner(week_used=counter.report_week_used,
+                               on_server=live.add_process)]
         report = sandbox.report_path(record)
         try:
             # Clear only at the caller-turn boundary, before any attempt: a
@@ -977,6 +990,8 @@ def _run_turn_logged(record: AgentRecord, prompt: str, resume_thread: str,
     workspace, sandbox_policy = sandbox.prepare_workspace(record)
     server = AppServer(workspace, log=log, approve=sandbox.escalation_judge(record),
                        approve_files=sandbox.file_change_judge(record))
+    if runner.on_server is not None:
+        runner.on_server(server.pid)
     wait = SubAgentWait(log=log, name=record.name)
     runner.network_log = log
     try:

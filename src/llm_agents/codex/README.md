@@ -28,6 +28,10 @@ bridge says so on stderr and runs with the empty policy: nothing leaves the
 sandbox unless that same call asked for it (`--escalate`,
 `--gates-from-prompt`).
 
+While a turn runs, the bridge also holds a live-worker record outside every
+checkout (`llm_agents.git.live_workers`); the worktree pool refuses the
+agent's slot by it.
+
 ## A second opinion from the other model
 
 Have Codex review the commits Claude wrote, and Claude (`llm_agents.claude`)

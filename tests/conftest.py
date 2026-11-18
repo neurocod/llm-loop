@@ -153,7 +153,17 @@ def _core_host(request):
         yield
 
 
-_SUITE_FIXTURES = ("isolate_process_policies", "isolate_launch_decision")
+_SUITE_FIXTURES = ("isolate_process_policies", "isolate_launch_decision",
+                   "isolate_live_workers")
+
+
+@pytest.fixture(autouse=True)
+def isolate_live_workers(tmp_path, monkeypatch):
+    """Each test's live-worker records (`llm_agents.git.live_workers`) in its
+    own folder: a turn the suite runs writes one, and the pool tests read
+    them; neither may meet the user's real folder."""
+    from llm_agents.git import live_workers
+    monkeypatch.setenv(live_workers.LIVE_DIR_ENV, str(tmp_path / "live-workers"))
 
 
 @pytest.hookimpl(trylast=True)

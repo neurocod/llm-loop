@@ -8,6 +8,7 @@ way a slot's submodule commit sits before its push).
 """
 
 import io
+import json
 import os
 import subprocess
 import sys
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_agents.git import worktree
+from llm_agents.git import live_workers, worktree
 
 _CONFIG = {
     "protocol.file.allow": "always",  # `submodule add/update` from a local path
@@ -565,7 +566,7 @@ def test_every_git_in_a_slot_s_submodule_is_bound_to_its_registered_admin(repos,
 
 
 def plant_hooks(main, slot, tmp_path):
-    """The main clone's `core.hooksPath` is MultiSkill's relative `.githooks`,
+    """The main clone's `core.hooksPath` is the first host's relative `.githooks`,
     so git by discovery in a slot runs `<slot>/.githooks/*`; the worker plants
     two there, ignored by a `.gitignore` of their own so the slot stays clean.
     Returns the marker file they append to."""
@@ -672,3 +673,93 @@ def test_find_slot_by_directory_asks_no_git(repos, tmp_path, monkeypatch):
         worktree.find_slot(str(main / "sub"))
     with pytest.raises(worktree.Fail, match="in no pool slot"):
         worktree.find_slot(str(tmp_path))
+
+
+# ------------------------------------------------------------ live workers
+
+LIVE_REFUSAL = "a worker is still alive there"
+# Each command that acts on a slot's tree, as `command` runs it.
+TREE_COMMANDS = {
+    "land": ("land", "wt2", "--no-push"),
+    "next": ("next", "wt2"),
+    "release": ("release", "wt2"),
+    "equalize": ("equalize", "wt2", "--no-push", "--no-install"),
+    "drop": ("drop", "wt2"),
+}
+
+
+@pytest.fixture
+def locked_slot(repos, monkeypatch):
+    """`repos` with the slot locked, as a task holds it, and work to land."""
+    main, slot, base = repos
+    commit_file(slot, "work.txt", "task")
+    run(main, "worktree", "lock", "--reason", "worktree.py:test", str(slot))
+    pool_slot = worktree.Slot(2, slot, "wt2", "", True, "worktree.py:test")
+    monkeypatch.setattr(worktree, "find_slot", lambda spec: pool_slot)
+    monkeypatch.setattr(worktree, "list_slots", lambda: [pool_slot])
+    return main, slot, pool_slot
+
+
+def ended_pid():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    identity = live_workers.process_identity(proc.pid)
+    proc.wait()
+    return proc.pid, identity
+
+
+@pytest.mark.parametrize("operation", sorted(TREE_COMMANDS))
+def test_a_live_worker_s_record_refuses_every_tree_command(locked_slot, operation):
+    """The pool's checks assume the slot's worker has ended (review of 2442):
+    while the Codex bridge's record names the slot, nothing acts on it."""
+    main, slot, pool_slot = locked_slot
+    head = run(main, "rev-parse", "main")
+    with live_workers.recorded("worker", [slot]):
+        with pytest.raises(worktree.Fail, match=LIVE_REFUSAL):
+            command(*TREE_COMMANDS[operation])
+    assert run(main, "rev-parse", "main") == head
+    assert "locked" in run(main, "worktree", "list", "--porcelain")
+    assert not (main / ".git" / worktree.NEXT_FILE).exists()
+    assert slot.is_dir()
+
+
+@pytest.mark.parametrize("operation", ["land", "next", "release"])
+def test_the_override_and_a_stale_record_let_a_command_through(locked_slot, operation):
+    main, slot, pool_slot = locked_slot
+    with live_workers.recorded("worker", [slot]):
+        assert command(*TREE_COMMANDS[operation], worktree.IGNORE_LIVE_FLAG) == 0
+    pid, identity = ended_pid()
+    folder = live_workers.live_dir()
+    stale = folder / f"stale{live_workers.RECORD_SUFFIX}"
+    stale.write_text(json.dumps({"name": "gone", "roots": [str(slot)],
+                                 "processes": [{"pid": pid, "identity": identity}]}),
+                     encoding="utf-8")
+    # `land` and `release` unlocked it; `next` did not (git refuses a second lock).
+    subprocess.run(["git", "worktree", "lock", "--reason", "worktree.py:test", str(slot)],
+                   cwd=main, capture_output=True)
+    assert command(*TREE_COMMANDS[operation]) == 0
+    assert not stale.exists()
+
+
+def test_a_live_worker_is_shown_and_its_slot_is_never_first_free(locked_slot):
+    main, slot, pool_slot = locked_slot
+    run(main, "worktree", "unlock", str(slot))
+    free = worktree.Slot(2, slot, "wt2", "", False)
+    with live_workers.recorded("worker", [slot]):
+        state = worktree.slot_state(free)
+        assert not state.free and "worker alive (worker (pid" in state.describe()
+
+
+def test_the_install_step_asks_again_right_before_it_runs(repos, monkeypatch):
+    """`equalize` checked before its reset; a worker started during the reset
+    still stops the host's install, which reads files a worker can plant."""
+    main, slot, base = repos
+    installed = []
+    monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(
+        main_branch="main", install=lambda path, admin: installed.append(path)))
+    pool_slot = worktree.Slot(2, slot, "wt2", "", False)
+    with live_workers.recorded("worker", [slot]):
+        with pytest.raises(worktree.Fail, match=LIVE_REFUSAL):
+            worktree.reset_to_main_branch(pool_slot, install=True)
+        assert installed == []
+        worktree.reset_to_main_branch(pool_slot, install=True, ignore_live=True)
+    assert installed == [slot]

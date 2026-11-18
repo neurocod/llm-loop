@@ -5,7 +5,9 @@ lands their branches; `commit` commits exactly the named paths, whoever else
 staged what; `check_gitlinks`, `branch_overlap` and `union_conflicts` are the
 small checks and repairs around them; `slots` is the pool's naming rule and
 `commit_identity` the commit-approval store, both shared with the Codex
-bridge's commit judge (`llm_agents.codex.command_commit`).
+bridge's commit judge (`llm_agents.codex.command_commit`); `live_workers` is
+the record a bridge keeps while its worker runs, which the pool refuses a
+slot by.
 
 What a project adds arrives explicitly: a `commit.CommitHost` and a
 `worktree.PoolHost`, handed to each script's `main` by the project's own entry

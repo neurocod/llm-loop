@@ -207,6 +207,11 @@ class AppServer:
         ), first_id=1)
 
     @property
+    def pid(self) -> int:
+        """The server process's pid (on Windows the `codex.cmd` shim's)."""
+        return self._connection.proc.pid
+
+    @property
     def stderr_lines(self) -> list[str]:
         return self._connection.stderr_lines
 

@@ -52,6 +52,7 @@ from typing import Callable, Mapping, Optional
 
 from ..gitlib import (Fail, PUSH_TIMEOUT_S, SKIP_SUBMODULES, Pinned, Repository, git,
                       trusted_git)
+from . import live_workers
 from .slots import (SLOT_NAME_RE, git_admin, registered_admin, registered_submodule,
                     slot_dir_name, slot_name, slot_number)
 
@@ -337,11 +338,14 @@ class SlotState:
     # "<sub>: <why>" per initialized submodule no git here may be bound to
     # (`slot_submodule`): the commands that would move it refuse the slot.
     foreign: list[str] = field(default_factory=list)
+    # One line per live-worker record naming the slot (`live_workers`): no
+    # command that acts on the tree runs there unless told IGNORE_LIVE_FLAG.
+    live: list[str] = field(default_factory=list)
 
     @property
     def free(self) -> bool:
         return (self.exists and not self.detached and not self.locked and self.clean
-                and not self.unlanded and not self.foreign)
+                and not self.unlanded and not self.foreign and not self.live)
 
     def describe(self) -> str:
         if not self.exists:
@@ -359,6 +363,8 @@ class SlotState:
             parts.append(f"{self.behind} behind {HOST.main_branch}")
         if self.foreign:
             parts.append(f"git not the slot's ({'; '.join(self.foreign)})")
+        if self.live:
+            parts.append(f"worker alive ({'; '.join(self.live)})")
         return ", ".join(parts) if parts else "free"
 
 
@@ -383,31 +389,34 @@ def slot_state(slot: Slot) -> SlotState:
         exists=exists, detached=slot.detached, locked=slot.locked, lock_reason=slot.lock_reason,
         clean=(top is not None and is_clean(slot.path, top)) if exists else True,
         unlanded=unlanded_branch(slot.branch) if usable else [],
-        behind=behind, head=slot.head, foreign=foreign)
+        behind=behind, head=slot.head, foreign=foreign,
+        live=live_worker_lines(slot) if exists else [])
 
 
 def describe(slot: Slot) -> str:
     return slot_state(slot).describe()
 
 
-def refuse_unless_idle(slot: Slot, state: SlotState | None = None) -> None:
+def refuse_unless_idle(slot: Slot, state: SlotState | None = None, *,
+                       ignore_live: bool = False) -> None:
     """Refuse a slot that is busy or holds work: `equalize` and `drop` both need this.
 
     Every pool operation on a slot (`equalize`, `drop`, `next` and the create
-    hook handing it out, `land`) assumes the slot's worker has ENDED: the
-    checks here and in `slot_state` look at the tree once, and the git that
-    follows acts on it later -- a live worker could swap `<slot>/<sub>` for a
-    junction between `slot_submodule`'s check and a bound checkout, or turn
-    `<sub>/.git` into a directory before `drop`'s `submodule deinit`. The
-    lock (`claim`) is the only liveness record checked: the Codex bridge
-    keeps none per slot (its registry lives under the root of whichever
-    entry point spawned the agent, and a turn's liveness is inferred from
-    its log's age), so stopping a Codex worker before these commands is the
-    orchestrator's job."""
+    hook handing it out, `land`, `release`) assumes the slot's worker has
+    ENDED: the checks here and in `slot_state` look at the tree once, and the
+    git that follows acts on it later -- a live worker could swap
+    `<slot>/<sub>` for a junction between `slot_submodule`'s check and a bound
+    checkout, or turn `<sub>/.git` into a directory before `drop`'s `submodule
+    deinit`. Two records say a worker may still be there: the lock (`claim`),
+    a task's, and a live-worker record (`live_workers`), a process's, which
+    the Codex bridge holds while its wrapper or app-server runs. A worker no
+    bridge records (a Claude agent, a shell) leaves only the lock."""
     state = state or slot_state(slot)
     if state.detached:
         raise Fail(f"{slot.name} is {state.describe()}")
     refuse_foreign(slot, state)
+    if not ignore_live:
+        refuse_live_worker(slot, state.live)
     if state.locked:
         raise Fail(f"{slot.name} is locked ({state.lock_reason or 'no reason'}): an agent may still be "
                    f"running there. If it is gone: {HOST.command} release {slot.name}")
@@ -417,6 +426,24 @@ def refuse_unless_idle(slot: Slot, state: SlotState | None = None) -> None:
         raise Fail(f"{slot.name} has uncommitted changes; commit or discard them first:\n{status}")
     if state.unlanded:
         raise unlanded_refusal(slot.name, state.unlanded, slot.path)
+
+
+IGNORE_LIVE_FLAG = "--ignore-live-worker"
+
+
+def live_worker_lines(slot: Slot) -> list[str]:
+    return [worker.describe() for worker in live_workers.live_workers(slot.path)]
+
+
+def refuse_live_worker(slot: Slot, live: list[str] | None = None) -> None:
+    """Refuse a slot a live-worker record names; `live`: the lines
+    `slot_state` already read, else read now. The override is
+    `IGNORE_LIVE_FLAG`, for a worker known to be hung or not the slot's."""
+    live = live_worker_lines(slot) if live is None else live
+    if live:
+        raise Fail(f"{slot.name}: a worker is still alive there ({'; '.join(live)}). Stop it "
+                   f"first: the pool's checks assume the slot's worker has ended. If it is hung "
+                   f"or not this slot's: rerun with {IGNORE_LIVE_FLAG}")
 
 
 def refuse_foreign(slot: Slot, state: SlotState | None = None) -> None:
@@ -545,7 +572,7 @@ def lfs_settings(trusted: Optional[Path]) -> tuple[str, ...]:
     the URL git-lfs downloads a missing object from and asks credentials
     for. A command-line `lfs.url` beats every `.lfsconfig` key that names an
     endpoint (measured 2026-11-18, git-lfs 3.7.1), so it is forced to the
-    endpoint `trusted` resolves. LFS is not simply switched off: MultiSkill
+    endpoint `trusted` resolves. LFS is not simply switched off: the first host
     tracks 507 files through it, and git-lfs's own `--skip` smudge writes a
     pointer even for an object the shared `lfs/objects` holds (measured the
     same day) -- a reset would turn every one of them into a pointer. Off
@@ -1002,7 +1029,8 @@ def update_submodules(slot: Slot, subs: list[str], *, strict: bool = True) -> No
         print(f"warning: {message}", file=sys.stderr)
 
 
-def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True) -> None:
+def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True,
+                         ignore_live: bool = False) -> None:
     """The slot's branch := the main branch, dependencies refreshed. Caller has
     checked it is safe.
 
@@ -1019,6 +1047,10 @@ def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True) -> N
     print(f"{slot.name} is at {top_git(slot.path, ['rev-parse', '--short', 'HEAD']).stdout.strip()} "
           f"(= {HOST.main_branch})")
     if install:
+        # Asked again right before the install: the host's step (an npm run)
+        # reads files a worker could plant, and the reset took time.
+        if not ignore_live:
+            refuse_live_worker(slot)
         HOST.install(slot.path, slot.admin_dir())
 
 
@@ -1196,8 +1228,8 @@ def slot_named(args: argparse.Namespace, *, default: str | None = None) -> str:
 
 def cmd_equalize(args: argparse.Namespace) -> int:
     slot = find_slot(slot_named(args, default="."))
-    refuse_unless_idle(slot)
-    reset_to_main_branch(slot, install=not args.no_install)
+    refuse_unless_idle(slot, ignore_live=args.ignore_live_worker)
+    reset_to_main_branch(slot, install=not args.no_install, ignore_live=args.ignore_live_worker)
     return finish(args)
 
 
@@ -1212,6 +1244,8 @@ def cmd_land(args: argparse.Namespace) -> int:
     state = slot_state(slot)
     if state.detached:
         raise Fail(f"{slot.name} is {state.describe()}")
+    if not args.ignore_live_worker:
+        refuse_live_worker(slot, state.live)
     if not state.clean:
         print(f"warning: {slot.name} has uncommitted changes; they stay behind, only commits land",
               file=sys.stderr)
@@ -1255,6 +1289,8 @@ def cmd_push(args: argparse.Namespace) -> int:
 def cmd_next(args: argparse.Namespace) -> int:
     slot = find_slot(slot_named(args))
     refuse_foreign(slot)
+    if not args.ignore_live_worker:
+        refuse_live_worker(slot)
     (git_dir() / NEXT_FILE).write_text(slot.name)
     follow_gitlinks(slot)
     print(f"next WorktreeCreate -> {slot.name} ({describe(slot)})")
@@ -1266,6 +1302,8 @@ def cmd_release(args: argparse.Namespace) -> int:
     if not slot.locked:
         print(f"{slot.name} is not locked")
         return 0
+    if not args.ignore_live_worker:
+        refuse_live_worker(slot)
     unclaim(slot)
     print(f"{slot.name} unlocked (was: {slot.lock_reason or 'no reason'})")
     return 0
@@ -1274,7 +1312,7 @@ def cmd_release(args: argparse.Namespace) -> int:
 def cmd_drop(args: argparse.Namespace) -> int:
     slot = find_slot(slot_named(args))
     if slot.path.is_dir():
-        refuse_unless_idle(slot)
+        refuse_unless_idle(slot, ignore_live=args.ignore_live_worker)
         # Before deinit too: it empties a submodule's tree the same way.
         detach_outside_links(slot.path)
         # git's own `deinit` follows each submodule's `.git`; `refuse_unless_idle`
@@ -1329,7 +1367,9 @@ def choose_slot(name: str, reason: str) -> tuple[Slot, bool, str]:
     -- and an assignment or a request by name gets it with a warning, because
     somebody chose it on purpose. A slot with a git that cannot be bound
     (`refuse_foreign`) is handed out by no policy: the hook fails, and the
-    harness starts no agent.
+    harness starts no agent. A slot a live-worker record names is never free;
+    an assignment is not asked again, since `next` refused it or was told
+    `IGNORE_LIVE_FLAG`, which a hook cannot be.
     """
     slots = list_slots()
     wanted = take_next_assignment()
@@ -1399,7 +1439,7 @@ def cmd_hook_remove(args: argparse.Namespace) -> int:
         return 0
     with contextlib.redirect_stdout(sys.stderr):
         state = slot_state(slot)
-        if state.detached or not state.clean or state.unlanded or state.foreign:
+        if state.detached or not state.clean or state.unlanded or state.foreign or state.live:
             print(f"worktree hook remove: {slot.name} is {state.describe()}; keeping it as is")
             return 0
         unclaim(slot)
@@ -1428,6 +1468,10 @@ def build_parser() -> argparse.ArgumentParser:
     naming = argparse.ArgumentParser(allow_abbrev=False, add_help=False)
     naming.add_argument("slot", nargs="?", help="wtN, N, or a slot directory")
     naming.add_argument("--dir", help="the same slot, as an option (either spelling works)")
+    overriding = argparse.ArgumentParser(allow_abbrev=False, add_help=False)
+    overriding.add_argument(IGNORE_LIVE_FLAG, action="store_true",
+                            help="act although a live-worker record names the slot "
+                                 "(its worker is hung or not this slot's)")
 
     sub.add_parser("status", allow_abbrev=False, help=f"slot state and unpushed {main}").set_defaults(func=cmd_status)
 
@@ -1437,7 +1481,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help=help_text("--submodules"))
     p.set_defaults(func=cmd_new)
 
-    p = sub.add_parser("equalize", allow_abbrev=False, parents=[pushing, installing, naming],
+    p = sub.add_parser("equalize", allow_abbrev=False, parents=[pushing, installing, naming, overriding],
                        help=f"slot branch := {main} (refuses dirty, unlanded or locked slots); "
                             "default slot: the current worktree")
     p.set_defaults(func=cmd_equalize)
@@ -1446,20 +1490,20 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(HOST.share_command, allow_abbrev=False, parents=[naming], help=help_text("share"))
         p.set_defaults(func=cmd_share)
 
-    p = sub.add_parser("land", allow_abbrev=False, parents=[pushing, naming],
+    p = sub.add_parser("land", allow_abbrev=False, parents=[pushing, naming, overriding],
                        help=f"{main} := slot branch (ff-only), unlock the slot"
                             + (", push" if HOST.push_by_default else ""))
     p.set_defaults(func=cmd_land)
 
     sub.add_parser("push", allow_abbrev=False, help=f"push {main} to {remote}").set_defaults(func=cmd_push)
 
-    p = sub.add_parser("next", allow_abbrev=False, parents=[naming], help="which slot the next WorktreeCreate hook hands out")
+    p = sub.add_parser("next", allow_abbrev=False, parents=[naming, overriding], help="which slot the next WorktreeCreate hook hands out")
     p.set_defaults(func=cmd_next)
 
-    p = sub.add_parser("release", allow_abbrev=False, parents=[naming], help="drop a slot's lock (the agent that held it is gone)")
+    p = sub.add_parser("release", allow_abbrev=False, parents=[naming, overriding], help="drop a slot's lock (the agent that held it is gone)")
     p.set_defaults(func=cmd_release)
 
-    p = sub.add_parser("drop", allow_abbrev=False, parents=[naming],
+    p = sub.add_parser("drop", allow_abbrev=False, parents=[naming, overriding],
                        help=help_text("drop shared" if HOST.shared else "drop"))
     p.set_defaults(func=cmd_drop)
 

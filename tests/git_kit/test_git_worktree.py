@@ -254,7 +254,7 @@ def test_removing_a_worktree_keeps_shared_files(tmp_path, monkeypatch, hosted):
     assert slot.resolve().is_relative_to(tmp_path.resolve())
     pool_slot = worktree.Slot(2, slot, "wt2", "head", False)
     monkeypatch.setattr(worktree, "find_slot", lambda spec: pool_slot)
-    monkeypatch.setattr(worktree, "refuse_unless_idle", lambda slot: None)
+    monkeypatch.setattr(worktree, "refuse_unless_idle", lambda slot, **checks: None)
     monkeypatch.setattr(worktree, "all_submodules", lambda: [])
     assert worktree.cmd_drop(_parse(["drop", "wt2"])) == 0
     assert not slot.exists()
