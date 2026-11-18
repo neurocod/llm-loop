@@ -1074,6 +1074,21 @@ def test_a_cancelled_job_missing_from_log_failed_shows_its_own_log(monkeypatch, 
     assert (tmp_path / "pytest_ubuntu-latest_3.13.log").read_text(encoding="utf-8") == own
 
 
+@pytest.mark.parametrize("status, where", [("completed", "no lines in `gh run view --log-failed`"),
+                                           ("in_progress", "run in progress")])
+def test_a_job_without_lines_or_an_own_log_says_why(monkeypatch, capsys, gh, tmp_path, status, where):
+    stderr = "HTTP 410: Gone (https://api.github.com/repos/o/r/actions/jobs/2003/logs)"
+    rules = [AUTH, view(run_payload(status=status, jobs=[job(UBU, "cancelled"), job(WIN, "timed_out", job_id=2003)])),
+             ("run view 42 --log-failed", (0, prefixed(MAC, TAIL_OF_JOB), "")),
+             ("api repos/o/r/actions/jobs/2003/logs", (1, "", stderr))]
+    code, _ = main(monkeypatch, rules, run42(gh, "--raw-dir", tmp_path, "--json"))
+    data = json.loads(capsys.readouterr().out)
+    assert [f["headline"] for f in data["runs"][0]["failures"]] == [
+        f"{where} and no job id to read the job's own log",
+        f"{where}; its own log could not be read: gh api repos/o/r/actions/jobs/2003/logs failed (exit 1): {stderr}"]
+    assert [j["rawLog"] for j in data["runs"][0]["jobs"]] == [None, None]
+
+
 def test_a_running_run_shows_the_failures_already_known(monkeypatch, capsys, gh, tmp_path):
     running = run_payload(status="in_progress", jobs=[job(MAC, job_id=1001), job(UBU, status="in_progress")])
     own = own_log(MAC_BODY.split("\n"))
@@ -1117,8 +1132,9 @@ def test_a_job_log_over_the_limit_keeps_its_own_path(monkeypatch, capsys, gh, lo
     code, _ = main(monkeypatch, rules, run42(gh, "--raw-dir", long_dir, "--json"))
     data = json.loads(capsys.readouterr().out)
     assert code == cf.EXIT_RED
-    assert sorted(f["savedLog"] for f in data["runs"][0]["failures"]) == sorted(
-        str(long_dir / n) for n in ("pytest_ubuntu-latest_3.13.log", "pytest_windows-latest_3.12.log"))
+    saved = sorted(str(long_dir / n) for n in ("pytest_ubuntu-latest_3.13.log", "pytest_windows-latest_3.12.log"))
+    assert sorted(f["savedLog"] for f in data["runs"][0]["failures"]) == saved
+    assert sorted(j["rawLog"] for j in data["runs"][0]["jobs"]) == saved   # unparsed, still the job's raw log
 
 
 def test_a_multi_step_failure_names_every_step(monkeypatch, capsys, gh, tmp_path):

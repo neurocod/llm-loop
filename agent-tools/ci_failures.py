@@ -64,6 +64,7 @@ import sys
 import tempfile
 import time
 import traceback
+from typing import NamedTuple
 
 # Exit codes. 0 and 1 answer the question (green / red, report printed); every
 # other code means there is no answer yet, so a caller can tell "the run is
@@ -1227,60 +1228,81 @@ def missing(headline: str, saved_log: str | None = None) -> list:
     return [{"kind": "missing", "headline": headline, "block": [], "savedLog": saved_log}]
 
 
+def log_failed(gh: Gh, run: dict, raw_dir: str, prefix: str) -> tuple[dict, list | None]:
+    """(raw lines by job, None) of a completed run's `--log-failed`, or ({},
+    the units every failed job shows instead) when it cannot be read or is
+    over MAX_LOG_BYTES; ({}, None) for a run still in progress, whose jobs are
+    read from their own logs. A parsed download is not kept: each job's lines
+    are saved on their own."""
+    if run.get("status") != "completed":
+        return {}, None
+    path = os.path.join(raw_dir, f"{prefix}log-failed.txt")
+    try:
+        size = gh.call_to_file(["run", "view", str(run.get("databaseId")), "--log-failed"], path)
+    except DeadlineHit as exc:
+        # The verdict is known; the failures' text is not -- said per job.
+        return {}, missing(f"`gh run view --log-failed` not read: {exc}")
+    if size > MAX_LOG_BYTES:
+        return {}, over_limit("`gh run view --log-failed`", size, path)
+    by_job = split_log(read_text(path))
+    os.remove(path)
+    return by_job, None
+
+
+class JobLines(NamedTuple):
+    """A failed job's raw lines, `source` naming the log they came from, saved whole at `path`."""
+    lines: list
+    source: str
+    path: str
+
+
+def job_lines(gh: Gh, run: dict, job: dict, by_job: dict, path: str) -> JobLines | list:
+    """A failed job's lines from `by_job` (its part of `--log-failed`), else
+    from its own log; written to `path` either way. Else the units saying why
+    there are none -- one naming `path` when the log was saved but is too big
+    to parse (a cancelled or timed-out job is often missing from
+    `--log-failed`; every job of a run in progress is)."""
+    name = job.get("name")
+    if by_job.get(name):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(by_job[name]) + "\n")
+        return JobLines(by_job[name], "log", path)
+    job_id = job.get("databaseId")
+    where = "no lines in `gh run view --log-failed`" if run.get("status") == "completed" else "run in progress"
+    if job_id is None:
+        return missing(f"{where} and no job id to read the job's own log")
+    try:
+        size = gh.job_log_to_file(job_id, path)
+    except Failure as exc:
+        return missing(f"{where}; its own log could not be read: {exc}")
+    if size > MAX_LOG_BYTES:
+        return over_limit("the job's own log", size, path)
+    return JobLines(split_job_log(read_text(path)), "own log", path)
+
+
 def analyse(gh: Gh, run: dict, raw_dir: str, tail: int, prefix: str, taken: set) -> tuple[dict, list, dict]:
     """(pytest outcome lines by job, failure groups, raw log path by job) of
-    the failed jobs of `run`, writing each one's whole log into `raw_dir`.
-
-    A completed run's logs come from `--log-failed`; a job missing there (a
-    cancelled or timed-out job often is) and every job of a run still in
-    progress is read from its own log instead."""
+    the failed jobs of `run`, writing each one's whole log into `raw_dir`:
+    fetch (`log_failed`, `job_lines`), parse (`failure_units`), group."""
     failed = [j for j in run.get("jobs") or [] if is_failed(j)]
     outcomes, per_job, raw = {}, [], {}
     if not failed:
         return outcomes, [], raw
-    run_id = run.get("databaseId")
-    by_job, combined = {}, None
-    if run.get("status") == "completed":
-        path = os.path.join(raw_dir, f"{prefix}log-failed.txt")
-        try:
-            size = gh.call_to_file(["run", "view", str(run_id), "--log-failed"], path)
-        except DeadlineHit as exc:
-            # The verdict is known; the failures' text is not -- said per job.
-            combined = missing(f"`gh run view --log-failed` not read: {exc}")
-        else:
-            if size > MAX_LOG_BYTES:
-                combined = over_limit("`gh run view --log-failed`", size, path)
-            else:
-                by_job = split_log(read_text(path))
-                os.remove(path)
+    by_job, combined = log_failed(gh, run, raw_dir, prefix)
     for job in failed:
         name = job.get("name")
         if combined:
             per_job.append((name, combined))
             continue
-        path = os.path.join(raw_dir, safe_name(prefix + str(name), taken))
-        lines, source = by_job.get(name), "log"
-        if lines:
-            with open(path, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write("\n".join(lines) + "\n")
-        else:
-            job_id = job.get("databaseId")
-            where = "no lines in `gh run view --log-failed`" if run.get("status") == "completed" else "run in progress"
-            if job_id is None:
-                per_job.append((name, missing(f"{where} and no job id to read the job's own log")))
-                continue
-            try:
-                size = gh.job_log_to_file(job_id, path)
-            except Failure as exc:
-                per_job.append((name, missing(f"{where}; its own log could not be read: {exc}")))
-                continue
-            if size > MAX_LOG_BYTES:
-                raw[name] = path
-                per_job.append((name, over_limit("the job's own log", size, path)))
-                continue
-            lines, source = split_job_log(read_text(path)), "own log"
-        raw[name] = path
-        units, outs = failure_units([clean(ln) for ln in lines], tail, len(failed_steps(job)), source)
+        got = job_lines(gh, run, job, by_job, os.path.join(raw_dir, safe_name(prefix + str(name), taken)))
+        if not isinstance(got, JobLines):
+            # Only the job's own log, saved but over the limit, names a path here.
+            if got[0]["savedLog"]:
+                raw[name] = got[0]["savedLog"]
+            per_job.append((name, got))
+            continue
+        raw[name] = got.path
+        units, outs = failure_units([clean(ln) for ln in got.lines], tail, len(failed_steps(job)), got.source)
         outcomes[name] = outs
         per_job.append((name, units))
     return outcomes, group_failures(per_job), raw
