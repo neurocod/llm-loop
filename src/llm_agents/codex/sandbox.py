@@ -339,7 +339,9 @@ def _rebase_fact(workspace: Path, main: str) -> str:
     reports only "rejected")."""
     if not main:
         return ""
-    run = f"python {BROKER.as_posix()}"
+    # The one spelling the judge accepts (`command_rebase.broker_script`,
+    # `broker_launch_refusal`): isolated, the bridge's own path, literally.
+    run = f"python -I {BROKER.as_posix()}"
     return (
         f" To bring your slot up to {main}, run `{run} start` with escalated "
         f"permissions (`git rebase` itself is declined: the broker runs git "

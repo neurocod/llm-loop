@@ -5,10 +5,10 @@ The worker never gets `git` itself outside the sandbox: an escalated command
 runs with the user's full rights, and the judge can only read a command, not
 rewrite it — it cannot turn hooks off, pin the executable or force the
 configuration of a `git` the worker typed (the broker's docstring lists
-what each of those would let through). What it grants instead is `python
+what each of those would let through). What it grants instead is `python -I
 <BROKER> <op> ...`, where BROKER is the broker file of the bridge's OWN
-checkout: outside every writable root, so the code that runs is not the
-worker's to edit. The broker takes its facts from the environment the
+checkout, spelled literally (`broker_script`): outside every writable root,
+so the code that runs is not the worker's to edit. The broker takes its facts from the environment the
 bridge hands every escalated command (`Grant`, set up by
 `sandbox.escalation_judge`), not from the command line, and checks the
 request again (`rebase.refusal`) right before git runs.
@@ -16,6 +16,7 @@ request again (`rebase.refusal`) right before git runs.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from ..git import rebase as broker
@@ -56,9 +57,34 @@ def _rebase_broker(args: list[str], cwd: Path, ctx: CommandContext) -> str:
     return ""
 
 
-def broker_script(word: str, cwd: Path) -> bool:
-    """Whether a `python <word>` names the bridge's broker file."""
-    try:
-        return (cwd / word).resolve() == BROKER
-    except (OSError, ValueError):
-        return False
+def _spelled(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path))
+
+
+def broker_script(word: str) -> bool:
+    """Whether a `python <word>` names the broker — by its LITERAL spelling:
+    the one absolute canonical path of the bridge's file (`BROKER`, letter
+    case and separators folded, nothing resolved). A spelling that only
+    RESOLVES to it (a junction or symlink in the worker's tree, `..` through
+    one) is not the broker: the worker could swap the link between the grant
+    and Python opening the file, and run its own code with the user's rights
+    (review 2026-11-18). Such a word is judged as any other script."""
+    return os.path.isabs(word) and _spelled(word) == _spelled(str(BROKER))
+
+
+def broker_launch_refusal(switches: list[str], ctx: CommandContext) -> str:
+    """Why `python <switches> <BROKER>` may not start the broker, or "":
+    `-I` is required (isolated mode: no PYTHON* variables, no user site, no
+    script folder from the cwd — a `sitecustomize.py` on an inherited
+    PYTHONPATH runs before any check of the broker's), and no folder along
+    BROKER's path may be a link or junction or lie in a writable root: its
+    literal spelling must name the file it names now and after the grant."""
+    if "-I" not in switches:
+        return (f"the rebase broker starts only isolated: `python -I {BROKER} "
+                f"<op>` (an inherited PYTHONPATH could plant code before it runs)")
+    for folder in (BROKER, *BROKER.parents):
+        if folder.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(folder):
+            return f"the rebase broker's path holds a link or junction at {folder}"
+        if within(folder, ctx.roots):
+            return f"the rebase broker {BROKER} lies in your writable roots"
+    return ""

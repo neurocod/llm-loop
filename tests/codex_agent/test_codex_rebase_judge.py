@@ -23,6 +23,7 @@ from llm_agents.codex import sandbox
 from llm_agents.codex.command_rebase import BROKER
 from llm_agents.codex.registry import AgentRecord
 from llm_agents.git import rebase as broker
+from llm_agents.codex.testing import PS
 from core_judge_support import commit_judge, git_in, junction, pool_slot, slot_with_submodule
 from core_policy import CORE_POLICY
 
@@ -30,7 +31,7 @@ from core_policy import CORE_POLICY
 # Python start plus a few git calls); the bound only keeps a hung git or an
 # editor that did open from holding the suite.
 _TIMEOUT_S = 120.0
-RUN = f"python {BROKER}"
+RUN = f"python -I {BROKER}"
 windows = pytest.mark.skipif(os.name != "nt", reason="Windows junctions")
 
 
@@ -49,7 +50,7 @@ def _broker(ask, slot: Path, *args: str, environment=None) -> subprocess.Complet
     """The granted `python <BROKER> <args>` as the escalation runs it: the
     bridge's environment plus the judge's, from the slot."""
     env = {**os.environ, **(environment or ask.environment)}
-    return subprocess.run([sys.executable, str(BROKER), *args], cwd=slot, env=env,
+    return subprocess.run([sys.executable, "-I", str(BROKER), *args], cwd=slot, env=env,
                           capture_output=True, text=True, encoding="utf-8",
                           errors="replace", timeout=_TIMEOUT_S)
 
@@ -116,7 +117,9 @@ def test_a_slot_worker_may_run_the_broker_and_not_git(tmp_path, monkeypatch):
     slot = _with_trunk(tmp_path)
     ask = commit_judge(tmp_path, monkeypatch, slot)
     for command in [f"{RUN} start", f"{RUN} status", f"{RUN} diff --name-only",
-                    f"{RUN} unmerged", f"python -I {BROKER} status"]:
+                    f"{RUN} unmerged", f"python -I -B {BROKER} status",
+                    f"python -I {BROKER.as_posix()} status",
+                    *([f"python -I {str(BROKER).upper()} status"] if os.name == "nt" else [])]:
         _granted(ask, command)
     _granted(ask, f"{RUN} status", cwd=slot / "src")
     grant = broker.Grant.from_env(ask.environment[broker.ENV])
@@ -189,7 +192,7 @@ def test_a_slot_worker_is_told_the_broker_operations(tmp_path, monkeypatch):
     told = sandbox.thread_params(AgentRecord(
         name="w", cwd=str(slot), sandbox="workspace-write",
         role="worker"))["developerInstructions"]
-    run = f"python {BROKER.as_posix()}"
+    run = f"python -I {BROKER.as_posix()}"
     for step in ("start", "unmerged", "add <paths>", "rm <paths>", "continue",
                  "abort", "skip"):
         assert f"`{run} {step}`" in told, step
@@ -404,3 +407,61 @@ def test_a_gitlink_conflict_is_refused_whatever_gitmodules_says(tmp_path, monkey
     _declined(ask, f"{RUN} add {gitlink}", "submodule's pointer")
     environment = json.loads(ask.environment[broker.ENV])
     assert Path(environment["workspace"]) == slot.resolve()
+
+
+# --- the production launch ----------------------------------------------------
+
+def _launch(ask, slot: Path, command: str, extra=None) -> subprocess.CompletedProcess:
+    """`command` started the way production does: Codex hands PowerShell the
+    command as one `-Command` argument (the approval logs show it quoted,
+    `PS.format`), with the bridge's environment plus the judge's
+    (`protocol.AppServer`). The grant itself is asked separately, on the
+    same words."""
+    shell = PS.PREFIX.split('"')[1]
+    env = {**os.environ, **ask.environment, **(extra or {})}
+    return subprocess.run([shell, "-Command", command], cwd=slot, env=env,
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=_TIMEOUT_S)
+
+
+@windows
+def test_the_granted_line_starts_isolated_whatever_pythonpath_holds(tmp_path, monkeypatch):
+    """A `sitecustomize.py` on an inherited PYTHONPATH in a writable folder
+    runs before any check of the broker's — unless Python starts isolated,
+    which the judge requires (`broker_launch_refusal`)."""
+    slot = _with_trunk(tmp_path)
+    planted = slot / "planted"
+    planted.mkdir()
+    marker = tmp_path / "sitecustomize.txt"
+    (planted / "sitecustomize.py").write_text(
+        f"open({str(marker)!r}, 'a').write('ran')\n", encoding="utf-8")
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    poisoned = {"PYTHONPATH": str(planted)}
+    granted = f"{RUN} status"
+    _granted(ask, granted)
+    done = _launch(ask, slot, granted, poisoned)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.startswith("##"), done.stdout  # git status ran, not an echo
+    assert not marker.exists()
+    # The control: the same line without -I runs the planted file — and is
+    # what the judge refuses.
+    bare = f"python {BROKER} status"
+    _declined(ask, bare, "starts only isolated")
+    _declined(ask, f"python -E {BROKER} status", "starts only isolated")
+    control = _launch(ask, slot, bare, poisoned)
+    assert marker.exists(), control.stdout + control.stderr
+
+
+@windows
+def test_an_alias_of_the_broker_through_the_tree_is_refused(tmp_path, monkeypatch):
+    """A junction in the worker's tree to the bridge's folder resolves to the
+    broker now, and could be swapped for the worker's own file after the
+    grant: only the literal canonical spelling is the broker."""
+    slot = _with_trunk(tmp_path)
+    junction(slot / "bridge", BROKER.parent)
+    alias = slot / "bridge" / BROKER.name
+    assert alias.resolve() == BROKER
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    for spelled in (alias, Path("bridge") / BROKER.name):
+        _declined(ask, f"python -I {spelled} status", "outside your writable roots")
+    _granted(ask, f"{RUN} status")
