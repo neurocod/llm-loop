@@ -58,7 +58,19 @@ def _rebase_broker(args: list[str], cwd: Path, ctx: CommandContext) -> str:
 
 
 def _spelled(path: str) -> str:
-    return os.path.normcase(os.path.normpath(path))
+    """Letter case and (on Windows) `/` folded — and nothing else: no
+    `normpath`, which drops `..` lexically, while on POSIX the kernel walks
+    `j/..` through whatever `j` links to (review 2026-11-18:
+    `/srv/main-wt1/j/../../main/<broker>` with `j` a symlink normalised to
+    the broker and opened a worker file)."""
+    return os.path.normcase(path.replace("/", os.sep))
+
+
+def _dotted(path: str) -> bool:
+    """Whether a path holds a `.` or `..` segment or a redundant separator
+    (an empty segment past the root)."""
+    return any(part in ("", ".", "..")
+               for part in path.replace("/", os.sep).split(os.sep)[1:])
 
 
 def broker_script(word: str) -> bool:
@@ -68,8 +80,21 @@ def broker_script(word: str) -> bool:
     RESOLVES to it (a junction or symlink in the worker's tree, `..` through
     one) is not the broker: the worker could swap the link between the grant
     and Python opening the file, and run its own code with the user's rights
-    (review 2026-11-18). Such a word is judged as any other script."""
-    return os.path.isabs(word) and _spelled(word) == _spelled(str(BROKER))
+    (review 2026-11-18). Such a word is judged as any other script, unless it
+    is a dotted spelling of the broker (`broker_spelling_refusal`)."""
+    return (os.path.isabs(word) and not _dotted(word)
+            and _spelled(word) == _spelled(str(BROKER)))
+
+
+def broker_spelling_refusal(word: str) -> str:
+    """Refuse outright a script word with `.`/`..` segments or a redundant
+    separator that LEXICALLY reads as the broker: it is no spelling of the
+    broker the judge accepts, and what it opens depends on the links along
+    it, not on the text."""
+    if _dotted(word) and _spelled(os.path.normpath(word)) == _spelled(str(BROKER)):
+        return (f"script {word}: spell the rebase broker exactly as {BROKER} "
+                f"(no `.`/`..` segments, no doubled separators)")
+    return ""
 
 
 def broker_launch_refusal(switches: list[str], ctx: CommandContext) -> str:

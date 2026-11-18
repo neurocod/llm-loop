@@ -452,6 +452,30 @@ def test_the_granted_line_starts_isolated_whatever_pythonpath_holds(tmp_path, mo
     assert marker.exists(), control.stdout + control.stderr
 
 
+def test_a_dotted_spelling_of_the_broker_is_refused(tmp_path, monkeypatch):
+    """`..`, `.` and doubled separators read as the broker only lexically;
+    what they open depends on the links along them (`_spelled` has no
+    normpath)."""
+    slot = _with_trunk(tmp_path)
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    folder, name, sep = str(BROKER.parent), BROKER.name, os.sep
+    for spelled in (f"{folder}{sep}..{sep}{BROKER.parent.name}{sep}{name}",
+                    f"{folder}{sep}.{sep}{name}", f"{folder}{sep}{sep}{name}",
+                    f"{BROKER.parent.as_posix()}/../{BROKER.parent.name}/{name}"):
+        _declined(ask, f"python -I {spelled} status", "spell the rebase broker exactly")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX walks `..` through a symlink")
+def test_a_symlink_and_dotdot_alias_of_the_broker_is_refused(tmp_path, monkeypatch):
+    slot = _with_trunk(tmp_path)
+    os.symlink(tmp_path / "scratch", slot / "j", target_is_directory=True)
+    climb = "../" * len((slot / "j").parts[1:])
+    word = f"{slot}/j/{climb}{str(BROKER).lstrip('/')}"
+    assert os.path.normpath(word) == str(BROKER)
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    _declined(ask, f"python -I {word} status", "spell the rebase broker exactly")
+
+
 @windows
 def test_an_alias_of_the_broker_through_the_tree_is_refused(tmp_path, monkeypatch):
     """A junction in the worker's tree to the bridge's folder resolves to the

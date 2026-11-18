@@ -26,7 +26,12 @@ from .command_arguments import (
 from .command_paths import (
     resolve_path,
 )
-from .command_rebase import _rebase_broker, broker_launch_refusal, broker_script
+from .command_rebase import (
+    _rebase_broker,
+    broker_launch_refusal,
+    broker_script,
+    broker_spelling_refusal,
+)
 
 _PYTHON_SWITCHES = frozenset({"-B", "-u", "-I", "-E", "-s"})
 _PYTHON_X = frozenset({"utf8", "utf8=1"})
@@ -60,6 +65,9 @@ def _python(argv: list[str], cwd: Path, ctx: CommandContext, *,
         if module != "pytest":
             return f"python -m {module} (only pytest)"
         return _pytest_refusal(words[at + 2:], cwd, ctx)
+    why = broker_spelling_refusal(words[at])
+    if why:
+        return why
     if broker_script(words[at]):
         # The bridge's own file, outside the roots by design (command_rebase).
         return (broker_launch_refusal(words[:at], ctx)
