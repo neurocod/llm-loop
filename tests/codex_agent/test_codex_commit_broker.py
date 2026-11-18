@@ -8,7 +8,7 @@ this checkout — and assert what happened: which hooks ran, which git ran,
 what was committed. Each "did not run" has its control showing that the
 same fixture runs it without the broker."""
 
-from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401 — see no_badge's docstring
+from llm_agents.codex.testing.fixtures import bridge_path, no_badge  # noqa: F401 — see their docstrings
 import os
 import subprocess
 import sys
@@ -52,7 +52,7 @@ def _granted(ask, command, **where):
 def _hook(folder: Path, name: str, body: str) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / name
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8", newline="\n")
+    path.write_bytes(f"#!/bin/sh\n{body}\n".encode("utf-8"))
     path.chmod(0o755)
 
 
@@ -255,6 +255,46 @@ def test_a_python_path_entry_through_a_junction_is_not_pinned(tmp_path):
     # The control: the same folder, spelled plainly (a trailing separator too).
     for path in (str(real), f"{real}{os.sep}"):
         assert command_brokers.trusted_python("python", (), path)[0] is not None, path
+
+
+def test_a_doubled_separator_inside_a_python_path_entry_is_one_separator(tmp_path):
+    """Only a LEADING doubled separator (a UNC share, POSIX `//`) refuses:
+    inside an entry it names no link (a Windows runner's `C:\\\\ghcup\\bin`)."""
+    real = Path(sys.executable).parent.resolve()
+    name = "python" if os.name == "nt" else Path(sys.executable).name
+    doubled = f"{real.parent}{os.sep}{os.sep}{real.name}"
+    found, why = command_brokers.trusted_python(name, (), doubled)
+    assert found is not None and not why, (doubled, why)
+    leading = f"{os.sep}{os.sep}{str(real).lstrip(os.sep)}"
+    found, why = command_brokers.trusted_python(name, (), leading)
+    assert found is None and "starts with a doubled separator" in why, (leading, why)
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
+                    reason="POSIX symlinks under a folder the user may not write")
+def test_a_python_path_link_only_its_user_could_not_repoint_is_pinned(tmp_path):
+    """`/sbin -> usr/sbin` under a root-owned `/` (every usr-merged Linux):
+    with the user's rights the worker cannot repoint it, so the PATH entry
+    through it pins; the same link in a folder the user writes refuses, and
+    so does a fixed link whose target passes a writable one."""
+    real = Path(sys.executable).parent.resolve()
+    name = Path(sys.executable).name
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    (fixed / "bin").symlink_to(real)
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    (loose / "bin").symlink_to(real)
+    (fixed / "via").symlink_to(loose / "bin")
+    fixed.chmod(0o555)
+    try:
+        found, why = command_brokers.trusted_python(name, (), str(fixed / "bin"))
+        assert found is not None and not why, why
+        for entry in (loose / "bin", fixed / "via"):
+            found, why = command_brokers.trusted_python(name, (), str(entry))
+            assert found is None and "link or junction" in why, (entry, why)
+    finally:
+        fixed.chmod(0o755)
 
 
 @windows

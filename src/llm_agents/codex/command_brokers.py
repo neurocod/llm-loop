@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from ..links import is_link
 from .command_arguments import CommandContext
 from .command_paths import within
 
@@ -75,7 +76,46 @@ def _linked(path: Path) -> Optional[Path]:
     """The first of `path` and its parents, AS SPELLED (nothing resolved),
     that is a symlink or junction, or None."""
     for folder in (path, *path.parents):
-        if folder.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(folder):
+        if is_link(folder):
+            return folder
+    return None
+
+
+def _dotted_entry(folder: str) -> bool:
+    """Whether a PATH entry holds a `.`/`..` segment or STARTS with a doubled
+    separator (a UNC share, POSIX's implementation-defined `//`). A doubled
+    separator inside the entry is one separator to both kernels and names
+    no link, so it is not refused: Windows runners ship `C:\\\\ghcup\\bin`
+    on their PATH (CI 2026-11-18)."""
+    parts = folder.rstrip("\\/").replace("/", os.sep).split(os.sep)
+    return (any(part in (".", "..") for part in parts)
+            or (len(parts) > 1 and parts[0] == "" and parts[1] == ""))
+
+
+def _swappable_link(path: Path, depth: int = 0) -> Optional[Path]:
+    """The first link or junction along `path` AS SPELLED, from the root
+    down, that this user could repoint, or None.
+
+    A link is as fixed as the folder holding it: escalated with the user's
+    rights, the worker can repoint only what the user may write. So a link
+    in a folder `os.access` says this user may not write — `/sbin ->
+    usr/sbin` under a root-owned `/`, on every usr-merged Linux — stays, and
+    its target is judged the same way (a `..` in it refuses: what it names
+    depends on links again). On Windows `os.access` reads no ACL, so every
+    junction there counts as swappable: the rule of the review of 2432
+    unchanged."""
+    for folder in (*reversed(path.parents), path):
+        if not is_link(folder):
+            continue
+        if os.name == "nt" or depth > 8 or os.access(folder.parent, os.W_OK):
+            return folder
+        try:
+            target = Path(os.readlink(folder))
+        except OSError:
+            return folder
+        if not target.is_absolute():
+            target = folder.parent / target
+        if ".." in target.parts or _swappable_link(target, depth + 1) is not None:
             return folder
     return None
 
@@ -120,10 +160,11 @@ def trusted_python(name: str, roots: tuple[Path, ...],
         # after the grant, so a junction along it (`C:\slot\python-link` ->
         # the real Python) resolves clean at the judge and is the worker's
         # to swap before PowerShell looks `name` up (review of 2432).
-        if _dotted(folder.rstrip("\\/")):
-            return None, (f"PATH entry {folder} has `.`/`..` segments or doubled "
-                          f"separators: what it names depends on the links along it")
-        link = _linked(Path(folder))
+        if _dotted_entry(folder):
+            return None, (f"PATH entry {folder} has `.`/`..` segments or starts with "
+                          f"a doubled separator: what it names depends on the links "
+                          f"along it")
+        link = _swappable_link(Path(folder))
         if link is not None:
             return None, (f"PATH entry {folder} passes through the link or junction "
                           f"{link}: it may be swapped after the grant")
