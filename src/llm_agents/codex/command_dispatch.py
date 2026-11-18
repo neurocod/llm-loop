@@ -20,6 +20,7 @@ from .command_arguments import (
     CommandContext,
     _arg_path_refusal,
 )
+from .command_brokers import pinned_program
 from .command_shell import (
     Token,
     Unparsed,
@@ -48,8 +49,14 @@ def argv_refusal(argv: list[str], cwd: Path, ctx: CommandContext) -> str:
     if not argv:
         return "an empty command"
     program = argv[0].lower()
-    if re.search(r"[\\/]", program):
-        return f"{argv[0]}: programs are named, not given by path"
+    pinned, unpinned = pinned_program(argv[0], ctx.roots)
+    if pinned:
+        # Off Windows the broker's interpreter is typed by its judged path
+        # (`command_brokers.launch_word`): the python shape reads the rest.
+        program = "python"
+    elif re.search(r"[\\/]", program):
+        return f"{argv[0]}: programs are named, not given by path" + (
+            f" (and no broker interpreter is pinned: {unpinned})" if unpinned else "")
     for suffix in _PROGRAM_SUFFIXES:
         if program.endswith(suffix):
             program = program[:-len(suffix)]

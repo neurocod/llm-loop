@@ -732,7 +732,9 @@ def run_turn():
         assert approval_store["workspace"] == slot
         assert os.path.isdir(approval_store["directory"])
         assert json.loads(os.environ["LLM_AGENTS_COMMIT_BROKER"])["git"]
-        run = f"python -I {os.environ['FAKE_COMMIT_BROKER']}"
+        # The interpreter word the briefing names (`command_brokers.launch_word`).
+        python = os.environ.get("FAKE_BROKER_PYTHON", "python")
+        run = f"{python} -I {os.environ['FAKE_COMMIT_BROKER']}"
         message = os.path.join(os.environ["FAKE_SCRATCH"], "msg.txt")
         elsewhere = os.path.join(os.path.dirname(WORK), "elsewhere", "msg.txt")
         wrap = ('"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\'

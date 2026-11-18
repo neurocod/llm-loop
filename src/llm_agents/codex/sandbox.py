@@ -37,6 +37,7 @@ from ..git.commit_identity import ENV as COMMIT_APPROVAL_ENV
 from ..git.slots import registered_admin
 from ..gitlib import trusted_git
 from ..links import is_link
+from .command_brokers import launch_word
 from ..host_policy import EMPTY as EMPTY_POLICY
 from ..host_policy import active as host_policy
 from ..host_policy import explicit as explicit_grants
@@ -346,12 +347,13 @@ def _worktree_fact(workspace: Path,
         where += (" or a --writable directory ("
                   + ", ".join(str(root) for root in writable) + ")")
     # The one spelling the judge accepts (`command_brokers`).
-    run = f"python -I {COMMIT_BROKER.as_posix()}"
+    python = launch_word(tuple(root.resolve() for root in (workspace, *commit_roots)))
+    run = f"{python} -I {COMMIT_BROKER.as_posix()}"
     return (head + host_policy().commit_briefing(where, model, run)
-            + _rebase_fact(workspace, host_policy().main_branch))
+            + _rebase_fact(workspace, host_policy().main_branch, python))
 
 
-def _rebase_fact(workspace: Path, main: str) -> str:
+def _rebase_fact(workspace: Path, main: str, python: str = "python") -> str:
     """Told beside the commit grant when the host names its main branch: the
     rebase broker's operations (`command_rebase._rebase_broker` grants them),
     so the worker neither asks the orchestrator nor types a `git rebase` the
@@ -361,7 +363,7 @@ def _rebase_fact(workspace: Path, main: str) -> str:
         return ""
     # The one spelling the judge accepts (`command_brokers.broker_script`,
     # `broker_launch_refusal`): isolated, the bridge's own path, literally.
-    run = f"python -I {BROKER.as_posix()}"
+    run = f"{python} -I {BROKER.as_posix()}"
     return (
         f" To bring your slot up to {main}, run `{run} start` with escalated "
         f"permissions (`git rebase` itself is declined: the broker runs git "

@@ -8,7 +8,7 @@ judge hands every escalated command (`ask.environment`), the broker file of
 this checkout — and assert what happened in the repository: hooks did not
 run, other branches did not move, a resumed rebase ran no exec line."""
 
-from llm_agents.codex.testing.fixtures import bridge_path, no_badge  # noqa: F401 — see their docstrings
+from llm_agents.codex.testing.fixtures import BROKER_PYTHON as PY, bridge_path, no_badge  # noqa: F401 — see their docstrings
 import json
 import os
 import subprocess
@@ -33,7 +33,7 @@ from core_policy import CORE_POLICY
 # Python start plus a few git calls); the bound only keeps a hung git or an
 # editor that did open from holding the suite.
 _TIMEOUT_S = 120.0
-RUN = f"python -I {BROKER}"
+RUN = f"{PY} -I {BROKER}"
 windows = pytest.mark.skipif(os.name != "nt", reason="Windows junctions")
 
 
@@ -119,9 +119,9 @@ def test_a_slot_worker_may_run_the_broker_and_not_git(tmp_path, monkeypatch):
     slot = _with_trunk(tmp_path)
     ask = commit_judge(tmp_path, monkeypatch, slot)
     for command in [f"{RUN} start", f"{RUN} status", f"{RUN} diff --name-only",
-                    f"{RUN} unmerged", f"python -I -B {BROKER} status",
-                    f"python -I {BROKER.as_posix()} status",
-                    *([f"python -I {str(BROKER).upper()} status"] if os.name == "nt" else [])]:
+                    f"{RUN} unmerged", f"{PY} -I -B {BROKER} status",
+                    f"{PY} -I {BROKER.as_posix()} status",
+                    *([f"{PY} -I {str(BROKER).upper()} status"] if os.name == "nt" else [])]:
         _granted(ask, command)
     _granted(ask, f"{RUN} status", cwd=slot / "src")
     grant = broker.Grant.from_env(ask.environment[broker.ENV])
@@ -197,7 +197,7 @@ def test_a_slot_worker_is_told_the_broker_operations(tmp_path, monkeypatch):
     told = sandbox.thread_params(AgentRecord(
         name="w", cwd=str(slot), sandbox="workspace-write",
         role="worker"))["developerInstructions"]
-    run = f"python -I {BROKER.as_posix()}"
+    run = f"{PY} -I {BROKER.as_posix()}"
     for step in ("start", "unmerged", "add <paths>", "rm <paths>", "continue",
                  "abort", "skip"):
         assert f"`{run} {step}`" in told, step

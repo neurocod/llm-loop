@@ -7,15 +7,18 @@ A fixture is registered by importing it into the test module that uses it
 
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
 from ... import agent_counter
-from .. import paths, sandbox
+from .. import command_brokers, paths, sandbox
 from ..registry import AgentRecord
 
 
@@ -55,26 +58,30 @@ def bridge_path_folders(shim: Path | None = None) -> list[str]:
     return list(dict.fromkeys(str(folder) for folder in folders))
 
 
-_SHIMS: dict[str, Path] = {}
+def _python_shim() -> Optional[Path]:
+    """Off Windows, a folder holding `python` and `python3` as plain scripts
+    that exec this interpreter, removed at exit; None on Windows. Made at
+    import so that test modules can spell `BROKER_PYTHON` in constants."""
+    if os.name == "nt":
+        return None
+    folder = Path(tempfile.mkdtemp(prefix="bridge-python-")).resolve()
+    atexit.register(shutil.rmtree, folder, True)
+    for name in ("python", "python3"):
+        script = folder / name
+        script.write_bytes(f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n".encode("utf-8"))
+        script.chmod(0o755)
+    return folder
 
 
-def _python_shim(tmp_path_factory) -> Path:
-    """A folder holding `python` and `python3` as plain scripts that exec
-    this interpreter. Off Windows the `python` of a tool cache or a venv is
-    a link its user owns, which `trusted_python` refuses (only a chain root
-    alone may change pins); a plain file in a plain folder is pinned."""
-    if "shim" not in _SHIMS:
-        folder = tmp_path_factory.mktemp("bridge-python").resolve()
-        for name in ("python", "python3"):
-            script = folder / name
-            script.write_bytes(f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n".encode("utf-8"))
-            script.chmod(0o755)
-        _SHIMS["shim"] = folder
-    return _SHIMS["shim"]
+_SHIM = _python_shim()
+# The word a broker launch starts with under `bridge_path`
+# (`command_brokers.launch_word`): `python` on Windows, the shim's absolute
+# `python3` elsewhere.
+BROKER_PYTHON = "python" if _SHIM is None else str(_SHIM / "python3")
 
 
 @pytest.fixture(autouse=True)
-def bridge_path(monkeypatch, tmp_path_factory):
+def bridge_path(monkeypatch):
     """PATH = `bridge_path_folders()` for every test of a module that imports
     this fixture.
 
@@ -82,9 +89,24 @@ def bridge_path(monkeypatch, tmp_path_factory):
     PATH entry of the bridge, and a verdict read from the test machine's own
     PATH tests that machine's image, not the judge: a linked tool cache on a
     macOS runner refused every broker grant there (CI 2026-11-18). A test
-    about one PATH entry prepends it to this PATH."""
-    shim = None if os.name == "nt" else _python_shim(tmp_path_factory)
-    monkeypatch.setenv("PATH", os.pathsep.join(bridge_path_folders(shim)))
+    about one PATH entry prepends it to this PATH.
+
+    Off Windows the broker needs an interpreter root alone may change
+    (`command_brokers._root_chain`), which no CI runner's Python is and no
+    test can make: the shim, its scripts and the folders above it stand in
+    for root's (`_fixed` patched for those paths only), the way the chain
+    tests stand their own trees in."""
+    monkeypatch.setenv("PATH", os.pathsep.join(bridge_path_folders(_SHIM)))
+    monkeypatch.setenv("FAKE_BROKER_PYTHON", BROKER_PYTHON)
+    if _SHIM is None:
+        return
+    original = command_brokers._fixed
+    trusted = {_SHIM, *_SHIM.parents}
+
+    def fixed(path: Path, status: os.stat_result) -> bool:
+        return path in trusted or path.parent == _SHIM or original(path, status)
+
+    monkeypatch.setattr(command_brokers, "_fixed", fixed)
 
 
 @pytest.fixture

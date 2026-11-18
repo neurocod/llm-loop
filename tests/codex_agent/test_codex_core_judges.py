@@ -4,7 +4,7 @@ submodule rules, junction paths, the worker briefing skeleton and the fake
 wire. A host's own tables are pinned in the host's repository; these hold
 for any host binding the same judges."""
 
-from llm_agents.codex.testing.fixtures import bridge_path, no_badge  # noqa: F401 — see their docstrings
+from llm_agents.codex.testing.fixtures import BROKER_PYTHON as PY, bridge_path, no_badge  # noqa: F401 — see their docstrings
 import json
 import os
 
@@ -21,7 +21,7 @@ from core_judge_support import (
 windows = pytest.mark.skipif(os.name != "nt", reason="Windows junction")
 
 # The one spelling of the commit broker the judge grants (`command_brokers`).
-RUN = f"python -I {command_commit.BROKER}"
+RUN = f"{PY} -I {command_commit.BROKER}"
 
 
 def _declined(ask, command, reason, **where):
@@ -356,5 +356,5 @@ def test_a_commit_is_judged_on_the_wire(tmp_path, monkeypatch):
             for request in range(9301, 9305)} == {
         9301: "accept", 9302: "decline", 9303: "decline", 9304: "decline"}
     briefing = wire.first_request(tmp_path, "thread/start")["params"]["developerInstructions"]
-    assert (f"commit with `python -I {command_commit.BROKER.as_posix()} -F <file> "
+    assert (f"commit with `{PY} -I {command_commit.BROKER.as_posix()} -F <file> "
             f"<paths>`, the message file in your scratch") in briefing

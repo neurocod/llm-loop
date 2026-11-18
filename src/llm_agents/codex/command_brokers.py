@@ -231,7 +231,52 @@ def trusted_python(name: str, roots: tuple[Path, ...],
         return None, f"no `{name}` on the bridge's PATH"
     if within(found, roots):
         return None, f"the `{name}` on PATH, {found}, lies in your writable roots"
+    if os.name != "nt":
+        # The interpreter FILE and every folder above it, link or not, are
+        # root's alone (review of c951421): a user-owned file in root's
+        # folders changes through a hard link in a writable root, and a bind
+        # mount of a worker folder shows its source's owner, not root.
+        _, why = _root_chain(found, roots)
+        if why:
+            return None, (f"the `{name}` on PATH, {found}: {why} (off Windows the "
+                          f"broker needs root's interpreter, e.g. /usr/bin/python3)")
     return found, ""
+
+
+def launch_interpreter(roots: tuple[Path, ...]) -> tuple[Optional[Path], str]:
+    """The interpreter a broker launch names, or None and why: `python` on
+    Windows (PowerShell looks the word up; `trusted_python` judged that
+    lookup), and off Windows `python3`, else `python`, which the worker then
+    types as its ABSOLUTE path (`launch_word`), so the shell runs the very
+    file judged instead of resolving a name again after the grant."""
+    if os.name == "nt":
+        return trusted_python("python", roots)
+    found, why = trusted_python("python3", roots)
+    if found is None and why.startswith("no `"):
+        found, why = trusted_python("python", roots)
+    return found, why
+
+
+def launch_word(roots: tuple[Path, ...]) -> str:
+    """The program word a briefing tells the worker to start a broker with:
+    `python` on Windows; off Windows the absolute path `launch_interpreter`
+    pins (or `python3` when it pins none, which the judge then refuses with
+    its reason)."""
+    if os.name == "nt":
+        return "python"
+    found, _ = launch_interpreter(roots)
+    return str(found) if found is not None else "python3"
+
+
+def pinned_program(word: str, roots: tuple[Path, ...]) -> tuple[bool, str]:
+    """Whether a program word given BY PATH is the interpreter a broker
+    launch pins (off Windows only; `argv_refusal` refuses every other
+    program given by path), and why none is pinned when that is the cause.
+    Compared as spelled: the path judged is the path the shell will open."""
+    if os.name == "nt" or not os.path.isabs(word):
+        return False, ""
+    found, why = launch_interpreter(roots)
+    return found is not None and str(found) == word, why
 
 
 def broker_launch_refusal(program: str, switches: list[str], ctx: CommandContext,
@@ -247,14 +292,25 @@ def broker_launch_refusal(program: str, switches: list[str], ctx: CommandContext
     the broker's); and no folder along the broker's path may be a link or
     junction or lie in a writable root: its literal spelling must name the
     file it names now and after the grant."""
-    if program.lower() not in ("python", "python3"):
-        return (f"{broker.what} starts as `python -I {broker.path} ...`, not "
+    word = launch_word(ctx.roots)
+    if os.name != "nt":
+        # By its judged absolute path, never by name: a name is looked up
+        # again after the grant, and what that finds was never judged.
+        pinned, why = launch_interpreter(ctx.roots)
+        if why:
+            return f"{broker.what}: {why}"
+        if program != str(pinned):
+            return (f"{broker.what} starts as `{pinned} -I {broker.path} ...` (the "
+                    f"judged interpreter by its path), not through `{program}`")
+    elif program.lower() not in ("python", "python3"):
+        return (f"{broker.what} starts as `{word} -I {broker.path} ...`, not "
                 f"through `{program}`")
-    _, why = trusted_python(program.lower(), ctx.roots)
-    if why:
-        return f"{broker.what}: {why}"
+    else:
+        _, why = trusted_python(program.lower(), ctx.roots)
+        if why:
+            return f"{broker.what}: {why}"
     if "-I" not in switches:
-        return (f"{broker.what} starts only isolated: `python -I {broker.path} "
+        return (f"{broker.what} starts only isolated: `{word} -I {broker.path} "
                 f"...` (an inherited PYTHONPATH could plant code before it runs)")
     link = _linked(broker.path)
     if link is not None:

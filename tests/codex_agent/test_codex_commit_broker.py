@@ -8,7 +8,7 @@ this checkout — and assert what happened: which hooks ran, which git ran,
 what was committed. Each "did not run" has its control showing that the
 same fixture runs it without the broker."""
 
-from llm_agents.codex.testing.fixtures import bridge_path, no_badge  # noqa: F401 — see their docstrings
+from llm_agents.codex.testing.fixtures import BROKER_PYTHON as PY, bridge_path, no_badge  # noqa: F401 — see their docstrings
 import os
 import stat
 import subprocess
@@ -32,7 +32,7 @@ from core_policy import CORE_POLICY
 # plus a dozen git calls); the bound only keeps a hung git or hook from
 # holding the suite.
 _TIMEOUT_S = 120.0
-RUN = f"python -I {BROKER}"
+RUN = f"{PY} -I {BROKER}"
 windows = pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell and .cmd lookup")
 # The hooks the 2026-11-18 probe saw a granted commit run from the worker's
 # hooks folder.
@@ -119,14 +119,14 @@ def test_a_slot_worker_commits_only_through_the_isolated_broker(tmp_path, monkey
     ask = commit_judge(tmp_path, monkeypatch, slot)
     message = _message(tmp_path)
     _granted(ask, f"{RUN} -F {message} src/a.ts")
-    _granted(ask, f"python -I -B {BROKER.as_posix()} -F {message} src/a.ts")
+    _granted(ask, f"{PY} -I -B {BROKER.as_posix()} -F {message} src/a.ts")
     grant = commit_broker.Grant.from_env(ask.environment[commit_broker.ENV])
     assert grant.git.is_absolute() and grant.git.is_file()
     assert grant.hooks == grant.no_hooks and not any(grant.no_hooks.iterdir())
     for root in (slot, tmp_path / "scratch"):
         assert root.resolve() not in grant.no_hooks.parents
     for command, reason in {
-        f"python {BROKER} -F {message} src/a.ts": "starts only isolated",
+        f"{PY} {BROKER} -F {message} src/a.ts": "starts only isolated",
         f"py -3 -I {BROKER} -F {message} src/a.ts": "not through `py`",
         # the slot's copy of the broker is the worker's to edit
         f"python -I {copy} -F {message} src/a.ts": "not on the core test entrypoints",
@@ -215,20 +215,27 @@ def test_the_broker_starts_only_as_python_typed_plainly(tmp_path, monkeypatch):
                     "python3.cmd"):
         _declined(ask, f"{program} -I {BROKER} -F {message} src/a.ts",
                   f"not through `{program}`")
-    _granted(ask, f"Python -I {BROKER} -F {message} src/a.ts")
+    if os.name == "nt":
+        _granted(ask, f"Python -I {BROKER} -F {message} src/a.ts")
+        return
+    # Off Windows by the judged path only (review of c951421): a name is
+    # resolved again after the grant, so what runs was never judged.
+    _granted(ask, f"{RUN} -F {message} src/a.ts")
+    for program in ("python", "python3", "Python"):
+        _declined(ask, f"{program} -I {BROKER} -F {message} src/a.ts",
+                  "the judged interpreter by its path")
+    # Another path, even to a file beside the judged one, is no program word.
+    _declined(ask, f"{Path(PY).parent / 'python'} -I {BROKER} -F {message} src/a.ts",
+              "programs are named, not given by path")
 
 
 def _plain_python(tmp_path: Path) -> tuple[Path, str]:
-    """(folder, name) of a `python` no link leads to: this interpreter's own
-    folder on Windows; off Windows a plain executable file in a plain folder
-    (a tool cache's or a venv's `python` is a link its user owns, refused)."""
+    """(folder, name) of an interpreter `trusted_python` pins: this one's own
+    folder on Windows; off Windows the `bridge_path` shim, which stands in
+    for root's (a tool cache's or a venv's `python` is the user's, refused)."""
     if os.name == "nt":
         return Path(sys.executable).parent.resolve(), "python"
-    folder = (tmp_path / "plain-python").resolve()
-    folder.mkdir()
-    (folder / "python").write_bytes(b"#!/bin/sh\n")
-    (folder / "python").chmod(0o755)
-    return folder, "python"
+    return Path(PY).parent, Path(PY).name
 
 
 def test_python_is_pinned_on_the_path(tmp_path):
@@ -359,6 +366,44 @@ def test_a_link_chain_pins_only_if_root_alone_may_change_all_of_it(tmp_path, mon
 
 
 @posix_links
+def test_an_interpreter_file_root_does_not_own_alone_is_not_pinned(tmp_path, monkeypatch):
+    """Review of c951421: root's folders do not fix the FILE. A user-owned
+    `/srv/tools/python` with a hard link `/work/python` in a writable root
+    changes through that link (a bind mount of a worker folder shows the
+    same: its source's owner). And a folder above it group-writable lets
+    the group swap it."""
+    tmp = tmp_path.resolve()
+    tools, work = tmp / "srv" / "tools", tmp / "work"
+    _folders(tools, work)
+    (tools / "python").write_bytes(b"#!/bin/sh\n")
+    (tools / "python").chmod(0o755)
+    os.link(tools / "python", work / "python")
+    original = command_brokers._fixed
+
+    def folders_are_root_s(path, status):
+        # Every folder of the fixture stands in for root's; files do not.
+        if stat.S_ISDIR(status.st_mode) and (path == tmp or tmp in path.parents
+                                            or path in tmp.parents):
+            return not status.st_mode & 0o022 or path in tmp.parents
+        return original(path, status)
+
+    monkeypatch.setattr(command_brokers, "_fixed", folders_are_root_s)
+    found, why = command_brokers.trusted_python("python", (work,), str(tools))
+    assert found is None and f"{tools / 'python'} is not root's alone (uid" in why, why
+    # Standing the file in for root's too, the same entry pins...
+    _as_root_s(monkeypatch, tmp)
+    found, why = command_brokers.trusted_python("python", (work,), str(tools))
+    assert found == tools / "python" and not why, why
+    # ...unless a folder above it is writable by its group.
+    (tmp / "srv").chmod(0o775)
+    try:
+        found, why = command_brokers.trusted_python("python", (), str(tools))
+        assert found is None and f"{tmp / 'srv'} is not root's alone" in why, why
+    finally:
+        (tmp / "srv").chmod(0o755)
+
+
+@posix_links
 @pytest.mark.skipif(not Path("/sbin").is_symlink(), reason="no usr-merged /sbin here")
 def test_a_usr_merged_sbin_entry_is_pinned(tmp_path):
     """`/sbin -> usr/sbin`, root's from `/` down (every usr-merged Linux)."""
@@ -409,7 +454,7 @@ def test_a_python_path_entry_in_the_roots_refuses_the_launch(tmp_path, monkeypat
     monkeypatch.setenv("PATH", f"{tmp_path / 'scratch'}{os.pathsep}{os.environ['PATH']}")
     ask = commit_judge(tmp_path, monkeypatch, slot)
     _declined(ask, f"{RUN} -F {tmp_path / 'scratch/m.txt'} src/a.ts",
-              "lies in your writable roots: a `python` planted there would run")
+              "lies in your writable roots: a `python")
 
 
 def test_the_sandbox_temp_folder_counts_as_a_writable_root(tmp_path, monkeypatch):
@@ -429,7 +474,7 @@ def test_the_sandbox_temp_folder_counts_as_a_writable_root(tmp_path, monkeypatch
     monkeypatch.setenv("PATH", f"{tmp_path / 'temp'}{os.pathsep}{os.environ['PATH']}")
     ask = commit_judge(tmp_path, monkeypatch, slot)
     _declined(ask, f"{RUN} -F {_message(tmp_path)} src/a.ts",
-              "lies in your writable roots: a `python` planted there would run")
+              "lies in your writable roots: a `python")
 
 
 # --- effects -----------------------------------------------------------------

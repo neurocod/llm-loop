@@ -175,6 +175,10 @@ a conflict `add` (or `rm` for a modify/delete one) of the unmerged files and
 `continue`, or `abort`; never `git rebase` itself, whose hooks and
 configuration the judge cannot turn off (judge: `command_rebase._rebase_broker`,
 briefing: `sandbox._rebase_fact`) — and moves files with `Move-Item`.
+Off Windows a broker starts only from an interpreter root alone may change,
+typed by the absolute path the briefing names (the system `/usr/bin/python3`,
+resolved, e.g. `/usr/bin/python3.12`); a user's venv or a
+setup-python tool cache is refused (`command_brokers.launch_interpreter`).
 
 ## One task, one agent
 
