@@ -10,6 +10,8 @@ plants one of them, runs git through the pin, and asserts the planted
 program did not run or the redirect did not take; its control shows that
 the same fixture does run it with git unpinned."""
 
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -111,6 +113,58 @@ def test_the_repository_s_editor_is_not_the_editor(repo, tmp_path):
     assert gitlib.git(["var", "GIT_EDITOR"], cwd=work).stdout.strip() == planted
     _pin(tmp_path)
     assert gitlib.git(["var", "GIT_EDITOR"], cwd=work).stdout.strip() == "true"
+
+
+def test_git_s_own_status_asks_no_submodule_under_the_pin(repo, tmp_path):
+    """Round 3 of 2432: a commit with nothing to commit prints a full status
+    (`-F` or not), which asks each checked-out submodule through its own
+    `.git` — the worker's to fill with a clean filter. The forced
+    `diff.ignoreSubmodules=all` (`gitlib.FORCED`) keeps that status out."""
+    work, marker = repo
+    sub = work / "sub"
+    sub.mkdir()
+    gitlib.git(["init", "--quiet"], cwd=sub)
+    (sub / "work.txt").write_text("one\n", encoding="utf-8")
+    gitlib.git(["add", "work.txt"], cwd=sub)
+    gitlib.git(["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                "commit", "--quiet", "-m", "sub"], cwd=sub)
+    gitlib.git(["add", "sub"], cwd=work)
+    gitlib.git(["commit", "--quiet", "-m", "gitlink", "--", "sub"], cwd=work)
+    gitlib.git(["config", "filter.evil.clean", _program(tmp_path, marker)], cwd=sub)
+    (sub / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
+
+    def nothing_to_commit(ahead_s: float) -> None:
+        # A new mtime: the submodule's status re-hashes the file, filtered.
+        later = time.time() + ahead_s
+        os.utime(sub / "work.txt", (later, later))
+        done = gitlib.git(["commit", "-m", "x", "--", "sub"], cwd=work, check=False)
+        assert done.returncode == 1, done.stdout + done.stderr
+
+    nothing_to_commit(10)
+    assert marker.exists()  # the control
+    marker.unlink()
+    _pin(tmp_path)
+    nothing_to_commit(20)
+    assert not marker.exists()
+
+
+def test_a_staged_gitlink_still_counts_under_the_pin(repo, tmp_path, monkeypatch):
+    """The forced `diff.ignoreSubmodules=all` (`gitlib.FORCED`) hides a
+    staged gitlink from a porcelain `diff --cached`: the commit script's own
+    questions say `--ignore-submodules=none` (`commit.is_staged_deletion`,
+    `commit.nothing_staged`)."""
+    from llm_agents.git import commit
+    work, _ = repo
+    head = gitlib.git(["rev-parse", "HEAD"], cwd=work).stdout.strip()
+    gitlib.git(["update-index", "--add", "--cacheinfo", f"160000,{head},sub"], cwd=work)
+    monkeypatch.chdir(work)
+    _pin(tmp_path)
+    assert not commit.nothing_staged(["sub"])
+    assert gitlib.git(["diff", "--cached", "--name-only"], cwd=work).stdout == ""  # the cost
+    gitlib.git(["commit", "--quiet", "-m", "gitlink"], cwd=work)
+    assert commit.nothing_staged(["sub"])
+    gitlib.git(["rm", "--quiet", "--cached", "sub"], cwd=work)
+    assert commit.is_staged_deletion("sub")
 
 
 def test_an_inherited_git_dir_does_not_redirect_the_pinned_git(repo, tmp_path, monkeypatch):

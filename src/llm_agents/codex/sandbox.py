@@ -22,6 +22,7 @@ from .commands import (  # noqa: F401 — split_shell/unwrap_shell re-exported
     CommandContext, path_refusal, pool_slot, resolve_path, shapes_text,
     split_shell, unwrap_shell, within, worker_command_refusal,
 )
+from .command_shell import Unparsed, Word, _segments, _words
 from .file_renewal import renew_file  # re-exported for edit-judge callers
 from .gates import escalate_pattern
 from .paths import host_root, scratch_dir
@@ -784,12 +785,15 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
         # or one the worker typed inside PowerShell's (review 2).
         if worker and _runs_cmd(command):
             return Verdict(False, f"{refusal}; {decline_tail}")
-        if pattern is not None and pattern.search(unwrap_shell(command)):
+        unliteral = literal_command_refusal(command) if pattern is not None else ""
+        if pattern is not None and not unliteral and pattern.search(unwrap_shell(command)):
             return Verdict(True, "matches the escalate rule")
         if automatic and cleanup_targets(command, cwd, workspace):
             return Verdict(True, "deletes the agent's own pytest directories")
         if worker:
             return Verdict(False, f"{refusal}; {decline_tail}")
+        if unliteral:
+            return Verdict(False, f"the escalate rule reads literal commands only: {unliteral}")
         return Verdict(False, f"does not match the escalate rule /{escalate}/")
 
     if commit_store is not None:
@@ -826,6 +830,51 @@ def _runs_cmd(command: str) -> bool:
             return False
         command = inner
     return True
+
+
+# Programs that run a command they are handed rather than being one: an
+# escalate regex matching `npm test` in their argument would grant whatever
+# they make of it (round 3 of 2432, Codex: `& $env:ComSpec /c 'npm test'`).
+# Lower-case, without `.exe`.
+_INDIRECT_PROGRAMS = frozenset({
+    ".", "invoke-expression", "iex", "invoke-command", "icm", "start-process",
+    "saps", "start", "start-job", "sajb", "start-threadjob", "invoke-item", "ii",
+    "powershell", "pwsh", "cmd", "bash", "sh", "zsh", "wsl", "env", "runas",
+    "wscript", "cscript", "mshta", "rundll32", "conhost", "forfiles"})
+
+
+def literal_command_refusal(command: str) -> str:
+    """Why `command` is no literal command line, or "": what the escalate
+    rule's regex may judge. Read through Codex's wrapper (`split_shell`)
+    into literal words (`command_shell._words`: no `$` expansion, no `&`
+    call operator, no `( )` expression), and no command — first word of
+    each `;`/`&&`/`||` segment and of each pipeline stage — that is an
+    `_INDIRECT_PROGRAMS` one, a nested shell included. Otherwise an
+    unanchored rule (`npm test`) matches a string some other program runs:
+    `& $env:ComSpec /c 'npm test'` names no `cmd` word for `_runs_cmd` and
+    no shape, and was granted (round 3 of 2432)."""
+    shell, inner = split_shell(command)
+    try:
+        tokens = _words(inner, shell)
+    except Unparsed as unparsed:
+        return str(unparsed)
+    segments = _segments(tokens)
+    if not segments:
+        return "an empty command"
+    for segment in segments:
+        stage_start = True
+        for token in segment:
+            if token == "|":
+                stage_start = True
+                continue
+            if not stage_start or not isinstance(token, Word):
+                continue
+            stage_start = False
+            program = re.split(r"[\\/]", token.value)[-1].lower()
+            program = program[:-4] if program.endswith(".exe") else program
+            if program in _INDIRECT_PROGRAMS:
+                return f"`{token.value}` runs a command it is handed"
+    return ""
 
 
 def _slot_admin(workspace: Path, roots: tuple[Path, ...]) -> tuple[Optional[Path], str]:
@@ -941,8 +990,16 @@ def sandbox_temp_dirs(record: AgentRecord) -> list[Path]:
     (`windows-sandbox-rs` `allow.rs`, `includes_tmp_env_vars_when_requested`;
     `$TMPDIR` elsewhere) unless `excludeTmpdirEnvVar`, which this wrapper
     never sends (`scratch_root`: workers' tools and pytest's default
-    `tmp_path` write there). Read from the bridge's own environment, which
-    the app-server and its commands inherit.
+    `tmp_path` write there). Codex takes them from the COMMAND's completed
+    environment (`windows-sandbox-rs` `resolved_permissions.rs`,
+    `resolve_workload_temp_paths`, read at 0.166.0), never the host's; this
+    reads the bridge's own, which the app-server inherits (`protocol.AppServer`
+    adds no TEMP/TMP) and passes on to a command as long as no
+    `shell_environment_policy` of the user's Codex config sets or drops
+    them — an assumption, not a check: that config is not the bridge's to
+    read, and a TEMP set there would be a root this list misses. A worker's
+    `$env:TEMP = ...` inside its command changes nothing: the roots are
+    fixed when the sandbox starts the command.
 
     Not one of `writable_roots` — the briefing does not offer them — but a
     place the worker can write all the same, so every "outside the writable

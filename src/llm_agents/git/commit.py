@@ -40,7 +40,6 @@ import os
 import random
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -117,12 +116,14 @@ def _lock_denied(stderr: str) -> bool:
 _LOCK_DEADLINE = time.monotonic() + LOCK_WAIT_S
 
 
-def run_indexing(args: list[str], identity: Optional[dict] = None) -> subprocess.CompletedProcess:
+def run_indexing(args: list[str], identity: Optional[dict] = None,
+                 input: Optional[str] = None) -> subprocess.CompletedProcess:
     """Run an index-taking git command, retrying while the index lock is held.
 
     Only the lock is retried — a real failure (bad pathspec, rejecting hook,
     nothing to commit) returns on the first try, as it should. Output is captured
     so it can be inspected, then replayed to the caller's streams unchanged.
+    `input` goes to git's stdin on every try.
     """
     # Do not rediscover the index after the identity check. Even a later
     # junction swap must never redirect a write into another repository.
@@ -130,7 +131,7 @@ def run_indexing(args: list[str], identity: Optional[dict] = None) -> subprocess
                 if identity is not None else args)
     delay = 0.2
     while True:
-        proc = git(git_args, capture_output=True)
+        proc = git(git_args, capture_output=True, input=input)
         stderr = proc.stderr or ""
         if proc.returncode != 0 and _lock_denied(stderr):
             print(f"error: `git {args[0]}` cannot write the index: creating its "
@@ -171,11 +172,31 @@ def is_staged_deletion(path: str) -> bool:
     pathspecs and Windows backslashes work as they do everywhere else.
     """
     # `--cached` asks no submodule's work tree (`gitlib.SKIP_SUBMODULES`), and
-    # that flag here would hide a staged gitlink deletion.
+    # `=none` overrides the forced `diff.ignoreSubmodules=all`
+    # (`gitlib.FORCED`), which would hide a staged gitlink deletion.
     staged = git(["diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only",
-                  "--diff-filter=D", "--", path],
+                  "--ignore-submodules=none", "--diff-filter=D", "--", path],
                  capture_output=True)
     return staged.returncode == 0 and bool(staged.stdout.strip())
+
+
+def nothing_staged(paths: list[str]) -> bool:
+    """True when the index holds no change of `paths` against HEAD (on an
+    unborn branch: no entry of them at all) — git's own "nothing to commit".
+
+    Asked before `commit` because git answers that case with a full
+    `status` (builtin/commit.c, whatever `-F` says), which asks every
+    checked-out submodule through the `<sub>/.git` the worker may have
+    re-pointed, and a worker's `.gitmodules` (`ignore = none`) beats the
+    forced `diff.ignoreSubmodules=all` there (`gitlib.FORCED`). `--cached`
+    reads no work tree; `=none` keeps a staged gitlink counted.
+    """
+    if git(["rev-parse", "--verify", "--quiet", "HEAD"], capture_output=True).returncode:
+        listed = git(["ls-files", "--cached", "-z", "--", *paths], capture_output=True)
+        return listed.returncode == 0 and not listed.stdout.strip("\0")
+    differs = git(["diff-index", "--cached", "--quiet", "--ignore-submodules=none",
+                   "HEAD", "--", *paths], capture_output=True)
+    return differs.returncode == 0
 
 
 def toplevel() -> Optional[Path]:
@@ -490,18 +511,23 @@ def main(host: Optional[CommitHost] = None) -> int:
                "re-stages them from the working tree)."):
         return 1
 
+    if nothing_staged(options.paths):
+        print("error: nothing to commit: the paths match HEAD.", file=sys.stderr)
+        return 1
+
     # Pathspec commit: only the listed paths are snapshotted, whatever else
     # happens to sit in the index stays staged for its own future commit.
-    with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", suffix=".txt", delete=False) as handle:
-        handle.write(message)
-        message_path = handle.name
-    try:
-        if refused(approved_identity_problems(expected), "nothing was committed."):
-            return 1
-        commit = run_indexing(["commit", "-F", message_path, "--", *options.paths], expected)
-    finally:
-        Path(message_path).unlink(missing_ok=True)
+    # The message goes on stdin, never through a file: %TEMP% is a writable
+    # root of a sandboxed worker (`sandbox.sandbox_temp_dirs`), which could
+    # rewrite a file there between its close and git's read (round 3 of 2432).
+    # Under the broker `--allow-empty`: `commit -- <paths>` re-reads the work
+    # tree, and a worker that reverts its file after `nothing_staged` must
+    # get an empty commit, not git's "nothing to commit" status.
+    if refused(approved_identity_problems(expected), "nothing was committed."):
+        return 1
+    commit = run_indexing(["commit", "-F", "-",
+                           *(["--allow-empty"] if expected is not None else []),
+                           "--", *options.paths], expected, input=message)
     if commit.returncode != 0:
         return commit.returncode
 

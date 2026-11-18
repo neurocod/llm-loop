@@ -67,7 +67,33 @@ NO_CWD_LOOKUP = {"NoDefaultCurrentDirectoryInExePath": "1"}
 # value for a program name and every patch-producing diff dies with 128
 # (measured 2026-11-18, Git for Windows 2.53); a diff the kit runs passes
 # `--no-ext-diff` instead.
-FORCED = ("core.fsmonitor=false", "core.editor=true", "sequence.editor=true")
+#
+# The last two keep git's INTERNAL status scans out of submodules, where a
+# command-line `SKIP_SUBMODULES` cannot reach (round 3 of 2432). Measured
+# 2026-11-18 (Git for Windows 2.53, a planted `<sub>/.git` whose config names
+# a clean filter, the submodule's file touched), plain git ran the filter in
+# `status`, `status --porcelain -uno`, `diff`, `diff-index HEAD`,
+# `diff-files`, `describe --dirty`, `commit -a`, `commit -e`, `commit` of an
+# unchanged path ("nothing to commit" prints a status, `-F` or not),
+# `stash` (dirty), `rebase --autostash` (dirty), `rebase -x 'git status'`
+# and `rebase --continue` after a conflict (the sequencer's commit edits the
+# message, and an editor commit writes a status template even when the editor
+# is `true`); it did not in the same with `--ignore-submodules`,
+# `diff --cached`, `log --stat`, `add`/`commit`/`stash push -- <file>`,
+# `reset --hard`, `checkout`, a plain `rebase`, `rebase --skip`/`--abort`,
+# `ls-files -u` or `submodule status`. `commit.status=false` drops the
+# editor commit's template (`commit -e`, `rebase --continue`), whatever the
+# worker's `.gitmodules` says. `diff.ignoreSubmodules=all` is the default of
+# every porcelain diff and status, the "nothing to commit" one included, but
+# only a default: a `submodule.<name>.ignore = none` in the worker's
+# `.gitmodules` beats it (measured), so `commit` of an unchanged path is
+# refused before git runs (`commit.nothing_staged`). Its cost: a porcelain
+# `diff --cached` no longer lists a staged gitlink change; one that must see
+# it says `--ignore-submodules=none`, which reads no submodule for
+# `--cached` (measured). A commit still takes a staged gitlink (measured).
+# These reach a hook's own git too (git hands `-c` to its children).
+FORCED = ("core.fsmonitor=false", "core.editor=true", "sequence.editor=true",
+          "commit.status=false", "diff.ignoreSubmodules=all")
 
 # For every `status` and `diff` a broker runs over a working tree. The
 # binding (`Repository`) holds for the git it is given to, not for the git
@@ -178,6 +204,7 @@ def git(args: list[str], *, cwd: Union[str, Path, None] = None,
         encoding: Optional[str] = "utf-8", errors: Optional[str] = None,
         terminal_prompt: Optional[bool] = None,
         failure: Literal["raise", "exit", "command"] = "raise",
+        input: Optional[str] = None,
         ) -> subprocess.CompletedProcess:
     """Run Git arguments (without the executable) and return CompletedProcess.
 
@@ -202,6 +229,7 @@ def git(args: list[str], *, cwd: Union[str, Path, None] = None,
     TimeoutExpired into Fail even when check=False, so a timed-out automatic
     push can report a warning while keeping its local result. Capture can be
     disabled for commands whose output belongs directly on the console.
+    `input` is written to git's stdin (`commit -F -`).
     """
     env = None if terminal_prompt is None else {
         **os.environ, "GIT_TERMINAL_PROMPT": "1" if terminal_prompt else "0",
@@ -214,7 +242,7 @@ def git(args: list[str], *, cwd: Union[str, Path, None] = None,
         proc = subprocess.run(
             [*_program(), *args], cwd=str(cwd) if cwd else None, env=env,
             capture_output=capture_output, text=text, encoding=encoding,
-            errors=errors, timeout=timeout,
+            errors=errors, timeout=timeout, input=input,
         )
     except subprocess.TimeoutExpired:
         if failure == "exit":

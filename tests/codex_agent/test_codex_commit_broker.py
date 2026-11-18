@@ -182,6 +182,26 @@ def test_a_cmd_inside_powershell_is_refused_over_the_escalate_rule(tmp_path, mon
         assert verdict and verdict.reason == "matches the escalate rule", (command, verdict.reason)
 
 
+@pytest.mark.parametrize("role", ["worker", "reviewer"])
+def test_an_indirect_invocation_is_refused_over_the_escalate_rule(tmp_path, monkeypatch, role):
+    """Round 3 of 2432 (Codex): `& $env:ComSpec /c 'npm test'` names no
+    `cmd` word, so the final cmd refusal missed it and an unanchored rule
+    granted cmd running whatever npm.cmd the cwd holds. The rule now reads
+    literal command lines only (`sandbox.literal_command_refusal`)."""
+    _, ask = worker_judge(tmp_path, monkeypatch, escalate=r"npm test", role=role)
+    for command in ("& $env:ComSpec /c 'npm test'", "$c = 'npm test'; & $c",
+                    "Invoke-Expression 'npm test'", "iex 'npm test'",
+                    "Start-Process npm -ArgumentList 'npm test'",
+                    "pwsh -Command 'npm test'", "bash -c 'npm test'",
+                    "echo x | iex 'npm test'", ". ./setup.ps1; npm test",
+                    "& (Get-Command npm) test; npm test"):
+        verdict = ask(command)
+        assert not verdict, (command, verdict.reason)
+    for command in ("npm test", "npm test 2>&1 | Select-Object -Last 40"):
+        verdict = ask(command)
+        assert verdict and verdict.reason == "matches the escalate rule", (command, verdict.reason)
+
+
 def test_the_broker_starts_only_as_python_typed_plainly(tmp_path, monkeypatch):
     """`argv_refusal` drops a program suffix to find the shape; the broker
     launch judges the word as typed: `python.cmd` is a script PowerShell
@@ -551,3 +571,59 @@ def test_a_commit_runs_no_filter_a_submodule_s_git_file_names(tmp_path, monkeypa
     assert not marker.exists(), done.stdout + done.stderr
     git_in(slot, "status", "--short")
     assert marker.exists()  # the control: a plain status runs it
+
+
+def test_a_commit_of_an_unchanged_path_runs_no_submodule_filter(tmp_path, monkeypatch):
+    """Round 3 of 2432: git answers "nothing to commit" with a full status,
+    `-F` or not, and a worker's `.gitmodules` `ignore = none` beats the
+    forced `diff.ignoreSubmodules=all` there. The broker refuses before git
+    runs (`commit.nothing_staged`)."""
+    slot, sub, _ = slot_with_submodule(tmp_path)
+    main = tmp_path / "main"
+    git_in(main, "config", "user.name", "t")
+    git_in(main, "config", "user.email", "t@example.invalid")
+    git_in(slot, "commit", "--quiet", "-m", "fixture")
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    git_in(slot, "config", "--file", ".gitmodules", "submodule.vendor.ignore", "none")
+    git_in(slot, "commit", "--quiet", "-m", "worker's gitmodules", "--", ".gitmodules")
+    marker = nested_filter(tmp_path, sub)
+    message = _message(tmp_path)
+    _granted(ask, f"{RUN} -F {message} src/a.ts")
+    done = _commit(ask, slot, "-F", str(message), "src/a.ts")
+    assert done.returncode == 1 and "nothing to commit" in done.stderr, done.stdout + done.stderr
+    assert not marker.exists(), done.stdout + done.stderr
+    # The control: the forced settings alone do not stop git's own answer.
+    plain = subprocess.run(
+        ["git", "-c", "diff.ignoreSubmodules=all", "-c", "commit.status=false", "-C", str(slot),
+         "commit", "-m", "x", "--", "src/a.ts"], capture_output=True, text=True, timeout=_TIMEOUT_S)
+    assert plain.returncode == 1, plain.stdout + plain.stderr
+    assert marker.exists()
+
+
+def test_the_message_reaches_git_on_stdin_not_through_a_temp_file(tmp_path, monkeypatch):
+    """Round 3 of 2432: the broker wrote the approved message to a file in
+    %TEMP% — a root the worker writes — and closed it before git read it,
+    so a racing worker could change the committed text. The pinned git is
+    a recording wrapper: `commit -F -`, and no file appears in TEMP."""
+    if os.name != "nt":
+        pytest.skip("a .cmd wrapper")
+    slot, _ = _slot(tmp_path)
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    grant = commit_broker.Grant.from_env(ask.environment[commit_broker.ENV])
+    log = tmp_path / "pinned.txt"
+    wrapper = tmp_path / "pinned-git.cmd"
+    wrapper.write_text(f"@echo %*>>\"{log}\"\n@\"{grant.git}\" %*\n", encoding="utf-8")
+    temp = tmp_path / "broker-temp"
+    temp.mkdir()
+    env = {**ask.environment, commit_broker.ENV: replace(grant, git=wrapper).to_env(),
+           "TEMP": str(temp), "TMP": str(temp)}
+    (slot / "src/a.ts").write_text("work\n", encoding="utf-8")
+    message = _message(tmp_path)
+    _granted(ask, f"{RUN} -F {message} src/a.ts")
+    done = _commit(ask, slot, "-F", str(message), "src/a.ts", environment=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _head_message(slot).strip() == "Slot work"
+    commits = [line for line in log.read_text(encoding="utf-8").splitlines()
+               if " commit " in f" {line} "]
+    assert commits and all(" -F - " in line for line in commits), commits
+    assert list(temp.iterdir()) == []

@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -283,6 +284,57 @@ def test_status_and_diff_run_no_filter_a_submodule_s_git_file_names(tmp_path, mo
         assert not marker.exists(), request
     _plain_git(slot, "diff", "--name-only")
     assert marker.exists()  # the control: a plain diff runs it
+
+
+def _touch(path: Path, ahead_s: float) -> None:
+    later = time.time() + ahead_s
+    os.utime(path, (later, later))
+
+
+def test_a_resumed_rebase_runs_no_filter_a_submodule_s_git_file_names(tmp_path, monkeypatch):
+    """Round 3 of 2432: `rebase --continue` after a conflict commits with an
+    editor, and an editor commit writes a status template that asks every
+    submodule through its `<sub>/.git` — the command-line
+    `SKIP_SUBMODULES` cannot reach git's internal status
+    (`gitlib.FORCED`). `start`'s status check, `add` and `continue` run
+    no planted filter; the control is plain git's same resume."""
+    slot, sub, _ = slot_with_submodule(tmp_path)
+    main = tmp_path / "main"
+    for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"),
+                       ("core.editor", "false")):
+        git_in(main, "config", key, value)
+    # The worker's `.gitmodules` beats a configured `diff.ignoreSubmodules`.
+    git_in(slot, "config", "--file", ".gitmodules", "submodule.vendor.ignore", "none")
+    git_in(slot, "add", ".gitmodules")
+    git_in(slot, "commit", "--quiet", "-m", "fixture")
+    git_in(main, "branch", "trunk", git_in(slot, "rev-parse", "HEAD").stdout.strip())
+    (slot / "app/src/b.ts").write_text("slot\n", encoding="utf-8")
+    git_in(slot, "commit", "--quiet", "-am", "slot work")
+    _trunk_commit(tmp_path, lambda m: (m / "app/src/b.ts").write_text("trunk\n", encoding="utf-8"))
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    marker = nested_filter(tmp_path, sub)
+    started = _broker(ask, slot, "start")
+    assert started.returncode != 0 and "CONFLICT" in started.stdout + started.stderr, (
+        started.stdout + started.stderr)
+    assert not marker.exists(), "start"
+    (slot / "app/src/b.ts").write_text("resolved\n", encoding="utf-8")
+    _touch(sub / "work.txt", 20)
+    for request in (["add", "app/src/b.ts"], ["continue"]):
+        _granted(ask, f"{RUN} {' '.join(request)}")
+        done = _broker(ask, slot, *request)
+        assert done.returncode == 0, (request, done.stdout + done.stderr)
+        assert not marker.exists(), request
+    assert git_in(slot, "show", "HEAD:app/src/b.ts").stdout == "resolved\n"
+    # The control: plain git's same resume runs the filter.
+    git_in(slot, "reset", "--quiet", "--hard", "ORIG_HEAD")
+    assert _plain_git(slot, "rebase", "trunk").returncode != 0
+    (slot / "app/src/b.ts").write_text("resolved\n", encoding="utf-8")
+    git_in(slot, "add", "app/src/b.ts")
+    marker.unlink(missing_ok=True)
+    _touch(sub / "work.txt", 30)
+    resumed = _plain_git(slot, "rebase", "--continue")
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert marker.exists()
 
 
 def test_the_broker_ignores_update_refs_and_autostash_config(tmp_path, monkeypatch):
