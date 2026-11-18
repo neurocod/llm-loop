@@ -15,9 +15,10 @@ live with the kit's commit script, which is the `commit.py` its messages name.
 import hashlib
 import json
 import os
-import subprocess
 from pathlib import Path
 from typing import Optional
+
+from ..gitlib import git
 
 
 ENV = "CODEX_COMMIT_APPROVAL_STORE"
@@ -39,10 +40,9 @@ def approved_invocation(args: list[str]) -> Optional[dict]:
     config = json.loads(setting)
     workspace = Path(config["workspace"]).resolve()
     directory = Path(config["directory"]).resolve()
-    result = subprocess.run(
-        ["git", "-C", str(workspace), "rev-parse", "--absolute-git-dir"],
-        capture_output=True, text=True, encoding="utf-8",
-    )
+    # Through gitlib: under the commit broker that is the bridge's pinned git.
+    result = git(["-C", str(workspace), "rev-parse", "--absolute-git-dir"],
+                 check=False)
     admin = Path(result.stdout.strip()).resolve()
     # The inherited workspace must contain this invocation, and only its
     # linked-worktree admin directory can hold approvals outside worker writes.

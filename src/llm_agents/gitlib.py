@@ -29,6 +29,32 @@ class Fail(SystemExit):
 PUSH_TIMEOUT_S = 120
 
 
+# The git a broker process runs instead of `git` by name (`pin`): (absolute
+# executable, `-c` settings forced before every command's own arguments).
+_pinned: Optional[tuple[str, tuple[str, ...]]] = None
+
+
+def pin(executable: Union[str, Path], forced: tuple[str, ...] = ()) -> None:
+    """Run every later `git` of this process as `executable` with each of
+    `forced` as a `-c` setting, in an environment without `GIT_*`.
+
+    For a process started for one job outside a sandbox (the commit broker,
+    `llm_agents.git.commit_broker`): `git` by name is whatever comes first
+    in the search order, and the inherited `GIT_*` (GIT_DIR, GIT_CONFIG_*,
+    GIT_EXEC_PATH...) redirect or widen what it does. Process-wide on
+    purpose: the commit script, its gitlink check and the host's checks all
+    run git through `git` below, and none of them may slip past the pin."""
+    global _pinned
+    _pinned = (str(executable), tuple(forced))
+
+
+def _program() -> list[str]:
+    if _pinned is None:
+        return ["git"]
+    executable, forced = _pinned
+    return [executable, *(part for setting in forced for part in ("-c", setting))]
+
+
 def git(args: list[str], *, cwd: Union[str, Path, None] = None,
         check: bool = True, timeout: Optional[float] = None,
         capture_output: bool = True, text: bool = True,
@@ -63,9 +89,12 @@ def git(args: list[str], *, cwd: Union[str, Path, None] = None,
     env = None if terminal_prompt is None else {
         **os.environ, "GIT_TERMINAL_PROMPT": "1" if terminal_prompt else "0",
     }
+    if _pinned is not None:
+        env = {key: value for key, value in (env or os.environ).items()
+               if not key.upper().startswith("GIT_") or key == "GIT_TERMINAL_PROMPT"}
     try:
         proc = subprocess.run(
-            ["git", *args], cwd=str(cwd) if cwd else None, env=env,
+            [*_program(), *args], cwd=str(cwd) if cwd else None, env=env,
             capture_output=capture_output, text=text, encoding=encoding,
             errors=errors, timeout=timeout,
         )

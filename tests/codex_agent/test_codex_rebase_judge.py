@@ -183,7 +183,10 @@ def test_a_git_inside_the_writable_roots_is_never_the_trusted_one(tmp_path, monk
         assert broker.trusted_git((), f"{shim}{os.pathsep}{real}")[0] == real / name
     monkeypatch.setenv("PATH", f"{slot}{os.pathsep}{os.environ['PATH']}")
     ask = commit_judge(tmp_path, monkeypatch, slot)
-    _declined(ask, f"{RUN} start", "lies in a writable root")
+    # No grant at all; the launch is refused first, on the same PATH entry
+    # (`command_brokers.trusted_python`).
+    assert broker.ENV not in ask.environment
+    _declined(ask, f"{RUN} start", "lies in your writable roots")
 
 
 def test_a_slot_worker_is_told_the_broker_operations(tmp_path, monkeypatch):

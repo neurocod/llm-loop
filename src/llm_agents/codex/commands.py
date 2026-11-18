@@ -15,10 +15,15 @@ shares). It does not defend against a worker crafting an evasion. Accepted
 residuals the judge does not read: npm's `.npmrc` and environment
 configuration (`script-shell` and the like), `PYTEST_ADDOPTS` and ini files,
 the contents of response files (for the programs whose `@` is not refused
-outright), side effects inside node/tsx script bodies, the git hooks a
-slot's commit runs (`core.hooksPath` is the tree's own `.githooks/`, as
-every listed script is the tree's own file), and what the host names as its
-own residuals beside its table.
+outright), side effects inside node/tsx script bodies, the host's listed
+scripts themselves (each is a file of the tree the worker edits, run by a
+`python`/`node` looked up by name), and what the host names as its own
+residuals beside its table.
+
+Git is the exception, and not cooperative: a worker's rebase and commit run
+only through the brokers of the bridge's own checkout (`command_brokers`:
+`python -I <literal path>`, a pinned interpreter, a pinned git, hooks from
+the bridge's side), never through a script or hooks of the worker's tree.
 
 Operator's decision 2026-11-03 (after both reviews of the denylist that
 preceded this): a worker's command leaves the sandbox only when every

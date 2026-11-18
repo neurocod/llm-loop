@@ -11,7 +11,7 @@ import os
 import pytest
 
 from llm_agents.codex.testing import wire
-from llm_agents.codex import roles, sandbox
+from llm_agents.codex import command_commit, roles, sandbox
 from llm_agents.codex.registry import AgentRecord
 from llm_agents.codex.store import AgentStore
 from core_judge_support import (
@@ -19,6 +19,9 @@ from core_judge_support import (
     worker_judge, worker_tree)
 
 windows = pytest.mark.skipif(os.name != "nt", reason="Windows junction")
+
+# The one spelling of the commit broker the judge grants (`command_brokers`).
+RUN = f"python -I {command_commit.BROKER}"
 
 
 def _declined(ask, command, reason, **where):
@@ -204,13 +207,13 @@ def test_a_worker_commits_named_paths_in_its_pool_slot(tmp_path, monkeypatch):
     extra.mkdir()
     ask = commit_judge(tmp_path, monkeypatch, slot, writable=[str(extra)])
     message = tmp_path / "scratch" / "msg.txt"
-    for command in [f"python tools/git/commit.py -F {message} src/a.ts",
-                    f"python tools/git/commit.py --file {extra / 'm.txt'} src/a.ts src/gone.ts",
-                    "python tools/git/commit.py -m 'subject' -m '- bullet' src/a.ts",
-                    f"python tools/git/commit.py -F {message} -- src/a.ts",
-                    f"python tools/git/commit.py -F {message} app/src tools/git"]:
+    for command in [f"{RUN} -F {message} src/a.ts",
+                    f"{RUN} --file {extra / 'm.txt'} src/a.ts src/gone.ts",
+                    f"{RUN} -m 'subject' -m '- bullet' src/a.ts",
+                    f"{RUN} -F {message} -- src/a.ts",
+                    f"{RUN} -F {message} app/src tools/git"]:
         _granted(ask, command)
-    assert ask(f"python ../tools/git/commit.py -C .. -F {message} src/a.ts", cwd=slot / "src")
+    assert ask(f"{RUN} -C .. -F {message} src/a.ts", cwd=slot / "src")
     sibling = pool_slot(tmp_path, "main-wt2")
     untracked = slot / "notes" / "vault" / "u.txt"
     untracked.parent.mkdir(parents=True)
@@ -218,24 +221,24 @@ def test_a_worker_commits_named_paths_in_its_pool_slot(tmp_path, monkeypatch):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     for command, reason in {
-        f"python tools/git/commit.py -F {elsewhere / 'msg.txt'} src/a.ts":
+        f"{RUN} -F {elsewhere / 'msg.txt'} src/a.ts":
             "outside your writable roots",
-        "python tools/git/commit.py -F src/a.ts app/src/b.ts": "outside the tree",
-        f"python tools/git/commit.py -C {sibling} -F {message} src/a.ts":
+        f"{RUN} -F src/a.ts app/src/b.ts": "outside the tree",
+        f"{RUN} -C {sibling} -F {message} src/a.ts":
             "outside your writable roots",
-        f"python tools/git/commit.py -F {message} vault/k.txt": "vault/",
-        f"python tools/git/commit.py -F {message} .": "the whole tree",
-        f"python tools/git/commit.py -F {message} app": "holds app/vault/y.txt",
-        f"python tools/git/commit.py -F {message} docs": "holds docs/vault/z.txt",
-        f"python tools/git/commit.py -F {message} notes": "holds notes/vault/u.txt",
-        f"python tools/git/commit.py -F {message} lib": f"submodule {SUBMODULE}",
-        f"python tools/git/commit.py -F {message} ':/'": "pathspec magic",
-        f"python tools/git/commit.py -F {message} 'src/*.ts'": "wildcard",
-        f"python tools/git/commit.py --amend -F {message} src/a.ts": "commit.py option --amend",
-        f"python tools/git/commit.py -F{message} src/a.ts": "glued",
-        f"python tools/git/commit.py src/a.ts -F {message}": "options go before the paths",
-        f"python tools/git/commit.py -F {message}": "no paths",
-        "python tools/git/commit.py -m -x src/a.ts": "-m with no value",
+        f"{RUN} -F {message} vault/k.txt": "vault/",
+        f"{RUN} -F {message} .": "the whole tree",
+        f"{RUN} -F {message} app": "holds app/vault/y.txt",
+        f"{RUN} -F {message} docs": "holds docs/vault/z.txt",
+        f"{RUN} -F {message} notes": "holds notes/vault/u.txt",
+        f"{RUN} -F {message} lib": f"submodule {SUBMODULE}",
+        f"{RUN} -F {message} ':/'": "pathspec magic",
+        f"{RUN} -F {message} 'src/*.ts'": "wildcard",
+        f"{RUN} --amend -F {message} src/a.ts": "commit.py option --amend",
+        f"{RUN} -F{message} src/a.ts": "glued",
+        f"{RUN} src/a.ts -F {message}": "options go before the paths",
+        f"{RUN} -F {message}": "no paths",
+        f"{RUN} -m -x src/a.ts": "-m with no value",
     }.items():
         _declined(ask, command, reason)
 
@@ -243,7 +246,7 @@ def test_a_worker_commits_named_paths_in_its_pool_slot(tmp_path, monkeypatch):
 def test_commit_is_declined_outside_a_pool_slot(tmp_path, monkeypatch):
     work = pool_slot(tmp_path, "review-tree")
     ask = commit_judge(tmp_path, monkeypatch, work)
-    _declined(ask, f"python tools/git/commit.py -F {tmp_path / 'scratch' / 'm.txt'} src/a.ts",
+    _declined(ask, f"{RUN} -F {tmp_path / 'scratch' / 'm.txt'} src/a.ts",
               "only in a pool slot")
 
 
@@ -252,21 +255,21 @@ def test_commit_in_the_slot_s_own_declared_submodule_only(tmp_path, monkeypatch)
     ask = commit_judge(tmp_path, monkeypatch, slot)
     msg = tmp_path / "scratch" / "msg.txt"
     for target in (f"-C {sub}", f"--cwd={SUBMODULE}"):
-        verdict = ask(f"python tools/git/commit.py {target} -F {msg} work.txt")
+        verdict = ask(f"{RUN} {target} -F {msg} work.txt")
         assert verdict, verdict.reason
-    _declined(ask, f"python tools/git/commit.py -C {sub} -F {msg} .", "whole tree")
+    _declined(ask, f"{RUN} -C {sub} -F {msg} .", "whole tree")
     (sub / "src" / "vault").mkdir(parents=True)
     (sub / "src" / "vault" / "x.txt").write_text("", encoding="utf-8")
-    _declined(ask, f"python tools/git/commit.py -C {sub} -F {msg} src", "holds src/vault/x.txt")
+    _declined(ask, f"{RUN} -C {sub} -F {msg} src", "holds src/vault/x.txt")
     plain = slot / "unlisted"
     plain.mkdir()
     git_in(plain, "init", "--quiet")
-    _declined(ask, f"python tools/git/commit.py -C {plain} -F {msg} work.txt",
+    _declined(ask, f"{RUN} -C {plain} -F {msg} work.txt",
               "not a declared submodule")
     other = pool_slot(tmp_path, "main-wt2")
     git_in(other, "-c", "protocol.file.allow=always", "submodule", "add",
            "--name", "vendor", str(source), SUBMODULE)
-    _declined(ask, f"python tools/git/commit.py -C {other / SUBMODULE} -F {msg} work.txt",
+    _declined(ask, f"{RUN} -C {other / SUBMODULE} -F {msg} work.txt",
               "another slot's submodule")
 
 
@@ -337,6 +340,7 @@ def test_a_commit_is_judged_on_the_wire(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox, "scratch_dir", lambda name: tmp_path / "scratch")
     monkeypatch.setenv("FAKE_SLOT", str(slot))
     monkeypatch.setenv("FAKE_SCRATCH", str(tmp_path / "scratch"))
+    monkeypatch.setenv("FAKE_COMMIT_BROKER", str(command_commit.BROKER))
     outcome = wire.run_fake_turn(tmp_path, monkeypatch, "commit", timeout=15.0,
                              sandbox="workspace-write", role="worker", expect="", cwd=slot)
     assert outcome.text.startswith("commit handled")
@@ -345,4 +349,5 @@ def test_a_commit_is_judged_on_the_wire(tmp_path, monkeypatch):
             for request in range(9301, 9305)} == {
         9301: "accept", 9302: "decline", 9303: "decline", 9304: "decline"}
     briefing = wire.first_request(tmp_path, "thread/start")["params"]["developerInstructions"]
-    assert "commit with tools/git/commit.py, the message file in your scratch" in briefing
+    assert (f"commit with `python -I {command_commit.BROKER.as_posix()} -F <file> "
+            f"<paths>`, the message file in your scratch") in briefing

@@ -109,11 +109,18 @@ class HostPolicy:
     # Extra lines of the worker's role briefing, before the edit rule.
     worker_lines: tuple[str, ...] = ()
     # How a worker in a pool slot is told to commit: (where the message file
-    # goes, the worker's model) -> text. None: workers are not told to commit.
-    commit_briefing: Optional[Callable[[str, str], str]] = None
-    # How a refusal of the commit judge names the host's stand-in of the git
-    # kit's commit script and its worktree pool (`codex.command_commit`).
-    commit_script: str = "commit.py"
+    # goes, the worker's model, the command that starts the commit broker)
+    # -> text. None: workers are not told to commit, and the commit broker
+    # is not granted (`codex.command_commit`).
+    commit_briefing: Optional[Callable[[str, str, str], str]] = None
+    # The hooks folder a worker's commit in its slot's own tree runs, relative
+    # to the host ROOT (the bridge's checkout, never the slot's copy the
+    # worker edits); "": none. A commit inside a submodule runs none.
+    commit_hooks: str = ""
+    # The host's `llm_agents.git.commit.CommitHost` the commit broker runs
+    # with, as `<file relative to the ROOT>:<attribute>`; "": the kit's EMPTY.
+    commit_host: str = ""
+    # How refusals name the host's worktree pool command.
     pool_script: str = "llm_agents.git.worktree"
     # The pool's main branch (the git kit's `PoolHost.main_branch`, which the
     # host hands over rather than copies): the one upstream a worker may

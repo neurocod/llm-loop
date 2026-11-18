@@ -724,20 +724,24 @@ def run_turn():
              'powershell.exe" -Command \'node -e "console.log(1)"\''})
         item({"type": "agentMessage", "text": "escalation handled"})
     elif SCENARIO == "commit":
-        # A worker in a pool slot commits its own work through commit.py.
+        # A worker in a pool slot commits its own work through the commit
+        # broker of the bridge's checkout (its path: FAKE_COMMIT_BROKER; this
+        # file runs from a copy in the test's directory).
         slot = os.environ["FAKE_SLOT"]
         approval_store = json.loads(os.environ["CODEX_COMMIT_APPROVAL_STORE"])
         assert approval_store["workspace"] == slot
         assert os.path.isdir(approval_store["directory"])
+        assert json.loads(os.environ["LLM_AGENTS_COMMIT_BROKER"])["git"]
+        run = f"python -I {os.environ['FAKE_COMMIT_BROKER']}"
         message = os.path.join(os.environ["FAKE_SCRATCH"], "msg.txt")
         elsewhere = os.path.join(os.path.dirname(WORK), "elsewhere", "msg.txt")
         wrap = ('"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\'
                 'powershell.exe" -Command \'{}\'')
         for request_id, words in (
-                (9301, f"python tools/git/commit.py -F {message} src/a.ts"),
-                (9302, f"python tools/git/commit.py -F {message} ."),
-                (9303, f"python tools/git/commit.py -F {elsewhere} src/a.ts"),
-                (9304, f"python tools/git/commit.py --amend -F {message} src/a.ts")):
+                (9301, f"{run} -F {message} src/a.ts"),
+                (9302, f"{run} -F {message} ."),
+                (9303, f"{run} -F {elsewhere} src/a.ts"),
+                (9304, f"{run} --amend -F {message} src/a.ts")):
             ask(request_id, "item/commandExecution/requestApproval",
                 {"itemId": f"c{request_id}", "cwd": slot,
                  "command": wrap.format(words)})

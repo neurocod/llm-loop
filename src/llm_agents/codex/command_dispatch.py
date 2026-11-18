@@ -4,8 +4,9 @@ The shapes themselves — which programs, judged how — are the host's
 (`HostPolicy.commands.shapes`, read off `CommandContext.policy`); the judges a
 host builds them from are command_node.py, command_python.py and
 command_commit.py, each handed `argv_refusal` for the commands it runs in turn
-(command_python.py also judges the bridge's own rebase broker,
-command_rebase.py).
+(command_python.py also starts the bridge's own brokers, command_brokers.py:
+the rebase broker of command_rebase.py, the commit broker of
+command_commit.py).
 """
 
 from __future__ import annotations
@@ -160,11 +161,19 @@ def worker_command_refusal(command: str, cwd: Path,
     (`path_refusal`, resolved against `cwd` or the command's own
     `--prefix`/`--cwd`), and whatever else the host's judges hold it to.
     Anything else is a "no": a cmdlet, git, a nested shell, an operator the
-    reader does not follow — and, under the empty policy, every program.
+    reader does not follow, a command Codex wrapped in cmd — and, under the
+    empty policy, every program.
     What it guards against, and what not, is the commands.py docstring's trust
     model.
     """
     shell, inner = split_shell(command)
+    if shell == "cmd":
+        # cmd looks a program up in the working directory before the PATH,
+        # so `python`/`npm` there is whatever `python.cmd`/`npm.bat` the
+        # worker left in its tree (item 2432). PowerShell does not.
+        return ("a command wrapped in cmd, which runs a program planted in "
+                "the working directory before the PATH's; request it under "
+                "PowerShell")
     try:
         tokens = _words(inner, shell)
     except Unparsed as unparsed:

@@ -41,7 +41,7 @@ TEST_POLICY = HostPolicy(
     protected_parts=GIT_STORE + (("vault",),),
     gate_cwd=lambda command, project: project / "sub",
     worker_lines=("Test host line.",),
-    commit_briefing=lambda where, model: f"commit with the test tool into {where}.",
+    commit_briefing=lambda where, model, run: f"commit with the test tool into {where}.",
     counter_exes=("bin/counter.exe",),
 )
 

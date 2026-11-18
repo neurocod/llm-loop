@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from typing import Optional
+from ..git.commit_broker import Grant as CommitGrant
 from ..git.rebase import Grant
 from ..host_policy import EMPTY, HostPolicy
 from .command_paths import (
@@ -38,6 +39,12 @@ class CommandContext:
     # or None and why not (`command_rebase._rebase_broker`).
     rebase: Optional[Grant] = None
     rebase_refusal: str = ""
+    # The commit broker's facts, or None and why not (`command_commit._commit`).
+    commit: Optional[CommitGrant] = None
+    commit_refusal: str = ""
+    # The absolute git the bridge pinned (`rebase.trusted_git`) for the
+    # judges' own git questions (`command_commit._judge_git`).
+    git: Optional[Path] = None
     policy: HostPolicy = EMPTY
     host_flags: frozenset[str] = frozenset()
 

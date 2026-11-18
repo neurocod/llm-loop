@@ -27,8 +27,9 @@ from .gates import escalate_pattern
 from .paths import host_root, scratch_dir
 from .registry import AgentRecord
 from .roles import role_briefing
-from .command_commit import _git_admin
+from .command_commit import BROKER as COMMIT_BROKER, _git_admin
 from .command_rebase import BROKER
+from ..git import commit_broker
 from ..git import rebase as rebase_broker
 from ..git.commit_identity import ENV as COMMIT_APPROVAL_ENV
 from ..host_policy import EMPTY as EMPTY_POLICY
@@ -300,10 +301,11 @@ def _worktree_fact(workspace: Path,
     `commit_roots` (the writable roots outside the tree, scratch first) is
     given when the agent may commit here — a worker that escalates by
     allowlist in a pool slot, on a host that names how (`commit_briefed`):
-    it commits through the host's commit command outside the sandbox
-    (`command_commit._commit` judges the git kit's commit.py), with its message
-    file in one of these roots, since commit.py deletes it; the words are
-    the host's `HostPolicy.commit_briefing`.
+    it commits through the commit broker outside the sandbox
+    (`command_commit._commit` judges commit.py's arguments), started as
+    `python -I <the broker's literal path>`, with its message file in one
+    of these roots, since commit.py deletes it; the words are the host's
+    `HostPolicy.commit_briefing`.
 
     `model` is the spawn's persisted AgentRecord.model, also used on resume;
     the orchestrator's model must not receive credit for the worker's commit.
@@ -327,7 +329,9 @@ def _worktree_fact(workspace: Path,
     if writable:
         where += (" or a --writable directory ("
                   + ", ".join(str(root) for root in writable) + ")")
-    return (head + host_policy().commit_briefing(where, model)
+    # The one spelling the judge accepts (`command_brokers`).
+    run = f"python -I {COMMIT_BROKER.as_posix()}"
+    return (head + host_policy().commit_briefing(where, model, run)
             + _rebase_fact(workspace, host_policy().main_branch))
 
 
@@ -339,7 +343,7 @@ def _rebase_fact(workspace: Path, main: str) -> str:
     reports only "rejected")."""
     if not main:
         return ""
-    # The one spelling the judge accepts (`command_rebase.broker_script`,
+    # The one spelling the judge accepts (`command_brokers.broker_script`,
     # `broker_launch_refusal`): isolated, the bridge's own path, literally.
     run = f"python -I {BROKER.as_posix()}"
     return (
@@ -409,7 +413,8 @@ def _worker_escalation_briefing(record: AgentRecord, extra: str) -> str:
         f"`Select-String` are read through. It declines everything else: git "
         f"and every cmdlet (`Set-Content`, `Copy-Item`, `Remove-Item`"
         + (f" but your own {', '.join(sorted(CLEANUP_DIRS))}" if _automatic() else "")
-        + f"), `node -e`, `python -c`, "
+        + f"), any command run under cmd rather than PowerShell, `node -e`, "
+        f"`python -c`, "
         f"{policy.commands.reserved.text(record)}, and any `$`, backtick, `&`, "
         f"parentheses, braces, `@`, `,` or wildcard outside quotes. A declined "
         f"escalation is that rule, not a person's answer: do not ask for "
@@ -727,14 +732,28 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
                                                dir=_git_admin(workspace))
                     if worker and pool_slot(workspace) else None)
     policy = host_policy()
-    grant, grant_refusal, broker_store = _rebase_grant(
-        workspace, roots, policy.main_branch if commit_store else "")
+    git, git_refusal = (rebase_broker.trusted_git(roots) if commit_store
+                        else (None, "not a worker in a pool slot"))
+    # The brokers' empty hooks folder, beside the approvals: outside every
+    # writable root, so the worker can plant no hook in it.
+    broker_store = (tempfile.TemporaryDirectory(prefix="brokers-",
+                                               dir=_git_admin(workspace))
+                    if commit_store else None)
+    no_hooks = Path(broker_store.name) / "no-hooks" if broker_store else None
+    if no_hooks is not None:
+        no_hooks.mkdir()
+    grant, grant_refusal = _rebase_grant(
+        workspace, roots, policy.main_branch if commit_store else "",
+        git, git_refusal, no_hooks)
+    commit_grant, commit_refusal = _commit_grant(
+        roots, policy, git, git_refusal, no_hooks)
     context = CommandContext(
         workspace=workspace, roots=roots,
         scratch=scratch.resolve() if scratch is not None else None,
         allow_online_probes=record.allow_online_probes,
         commit_approvals=Path(commit_store.name) if commit_store else None,
         rebase=grant, rebase_refusal=grant_refusal,
+        commit=commit_grant, commit_refusal=commit_refusal, git=git,
         policy=policy, host_flags=policy.commands.flags(roots))
     decline_tail = worker_decline_tail()
     automatic = _automatic()
@@ -768,35 +787,65 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
             "workspace": str(workspace), "directory": commit_store.name})}
         if grant is not None:
             judge.environment[rebase_broker.ENV] = grant.to_env()
+        if commit_grant is not None:
+            judge.environment[commit_broker.ENV] = commit_grant.to_env()
 
         def close() -> None:
             commit_store.cleanup()
-            if broker_store is not None:
-                broker_store.cleanup()
+            broker_store.cleanup()
         judge.close = close
     return judge
 
 
-def _rebase_grant(workspace: Path, roots: tuple[Path, ...], main: str):
-    """(grant, why not, its store) of the rebase broker for a worker in a pool
-    slot on a host naming `main`: the git the bridge's own PATH names
-    (`rebase.trusted_git`, never one inside the worker's roots) and an empty
-    hooks folder in a store under the slot's git admin directory — outside
-    every writable root, so the worker can plant no hook in it. The broker's
-    file itself must lie outside the roots too (`command_rebase`)."""
+def _rebase_grant(workspace: Path, roots: tuple[Path, ...], main: str,
+                  git: Optional[Path], git_refusal: str, no_hooks: Optional[Path]):
+    """(grant, why not) of the rebase broker for a worker in a pool slot on
+    a host naming `main`: the git the bridge's own PATH names
+    (`rebase.trusted_git`, never one inside the worker's roots) and the
+    brokers' empty hooks folder. The broker's file itself must lie outside
+    the roots too (`command_rebase`)."""
     if not main:
-        return None, "the host names no main branch to rebase onto", None
+        return None, "the host names no main branch to rebase onto"
     if within(BROKER, roots):
-        return None, (f"the bridge's broker {BROKER} lies in your writable "
-                      f"roots"), None
-    git, why = rebase_broker.trusted_git(roots)
-    if git is None:
-        return None, why, None
-    store = tempfile.TemporaryDirectory(prefix="rebase-broker-",
-                                        dir=_git_admin(workspace))
-    hooks = Path(store.name) / "no-hooks"
-    hooks.mkdir()
-    return rebase_broker.Grant(workspace, git, hooks, main), "", store
+        return None, f"the bridge's broker {BROKER} lies in your writable roots"
+    if git is None or no_hooks is None:
+        return None, git_refusal
+    return rebase_broker.Grant(workspace, git, no_hooks, main), ""
+
+
+def _commit_grant(roots: tuple[Path, ...], policy, git: Optional[Path],
+                  git_refusal: str, no_hooks: Optional[Path]):
+    """(grant, why not) of the commit broker for a worker in a pool slot on a
+    host that lets workers commit (`HostPolicy.commit_briefing`): the pinned
+    git, the brokers' empty hooks folder for a submodule's commit, and — read
+    from the host ROOT, the bridge's own checkout, and refused when it lies
+    in a writable root — the host's hooks folder (`commit_hooks`) and commit
+    rules (`commit_host`). The broker's file must lie outside the roots
+    (`command_commit`)."""
+    if policy.commit_briefing is None:
+        return None, "the host does not let workers commit"
+    if within(COMMIT_BROKER, roots):
+        return None, f"the bridge's broker {COMMIT_BROKER} lies in your writable roots"
+    if git is None or no_hooks is None:
+        return None, git_refusal
+    base = host_root()
+    hooks = no_hooks
+    if policy.commit_hooks:
+        hooks = (base / policy.commit_hooks).resolve()
+        if not hooks.is_dir():
+            return None, f"the host's hooks folder {hooks} is missing"
+        if within(hooks, roots):
+            return None, f"the host's hooks folder {hooks} lies in your writable roots"
+    host = ""
+    if policy.commit_host:
+        file, _, attribute = policy.commit_host.rpartition(":")
+        rules = (base / file).resolve()
+        if not file or not attribute or not rules.is_file():
+            return None, f"the host's commit rules {policy.commit_host} are missing under {base}"
+        if within(rules, roots):
+            return None, f"the host's commit rules {rules} lie in your writable roots"
+        host = f"{rules}:{attribute}"
+    return commit_broker.Grant(git, hooks, no_hooks, host), ""
 
 
 def worker_decline_tail() -> str:

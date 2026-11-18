@@ -3,14 +3,14 @@
 Every core test runs under `CORE_POLICY` (`_core_host` in tests/conftest.py) unless it asks for
 `EMPTY`; nothing here names a project. The tables are small on purpose: one
 entry per generic judge the core ships (pytest, try_patch, an editing script,
-the slot commit and rebase, npm/npx/node), so a judge's own rules are pinned here and
-travel with the code.
+npm/npx/node; the slot's commit and rebase are the core's own brokers, which
+the python shape knows without a table entry), so a judge's own rules are
+pinned here and travel with the code.
 """
 
 from functools import partial
 
 from llm_agents.codex.command_arguments import _args_refusal
-from llm_agents.codex.command_commit import _commit
 from llm_agents.codex.command_dispatch import Shape, argv_refusal
 from llm_agents.codex.command_node import NpmScript, _node, _npm, _npx
 from llm_agents.codex.command_python import Entrypoint, _checks, _edits, _python, _try_patch_refusal
@@ -25,7 +25,6 @@ PYTHON_ENTRIES = {
     "bin/edit.py": Entrypoint("edits the files it names", _edits),
     "bin/read.py": Entrypoint("reads", _args_refusal),
     "bin/gen.py": Entrypoint("compares its generated output", _checks("--stdout")),
-    "tools/git/commit.py": Entrypoint("commits a pool slot's named paths", _commit),
 }
 PYTHON_DECLINED = {"bin/agents/": "starts agents", "bin/*launch_*.py": "launches"}
 NPM_SCRIPTS = {"test": NpmScript("the unit tests"), "check:": NpmScript("a checker")}
@@ -60,7 +59,7 @@ CORE_POLICY = HostPolicy(
     protected_parts=GIT_STORE + (("vault",),),
     worker_lines=("Core test host line.",),
     main_branch="trunk",
-    commit_briefing=lambda where, model: (
-        f"commit with tools/git/commit.py, the message file in {where}; "
+    commit_briefing=lambda where, model, run: (
+        f"commit with `{run} -F <file> <paths>`, the message file in {where}; "
         f"end it with `Co-Authored-By: Codex {model or '<your model>'}`."),
 )

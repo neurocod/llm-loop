@@ -26,12 +26,17 @@ from .command_arguments import (
 from .command_paths import (
     resolve_path,
 )
-from .command_rebase import (
-    _rebase_broker,
+from .command_brokers import (
     broker_launch_refusal,
     broker_script,
     broker_spelling_refusal,
 )
+from .command_commit import COMMIT
+from .command_rebase import REBASE
+
+# The bridge's own files a worker may start outside the sandbox, each by
+# its literal path (`command_brokers`).
+BROKERS = (REBASE, COMMIT)
 
 _PYTHON_SWITCHES = frozenset({"-B", "-u", "-I", "-E", "-s"})
 _PYTHON_X = frozenset({"utf8", "utf8=1"})
@@ -65,13 +70,14 @@ def _python(argv: list[str], cwd: Path, ctx: CommandContext, *,
         if module != "pytest":
             return f"python -m {module} (only pytest)"
         return _pytest_refusal(words[at + 2:], cwd, ctx)
-    why = broker_spelling_refusal(words[at])
-    if why:
-        return why
-    if broker_script(words[at]):
-        # The bridge's own file, outside the roots by design (command_rebase).
-        return (broker_launch_refusal(words[:at], ctx)
-                or _rebase_broker(words[at + 1:], cwd, ctx))
+    for broker in BROKERS:
+        why = broker_spelling_refusal(words[at], broker)
+        if why:
+            return why
+        if broker_script(words[at], broker):
+            # The bridge's own file, outside the roots by design.
+            return (broker_launch_refusal(argv[0], words[:at], ctx, broker)
+                    or broker.judge(words[at + 1:], cwd, ctx))
     script, why = _existing_file(words[at], cwd, ctx, "script")
     if why:
         return why

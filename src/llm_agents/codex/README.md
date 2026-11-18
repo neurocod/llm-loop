@@ -160,10 +160,12 @@ is told to keep baselines and measuring scripts there, and `spawn` prints it
 first. Without it workers put those into the tree (measured 2026-09-13). A
 linked worktree's admin directory sits in the main checkout's `.git`, outside
 the working root, so `git add`/`git commit`/`git mv` from the sandbox fail; a
-worker in a pool slot commits by escalating the host's commit command (judge:
+worker in a pool slot commits through the commit broker
+`llm_agents.git.commit_broker` run from the bridge's own checkout, with the
+host's hooks and rules from that checkout too (judge:
 `command_commit._commit`, briefing: `sandbox._worktree_fact`), rebases its own
 slot onto the host's `HostPolicy.main_branch` through the rebase broker
-`llm_agents.git.rebase` run from the bridge's own checkout — `start`, then on
+`llm_agents.git.rebase`, run the same way — `start`, then on
 a conflict `add` (or `rm` for a modify/delete one) of the unmerged files and
 `continue`, or `abort`; never `git rebase` itself, whose hooks and
 configuration the judge cannot turn off (judge: `command_rebase._rebase_broker`,
@@ -215,9 +217,10 @@ Deleting without a regex is granted to any agent only for
 `commands.py` is the public facade and the one text of the trust model. The
 judge's map: `command_shell.py` — shell and words; `command_paths.py` and
 `command_arguments.py` — paths, arguments and context; `command_node.py` —
-npm/node/npx; `command_python.py` — Python; `command_commit.py` — the commit
-script; `command_rebase.py` — the rebase broker; `command_dispatch.py` — the
-dispatcher.
+npm/node/npx; `command_python.py` — Python; `command_brokers.py` — starting a
+broker (`python -I <literal path>`, the pinned interpreter);
+`command_commit.py` — the commit broker; `command_rebase.py` — the rebase
+broker; `command_dispatch.py` — the dispatcher.
 
 `workspace-write` breaks when a directory in the repository is owned by a
 `CodexSandbox*` user (the symptom: the agent silently cannot run ANY command —

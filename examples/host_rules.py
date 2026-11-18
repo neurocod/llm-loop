@@ -90,7 +90,6 @@ POLICY = HostPolicy(
     # Path runs (whole components) no agent writes, sandboxed or not.
     protected_parts=GIT_STORE + (("docs", "decisions"),),
     worker_lines=("Run the gates from the repository root.",),
-    commit_script="tools/commit.py",
     pool_script="tools/worktree.py",
     # What the Claude bridge's `review` profile reuses, and refuses to start
     # without: the ask-user-gate hook the project already runs. `settings` is

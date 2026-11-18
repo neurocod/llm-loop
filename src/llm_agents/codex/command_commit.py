@@ -1,8 +1,12 @@
-"""The commit.py policy for a worker in a linked pool slot.
+"""The commit policy for a worker in a linked pool slot.
 
-The commit script is the git kit's (`llm_agents.git.commit`), run through the
-host's stand-in, which the host names (`HostPolicy.commit_script`); the slot
-rule and the option table are the kit's own, read here rather than copied.
+The worker commits through the commit broker (`llm_agents.git.commit_broker`,
+granted as `python -I <the bridge's own copy> <commit.py's arguments>`,
+`COMMIT`), never through a commit script of its own tree: that file, the
+kit under its `src/` and the hooks of its `.githooks/` are the worker's to
+edit before it asks (the broker's docstring). The commit script is the git
+kit's (`llm_agents.git.commit`); the slot rule and the option table are the
+kit's own, read here rather than copied.
 """
 
 from __future__ import annotations
@@ -11,8 +15,10 @@ import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
+from ..git import commit_broker
 from ..git.commit import OPTION_FLAGS
 from ..git.commit_identity import write_approval
+from ..git.rebase import trusted_git
 from ..git.slots import git_admin as _git_admin, pool_slot
 from .command_arguments import (
     CommandContext,
@@ -21,12 +27,16 @@ from .command_arguments import (
     _parse_options,
     _value_refusal,
 )
+from .command_brokers import Broker
 from .command_paths import (
     PathRefused,
     protected_part,
     resolve_path,
     within,
 )
+
+# The broker file the worker names, as the bridge imported it.
+BROKER = Path(commit_broker.__file__).resolve()
 
 # --- committing from a pool slot -------------------------------------------
 
@@ -61,7 +71,8 @@ def _own_root_refusal(value: str, cwd: Path, ctx: CommandContext,
         return ""
     if _nested_repo(root.parent, ctx.workspace) is not None:
         return f"commit.py -C {value}: a nested submodule is not allowed"
-    declared = _submodule_paths(ctx.workspace)
+    git = _judge_git(ctx)
+    declared = _submodule_paths(ctx.workspace, git)
     if declared is None:
         return "commit.py: git cannot read the slot's .gitmodules"
     if root not in [(ctx.workspace / path).resolve() for path in declared]:
@@ -71,10 +82,10 @@ def _own_root_refusal(value: str, cwd: Path, ctx: CommandContext,
     slot_admin = _git_admin(ctx.workspace)
     if admin is None or slot_admin is None or not within(admin, (slot_admin / "modules",)):
         return f"commit.py -C {value}: submodule git directory is not owned by your slot"
-    toplevel = _git_names(root, "rev-parse", "--show-toplevel")
+    toplevel = _git_names(root, "rev-parse", "--show-toplevel", git=git)
     if toplevel is None or len(toplevel) != 1 or Path(toplevel[0].strip()).resolve() != root:
         return f"commit.py -C {value}: submodule checkout root does not match -C"
-    owner = _git_names(root, "rev-parse", "--show-superproject-working-tree")
+    owner = _git_names(root, "rev-parse", "--show-superproject-working-tree", git=git)
     if owner is None or len(owner) != 1 or Path(owner[0].strip()).resolve() != ctx.workspace:
         return f"commit.py -C {value}: not an initialized submodule of your slot"
     if identity is not None:
@@ -136,14 +147,25 @@ def _nested_repo(run: Path, workspace: Path) -> Optional[Path]:
 _GIT_TIMEOUT_S = 30.0
 
 
-def _git_names(workspace: Path, *args: str,
+def _judge_git(ctx: CommandContext) -> Optional[Path]:
+    """The git the judge asks its questions with: the one the bridge pinned
+    for this worker (`CommandContext.git`, `rebase.trusted_git`), or that
+    rule applied now to a context built without it — never `git` by name,
+    which on Windows is looked up in the bridge's cwd and along a PATH the
+    judge has not read (item 2432)."""
+    return ctx.git if ctx.git is not None else trusted_git(ctx.roots)[0]
+
+
+def _git_names(workspace: Path, *args: str, git: Optional[Path],
                none_found: int = 0) -> Optional[list[str]]:
     """The NUL-separated records `git <args>` prints in `workspace` (`-z`),
     [] when it exits `none_found` (git config's "no such key"), or None when
-    git fails (the caller declines: an unanswered question is no "nothing
-    there")."""
+    git fails or `git` is None (the caller declines: an unanswered question
+    is no "nothing there")."""
+    if git is None:
+        return None
     try:
-        proc = subprocess.run(["git", *args], cwd=workspace, capture_output=True,
+        proc = subprocess.run([str(git), *args], cwd=workspace, capture_output=True,
                               text=True, encoding="utf-8", errors="replace",
                               timeout=_GIT_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
@@ -155,13 +177,14 @@ def _git_names(workspace: Path, *args: str,
     return [name for name in proc.stdout.split("\0") if name]
 
 
-def _submodule_paths(workspace: Path) -> Optional[list[str]]:
+def _submodule_paths(workspace: Path, git: Optional[Path]) -> Optional[list[str]]:
     """The `path =` entries of the tree's `.gitmodules`, or None when git
     cannot read it."""
     if not (workspace / ".gitmodules").is_file():
         return []
     records = _git_names(workspace, "config", "--file", ".gitmodules", "-z",
-                         "--get-regexp", r"^submodule\..*\.path$", none_found=1)
+                         "--get-regexp", r"^submodule\..*\.path$", git=git,
+                         none_found=1)
     return None if records is None else [
         record.partition("\n")[2] for record in records]
 
@@ -215,10 +238,11 @@ def _commit_path_refusal(raw: str, run: Path, ctx: CommandContext,
     if resolved.is_file():
         return ""
     spec = f":(literal){relative}"
+    git = _judge_git(ctx)
     below = _git_names(ctx.workspace, "ls-files", "-z", "--full-name", "-co",
-                       "--exclude-standard", "--", spec)
+                       "--exclude-standard", "--", spec, git=git)
     gone = _git_names(ctx.workspace, "ls-tree", "-r", "-z", "--name-only",
-                      "HEAD", "--", spec)
+                      "HEAD", "--", spec, git=git)
     if below is None or gone is None:
         return (f"{raw}: git cannot list what the folder holds, so the judge "
                 f"cannot tell whether it holds a protected path")
@@ -231,16 +255,23 @@ def _commit_path_refusal(raw: str, run: Path, ctx: CommandContext,
 
 
 def _commit(args: list[str], cwd: Path, ctx: CommandContext) -> str:
-    """The host's commit script (`HostPolicy.commit_script`) from a worker:
-    only in a pool slot (`pool_slot`), run in the worker's own tree or with
+    """commit.py's arguments from a worker, as the commit broker (`COMMIT`)
+    takes them: only in a pool slot (`pool_slot`) with the bridge's grant in
+    place (`CommandContext.commit`), run in the worker's own tree or with
     `-C` selecting a directly declared submodule of that slot, options of
     `_COMMIT_OPTIONS` before the paths, every path by
-    `_commit_path_refusal`."""
+    `_commit_path_refusal`. Granted, it writes the invocation's approval
+    ticket, without which the broker commits nothing."""
     if not pool_slot(ctx.workspace):
         policy = ctx.policy
-        return (f"{policy.commit_script}: a worker commits only in a pool slot "
+        return (f"the commit broker: a worker commits only in a pool slot "
                 f"(`<repo>-wtN`, {policy.pool_script}); the main tree's master "
                 f"is the orchestrator's")
+    if ctx.commit is None:
+        return f"the commit broker: {ctx.commit_refusal or 'not granted here'}"
+    if within(BROKER, ctx.roots):
+        return (f"the commit broker {BROKER} lies in your writable roots: the "
+                f"bridge must run from a checkout the worker cannot edit")
     parsed, paths, why = _parse_options(
         args, _COMMIT_OPTIONS, "commit.py", "its own, spelled in full",
         cwd, ctx, remainder=True, reject_option_value=True)
@@ -263,7 +294,7 @@ def _commit(args: list[str], cwd: Path, ctx: CommandContext) -> str:
                 f"(a submodule); use -C {nested} from {ctx.workspace}")
     tree = run if targets else ctx.workspace
     tree_ctx = replace(ctx, workspace=tree)
-    submodules = _submodule_paths(tree)
+    submodules = _submodule_paths(tree, _judge_git(ctx))
     if submodules is None:
         return "commit.py: git cannot read the tree's .gitmodules"
     for raw in paths:
@@ -278,3 +309,6 @@ def _commit(args: list[str], cwd: Path, ctx: CommandContext) -> str:
         identity["cwd"] = str(run)
         write_approval(ctx.commit_approvals, cwd, args, identity)
     return ""
+
+
+COMMIT = Broker(BROKER, "the commit broker", _commit)
