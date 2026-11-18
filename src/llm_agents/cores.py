@@ -19,8 +19,9 @@ wrapper closes the handle in the kernel, and the broker hands the cores to
 the next waiter. There is no "release" message to forget. And the child goes
 with it: `run` puts it in a kill-on-close job object (`Job`), so a wrapper
 killed without `/T` does not leave a child burning K cores nobody holds.
-Only a killed run ends the tree: after the child's normal exit the job is
-disarmed (`Job.disarm`) before it is closed.
+The job closes armed after a normal exit too, unless the caller opts in to
+keeping what a build leaves behind (`run`'s `keep_descendants`,
+`--keep-descendants`).
 
 Nested runs do not lease again: an inner `run` (one whose environment already
 carries `LEASE_ENV`) takes min(want, outer K) of the OUTER lease. Several
@@ -339,7 +340,8 @@ def _create_job(say: Callable[[str], None]) -> Optional[Job]:
 
 
 def _wait(child, job: Optional[Job], say: Callable[[str], None]) -> tuple[int, bool]:
-    """(The child's exit code, whether it exited on its own), through any
+    """(The child's exit code, whether THIS wrapper left it alone — no second
+    Ctrl+C ended it; a crash or a foreign kill also reads True), through any
     number of Ctrl+C. The first is the child's to answer (the console
     delivered it there too); a second ends it — the whole job — and the wait
     goes on until it has been reaped, because returning first would release
@@ -364,10 +366,20 @@ def _wait(child, job: Optional[Job], say: Callable[[str], None]) -> tuple[int, b
 def run(command: Sequence[str], want: int, minimum: int = 1, label: str = "",
         wait_s: float = DEFAULT_WAIT_S, *, popen=subprocess.Popen,
         make_job: Optional[Callable[[Callable[[str], None]], Optional[Job]]] = None,
-        **lease_options) -> int:
+        keep_descendants: bool = False, **lease_options) -> int:
     """Run `command` under a lease; return its exit code unchanged, or
     INTERRUPTED_EXIT for a Ctrl+C before it started. `popen`/`make_job`
-    exist for tests."""
+    exist for tests.
+
+    By default the job closes ARMED however the child ends: what it left
+    running dies with it, so a test runner's stray worker or a crashed
+    root's descendants do not keep burning cores nobody holds.
+    `keep_descendants` (opt-in, for a build) disarms it (`Job.disarm`) once
+    the child has exited without this wrapper ending it — with any exit
+    code: MSBuild's reusable nodes and `mspdbsrv` serve the next build
+    whether this one compiled or not. The price, named: a build root killed
+    from outside reads the same as a failed one, and its leftovers are kept.
+    """
     label = label or " ".join(command)
     say = lease_options.get("say", _say)
     job = (make_job or _create_job)(say)
@@ -396,11 +408,8 @@ def run(command: Sequence[str], want: int, minimum: int = 1, label: str = "",
                     except OSError as exc:
                         say(f"cannot start {command[0]}: {exc}")
                         return 127
-                code, on_its_own = _wait(child, job if cores is not None else None, say)
-                if job is not None and on_its_own:
-                    # A normal exit: what the child left running on purpose
-                    # (`Job.disarm`) outlives the close below. Any other way
-                    # out of here closes the job armed and ends its tree.
+                code, left_alone = _wait(child, job if cores is not None else None, say)
+                if job is not None and keep_descendants and left_alone:
                     try:
                         job.disarm()
                     except OSError as exc:
@@ -453,6 +462,9 @@ def _parser() -> argparse.ArgumentParser:
     go.add_argument("--label", default="", help="the name the badge's status shows (default: the command)")
     go.add_argument("--wait", type=float, default=DEFAULT_WAIT_S, dest="wait_s",
                     help=f"seconds to wait for --min before running with it anyway (default {DEFAULT_WAIT_S:.0f})")
+    go.add_argument("--keep-descendants", action="store_true",
+                    help="a build: what the command leaves running once it has exited "
+                         "(MSBuild nodes, mspdbsrv) is kept, not killed with the job")
     go.add_argument("command", nargs=argparse.REMAINDER, help="-- then the command")
     sub.add_parser("status", help="print the broker's leases, queue and load as JSON")
     return parser
@@ -475,7 +487,8 @@ def main(argv: Optional[Sequence[str]] = None, *, policy: Optional[host_policy.H
             parser.error("run: no command after --")
         if args.want < 1 or not 1 <= args.minimum <= args.want or args.wait_s < 0:
             parser.error("run: need --want >= 1, 1 <= --min <= --want, --wait >= 0")
-        return run(command, args.want, args.minimum, args.label, args.wait_s)
+        return run(command, args.want, args.minimum, args.label, args.wait_s,
+                   keep_descendants=args.keep_descendants)
 
 
 if __name__ == "__main__":

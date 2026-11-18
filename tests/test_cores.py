@@ -146,21 +146,38 @@ def _reap(grandchild):
     kernel.CloseHandle(handle)
 
 
+_ROOT_ENDS = {"exits 0": "", "fails": "sys.exit(3)",
+              "is terminated": "import os; os.kill(os.getpid(), 9)"}
+
+
 @windows_only
-def test_a_normal_exit_leaves_what_the_child_left_running(wire, tmp_path):
-    """MSBuild's reusable nodes and `mspdbsrv` outlive a successful build on
-    purpose, and another slot's build may be using them (`Job.disarm`)."""
+@pytest.mark.parametrize("keep", [False, True], ids=["default", "keep_descendants"])
+@pytest.mark.parametrize("end", list(_ROOT_ENDS))
+def test_what_a_root_leaves_running_is_kept_only_when_opted_in(wire, tmp_path, monkeypatch,
+                                                               end, keep):
+    """Default: a test runner's stray worker or a crashed root's descendants
+    die with the job. Opted in (a build): MSBuild's reusable nodes and
+    `mspdbsrv` outlive it, whatever its exit code (`run`'s docstring)."""
     pid_file = tmp_path / "grandchild.pid"
-    code = cores.run([sys.executable, "-c", _LEAVES_A_GRANDCHILD, str(pid_file)], want=2,
-                     **wire["options"](FakeCounter(_grant(2))))
-    assert code == 0
-    grandchild = _grandchild(pid_file)
+    opened = []
+    real_wait = cores._wait
+
+    def wait(child, job, say):
+        answer = real_wait(child, job, say)
+        opened.append(_grandchild(pid_file))  # held open: its pid cannot be reused
+        return answer
+    monkeypatch.setattr(cores, "_wait", wait)
+    cores.run([sys.executable, "-c", _LEAVES_A_GRANDCHILD + _ROOT_ENDS[end], str(pid_file)],
+              want=2, keep_descendants=keep, **wire["options"](FakeCounter(_grant(2))))
+    kernel, handle = opened[0]
     try:
-        kernel, handle = grandchild
-        assert kernel.WaitForSingleObject(handle, _SURVIVES_MS) == _WAIT_TIMEOUT, \
-            "closing the job after a normal exit killed what the child left running"
+        waited = kernel.WaitForSingleObject(handle, _SURVIVES_MS if keep else _DIES_MS)
+        if keep:
+            assert waited == _WAIT_TIMEOUT, "an opted-in run killed what its root left running"
+        else:
+            assert waited == 0, "a default run left its root's descendants running"
     finally:
-        _reap(grandchild)
+        _reap(opened[0])
 
 
 @windows_only
@@ -175,7 +192,7 @@ def test_a_run_that_does_not_end_normally_ends_the_whole_tree(wire, tmp_path, mo
     monkeypatch.setattr(cores, "_wait", failing_wait)
     with pytest.raises(RuntimeError):
         cores.run([sys.executable, "-c", _LEAVES_A_GRANDCHILD, str(pid_file)], want=2,
-                  **wire["options"](FakeCounter(_grant(2))))
+                  keep_descendants=True, **wire["options"](FakeCounter(_grant(2))))
     grandchild = opened[0]
     try:
         kernel, handle = grandchild
@@ -183,6 +200,15 @@ def test_a_run_that_does_not_end_normally_ends_the_whole_tree(wire, tmp_path, mo
             "a run that failed left the child's tree running"
     finally:
         _reap(grandchild)
+
+
+@windows_only
+def test_the_command_line_opts_in_to_keeping_descendants(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cores, "run", lambda *a, **k: seen.append(k["keep_descendants"]) or 0)
+    cores.main(["run", "--want", "2", "--", "x"])
+    cores.main(["run", "--want", "2", "--keep-descendants", "--", "x"])
+    assert seen == [False, True]
 
 
 @windows_only
@@ -208,7 +234,8 @@ def test_only_a_child_that_exits_on_its_own_disarms_the_job(wire, script, disarm
         def close(self):
             calls.append("close")
 
-    cores.run(["x"], want=2, make_job=lambda say: FakeJob(), **wire["options"](FakeCounter(_grant(2))))
+    cores.run(["x"], want=2, make_job=lambda say: FakeJob(), keep_descendants=True,
+              **wire["options"](FakeCounter(_grant(2))))
     assert calls == disarmed
 
 
