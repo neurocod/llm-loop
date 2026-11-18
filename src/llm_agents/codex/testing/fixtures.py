@@ -7,6 +7,11 @@ A fixture is registered by importing it into the test module that uses it
 
 from __future__ import annotations
 
+import os
+import shutil
+import sys
+from pathlib import Path
+
 import pytest
 
 from ... import agent_counter
@@ -31,6 +36,34 @@ def no_badge(monkeypatch):
     """
     monkeypatch.setenv(agent_counter.DISABLE_ENV, "0")
     monkeypatch.delenv("CODEX_AGENTS_COUNTER", raising=False)
+
+
+def bridge_path_folders() -> list[str]:
+    """The folders of `bridge_path`: where this Python, git and (off
+    Windows) `sh`, `cat` and `env` lie, each resolved, so no entry passes
+    through a link; on Windows the system folders PowerShell runs from."""
+    programs = [sys.executable, shutil.which("git")]
+    if os.name == "nt":
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        extra = [system / "System32", system, system / "System32" / "WindowsPowerShell" / "v1.0"]
+    else:
+        programs += [shutil.which(name) for name in ("sh", "cat", "env")]
+        extra = []
+    folders = [Path(program).parent.resolve() for program in programs if program] + extra
+    return list(dict.fromkeys(str(folder) for folder in folders))
+
+
+@pytest.fixture(autouse=True)
+def bridge_path(monkeypatch):
+    """PATH = `bridge_path_folders()` for every test of a module that imports
+    this fixture.
+
+    The broker launch judge (`command_brokers.trusted_python`) judges EVERY
+    PATH entry of the bridge, and a verdict read from the test machine's own
+    PATH tests that machine's image, not the judge: a linked tool cache on a
+    macOS runner refused every broker grant there (CI 2026-11-18). A test
+    about one PATH entry prepends it to this PATH."""
+    monkeypatch.setenv("PATH", os.pathsep.join(bridge_path_folders()))
 
 
 @pytest.fixture

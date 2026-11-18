@@ -468,8 +468,8 @@ def plant(slot, tmp_path):
     marker file the program appends to."""
     marker = tmp_path / "marker.txt"
     script = tmp_path / "planted.sh"
-    script.write_text(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n",
-                      encoding="utf-8", newline="\n")
+    script.write_bytes(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n".encode("utf-8"))
+    script.chmod(0o755)  # POSIX git runs a hook or filter only when executable
     planted = tmp_path / "planted.git"
     run(tmp_path, "init", "-q", "--bare", str(planted))
     for key, value in (("core.bare", "false"), ("core.fsmonitor", script.as_posix()),
@@ -577,8 +577,9 @@ def plant_hooks(main, slot, tmp_path):
     hooks.mkdir()
     (hooks / ".gitignore").write_text("*\n", encoding="utf-8")
     for name in ("post-index-change", "reference-transaction"):
-        (hooks / name).write_text(f"#!/bin/sh\necho {name} >> '{marker.as_posix()}'\n",
-                                  encoding="utf-8", newline="\n")
+        (hooks / name).write_bytes(f"#!/bin/sh\necho {name} >> '{marker.as_posix()}'\n"
+                                   .encode("utf-8"))
+        (hooks / name).chmod(0o755)  # POSIX git runs a hook only when executable
     # The control: git by discovery there runs both.
     os.utime(slot / "readme.txt")
     subprocess.run(["git", "status", "--porcelain"], cwd=slot, capture_output=True)

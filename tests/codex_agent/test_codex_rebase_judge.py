@@ -8,7 +8,7 @@ judge hands every escalated command (`ask.environment`), the broker file of
 this checkout — and assert what happened in the repository: hooks did not
 run, other branches did not move, a resumed rebase ran no exec line."""
 
-from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401 — see no_badge's docstring
+from llm_agents.codex.testing.fixtures import bridge_path, no_badge  # noqa: F401 — see their docstrings
 import json
 import os
 import subprocess
@@ -224,8 +224,7 @@ def _hook_fixture(tmp_path):
     for hook in ("pre-rebase", "post-checkout", "post-rewrite", "post-commit"):
         path = slot / ".githooks" / hook
         path.parent.mkdir(exist_ok=True)
-        path.write_text(f"#!/bin/sh\necho {hook} >> '{marker.as_posix()}'\n",
-                        encoding="utf-8", newline="\n")
+        path.write_bytes(f"#!/bin/sh\necho {hook} >> '{marker.as_posix()}'\n".encode("utf-8"))
         path.chmod(0o755)
     return slot, marker
 

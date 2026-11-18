@@ -42,8 +42,7 @@ def repo(tmp_path, monkeypatch):
 def _program(tmp_path: Path, marker: Path) -> str:
     """A shell script that records its start, as a config value git runs."""
     script = tmp_path / "planted.sh"
-    script.write_text(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n",
-                      encoding="utf-8", newline="\n")
+    script.write_bytes(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n".encode("utf-8"))
     script.chmod(0o755)
     return script.as_posix()
 

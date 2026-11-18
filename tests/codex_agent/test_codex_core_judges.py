@@ -4,7 +4,7 @@ submodule rules, junction paths, the worker briefing skeleton and the fake
 wire. A host's own tables are pinned in the host's repository; these hold
 for any host binding the same judges."""
 
-from llm_agents.codex.testing.fixtures import no_badge  # noqa: F401 — see no_badge's docstring
+from llm_agents.codex.testing.fixtures import bridge_path, no_badge  # noqa: F401 — see their docstrings
 import json
 import os
 
@@ -239,7 +239,9 @@ def test_a_worker_commits_named_paths_in_its_pool_slot(tmp_path, monkeypatch):
         f"{RUN} -F {message} ':/'": "pathspec magic",
         f"{RUN} -F {message} 'src/*.ts'": "wildcard",
         f"{RUN} --amend -F {message} src/a.ts": "commit.py option --amend",
-        f"{RUN} -F{message} src/a.ts": "glued",
+        # Off Windows no drive colon comes before the file's dot, and the
+        # reader's PowerShell dot-split rule refuses the word first.
+        f"{RUN} -F{message} src/a.ts": "glued" if os.name == "nt" else "at its dot",
         f"{RUN} src/a.ts -F {message}": "options go before the paths",
         f"{RUN} -F {message}": "no paths",
         f"{RUN} -m -x src/a.ts": "-m with no value",

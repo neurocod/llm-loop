@@ -69,8 +69,7 @@ def planted_gitdir(tmp_path: Path, sub: Path, marker: Path) -> Path:
     through."""
     script = tmp_path / "scratch" / "planted.sh"
     script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n",
-                      encoding="utf-8", newline="\n")
+    script.write_bytes(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n".encode("utf-8"))
     script.chmod(0o755)
     real = git_in(sub, "rev-parse", "--absolute-git-dir").stdout.strip()
     planted = tmp_path / "scratch" / "planted.git"

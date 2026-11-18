@@ -91,6 +91,9 @@ def test_a_dead_process_s_record_is_stale_and_pruned(tmp_path):
     assert not path.exists()
 
 
+@pytest.mark.skipif(os.name != "nt" and not Path("/proc/self/stat").exists(),
+                    reason="no process creation time here (macOS): `process_identity` "
+                           "is None by contract and the pid alone is trusted")
 def test_a_reused_pid_with_another_creation_time_is_stale(tmp_path):
     """Windows hands a pid out again within seconds: the pid alone would read
     a stranger as the worker."""
