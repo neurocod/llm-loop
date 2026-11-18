@@ -319,14 +319,13 @@ def run_turn(agent: dict, turn: dict, directory: Path,
             if opts.get("profile", "review") == "review":
                 verify_review_gate()
             job = ChildJob()
-            proc = subprocess.Popen(
+            proc = job.start(
                 command(agent, turn["resume"]), cwd=agent["cwd"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
                 text=True, encoding="utf-8", errors="replace", bufsize=1,
                 env=child_environment(review=opts.get("profile", "review") == "review"),
                 **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt"
                    else {"start_new_session": True}))
-            job.assign(proc)
 
             def read_stream():
                 try:

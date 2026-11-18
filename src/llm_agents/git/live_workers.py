@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
 
+from .. import win_job
+
 LIVE_DIR_ENV = "LLM_AGENTS_LIVE_DIR"
 RECORD_SUFFIX = ".live.json"
 LOCKS_DIR = "locks"
@@ -147,15 +149,10 @@ def _kernel32():
     kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-    kernel.CreateJobObjectW.restype = wintypes.HANDLE
     kernel.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
     kernel.OpenJobObjectW.restype = wintypes.HANDLE
-    kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
-                                               wintypes.DWORD]
     kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
                                                  wintypes.DWORD, ctypes.c_void_p]
-    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
     kernel.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
                                   wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
@@ -236,9 +233,6 @@ def same_process(pid: int, identity: Optional[int]) -> bool:
 
 _JOB_OBJECT_QUERY = 0x0004
 _JOB_BASIC_ACCOUNTING = 1
-_JOB_EXTENDED_LIMITS = 9
-_KILL_ON_JOB_CLOSE = 0x2000
-CREATE_SUSPENDED = 0x00000004
 
 
 def _accounting_struct():
@@ -300,67 +294,21 @@ class WorkerJob:
         contained is not started (the caller's to report)."""
         if os.name != "nt":
             return cls()
-        import ctypes
-        from ctypes import wintypes
-
-        class Basic(ctypes.Structure):
-            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
-                        ("PerJobUserTimeLimit", ctypes.c_int64),
-                        ("LimitFlags", wintypes.DWORD),
-                        ("MinimumWorkingSetSize", ctypes.c_size_t),
-                        ("MaximumWorkingSetSize", ctypes.c_size_t),
-                        ("ActiveProcessLimit", wintypes.DWORD),
-                        ("Affinity", ctypes.c_size_t),
-                        ("PriorityClass", wintypes.DWORD),
-                        ("SchedulingClass", wintypes.DWORD)]
-
-        class Extended(ctypes.Structure):
-            _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_ulonglong * 6),
-                        ("ProcessMemoryLimit", ctypes.c_size_t),
-                        ("JobMemoryLimit", ctypes.c_size_t),
-                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
-
-        kernel = _kernel32()
         name = f"Local\\llm-agents-worker-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-        handle = kernel.CreateJobObjectW(None, name)
-        if not handle:
-            raise ctypes.WinError(ctypes.get_last_error())
-        info = Extended()
-        info.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
-        if not kernel.SetInformationJobObject(handle, _JOB_EXTENDED_LIMITS, ctypes.byref(info),
-                                              ctypes.sizeof(info)):
-            error = ctypes.get_last_error()
-            kernel.CloseHandle(handle)
-            raise ctypes.WinError(error)
-        return cls(name, handle)
+        return cls(name, win_job.create(name, win_job.KILL_ON_JOB_CLOSE))
 
     @property
     def creationflags(self) -> int:
         """What the child is started with, so that `adopt` puts it in the job
         before it can start a process of its own."""
-        return CREATE_SUSPENDED if self._handle else 0
+        return win_job.CREATE_SUSPENDED if self._handle else 0
 
     def adopt(self, child) -> None:
         """Put a `Popen` started with `creationflags` into the job and resume
-        it; a child that cannot be put there is killed and the error raised."""
-        if not self._handle:
-            return
-        import ctypes
-
-        kernel = _kernel32()
-        handle = int(child._handle)
-        if not kernel.AssignProcessToJobObject(self._handle, handle):
-            error = ctypes.get_last_error()
-            child.kill()
-            child.wait()
-            raise ctypes.WinError(error)
-        # NtResumeProcess: the one call that resumes a whole process from its
-        # handle (Popen keeps no thread handle to ResumeThread).
-        if ctypes.WinDLL("ntdll").NtResumeProcess(ctypes.c_void_p(handle)) != 0:
-            child.kill()
-            child.wait()
-            raise OSError("cannot resume the child after putting it in the job")
+        it (`win_job.adopt`); a child that cannot be put there is killed and
+        the error raised."""
+        if self._handle:
+            win_job.adopt(self._handle, child)
 
     def active(self) -> Optional[int]:
         return _active_in(_kernel32(), self._handle) if self._handle else 0

@@ -49,7 +49,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence
 
-from . import agent_counter, host_policy
+from . import agent_counter, host_policy, win_job
 
 # The variable the child reads its lease from: a whole number >= 1.
 LEASE_ENV = "LLM_CORES"
@@ -75,8 +75,6 @@ WIN_ERROR_BROKEN_PIPE = 109
 # shell convention for SIGINT, 128 + 2.
 INTERRUPTED_EXIT = 130
 
-CREATE_SUSPENDED = 0x00000004
-
 
 class Job:
     """A Windows job object holding the leased child and its descendants.
@@ -88,102 +86,34 @@ class Job:
     meant to outlive the run leave it (`agent_counter._spawn`: a counter
     started from inside a leased run must not die with it).
 
-    The child is started SUSPENDED and resumed once it is in the job, so no
-    grandchild can be spawned outside it in between.
+    The child is started SUSPENDED and resumed once it is in the job
+    (`win_job.start`), so no grandchild can be spawned outside it in between.
     """
-
-    _KILL_ON_JOB_CLOSE = 0x00002000
-    _BREAKAWAY_OK = 0x00000800
-    _EXTENDED_LIMIT_INFORMATION = 9
 
     def __init__(self, name: str, handle: int) -> None:
         self.name = name
         self._handle = handle
 
-    @staticmethod
-    def _kernel32():
-        import ctypes
-        from ctypes import wintypes
-
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateJobObjectW.restype = wintypes.HANDLE
-        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
-                                                wintypes.DWORD]
-        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-        k32.CloseHandle.argtypes = [wintypes.HANDLE]
-        return k32
-
     @classmethod
     def create(cls) -> "Job":
         """A new named job; OSError when Windows will not make one."""
-        import ctypes
-        from ctypes import wintypes
-
-        class Basic(ctypes.Structure):
-            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
-                        ("PerJobUserTimeLimit", ctypes.c_int64),
-                        ("LimitFlags", wintypes.DWORD),
-                        ("MinimumWorkingSetSize", ctypes.c_size_t),
-                        ("MaximumWorkingSetSize", ctypes.c_size_t),
-                        ("ActiveProcessLimit", wintypes.DWORD),
-                        ("Affinity", ctypes.c_size_t),
-                        ("PriorityClass", wintypes.DWORD),
-                        ("SchedulingClass", wintypes.DWORD)]
-
-        class Extended(ctypes.Structure):
-            _fields_ = [("BasicLimitInformation", Basic),
-                        ("IoInfo", ctypes.c_ulonglong * 6),
-                        ("ProcessMemoryLimit", ctypes.c_size_t),
-                        ("JobMemoryLimit", ctypes.c_size_t),
-                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
-
-        k32 = cls._kernel32()
         # Session-local and unguessable enough: the broker runs as the same
         # user in the same session, and only ever opens it for a query.
         name = f"Local\\llm-cores-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-        handle = k32.CreateJobObjectW(None, name)
-        if not handle:
-            raise ctypes.WinError(ctypes.get_last_error())
-        info = Extended()
-        info.BasicLimitInformation.LimitFlags = cls._KILL_ON_JOB_CLOSE | cls._BREAKAWAY_OK
-        if not k32.SetInformationJobObject(handle, cls._EXTENDED_LIMIT_INFORMATION,
-                                           ctypes.byref(info), ctypes.sizeof(info)):
-            error = ctypes.get_last_error()
-            k32.CloseHandle(handle)
-            raise ctypes.WinError(error)
-        return cls(name, handle)
+        return cls(name, win_job.create(name, win_job.KILL_ON_JOB_CLOSE | win_job.BREAKAWAY_OK))
 
     def start(self, argv: Sequence[str], env: dict, popen=subprocess.Popen):
         """Start `argv` inside the job. OSError from the start itself; a child
         that cannot be put in the job is killed and the error raised, so the
         caller can start it plainly instead."""
-        import ctypes
-
-        child = popen(argv, env=env, creationflags=CREATE_SUSPENDED)
-        k32 = self._kernel32()
-        handle = int(child._handle)
-        if not k32.AssignProcessToJobObject(self._handle, handle):
-            error = ctypes.get_last_error()
-            child.kill()
-            child.wait()
-            raise ctypes.WinError(error)
-        # NtResumeProcess: the one call that resumes a whole process from its
-        # handle (Popen keeps no thread handle to ResumeThread).
-        if ctypes.WinDLL("ntdll").NtResumeProcess(ctypes.c_void_p(handle)) != 0:
-            child.kill()
-            child.wait()
-            raise OSError("cannot resume the child after putting it in the job")
-        return child
+        return win_job.start(self._handle, argv, popen, env=env)
 
     def terminate(self, code: int = INTERRUPTED_EXIT) -> None:
-        self._kernel32().TerminateJobObject(self._handle, code)
+        win_job.kernel32().TerminateJobObject(self._handle, code)
 
     def close(self) -> None:
         if self._handle:
-            self._kernel32().CloseHandle(self._handle)
+            win_job.kernel32().CloseHandle(self._handle)
             self._handle = 0
 
 

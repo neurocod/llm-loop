@@ -443,7 +443,6 @@ if sys.argv[1] == "grandchild":
     print(json.dumps({"grandchild": os.getpid()}), flush=True)
     sys.stdin.readline()
 elif sys.argv[1] == "child":
-    assert sys.stdin.readline().strip() == "assigned"
     grandchild = subprocess.Popen(
         [sys.executable, __file__, "grandchild"], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -455,12 +454,9 @@ else:
     sys.path.insert(0, sys.argv[2])
     from llm_agents.child_job import ChildJob
     job = ChildJob()
-    child = subprocess.Popen(
+    child = job.start(
         [sys.executable, __file__, "child"], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-    job.assign(child)
-    child.stdin.write("assigned\n")
-    child.stdin.flush()
     print(child.stdout.readline().strip(), flush=True)
     sys.stdin.readline()
 '''
@@ -487,8 +483,8 @@ def test_owner_crash_kills_assigned_child_and_grandchild(tmp_path):
         text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
     handles = []
     try:
-        # Both descendants send readiness through pipes. The child cannot spawn
-        # its grandchild until assignment, so this covers inherited membership.
+        # Both descendants send readiness through pipes. The child runs only
+        # once it is in the job (`ChildJob.start`), so this covers inherited membership.
         line = owner.stdout.readline()
         assert line, owner.stderr.read()
         ready = json.loads(line)
