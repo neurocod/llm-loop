@@ -22,7 +22,7 @@ from .commands import (  # noqa: F401 — split_shell/unwrap_shell re-exported
     CommandContext, path_refusal, pool_slot, resolve_path, shapes_text,
     split_shell, unwrap_shell, within, worker_command_refusal,
 )
-from .command_shell import Unparsed, Word, _segments, _words
+from .command_escalate import escalate_refusal
 from .file_renewal import renew_file  # re-exported for edit-judge callers
 from .gates import escalate_pattern
 from .paths import host_root, scratch_dir
@@ -383,7 +383,11 @@ def _escalation_briefing(pattern: str) -> str:
         f"run outside the sandbox. Run them with escalated permissions "
         f"(request the escalation; it is granted automatically for exactly "
         f"these commands and declined for everything else) and read their "
-        f"output as usual. Run them from your working directory or below it."
+        f"output as usual. Run them from your working directory or below it. "
+        f"The regex must match each command WHOLE, as plain words: no "
+        f"redirect to a file, no `$`, `&` or parentheses, no typographic "
+        f"quotes; `2>&1` and a pipe into `Select-Object -Last N` or "
+        f"`Select-String` are read through."
     )
     if not _automatic():
         return text
@@ -419,14 +423,15 @@ def _worker_escalation_briefing(record: AgentRecord, extra: str) -> str:
         + f"), any command run under cmd rather than PowerShell, `node -e`, "
         f"`python -c`, "
         f"{policy.commands.reserved.text(record)}, and any `$`, backtick, `&`, "
-        f"parentheses, braces, `@`, `,` or wildcard outside quotes. A declined "
+        f"parentheses, braces, `@`, `,` or wildcard outside quotes, and any "
+        f"typographic quote (‘ ’ “ ”) anywhere. A declined "
         f"escalation is that rule, not a person's answer: do not ask for "
         f"permission — run the step inside the sandbox, do it another way, or "
         f"name it in your final answer for the orchestrator."
     )
     if extra:
         text += (f" Also granted for this task: commands matching the regex "
-                 f"{extra!r}.")
+                 f"{extra!r} (each command of the line matched whole).")
     return text
 
 
@@ -703,8 +708,9 @@ def asks_approval(record: AgentRecord) -> bool:
 def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]:
     """The "yes" an unattended run can give: a command may run OUTSIDE the
     sandbox when the agent asks — a worker's when it is of a known shape
-    (`commands.worker_command_refusal`), anyone's when it matches the
-    `escalate` regex (`escalation_pattern`).
+    (`commands.worker_command_refusal`), anyone's when each of its commands
+    matches the `escalate` regex whole (`escalation_pattern`,
+    `command_escalate.escalate_refusal`).
 
     Why it exists: the Windows sandbox cannot start a Node child with piped
     stdio (`_sandbox_facts`), so `npm test` and `npm run typecheck` — the two
@@ -785,16 +791,15 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
         # or one the worker typed inside PowerShell's (review 2).
         if worker and _runs_cmd(command):
             return Verdict(False, f"{refusal}; {decline_tail}")
-        unliteral = literal_command_refusal(command) if pattern is not None else ""
-        if pattern is not None and not unliteral and pattern.search(unwrap_shell(command)):
+        unmatched = (escalate_refusal(command, pattern, worker)
+                     if pattern is not None else "")
+        if pattern is not None and not unmatched:
             return Verdict(True, "matches the escalate rule")
         if automatic and cleanup_targets(command, cwd, workspace):
             return Verdict(True, "deletes the agent's own pytest directories")
         if worker:
             return Verdict(False, f"{refusal}; {decline_tail}")
-        if unliteral:
-            return Verdict(False, f"the escalate rule reads literal commands only: {unliteral}")
-        return Verdict(False, f"does not match the escalate rule /{escalate}/")
+        return Verdict(False, unmatched)
 
     if commit_store is not None:
         judge.environment = {COMMIT_APPROVAL_ENV: json.dumps({
@@ -830,51 +835,6 @@ def _runs_cmd(command: str) -> bool:
             return False
         command = inner
     return True
-
-
-# Programs that run a command they are handed rather than being one: an
-# escalate regex matching `npm test` in their argument would grant whatever
-# they make of it (round 3 of 2432, Codex: `& $env:ComSpec /c 'npm test'`).
-# Lower-case, without `.exe`.
-_INDIRECT_PROGRAMS = frozenset({
-    ".", "invoke-expression", "iex", "invoke-command", "icm", "start-process",
-    "saps", "start", "start-job", "sajb", "start-threadjob", "invoke-item", "ii",
-    "powershell", "pwsh", "cmd", "bash", "sh", "zsh", "wsl", "env", "runas",
-    "wscript", "cscript", "mshta", "rundll32", "conhost", "forfiles"})
-
-
-def literal_command_refusal(command: str) -> str:
-    """Why `command` is no literal command line, or "": what the escalate
-    rule's regex may judge. Read through Codex's wrapper (`split_shell`)
-    into literal words (`command_shell._words`: no `$` expansion, no `&`
-    call operator, no `( )` expression), and no command — first word of
-    each `;`/`&&`/`||` segment and of each pipeline stage — that is an
-    `_INDIRECT_PROGRAMS` one, a nested shell included. Otherwise an
-    unanchored rule (`npm test`) matches a string some other program runs:
-    `& $env:ComSpec /c 'npm test'` names no `cmd` word for `_runs_cmd` and
-    no shape, and was granted (round 3 of 2432)."""
-    shell, inner = split_shell(command)
-    try:
-        tokens = _words(inner, shell)
-    except Unparsed as unparsed:
-        return str(unparsed)
-    segments = _segments(tokens)
-    if not segments:
-        return "an empty command"
-    for segment in segments:
-        stage_start = True
-        for token in segment:
-            if token == "|":
-                stage_start = True
-                continue
-            if not stage_start or not isinstance(token, Word):
-                continue
-            stage_start = False
-            program = re.split(r"[\\/]", token.value)[-1].lower()
-            program = program[:-4] if program.endswith(".exe") else program
-            if program in _INDIRECT_PROGRAMS:
-                return f"`{token.value}` runs a command it is handed"
-    return ""
 
 
 def _slot_admin(workspace: Path, roots: tuple[Path, ...]) -> tuple[Optional[Path], str]:

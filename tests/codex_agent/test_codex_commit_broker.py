@@ -170,8 +170,9 @@ def test_the_cmd_refusal_is_final_over_the_escalate_rule(tmp_path, monkeypatch):
 def test_a_cmd_inside_powershell_is_refused_over_the_escalate_rule(tmp_path, monkeypatch):
     """Review 2 of 2432: the final refusal saw only Codex's wrapper; a `cmd`
     the worker typed inside PowerShell's reached the unanchored escalate
-    rule as `cmd /c npm test` and was granted."""
-    _, ask = worker_judge(tmp_path, monkeypatch, escalate=r"npm test")
+    rule as `cmd /c npm test` and was granted. (The rule now matches each
+    command whole, so the arguments it grants are its own words.)"""
+    _, ask = worker_judge(tmp_path, monkeypatch, escalate=r"npm test( .*)?")
     for command in ("cmd /c npm test", "cmd.exe /c 'npm test'", "& cmd /k npm test",
                     "C:\\Windows\\System32\\CMD.EXE /d /c npm test",
                     "powershell -Command 'cmd /c npm test'"):
@@ -187,7 +188,7 @@ def test_an_indirect_invocation_is_refused_over_the_escalate_rule(tmp_path, monk
     """Round 3 of 2432 (Codex): `& $env:ComSpec /c 'npm test'` names no
     `cmd` word, so the final cmd refusal missed it and an unanchored rule
     granted cmd running whatever npm.cmd the cwd holds. The rule now reads
-    literal command lines only (`sandbox.literal_command_refusal`)."""
+    literal command lines only (`command_escalate.escalate_refusal`)."""
     _, ask = worker_judge(tmp_path, monkeypatch, escalate=r"npm test", role=role)
     for command in ("& $env:ComSpec /c 'npm test'", "$c = 'npm test'; & $c",
                     "Invoke-Expression 'npm test'", "iex 'npm test'",

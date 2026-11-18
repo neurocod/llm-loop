@@ -98,7 +98,7 @@ def test_without_a_host_only_this_calls_explicit_asks_leave_the_sandbox(
     """Under EMPTY the wrapper grants nothing on its own account: no cleanup
     delete, no edit retry, no recorded `--escalate` or gate replayed by a
     `send`. What the caller passed in THIS invocation still holds."""
-    work, ask = _judge(tmp_path, monkeypatch, role="", escalate=r"^tool\b",
+    work, ask = _judge(tmp_path, monkeypatch, role="", escalate=r"tool\b.*",
                        gates=["tool gate"])
     (work / ".pytest-tmp").mkdir()
     assert not ask("Remove-Item -Recurse -Force .pytest-tmp")
@@ -108,7 +108,7 @@ def test_without_a_host_only_this_calls_explicit_asks_leave_the_sandbox(
     refused = edits([str(work / "src" / "a.txt")])
     assert not refused and "no host policy" in refused.reason
     host_policy.grant({"escalate"})
-    _, ask = _judge(tmp_path, monkeypatch, role="", escalate=r"^tool\b",
+    _, ask = _judge(tmp_path, monkeypatch, role="", escalate=r"tool\b.*",
                     gates=["tool gate"])
     assert ask("tool src/a.txt").reason == "matches the escalate rule"
     assert not ask("Remove-Item -Recurse -Force .pytest-tmp")

@@ -119,19 +119,46 @@ Token = Union[Word, str]
 
 # Outside quotes, every one of these makes PowerShell do something other than
 # pass a literal word: `$` and a backtick expand, `( ) { } @` start
-# expressions, arrays and splats, `,` builds an array (`a,C:\x` is two
-# arguments), `#` comments the rest out, `~` and wildcards expand for
-# cmdlets, `[ ]` are type literals, `< %` and `!` are operators or reserved.
-_PS_SPECIAL = frozenset("$`(){}@,#~!%^[]*?<")
+# expressions, arrays and splats, `,` builds an array (`a, C:\x` is two
+# arguments, a trailing `x,` takes the NEXT LINE as more of them), `#`
+# comments the rest out, `~` and wildcards expand for cmdlets (and for the
+# scripts that glob their own arguments), `< !` are operators or reserved.
+# `[ ]` are read by `_bracket_literal` instead, `%` by `_STOP_PARSING`.
+_PS_SPECIAL = frozenset("$`(){}@,#~!^*?<")
 # ...and the ones cmd.exe acts on outside quotes (`%` expands even inside).
 _CMD_SPECIAL = frozenset("%^!()<'*?,;=@`")
-# PowerShell takes the typographic quotes as quotes too.
+# PowerShell takes the typographic quotes as quotes too — and closes a `'…`
+# string on a `’` (any of the single ones, any of the double ones for `"…`).
+# Refused ANYWHERE, inside a string as well: a reader that kept only the
+# ASCII rule saw `'x’ ; Set-Content …'` as one literal while PowerShell ran
+# the tail (review of 2432, round 4). Re-implementing the rule buys an agent
+# nothing it cannot type in ASCII.
 _CURLY_QUOTES = frozenset("\u2018\u2019\u201a\u201b\u201c\u201d\u201e")
+# PowerShell's stop-parsing token: the rest of the line goes to the program
+# raw, `%VAR%` expanded and `;` no separator. PowerShell's dashes include the
+# en and em dash and the horizontal bar.
+_STOP_PARSING = re.compile("[-\u2013\u2014\u2015]{2}%")
+_UNKNOWN_SHELL_SPECIAL = frozenset("%[]")
+
+
+def _bracket_literal(current: list[str]) -> bool:
+    """Whether PowerShell keeps a `[` or `]` literal in the bare word
+    `current` (measured 2026-11-18 on Windows PowerShell 5.1, argv of a
+    native program): after the first character of a word that is no
+    parameter (`tests/x.py::t[1]`, `a]b`). At its start `[int]` is a type
+    literal in command position, and after a leading `-` PowerShell splits
+    the word there (`-k=a[x]` arrives as `-k=a`, `[x]`).
+
+    `%` needs no rule: the same measurement passed `--format=%H`, `100%`,
+    `%a%` and `--%x` literally — only the whole word `--%` is not
+    (`_STOP_PARSING`)."""
+    return bool(current) and current[0] != "-"
 
 
 def _words(text: str, shell: str) -> list[Token]:
     """The words and operators of `text` under `shell` ("" reads as
-    PowerShell, the stricter of the two); raises `Unparsed`.
+    PowerShell without its measured relaxations, the strictest); raises
+    `Unparsed`.
 
     Only what passes a LITERAL string to a program is read: bare words of
     plain characters, single-quoted strings (PowerShell: `''` is a quote),
@@ -141,17 +168,36 @@ def _words(text: str, shell: str) -> list[Token]:
     PowerShell's rules for it differ by context, and guessing is how a
     reader grants what the shell does not run.
     """
+    return [token for token, _ in _lexed(text, shell)]
+
+
+def _lexed(text: str, shell: str) -> list[tuple[Token, str]]:
+    """`_words`, each token with its source text (a quoted word's quotes
+    included): what the escalate rule matches (`sandbox.escalate_refusal`)."""
     cmd = shell == "cmd"
-    special = _CMD_SPECIAL if cmd else _PS_SPECIAL
-    out: list[Token] = []
+    # The measured PowerShell relaxations (`%`, `[ ]`) hold under a
+    # PowerShell wrapper only; with none the shell is unknown.
+    special = (_CMD_SPECIAL if cmd else _PS_SPECIAL if shell == "powershell"
+               else _PS_SPECIAL | _UNKNOWN_SHELL_SPECIAL)
+    curly = next((char for char in text if char in _CURLY_QUOTES), None)
+    if curly is not None:
+        raise Unparsed(f"a typographic quote {curly!r}")
+    out: list[tuple[Token, str]] = []
     current: list[str] = []
+    started = 0
     at = 0
     end = len(text)
 
     def flush() -> None:
         if current:
-            out.append(Word("".join(current)))
+            value = "".join(current)
+            if not cmd and _STOP_PARSING.fullmatch(value):
+                raise Unparsed(f"`{value}` (PowerShell's stop-parsing token)")
+            out.append((Word(value), text[started:at]))
             current.clear()
+
+    def operator(op: str) -> None:
+        out.append((op, op))
 
     while at < end:
         char = text[at]
@@ -161,14 +207,13 @@ def _words(text: str, shell: str) -> list[Token]:
             continue
         if char == "\n":
             flush()
-            out.append(";")
+            operator(";")
             at += 1
             continue
-        if char in _CURLY_QUOTES:
-            raise Unparsed(f"a typographic quote {char!r}")
         if char == '"' or (char == "'" and not cmd):
             if current:
                 raise Unparsed("a quote glued to other text")
+            started = at
             value: list[str] = []
             at += 1
             while True:
@@ -189,51 +234,50 @@ def _words(text: str, shell: str) -> list[Token]:
             at += 1
             if at < end and text[at] not in " \t\r\n;|&>":
                 raise Unparsed("a quote glued to other text")
-            out.append(Word(literal, quoted=True))
+            out.append((Word(literal, quoted=True), text[started:at]))
             continue
         if not current and text.startswith(_MERGE, at):
-            out.append(_MERGE)
+            operator(_MERGE)
             at += len(_MERGE)
             continue
         if not current and char in "2*" and text.startswith(">", at + 1):
-            flush()
             op = char + (">>" if text.startswith(">>", at + 1) else ">")
-            out.append(op)
+            operator(op)
             at += len(op)
             continue
         if char == ">":
             flush()
             op = ">>" if text.startswith(">>", at) else ">"
-            out.append(op)
+            operator(op)
             at += len(op)
             continue
         if char == "&":
             flush()
             if text.startswith("&&", at):
-                out.append("&&")
+                operator("&&")
                 at += 2
             elif cmd:
-                out.append(";")
+                operator(";")
                 at += 1
             else:
                 raise Unparsed("`&` (PowerShell's call operator)")
             continue
         if char == "|":
             flush()
-            if text.startswith("||", at):
-                out.append("||")
-                at += 2
-            else:
-                out.append("|")
-                at += 1
+            op = "||" if text.startswith("||", at) else "|"
+            operator(op)
+            at += len(op)
             continue
         if char == ";" and not cmd:
             flush()
-            out.append(";")
+            operator(";")
             at += 1
             continue
-        if char in special:
+        if char in special or (not cmd and char in "[]"
+                               and not _bracket_literal(current)):
             raise Unparsed(f"`{char}` outside quotes")
+        if not current:
+            started = at
         current.append(char)
         at += 1
     flush()

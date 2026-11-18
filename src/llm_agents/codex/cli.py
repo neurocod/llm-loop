@@ -897,10 +897,11 @@ def build_parser() -> argparse.ArgumentParser:
     # (`sandbox.opens_commands`), named in the help by the host's own word for
     # it (`shapes_name`) so the help and the judge's refusals agree.
     spawn.add_argument("--escalate", default="", metavar="REGEX",
-                       help="commands matching this regex may run OUTSIDE the "
-                            "sandbox when the agent asks (e.g. "
-                            r"'^npm (test|run typecheck)\b'); everything else "
-                            "is still declined. A --role worker needs no regex "
+                       help="commands matching this regex WHOLE (each command "
+                            "of a line, plain words, no redirect) may run "
+                            "OUTSIDE the sandbox when the agent asks (e.g. "
+                            r"'npm (test|run typecheck)( .*)?'); everything "
+                            "else is still declined. A --role worker needs no regex "
                             "for its host's allowlist "
                             f"({policy.commands.shapes_name}); given, the "
                             "regex adds to it")
