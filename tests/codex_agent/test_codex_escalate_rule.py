@@ -122,7 +122,7 @@ def test_honest_gates_pass_as_recorded(tmp_path, monkeypatch):
              "node C:\\w\\node_modules\\vitest\\vitest.mjs run --root C:\\w test/x.test.ts",
              "python tools/try_patch.py --file a.ts --old 'a' --new 'b//c' -- npm test",
              "python C:/w/tools/selftest_run.py physics",
-             "python tools/webgame/list_endpoints.py --check"]
+             "python tools/client/list_endpoints.py --check"]
     _, ask = worker_judge(tmp_path, monkeypatch, gates=gates, role="reviewer")
     for command in (*gates, "npm run typecheck 2>&1",
                     "node node_modules\\vitest\\vitest.mjs run --root C:/w test/x.test.ts"):

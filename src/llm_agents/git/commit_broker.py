@@ -6,7 +6,7 @@ sandbox — with the user's full rights. The commit script itself
 (`llm_agents.git.commit`) is the kit's; what a plain `python
 tools/git/commit.py` from the worker's tree would also run is the worker's
 own: that script and the kit under the slot's `src/` (it may edit both
-before asking), the hooks under `core.hooksPath` (MultiSkill's is the
+before asking), the hooks under `core.hooksPath` (the first host's is the
 tracked `.githooks/` of the tree the worker writes; measured 2026-11-18:
 pre-commit, prepare-commit-msg, commit-msg, post-commit, post-index-change
 and reference-transaction all ran from there), and `git` resolved by name.
@@ -32,7 +32,7 @@ runs the kit's `commit.main` with:
   inherits the binding and `gitlib.FORCED`, but not
   `gitlib.SKIP_SUBMODULES`: a hook that asks `status` or a work-tree `diff`
   runs what a submodule's `.git` names once the worker's `.gitmodules` sets
-  that submodule's `ignore` (MultiSkill's ask only `diff --cached`, which
+  that submodule's `ignore` (the first host's ask only `diff --cached`, which
   reads no submodule);
 - the host's `CommitHost` from its main checkout (`HostPolicy.commit_host`),
   never the slot's copy of it;
