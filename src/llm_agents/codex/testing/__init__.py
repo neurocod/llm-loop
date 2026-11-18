@@ -43,8 +43,11 @@ PS = CodexWrap()
 
 def _judge(tmp_path: Path, monkeypatch: Any, cwd: Path, fields: dict) -> Callable:
     """A sandboxed worker's escalation judge over `cwd`, its scratch under
-    `tmp_path` (a role of "worker" unless `fields` names one)."""
+    `tmp_path` (a role of "worker" unless `fields` names one), its sandbox
+    temp folder `tmp_path/temp` (`sandbox.sandbox_temp_dirs`): the real one
+    holds `tmp_path`, which would put every fixture in the worker's reach."""
     monkeypatch.setattr(sandbox, "scratch_dir", lambda name: tmp_path / "scratch")
+    monkeypatch.setattr(sandbox, "sandbox_temp_dirs", lambda record: [tmp_path / "temp"])
     fields.setdefault("role", "worker")
     return sandbox.escalation_judge(AgentRecord(
         name="w", cwd=str(cwd), sandbox="workspace-write", **fields))

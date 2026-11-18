@@ -726,7 +726,10 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
         return None
     pattern = re.compile(escalate) if escalate else None
     workspace = workspace_of(record).resolve()
-    roots = tuple(root.resolve() for root in writable_roots(record))
+    # What the agent may write, the temp folders included: the judge's
+    # "outside the roots" checks guard against the worker's own files.
+    roots = tuple(dict.fromkeys(root.resolve() for root in (
+        *writable_roots(record), *sandbox_temp_dirs(record))))
     scratch = scratch_root(record)
     # The approvals and the brokers' empty hooks folder live in the slot's
     # admin directory: outside a slot worker's writable roots (a scratch
@@ -777,8 +780,9 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
         # Final for a worker, over the escalate rule and the cleanup grant
         # below: those read the command unwrapped, and cmd would still look
         # its program up in the worker's cwd first (`npm test` under
-        # `cmd /c` -> a planted npm.cmd; review of 2432).
-        if worker and split_shell(command)[0] == "cmd":
+        # `cmd /c` -> a planted npm.cmd; review of 2432) — Codex's wrapper
+        # or one the worker typed inside PowerShell's (review 2).
+        if worker and _runs_cmd(command):
             return Verdict(False, f"{refusal}; {decline_tail}")
         if pattern is not None and pattern.search(unwrap_shell(command)):
             return Verdict(True, "matches the escalate rule")
@@ -803,16 +807,44 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
     return judge
 
 
+# `cmd` as a word of a command (a path to it, `.exe` or not, `& cmd`), not
+# as part of a longer name or path segment (`tools/cmd/x`, `cmdlet`).
+_CMD_WORD = re.compile(r"""(?:^|[\s;&|("'\\/])cmd(?:\.exe)?(?=$|[\s"';&|)])""",
+                       re.IGNORECASE)
+
+
+def _runs_cmd(command: str) -> bool:
+    """Whether cmd runs anywhere in `command`: Codex's wrapper is cmd, or a
+    `cmd` word stands in what a wrapper (unwrapped as many times as there
+    are wrappers) holds. A `cmd` the shape judges never grant costs a
+    worker only an escalate-rule grant of a command that names cmd."""
+    for _ in range(8):
+        shell, inner = split_shell(command)
+        if shell == "cmd" or _CMD_WORD.search(inner):
+            return True
+        if not shell:
+            return False
+        command = inner
+    return True
+
+
 def _slot_admin(workspace: Path, roots: tuple[Path, ...]) -> tuple[Optional[Path], str]:
     """The slot's admin directory as the main clone registers it
     (`slots.registered_admin`, not the slot's `.git` file), or None and why:
     refused when it, or the repository it belongs to, lies in a writable
-    root — the approvals and every broker's git are bound to it."""
+    root, or a writable root lies in that repository (`--writable <main>/
+    .git/worktrees/<slot>/modules/...`: a submodule's admin, with its
+    config, the worker's) — the approvals and every broker's git are bound
+    to it."""
     admin, why = registered_admin(workspace)
     if admin is None:
         return None, why
-    if within(admin, roots) or within(admin.parent.parent, roots):
+    common = admin.parent.parent
+    if within(admin, roots) or within(common, roots):
         return None, f"the slot's admin directory {admin} lies in your writable roots"
+    inside = next((root for root in roots if within(root, (common,))), None)
+    if inside is not None:
+        return None, f"your writable root {inside} lies in the slot's repository {common}"
     return admin, ""
 
 
@@ -901,6 +933,27 @@ def writable_roots(record: AgentRecord) -> list[Path]:
         roots.append(scratch)
     roots.extend(Path(root) for root in record.writable)
     return roots
+
+
+def sandbox_temp_dirs(record: AgentRecord) -> list[Path]:
+    """The temp folders Codex's `workspaceWrite` lets the agent write BESIDE
+    `writable_roots`: the command environment's `TEMP` and `TMP` on Windows
+    (`windows-sandbox-rs` `allow.rs`, `includes_tmp_env_vars_when_requested`;
+    `$TMPDIR` elsewhere) unless `excludeTmpdirEnvVar`, which this wrapper
+    never sends (`scratch_root`: workers' tools and pytest's default
+    `tmp_path` write there). Read from the bridge's own environment, which
+    the app-server and its commands inherit.
+
+    Not one of `writable_roots` — the briefing does not offer them — but a
+    place the worker can write all the same, so every "outside the writable
+    roots" check of the escalation judge counts them (review 2 of 2432: a
+    `python` or `git` on the PATH, the host's hooks or commit rules, the
+    slot's admin, a broker's own file in %TEMP% passed those checks)."""
+    if SANDBOX_MODES.get(record.effective_sandbox) != "workspace-write":
+        return []
+    names = ("TEMP", "TMP") if os.name == "nt" else ("TMPDIR",)
+    found = (os.environ.get(name, "").strip() for name in names)
+    return [Path(value) for value in dict.fromkeys(found) if value and os.path.isabs(value)]
 
 
 def file_change_judge(record: AgentRecord) -> Callable[[list[str]], Verdict]:

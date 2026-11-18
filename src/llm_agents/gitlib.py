@@ -104,7 +104,12 @@ class Repository:
     own (read 2026-11-18 at codex 0.166.0). A git bound to a `Repository`
     whose `git_dir` lies outside every writable root reads only system,
     global and that repository's own config (and the files they include) —
-    none of them the worker's to write."""
+    none of them the worker's to write. That last is a trust assumption,
+    not a check: no `include.path`/`includeIf` exists in the pool's configs
+    today (2026-11-18), and one naming a file in a writable root (the
+    tree's own `.gitconfig`, say) would hand the worker every setting above.
+    Nor does the binding reach the git a command starts per submodule
+    (`SKIP_SUBMODULES`)."""
     git_dir: Path
     work_tree: Path
 

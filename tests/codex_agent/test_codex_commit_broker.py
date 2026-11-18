@@ -167,6 +167,21 @@ def test_the_cmd_refusal_is_final_over_the_escalate_rule(tmp_path, monkeypatch):
     assert verdict and verdict.reason == "matches the escalate rule", verdict.reason
 
 
+def test_a_cmd_inside_powershell_is_refused_over_the_escalate_rule(tmp_path, monkeypatch):
+    """Review 2 of 2432: the final refusal saw only Codex's wrapper; a `cmd`
+    the worker typed inside PowerShell's reached the unanchored escalate
+    rule as `cmd /c npm test` and was granted."""
+    _, ask = worker_judge(tmp_path, monkeypatch, escalate=r"npm test")
+    for command in ("cmd /c npm test", "cmd.exe /c 'npm test'", "& cmd /k npm test",
+                    "C:\\Windows\\System32\\CMD.EXE /d /c npm test",
+                    "powershell -Command 'cmd /c npm test'"):
+        verdict = ask(command)
+        assert not verdict, (command, verdict.reason)
+    for command in ("npm test", "npm test -- tools/cmd/x.test.ts"):
+        verdict = ask(command)
+        assert verdict and verdict.reason == "matches the escalate rule", (command, verdict.reason)
+
+
 def test_the_broker_starts_only_as_python_typed_plainly(tmp_path, monkeypatch):
     """`argv_refusal` drops a program suffix to find the shape; the broker
     launch judges the word as typed: `python.cmd` is a script PowerShell
@@ -237,6 +252,26 @@ def test_a_python_path_entry_in_the_roots_refuses_the_launch(tmp_path, monkeypat
     monkeypatch.setenv("PATH", f"{tmp_path / 'scratch'}{os.pathsep}{os.environ['PATH']}")
     ask = commit_judge(tmp_path, monkeypatch, slot)
     _declined(ask, f"{RUN} -F {tmp_path / 'scratch/m.txt'} src/a.ts",
+              "lies in your writable roots: a `python` planted there would run")
+
+
+def test_the_sandbox_temp_folder_counts_as_a_writable_root(tmp_path, monkeypatch):
+    """Review 2 of 2432: Codex's workspaceWrite lets the worker write %TEMP%
+    beside its roots, so a `python` on the PATH there is the worker's."""
+    from llm_agents.codex.registry import AgentRecord
+    temp, other = tmp_path / "t1", tmp_path / "t2"
+    monkeypatch.setenv("TEMP", str(temp))
+    monkeypatch.setenv("TMP", str(other))
+    monkeypatch.setenv("TMPDIR", str(temp))
+    writer = AgentRecord(name="w", cwd=str(tmp_path), sandbox="workspace-write")
+    expected = [temp, other] if os.name == "nt" else [temp]
+    assert sandbox.sandbox_temp_dirs(writer) == expected
+    assert sandbox.sandbox_temp_dirs(replace(writer, sandbox="read-only")) == []
+    slot, _ = _slot(tmp_path)
+    (tmp_path / "temp").mkdir(exist_ok=True)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'temp'}{os.pathsep}{os.environ['PATH']}")
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    _declined(ask, f"{RUN} -F {_message(tmp_path)} src/a.ts",
               "lies in your writable roots: a `python` planted there would run")
 
 
@@ -426,6 +461,18 @@ def test_no_broker_over_an_admin_directory_the_worker_may_write(tmp_path, monkey
     ask = commit_judge(tmp_path, monkeypatch, slot, writable=[str(tmp_path / "main")])
     assert APPROVALS not in ask.environment
     _declined(ask, f"{RUN} -F {_message(tmp_path)} src/a.ts", "lies in your writable roots")
+
+
+def test_no_broker_over_a_writable_root_inside_the_slot_s_repository(tmp_path, monkeypatch):
+    """Review 2 of 2432: the other direction — a `--writable` folder inside
+    the main clone's `.git` (a submodule's admin, its config) is the
+    worker's to write; no store, no grant."""
+    slot, _ = _slot(tmp_path)
+    inside = tmp_path / "main/.git/worktrees/main-wt1/modules/vendor"
+    inside.mkdir(parents=True)
+    ask = commit_judge(tmp_path, monkeypatch, slot, writable=[str(inside)])
+    assert APPROVALS not in ask.environment
+    _declined(ask, f"{RUN} -F {_message(tmp_path)} src/a.ts", "lies in the slot's repository")
 
 
 @windows

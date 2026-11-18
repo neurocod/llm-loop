@@ -141,6 +141,14 @@ def _core_host(request):
         yield
         return
     from core_policy import CORE_POLICY  # on `pythonpath` in pyproject.toml
+    # The judge counts the sandbox's temp folders as the worker's
+    # (`sandbox.sandbox_temp_dirs`, read from these variables); the real
+    # %TEMP% holds every test's tmp_path, so each test gets one of its own.
+    temp = request.getfixturevalue("tmp_path") / "temp"
+    temp.mkdir(exist_ok=True)
+    monkeypatch = request.getfixturevalue("monkeypatch")
+    for name in ("TEMP", "TMP", "TMPDIR"):
+        monkeypatch.setenv(name, str(temp))
     with host_policy.installed(CORE_POLICY):
         yield
 
