@@ -3,7 +3,11 @@ a pool slot with no project's names in them. The mechanisms are
 `llm_agents.codex.testing`, shared with any host's own judge tests."""
 
 import json
+import os
+import shutil
+import time
 from functools import partial
+from pathlib import Path
 
 from llm_agents.codex import testing
 from llm_agents.codex.testing import commit_judge, git_in, junction, worker_judge  # noqa: F401
@@ -47,3 +51,51 @@ def slot_with_submodule(tmp_path):
     slot = pool_slot(tmp_path)
     checkout, source = testing.add_submodule(tmp_path, slot, SUBMODULE, "vendor")
     return slot, checkout, source
+
+
+def scratch_message(tmp_path: Path, text: str = "Slot work\n") -> Path:
+    """`<tmp_path>/scratch/msg.txt` holding `text`: the judge reads a `-F`
+    file when it grants the commit (`command_commit._message_snapshot`)."""
+    message = tmp_path / "scratch" / "msg.txt"
+    message.parent.mkdir(parents=True, exist_ok=True)
+    message.write_text(text, encoding="utf-8")
+    return message
+
+
+def planted_gitdir(tmp_path: Path, sub: Path, marker: Path) -> Path:
+    """A copy of `sub`'s repository where the worker could write it (its
+    scratch) whose config names a program as fsmonitor and as the `evil`
+    clean filter; the program appends to `marker` and passes its input
+    through."""
+    script = tmp_path / "scratch" / "planted.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n",
+                      encoding="utf-8", newline="\n")
+    script.chmod(0o755)
+    real = git_in(sub, "rev-parse", "--absolute-git-dir").stdout.strip()
+    planted = tmp_path / "scratch" / "planted.git"
+    shutil.copytree(real, planted)
+    for key, value in (("core.worktree", sub.as_posix()), ("core.fsmonitor", script.as_posix()),
+                       ("filter.evil.clean", script.as_posix())):
+        git_in(tmp_path, "config", "--file", str(planted / "config"), key, value)
+    return planted
+
+
+def point(git_file: Path, gitdir: Path) -> None:
+    # Git marks the file hidden on Windows; opening it with 'w' is refused.
+    with git_file.open("r+", encoding="utf-8") as stream:
+        stream.write(f"gitdir: {gitdir}\n")
+        stream.truncate()
+
+
+def nested_filter(tmp_path: Path, sub: Path) -> Path:
+    """Review 2 of 2432: `sub/.git` pointed at `planted_gitdir`, every file
+    of `sub` filtered `evil`, and its tracked `work.txt` touched (same size,
+    new mtime), so the next git that asks whether `sub` is dirty runs the
+    planted filter. The marker the filter writes."""
+    marker = tmp_path / "nested-filter.txt"
+    point(sub / ".git", planted_gitdir(tmp_path, sub, marker))
+    (sub / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
+    later = time.time() + 10
+    os.utime(sub / "work.txt", (later, later))
+    return marker

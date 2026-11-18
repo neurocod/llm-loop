@@ -5,6 +5,8 @@ Instead it inherits the location of a private approval store in the slot's
 Git admin directory. The judge writes there before accepting; commit.py reads
 the exact invocation's resolved cwd and identity there before any Git write.
 The store is outside the worker's writable roots and removed with the server.
+A ticket for `-F` also holds the message text the judge read: the broker
+commits that copy and never opens the worker's path itself.
 
 `write_approval` is the judge's half (`llm_agents.codex.command_commit`),
 `approved_invocation` the commit script's (`llm_agents.git.commit`, which

@@ -24,7 +24,8 @@ from llm_agents.codex.command_rebase import BROKER
 from llm_agents.codex.registry import AgentRecord
 from llm_agents.git import rebase as broker
 from llm_agents.codex.testing import PS
-from core_judge_support import commit_judge, git_in, junction, pool_slot, slot_with_submodule
+from core_judge_support import (commit_judge, git_in, junction, nested_filter, pool_slot,
+                                slot_with_submodule)
 from core_policy import CORE_POLICY
 
 # A broker step on a two-commit fixture: under 2 s measured 2026-11-18 (a
@@ -265,6 +266,23 @@ def test_the_broker_runs_the_pinned_git_not_one_from_the_cwd(tmp_path, monkeypat
     assert grant.admin == (tmp_path / "main/.git/worktrees/main-wt1").resolve()
     assert all(f"--git-dir {grant.admin}" in line
                for line in log.read_text(encoding="utf-8").splitlines())
+
+
+def test_status_and_diff_run_no_filter_a_submodule_s_git_file_names(tmp_path, monkeypatch):
+    """Review 2 of 2432: the binding holds for the broker's git, not for the
+    git its `status`/`diff` start per submodule, which discovers the
+    worker-writable `<sub>/.git` and ran the clean filter its config names."""
+    slot, sub, _ = slot_with_submodule(tmp_path)
+    git_in(tmp_path / "main", "branch", "trunk")
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    marker = nested_filter(tmp_path, sub)
+    for request in (["status"], ["diff"], ["diff", "--stat"], ["diff", "--name-only"]):
+        _granted(ask, f"{RUN} {' '.join(request)}")
+        done = _broker(ask, slot, *request)
+        assert done.returncode == 0, (request, done.stdout + done.stderr)
+        assert not marker.exists(), request
+    _plain_git(slot, "diff", "--name-only")
+    assert marker.exists()  # the control: a plain diff runs it
 
 
 def test_the_broker_ignores_update_refs_and_autostash_config(tmp_path, monkeypatch):

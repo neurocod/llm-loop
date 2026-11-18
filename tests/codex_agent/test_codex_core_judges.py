@@ -15,8 +15,8 @@ from llm_agents.codex import command_commit, roles, sandbox
 from llm_agents.codex.registry import AgentRecord
 from llm_agents.codex.store import AgentStore
 from core_judge_support import (
-    SUBMODULE, commit_judge, git_in, junction, pool_slot, slot_with_submodule,
-    worker_judge, worker_tree)
+    SUBMODULE, commit_judge, git_in, junction, pool_slot, scratch_message,
+    slot_with_submodule, worker_judge, worker_tree)
 
 windows = pytest.mark.skipif(os.name != "nt", reason="Windows junction")
 
@@ -206,7 +206,8 @@ def test_a_worker_commits_named_paths_in_its_pool_slot(tmp_path, monkeypatch):
     extra = tmp_path / "pad"
     extra.mkdir()
     ask = commit_judge(tmp_path, monkeypatch, slot, writable=[str(extra)])
-    message = tmp_path / "scratch" / "msg.txt"
+    message = scratch_message(tmp_path)
+    (extra / "m.txt").write_text("Pad work\n", encoding="utf-8")
     for command in [f"{RUN} -F {message} src/a.ts",
                     f"{RUN} --file {extra / 'm.txt'} src/a.ts src/gone.ts",
                     f"{RUN} -m 'subject' -m '- bullet' src/a.ts",
@@ -224,6 +225,9 @@ def test_a_worker_commits_named_paths_in_its_pool_slot(tmp_path, monkeypatch):
         f"{RUN} -F {elsewhere / 'msg.txt'} src/a.ts":
             "outside your writable roots",
         f"{RUN} -F src/a.ts app/src/b.ts": "outside the tree",
+        # read when granted: the ticket carries the text, not the path
+        f"{RUN} -F {tmp_path / 'scratch' / 'none.txt'} src/a.ts":
+            "cannot read the message file",
         f"{RUN} -C {sibling} -F {message} src/a.ts":
             "outside your writable roots",
         f"{RUN} -F {message} vault/k.txt": "vault/",
@@ -253,7 +257,7 @@ def test_commit_is_declined_outside_a_pool_slot(tmp_path, monkeypatch):
 def test_commit_in_the_slot_s_own_declared_submodule_only(tmp_path, monkeypatch):
     slot, sub, source = slot_with_submodule(tmp_path)
     ask = commit_judge(tmp_path, monkeypatch, slot)
-    msg = tmp_path / "scratch" / "msg.txt"
+    msg = scratch_message(tmp_path)
     for target in (f"-C {sub}", f"--cwd={SUBMODULE}"):
         verdict = ask(f"{RUN} {target} -F {msg} work.txt")
         assert verdict, verdict.reason
@@ -341,6 +345,7 @@ def test_a_commit_is_judged_on_the_wire(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_SLOT", str(slot))
     monkeypatch.setenv("FAKE_SCRATCH", str(tmp_path / "scratch"))
     monkeypatch.setenv("FAKE_COMMIT_BROKER", str(command_commit.BROKER))
+    scratch_message(tmp_path)
     outcome = wire.run_fake_turn(tmp_path, monkeypatch, "commit", timeout=15.0,
                              sandbox="workspace-write", role="worker", expect="", cwd=slot)
     assert outcome.text.startswith("commit handled")

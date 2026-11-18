@@ -59,7 +59,9 @@ def _store_env(slot, directory):
 
 @pytest.mark.parametrize("mismatch,reason", [
     (None, ""), ("admin", "names a repository outside this slot"),
-    ("root", "approved root changed")])
+    ("root", "approved root changed"),
+    # a ticket for -F without the judge's copy of the message
+    ("message", "the approval holds no message")])
 def test_commit_rechecks_approved_identity(checkout, tmp_path, mismatch, reason):
     slot, sub, _ = checkout
     directory = Path(git(slot, "rev-parse", "--absolute-git-dir")) / "approvals"
@@ -69,8 +71,10 @@ def test_commit_rechecks_approved_identity(checkout, tmp_path, mismatch, reason)
     args = ["-C", str(sub), "-F", str(message), "work.txt"]
     identity = {"cwd": str(sub), "root": str(sub),
                 "admin": git(sub, "rev-parse", "--absolute-git-dir"),
-                "owner": str(slot)}
-    if mismatch:
+                "owner": str(slot), "message": "Identity check\n"}
+    if mismatch == "message":
+        del identity["message"]
+    elif mismatch:
         identity[mismatch] = str(tmp_path / "another")
     write_approval(directory, slot, args, identity)
     (sub / "work.txt").write_text("changed\n", encoding="utf-8")
@@ -84,6 +88,8 @@ def test_commit_rechecks_approved_identity(checkout, tmp_path, mismatch, reason)
     else:
         assert result.returncode == 0, result.stdout + result.stderr
         assert git(sub, "show", "HEAD:work.txt") == "changed"
+        # The broker commits the ticket's copy and leaves the file alone.
+        assert message.exists()
 
 
 def test_worker_commit_without_approval_fails_closed(checkout, tmp_path):

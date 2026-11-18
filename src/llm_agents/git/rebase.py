@@ -45,7 +45,7 @@ if __name__ == "__main__":
     # `-I` put no script folder on sys.path: this file's own src/ goes first.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from llm_agents.gitlib import Pinned, Repository  # noqa: E402
+from llm_agents.gitlib import SKIP_SUBMODULES, Pinned, Repository  # noqa: E402
 
 # The bridge's facts, as JSON: {"workspace", "admin", "git", "hooks", "main"}.
 ENV = "LLM_AGENTS_REBASE_BROKER"
@@ -219,7 +219,7 @@ def refusal(grant: Grant, op: str, args: list[str]) -> str:
                 f"refs/heads/{grant.main}^{{commit}}") is None:
             return f"rebase broker start: no branch refs/heads/{grant.main}"
         status = _ask(grant, "status", "--porcelain=v1", "-z",
-                      "--untracked-files=no", "--ignore-submodules=all")
+                      "--untracked-files=no", SKIP_SUBMODULES)
         if status is None:
             return "rebase broker start: git cannot read the slot's status"
         if status.strip("\0"):
@@ -289,10 +289,11 @@ def execute(grant: Grant, op: str, args: list[str]) -> int:
         return _run(grant, "rm", *cached, "--", *_index_names(grant, paths),
                     capture=False).returncode
     if op == "status":
-        return _run(grant, "status", "--short", "--branch", capture=False).returncode
-    if op == "diff":
-        return _run(grant, "diff", "--no-ext-diff", "--no-textconv", *args,
+        return _run(grant, "status", "--short", "--branch", SKIP_SUBMODULES,
                     capture=False).returncode
+    if op == "diff":
+        return _run(grant, "diff", "--no-ext-diff", "--no-textconv", SKIP_SUBMODULES,
+                    *args, capture=False).returncode
     return _run(grant, "ls-files", "-u", "--full-name", capture=False).returncode
 
 

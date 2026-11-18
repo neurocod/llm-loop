@@ -113,13 +113,15 @@ def _tree_repository(root: Path, ctx: CommandContext) -> tuple[Optional[Reposito
 
 
 def _message_file_refusal(value: str, cwd: Path, ctx: CommandContext) -> str:
-    """commit.py's `-F`: a DELETE as well as a read — commit.py removes the
-    message file after a successful commit — so it must lie in a writable
-    root OUTSIDE the tree (the scratch root, the operator's `--writable`
-    roots). In the tree it may be a tracked file (`-F CLAUDE.md`, review
-    2026-11-03: lost with its uncommitted edits; commit.py refuses a tracked
-    one too), elsewhere in %TEMP% it is nobody's to delete. Resolved
-    against the caller's cwd, as commit.py reads it before its `-C`."""
+    """commit.py's `-F`: in a writable root OUTSIDE the tree (the scratch
+    root, the operator's `--writable` roots) — a message is the worker's
+    own text, not a file of the tree nor anything else the judge would read
+    for it. Resolved against the caller's cwd, as commit.py reads it before
+    its `-C`. Read once, here (`_message_snapshot`): the broker commits that
+    text from the ticket and never opens, moves or deletes the path, which
+    the worker may re-point after the approval (review 2 of 2432: a
+    junction swapped in for the folder had the broker read and delete a
+    file outside the writable roots)."""
     why = _value_refusal(value, cwd, ctx, is_path=True)
     if why:
         return why
@@ -127,9 +129,33 @@ def _message_file_refusal(value: str, cwd: Path, ctx: CommandContext) -> str:
     outside = tuple(root for root in ctx.roots if root != ctx.workspace)
     if within(resolved, (ctx.workspace,)) or not within(resolved, outside):
         return (f"commit.py -F {value}: the message file goes in your scratch "
-                f"directory or a --writable directory outside the tree, since "
-                f"commit.py deletes it after the commit")
+                f"directory or a --writable directory outside the tree")
     return ""
+
+
+# A commit message longer than this is no message (a 72-column body of
+# 3 000 lines); the bound keeps a re-pointed `-F` from having the judge
+# copy a large file into the ticket.
+_MESSAGE_MAX_BYTES = 256 * 1024
+
+
+def _message_snapshot(value: str, cwd: Path) -> tuple[Optional[str], str]:
+    """The text of the `-F` file `_message_file_refusal` passed, or None
+    and why. Residual: the folder can still be re-pointed between that
+    check and this read; what is read then is a file the sandboxed worker
+    may read anyway (Codex's workspace-write sandbox reads the whole disk),
+    and it is only read, never moved or deleted."""
+    try:
+        with open(resolve_path(value, cwd)[1], "rb") as stream:
+            data = stream.read(_MESSAGE_MAX_BYTES + 1)
+    except (OSError, PathRefused) as error:
+        return None, f"commit.py -F {value}: cannot read the message file ({error})"
+    if len(data) > _MESSAGE_MAX_BYTES:
+        return None, f"commit.py -F {value}: over {_MESSAGE_MAX_BYTES} bytes"
+    try:
+        return data.decode("utf-8"), ""
+    except UnicodeDecodeError:
+        return None, f"commit.py -F {value}: the message file is not UTF-8"
 
 
 # commit.py's own options (the kit's `OPTION_FLAGS`, which its parser is built
@@ -326,6 +352,13 @@ def _commit(args: list[str], cwd: Path, ctx: CommandContext) -> str:
     submodules = [path for _, path in declared]
     for raw in paths:
         why = _commit_path_refusal(raw, run, tree_ctx, submodules, repository)
+        if why:
+            return why
+    files = [value for key, value in parsed.items() if key in OPTION_FLAGS["file"]]
+    if len(files) > 1:
+        return "commit.py: use only one spelling of -F/--file"
+    if files:
+        identity["message"], why = _message_snapshot(files[0], cwd)
         if why:
             return why
     if ctx.commit_approvals is not None:

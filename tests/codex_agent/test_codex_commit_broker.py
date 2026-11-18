@@ -23,7 +23,8 @@ from llm_agents.codex.command_commit import BROKER
 from llm_agents.codex.testing import PS, junction
 from llm_agents.git import commit_broker
 from llm_agents.git.commit_identity import ENV as APPROVALS
-from core_judge_support import commit_judge, git_in, pool_slot, slot_with_submodule, worker_judge
+from core_judge_support import (commit_judge, git_in, nested_filter, planted_gitdir, point,
+                                pool_slot, slot_with_submodule, worker_judge)
 from core_policy import CORE_POLICY
 
 # A commit on a fixture slot: about 1 s measured 2026-11-18 (a Python start
@@ -115,7 +116,7 @@ def test_a_slot_worker_commits_only_through_the_isolated_broker(tmp_path, monkey
     copy.parent.mkdir(parents=True)
     copy.write_text("", encoding="utf-8")
     ask = commit_judge(tmp_path, monkeypatch, slot)
-    message = tmp_path / "scratch" / "msg.txt"
+    message = _message(tmp_path)
     _granted(ask, f"{RUN} -F {message} src/a.ts")
     _granted(ask, f"python -I -B {BROKER.as_posix()} -F {message} src/a.ts")
     grant = commit_broker.Grant.from_env(ask.environment[commit_broker.ENV])
@@ -172,7 +173,7 @@ def test_the_broker_starts_only_as_python_typed_plainly(tmp_path, monkeypatch):
     finds on the PATH, not the interpreter `trusted_python` pinned."""
     slot, _ = _slot(tmp_path)
     ask = commit_judge(tmp_path, monkeypatch, slot)
-    message = tmp_path / "scratch" / "msg.txt"
+    message = _message(tmp_path)
     for program in ("python.cmd", "python.bat", "python.ps1", "python.exe",
                     "python3.cmd"):
         _declined(ask, f"{program} -I {BROKER} -F {message} src/a.ts",
@@ -365,33 +366,6 @@ def test_the_granted_line_runs_the_pinned_git_and_python(tmp_path, monkeypatch):
 
 # --- the repository is named, never discovered (item 2432, 2435) -------------
 
-def _planted_gitdir(tmp_path: Path, sub: Path, marker: Path) -> Path:
-    """A copy of `sub`'s repository where the worker could write it (its
-    scratch) whose config names a program as fsmonitor and as the `evil`
-    clean filter; the program appends to `marker` and passes its input
-    through."""
-    import shutil
-    script = tmp_path / "scratch" / "planted.sh"
-    script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n",
-                      encoding="utf-8", newline="\n")
-    script.chmod(0o755)
-    real = git_in(sub, "rev-parse", "--absolute-git-dir").stdout.strip()
-    planted = tmp_path / "scratch" / "planted.git"
-    shutil.copytree(real, planted)
-    for key, value in (("core.worktree", sub.as_posix()), ("core.fsmonitor", script.as_posix()),
-                       ("filter.evil.clean", script.as_posix())):
-        git_in(tmp_path, "config", "--file", str(planted / "config"), key, value)
-    return planted
-
-
-def _point(git_file: Path, gitdir: Path) -> None:
-    # Git marks the file hidden on Windows; opening it with 'w' is refused.
-    with git_file.open("r+", encoding="utf-8") as stream:
-        stream.write(f"gitdir: {gitdir}\n")
-        stream.truncate()
-
-
 def test_the_judge_never_asks_git_through_a_submodule_s_git_file(tmp_path, monkeypatch):
     """Review A: `<sub>/.git` is writable under Codex's sandbox (only each
     root's top-level `.git` is protected); flipped to a worker repository
@@ -402,11 +376,11 @@ def test_the_judge_never_asks_git_through_a_submodule_s_git_file(tmp_path, monke
     (sub / "src").mkdir()
     (sub / "src/b.py").write_text("", encoding="utf-8")
     marker = tmp_path / "fsmonitor.txt"
-    planted = _planted_gitdir(tmp_path, sub, marker)
+    planted = planted_gitdir(tmp_path, sub, marker)
     listed = command_commit._commit_path_refusal
 
     def flipped_first(*args, **kwargs):
-        _point(sub / ".git", planted)
+        point(sub / ".git", planted)
         return listed(*args, **kwargs)
 
     ask = commit_judge(tmp_path, monkeypatch, slot)
@@ -425,7 +399,7 @@ def test_the_approvals_live_in_the_registered_admin_not_the_git_file_s(tmp_path,
     slot, _ = _slot(tmp_path)
     fake = tmp_path / "scratch" / "main" / ".git" / "worktrees" / "main-wt1"
     fake.mkdir(parents=True)
-    _point(slot / ".git", fake)
+    point(slot / ".git", fake)
     ask = commit_judge(tmp_path, monkeypatch, slot)
     import json
     store = Path(json.loads(ask.environment[APPROVALS])["directory"])
@@ -481,3 +455,52 @@ def test_every_git_after_the_ticket_is_bound_to_its_repository(tmp_path, monkeyp
     assert any(" status " in line for line in lines), lines
     unbound = [line for line in lines if f"--git-dir {admin}" not in line]
     assert not unbound, unbound
+
+
+@windows
+def test_the_commit_takes_the_approved_message_not_a_re_pointed_file(tmp_path, monkeypatch):
+    """Review 2 of 2432: after the approval the worker swaps its message
+    folder for a junction to a folder outside its writable roots. The
+    broker commits the text the judge read, and neither reads nor deletes
+    the file the junction now reaches."""
+    import shutil
+    slot, _ = _slot(tmp_path)
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    (slot / "src/a.ts").write_text("work\n", encoding="utf-8")
+    folder = tmp_path / "scratch" / "messages"
+    folder.mkdir(parents=True)
+    note = folder / "note.txt"
+    note.write_text("Approved text\n", encoding="utf-8")
+    _granted(ask, f"{RUN} -F {note} src/a.ts")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "note.txt").write_text("The user's file\n", encoding="utf-8")
+    shutil.rmtree(folder)
+    junction(folder, outside)
+    done = _commit(ask, slot, "-F", str(note), "src/a.ts")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _head_message(slot).strip() == "Approved text"
+    assert (outside / "note.txt").read_text(encoding="utf-8") == "The user's file\n"
+    assert list(outside.iterdir()) == [outside / "note.txt"]
+
+
+def test_a_commit_runs_no_filter_a_submodule_s_git_file_names(tmp_path, monkeypatch):
+    """Review 2 of 2432: binding the outer git does not bind the git its
+    `status` starts per submodule, which discovers `<sub>/.git` — the
+    worker's to point at a repository with a clean filter of its own. A
+    commit of an unrelated slot file must not run it."""
+    slot, sub, _ = slot_with_submodule(tmp_path)
+    main = tmp_path / "main"
+    git_in(main, "config", "user.name", "t")
+    git_in(main, "config", "user.email", "t@example.invalid")
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    marker = nested_filter(tmp_path, sub)
+    (slot / "src/a.ts").write_text("work\n", encoding="utf-8")
+    message = _message(tmp_path)
+    _granted(ask, f"{RUN} -F {message} src/a.ts")
+    done = _commit(ask, slot, "-F", str(message), "src/a.ts")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert git_in(slot, "show", "HEAD:src/a.ts").stdout == "work\n"
+    assert not marker.exists(), done.stdout + done.stderr
+    git_in(slot, "status", "--short")
+    assert marker.exists()  # the control: a plain status runs it

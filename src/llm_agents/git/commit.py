@@ -21,7 +21,9 @@ Usage:
 The message file/paragraphs are used verbatim (the repo's commit-msg hook may
 still trim trailers). After a successful commit, the source file passed with
 ``-F`` is removed and that cleanup is reported; a failed commit leaves it in
-place for a retry, and a message file git tracks is refused outright. Prints
+place for a retry, and a message file git tracks is refused outright. Under
+the commit broker the message is the approval's copy and the file is left
+alone (`commit_identity`). Prints
 the resulting commit and the remaining working tree state so the caller sees
 what was left uncommitted.
 
@@ -47,7 +49,7 @@ from typing import Callable, Optional
 
 from . import check_gitlinks
 from .commit_identity import approved_invocation
-from ..gitlib import git
+from ..gitlib import SKIP_SUBMODULES, git
 
 git = partial(git, check=False, capture_output=False)
 
@@ -168,6 +170,8 @@ def is_staged_deletion(path: str) -> bool:
     records the deletion happily. Matching is delegated to git, so directory
     pathspecs and Windows backslashes work as they do everywhere else.
     """
+    # `--cached` asks no submodule's work tree (`gitlib.SKIP_SUBMODULES`), and
+    # that flag here would hide a staged gitlink deletion.
     staged = git(["diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only",
                   "--diff-filter=D", "--", path],
                  capture_output=True)
@@ -408,7 +412,19 @@ def main(host: Optional[CommitHost] = None) -> int:
     if bool(options.file) == bool(options.message):
         parser.error("provide a message via exactly one of -F or -m")
     message_file = Path(options.file) if options.file else None
-    if message_file:
+    if message_file and expected is not None:
+        # Approved: the judge read the file when it granted the command
+        # (`command_commit._message_snapshot`), and the path is not opened
+        # again — the worker may have re-pointed it at a file of the user's
+        # since, which reading or deleting with the broker's rights would
+        # expose or destroy. The worker removes its own file.
+        message = expected.get("message")
+        if not isinstance(message, str):
+            print("error: commit.py: the approval holds no message for -F; "
+                  "nothing was committed or staged.", file=sys.stderr)
+            return 1
+        message_file = message_bytes = message_identity = None
+    elif message_file:
         with message_file.open("rb") as handle:
             message_bytes = handle.read()
             message_identity = file_identity(handle)
@@ -496,9 +512,12 @@ def main(host: Optional[CommitHost] = None) -> int:
     # Read-only, but not harmless: `status` runs the clean filter a
     # `.gitattributes` names and `log --stat` diffs. Under the broker both go
     # to the bound repository (`gitlib.pin`), whose configuration — where a
-    # filter's program is named — the worker cannot write.
+    # filter's program is named — the worker cannot write. The binding stops
+    # at a submodule: status asks each checked-out one through a git of its
+    # own that DISCOVERS `<sub>/.git` (the worker's to point at a repository
+    # with a filter of its own), hence `SKIP_SUBMODULES`.
     git(["log", "-1", "--oneline", "--stat", "--no-ext-diff", "--no-textconv"])
-    status = git(["status", "--short"], capture_output=True)
+    status = git(["status", "--short", SKIP_SUBMODULES], capture_output=True)
     if status.stdout.strip():
         print("\nleft uncommitted (as intended):")
         print(status.stdout.rstrip())

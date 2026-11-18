@@ -69,6 +69,22 @@ NO_CWD_LOOKUP = {"NoDefaultCurrentDirectoryInExePath": "1"}
 # `--no-ext-diff` instead.
 FORCED = ("core.fsmonitor=false", "core.editor=true", "sequence.editor=true")
 
+# For every `status` and `diff` a broker runs over a working tree. The
+# binding (`Repository`) holds for the git it is given to, not for the git
+# that one starts per checked-out submodule to ask whether it is dirty: that
+# child discovers `<sub>/.git`, which the worker may point at a repository
+# whose config names a clean filter or an fsmonitor, and the filter runs
+# with the broker's rights. Measured 2026-11-18 (Git for Windows 2.53, a
+# planted `filter.evil.clean` + `.gitattributes`, the submodule's file
+# touched): `status`, `diff`, `diff --stat` and `diff --name-only` ran it;
+# the same with this flag, `diff --cached`, `log --stat`, `add`/`rm`/`commit
+# -- <file>`, `ls-files` and `rebase` did not. `=dirty` ran nothing either
+# but still opens that repository in-process to read its HEAD; `all` reads
+# nothing of it, at the cost of not showing a moved submodule pointer. The
+# command-line flag beats a `submodule.<name>.ignore` in the worker's
+# `.gitmodules`.
+SKIP_SUBMODULES = "--ignore-submodules=all"
+
 
 @dataclass(frozen=True)
 class Repository:

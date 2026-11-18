@@ -28,7 +28,10 @@ runs the kit's `commit.main` with:
 - the hooks the grant names: the host's folder in its MAIN checkout
   (`HostPolicy.commit_hooks`: the house rules a commit must pass) for the
   slot's own tree, an empty folder for a commit inside a submodule (which
-  runs no hooks of its own in a pool slot either);
+  runs no hooks of its own in a pool slot either). A host hook's own git
+  inherits the binding but not `gitlib.SKIP_SUBMODULES`: a hook that asks
+  `status` or a work-tree `diff` runs what a submodule's `.git` names
+  (MultiSkill's ask only `diff --cached`, which reads no submodule);
 - the host's `CommitHost` from its main checkout (`HostPolicy.commit_host`),
   never the slot's copy of it;
 - an approval ticket (`commit_identity`) for exactly this invocation, which

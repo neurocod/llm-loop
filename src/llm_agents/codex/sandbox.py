@@ -306,7 +306,7 @@ def _worktree_fact(workspace: Path,
     it commits through the commit broker outside the sandbox
     (`command_commit._commit` judges commit.py's arguments), started as
     `python -I <the broker's literal path>`, with its message file in one
-    of these roots, since commit.py deletes it; the words are the host's
+    of these roots (read when the command is granted); the words are the host's
     `HostPolicy.commit_briefing`.
 
     `model` is the spawn's persisted AgentRecord.model, also used on resume;
