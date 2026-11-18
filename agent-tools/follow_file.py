@@ -5,6 +5,11 @@ r"""Print a growing file (existing content first) until a pattern shows up or a 
     python agent-tools/follow_file.py server.log --until "listening on \d+" --timeout 120
     python agent-tools/follow_file.py run.txt --define-preset batch "=== summary ===" \
         --preset batch --timeout 580
+    python agent-tools/follow_file.py probe.log --until "^VERDICT" --grep "^FAIL" --timeout 580
+
+Do not pipe the output into grep -- use --grep. A `| grep` (and the `2>&1`
+before it) makes the call a chain, which shell gates such as ask-user-gate
+stop on and ask the human about, every time.
 
 What it is for: an LLM agent that has started a long job in the background
 needs to wait for it, and the obvious ways to wait are the ones an agent harness
@@ -86,8 +91,13 @@ def main() -> int:
     ap.add_argument("--poll", type=float, default=1.0, help="seconds between reads (default 1)")
     ap.add_argument("--timeout", type=float, default=None,
                     help="give up after this many seconds (exit 1)")
+    ap.add_argument("--grep", action="append", default=[], metavar="REGEX",
+                    help="stream only the lines matching this regex (repeatable), plus each "
+                         "line an end pattern matches; the --tail lines still print "
+                         "unfiltered at exit. Do not pipe into grep -- use --grep")
     ap.add_argument("--quiet", action="store_true",
-                    help="do not stream lines; print only the last --tail lines at the end")
+                    help="do not stream lines; print only the last --tail lines at the end "
+                         "(the --grep lines and end-marker lines still stream)")
     ap.add_argument("--tail", type=int, default=0,
                     help="at exit, print the last N lines of the file (default 0)")
     args = ap.parse_args()
@@ -108,6 +118,18 @@ def main() -> int:
         patterns += [re.compile(p, re.MULTILINE) for p in presets[name]]
     if not patterns and args.timeout is None:
         ap.error("give --until/--preset, --timeout, or both: otherwise this never ends")
+    greps = []
+    for pattern in args.grep:
+        try:
+            greps.append(re.compile(pattern))
+        except re.error as exc:
+            ap.error(f"--grep: invalid regex {pattern!r}: {exc}")
+
+    def shown(line: str) -> bool:
+        """A line --grep keeps: one it matches, or one an end pattern matches
+        (the marker the wait ended on must never be filtered away)."""
+        text = line.rstrip("\r\n")
+        return any(p.search(text) for p in (*greps, *patterns))
 
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -125,8 +147,13 @@ def main() -> int:
             chunk, offset = read_from(path, offset)
             if chunk:
                 seen += chunk
-                if not args.quiet:
-                    sys.stdout.write(chunk)
+                # A kept line goes out with a bare "\n": its own "\r\n" would
+                # print as "\r\r\n" through Windows' text-mode stdout.
+                out = ("".join(line.rstrip("\r\n") + "\n"
+                               for line in chunk.splitlines(keepends=True) if shown(line))
+                       if greps else "" if args.quiet else chunk)
+                if out:
+                    sys.stdout.write(out)
                     sys.stdout.flush()
                 last_beat = time.monotonic()
             if patterns and any(p.search(seen) for p in patterns):

@@ -67,6 +67,43 @@ def test_follow_file_times_out_with_exit_1(tmp_path):
     assert "timeout" in done.stdout
 
 
+_PROBE_LOG = "boot\nFAIL one\nstep 2\nFAIL two\nVERDICT pass\n"
+
+
+def test_follow_file_grep_streams_only_the_matching_lines(tmp_path):
+    log = tmp_path / "probe.log"
+    log.write_text(_PROBE_LOG, encoding="utf-8")
+    done = _run("follow_file.py", str(log), "--until", "^VERDICT", "--grep", "^FAIL",
+                "--grep", "^step", "--poll", "0.05", "--timeout", "30")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.splitlines() == ["FAIL one", "step 2", "FAIL two", "VERDICT pass"]
+
+
+def test_follow_file_grep_keeps_the_end_marker_it_does_not_match(tmp_path):
+    log = tmp_path / "probe.log"
+    log.write_text(_PROBE_LOG, encoding="utf-8")
+    done = _run("follow_file.py", str(log), "--until", "^VERDICT", "--grep", "^FAIL",
+                "--poll", "0.05", "--timeout", "30")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.splitlines() == ["FAIL one", "FAIL two", "VERDICT pass"]
+
+
+def test_follow_file_quiet_grep_streams_the_matches_and_then_the_tail(tmp_path):
+    log = tmp_path / "probe.log"
+    log.write_text(_PROBE_LOG, encoding="utf-8")
+    done = _run("follow_file.py", str(log), "--until", "^VERDICT", "--grep", "^FAIL",
+                "--quiet", "--tail", "2", "--poll", "0.05", "--timeout", "30")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.splitlines() == ["FAIL one", "FAIL two", "VERDICT pass",
+                                        "FAIL two", "VERDICT pass"]
+
+
+def test_follow_file_refuses_an_invalid_grep_regex(tmp_path):
+    done = _run("follow_file.py", str(tmp_path / "x"), "--grep", "(", "--timeout", "30")
+    assert done.returncode == 2
+    assert "--grep: invalid regex" in done.stderr
+
+
 def test_follow_file_refuses_a_wait_that_never_ends(tmp_path):
     done = _run("follow_file.py", str(tmp_path / "x"))
     assert done.returncode == 2
