@@ -194,6 +194,19 @@ def _bracket_literal(current: list[str]) -> bool:
     return bool(current) and current[0] != "-"
 
 
+def _dash_dot_split(word: str) -> bool:
+    """Whether PowerShell 5.1 splits the bare word `word` at a dot (measured
+    2026-11-18, argv of a native program): a one-dash parameter word does,
+    before any `:` — `-Dfoo.bar=1` arrives as `-Dfoo`, `.bar=1`, `-k=a.b` as
+    `-k=a`, `.b` — while `--cov=src.pkg`, `-x:a.b` and `-1.5` arrive whole.
+    Refused rather than re-split: the reader's word would not be the
+    program's, and the rule would match what the program never sees."""
+    if len(word) < 2 or word[0] != "-" or word[1] in "-0123456789":
+        return False
+    dot = word.find(".")
+    return dot > 0 and ":" not in word[:dot]
+
+
 def _native_quoting_refusal(literal: str) -> str:
     """Why PowerShell 5.1 would not hand the quoted string `literal` to a
     native program as ONE argument, or "".
@@ -256,6 +269,9 @@ def _lexed(text: str, shell: str) -> list[tuple[Token, str]]:
             value = "".join(current)
             if not cmd and value == _STOP_PARSING:
                 raise Unparsed(f"`{value}` (PowerShell's stop-parsing token)")
+            if not cmd and _dash_dot_split(value):
+                raise Unparsed(f"`{value}` (PowerShell 5.1 splits a "
+                               f"parameter word at its dot)")
             out.append((Word(value), text[started:at]))
             current.clear()
 

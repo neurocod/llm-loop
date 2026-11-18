@@ -44,7 +44,7 @@ def _granted(ask, command, **where):
     ("python -m pytest -p bin.read", "loads a module"),
     ("python -m pytest -qp bin.read", "loads a module"),
     ("python -m pytest -o addopts=--basetemp=..", "only the ini keys"),
-    ("python -m pytest -oaddopts=--basetemp=..", "only the ini keys"),
+    ("python -m pytest -oaddopts=--basetemp=..", "splits a parameter word"),
     ("python -m pytest -qo addopts=--basetemp=..", "only the ini keys"),
     ("python -m pytest --override-ini=addopts=-pbin.read", "only the ini keys"),
     ("python -m pytest -o cache_dir", "only the ini keys"),

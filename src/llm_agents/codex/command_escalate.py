@@ -8,6 +8,7 @@ import re
 from typing import Pattern
 
 from .command_dispatch import _pipe_refusal
+from .command_node import _SHIM_BARE
 from .command_shell import (
     Token,
     Unparsed,
@@ -33,6 +34,45 @@ _INDIRECT_PROGRAMS = frozenset({
 
 _PROGRAM_SUFFIXES = (".exe", ".com", ".cmd", ".bat", ".ps1")
 
+# Git and the programs that ship with it (`C:\Program Files\Git\cmd` holds
+# `gitk`, `scalar`, `git-receive-pack`, …): each reads the repository's
+# config and hooks from its cwd, so fsmonitor, textconv and external diff
+# run what the agent planted, and `diff --output=<path>` writes anywhere —
+# outside the sandbox under an escalate grant, for a worker and a reviewer
+# alike (both reviews of 2445). Their reads run inside the sandbox; a
+# worker's commits and rebases go through the brokers.
+_GIT_FAMILY = frozenset({"git", "gitk", "scalar"})
+
+
+def _git_family(name: str) -> bool:
+    return name in _GIT_FAMILY or name.startswith("git-")
+
+
+# The rule names a program but cannot see what it resolves to, and `npm`,
+# `npx`, `yarn` and any tool the PATH holds as a `.cmd`/`.bat` are cmd
+# shims: PowerShell writes their command line for cmd.exe, which acts on
+# `& | < > ^` in a word it sees unquoted (`npm.cmd test 'a&whoami'` runs
+# `whoami`; Codex review of 2445), on `!`, a line break, and on a `%…%`
+# pair anywhere (`%CMDCMDLINE%` brings its own quotes: `shim 'x&echo
+# INJECT' %CMDCMDLINE%` ran `echo INJECT`, Claude review of 2445). So
+# every escalated command is judged as if it were one. A single `%` stays
+# (`--format=%H`): cmd leaves it be. PowerShell double-quotes a word holding
+# whitespace, which is why `-k 'a or b'` passes (`command_node._shim_refusal`
+# is the same rule for npm/npx, without the single `%`).
+_SHIM_ALWAYS = re.compile(r"[!\n\r]")
+
+
+def _shim_refusal(args: list[str]) -> str:
+    for arg in args:
+        quoted = bool(re.search(r"\s", arg)) and not arg.endswith("\\")
+        if _SHIM_ALWAYS.search(arg) or (_SHIM_BARE.search(arg) and not quoted):
+            return (f"{arg!r}: the program may be a cmd shim, and cmd acts on "
+                    f"! anywhere and on & | < > ^ in a word with no space")
+    if sum(arg.count("%") for arg in args) > 1:
+        return ("two `%` in one command: cmd expands a `%…%` pair if the "
+                "program is a cmd shim")
+    return ""
+
 
 def _program(word: str) -> str:
     """`word` as a program name: lower-case, no `.exe`-like suffix."""
@@ -56,7 +96,7 @@ def _stages(lexed: list[tuple[Token, str]]) -> list[tuple[list[tuple[Token, str]
     return [(tokens, piped) for tokens, piped in stages if tokens or piped]
 
 
-def escalate_refusal(command: str, pattern: Pattern[str], worker: bool) -> str:
+def escalate_refusal(command: str, pattern: Pattern[str]) -> str:
     """Why `pattern` does not grant `command`, or "" when it does.
 
     The rule is matched against each COMMAND of the line, whole
@@ -79,14 +119,13 @@ def escalate_refusal(command: str, pattern: Pattern[str], worker: bool) -> str:
       path: `.\\npm` or `C:\\<slot>\\git.exe` is a file the agent may have
       written, and the rule has no roots to tell it from a trusted one —
       a program is named and looked up on the PATH;
-    - a worker's git is refused whatever the rule says (nothing after this
-      function grants git, so the refusal is final). "Read-only"
-      subcommands are no limit: `status`, `diff`, `log -p`, `show`, `blame`
-      and `ls-files -m` run the fsmonitor, external diff or textconv
-      programs of a repository config the worker can plant under any cwd
-      of its workspace, and `diff --output=<path>` writes anywhere (both
-      reviews of 2445). Its reads run inside the sandbox; its commits and
-      rebases go through the brokers.
+    - git and its family (`_GIT_FAMILY`) are refused whatever the rule says
+      and whoever asks. "Read-only" subcommands are no limit: `status`,
+      `diff`, `log -p`, `show`, `blame` and `ls-files -m` run the
+      fsmonitor, external diff or textconv programs of a repository config
+      the agent can plant under any cwd of its workspace;
+    - every command's arguments pass the cmd-shim rule (`_shim_refusal`)
+      before the rule may grant it.
 
     An operator who wants arguments says so in the rule: `npm test( .*)?`.
     """
@@ -99,14 +138,14 @@ def escalate_refusal(command: str, pattern: Pattern[str], worker: bool) -> str:
     if not stages:
         return "an empty command"
     for tokens, piped in stages:
-        why = _stage_refusal(tokens, piped, pattern, worker)
+        why = _stage_refusal(tokens, piped, pattern)
         if why:
             return why
     return ""
 
 
 def _stage_refusal(tokens: list[tuple[Token, str]], piped: bool,
-                   pattern: Pattern[str], worker: bool) -> str:
+                   pattern: Pattern[str]) -> str:
     if not tokens:
         return "a pipe into nothing"
     for token, _ in tokens:
@@ -121,9 +160,12 @@ def _stage_refusal(tokens: list[tuple[Token, str]], piped: bool,
     name = _program(program)
     if name in _INDIRECT_PROGRAMS:
         return f"`{program}` runs a command it is handed"
-    if worker and name == "git":
-        return ("a worker's git does not leave the sandbox: its reads run "
-                "inside, its commits and rebases through the brokers")
+    if _git_family(name):
+        return (f"`{program}` does not leave the sandbox: git reads run "
+                f"inside, a worker's commits and rebases through the brokers")
+    why = _shim_refusal([word.value for word in words[1:]])
+    if why:
+        return why
     full = " ".join(source for _, source in tokens)
     bare = " ".join(source for token, source in tokens if token != _MERGE)
     if pattern.fullmatch(full) or pattern.fullmatch(bare):

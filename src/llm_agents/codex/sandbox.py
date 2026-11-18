@@ -797,7 +797,7 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
         # or one the worker typed inside PowerShell's (review 2).
         if worker and _runs_cmd(command):
             return Verdict(False, f"{refusal}; {decline_tail}")
-        unmatched = (escalate_refusal(command, pattern, worker)
+        unmatched = (escalate_refusal(command, pattern)
                      if pattern is not None else "")
         if pattern is not None and not unmatched:
             return Verdict(True, "matches the escalate rule")

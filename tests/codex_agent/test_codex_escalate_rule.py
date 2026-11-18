@@ -50,10 +50,10 @@ def test_a_rule_grants_no_redirect_relative_program_or_method_call(tmp_path, mon
     assert ask("npm test -- a.test.ts").reason == GRANTED
 
 
-def _why(command: str, rule: str, worker: bool) -> str:
+def _why(command: str, rule: str) -> str:
     """The escalate rule's own reason (a worker's verdict names its shape
     refusal instead), for `command` in Codex's wrapper."""
-    return escalate_refusal(PS.format(command), re.compile(rule), worker)
+    return escalate_refusal(PS.format(command), re.compile(rule))
 
 
 @pytest.mark.parametrize("role", ["worker", "reviewer"])
@@ -66,28 +66,52 @@ def test_a_rule_grants_no_program_given_by_a_path(tmp_path, monkeypatch, role):
     for command in ("C:\\w\\npm.exe test", "C:/w/npm test", "C:npm.exe test",
                     "\\\\host\\share\\npm test", "C:\\slot\\git.exe status"):
         _refused(ask, command)
-        assert "given by path" in _why(command, rule, role == "worker"), command
-    assert _why("npm.exe test", rule, role == "worker") == ""
+        assert "given by path" in _why(command, rule), command
+    assert _why("npm.exe test", rule) == ""
 
 
-def test_a_workers_git_is_refused_whatever_the_rule_says(tmp_path, monkeypatch):
+@pytest.mark.parametrize("role", ["worker", "reviewer"])
+def test_git_and_its_family_are_refused_whatever_the_rule_says(tmp_path, monkeypatch, role):
     """Both reviews of 2445: a "read-only" git runs the fsmonitor, external
-    diff and textconv programs of a config the worker plants (`status`,
+    diff and textconv programs of a config the agent plants (`status`,
     `diff`, `log -p`, `show`, `blame`, `ls-files -m`) and `diff --output`
-    writes anywhere. A worker's git reads inside the sandbox and commits and
-    rebases through the brokers; no rule lets it out."""
-    _, ask = worker_judge(tmp_path, monkeypatch, escalate=r"(?i)git.*")
+    writes anywhere — a reviewer's as much as a worker's, and `gitk`,
+    `scalar` and `git-*` read the same config. Git reads inside the
+    sandbox; no rule lets it out."""
+    rule = r"(?i)(git|gitk|scalar|git-\S+).*"
+    _, ask = worker_judge(tmp_path, monkeypatch, escalate=rule, role=role)
     for command in ("git status", "git log --format=%H -1", "git diff",
                     "git diff --no-ext-diff", "git log -p", "git show HEAD",
                     "git blame a.txt", "git ls-files -m", "git cat-file --textconv HEAD:a",
                     "git diff --output=C:/anywhere/x.txt", "GIT.EXE status",
                     "git.cmd status", "git commit -m x", "git rebase main",
-                    "git -c core.hooksPath=.githooks status"):
+                    "git -c core.hooksPath=.githooks status", "gitk --all",
+                    "scalar list", "git-receive-pack x", "Git-Upload-Pack.exe x"):
         _refused(ask, command)
-        assert "worker's git" in _why(command, r"(?i)git.*", True), command
-        assert _why(command, r"(?i)git.*", False) == "", command
-    _, reviewer = worker_judge(tmp_path, monkeypatch, escalate=r"git .*", role="reviewer")
-    assert reviewer("git commit -m x").reason == GRANTED
+        assert "does not leave the sandbox" in _why(command, rule), command
+    assert _why("gitlab-ci-lint x", r"gitlab-ci-lint.*") == ""
+
+
+@pytest.mark.parametrize("role", ["worker", "reviewer"])
+def test_a_cmd_shim_s_metacharacters_are_refused(tmp_path, monkeypatch, role):
+    """Codex review of 2445: `npm.cmd test 'a&whoami'` matched `npm(\\.cmd)?
+    test( .*)?`, PowerShell handed the unspaced quoted word to the shim bare
+    and cmd ran `whoami`. Claude's: a `%…%` pair expands in cmd
+    (`%CMDCMDLINE%` brings quotes). The rule cannot see whether a name
+    resolves to a `.cmd`, so every escalated command is judged as one."""
+    rule = r"(npm(\.cmd)?|shimx) test( .*)?"
+    _, ask = worker_judge(tmp_path, monkeypatch, escalate=rule, role=role)
+    for command in ("npm.cmd test 'a&whoami'", "npm test 'a|whoami'",
+                    "npm test 'a<b'", "npm test 'a>b'", "npm test 'a^b'",
+                    "shimx test 'a&whoami'", "npm test 'a b!'",
+                    "shimx test x%CMDCMDLINE%", "shimx test %PATH%",
+                    "shimx test 'x&echo INJECT' %CMDCMDLINE%",
+                    "shimx test --a=%x --b=y%"):
+        _refused(ask, command)
+        assert "cmd" in _why(command, rule), command
+    for command in ("npm test -- -t 'a & b'", "shimx test --format=%H",
+                    "shimx test 100%"):
+        assert _why(command, rule) == "", command
 
 
 def test_honest_gates_pass_as_recorded(tmp_path, monkeypatch):
@@ -170,7 +194,7 @@ def test_a_quoted_string_powershell_5_splits_is_refused(tmp_path, monkeypatch, r
                     "python -m pytest -k ''", "python -m pytest -k \"\""):
         assert "PowerShell 5.1" in _refused(ask, command), command
     assert ask("python -m pytest -k 'C:\\d\\'")
-    assert _why("python -m pytest -k 'C:\\d\\'", r"python -m pytest -k \S+", True) == ""
+    assert _why("python -m pytest -k 'C:\\d\\'", r"python -m pytest -k \S+") == ""
 
 
 @pytest.mark.parametrize("role", ["worker", "reviewer"])
@@ -197,7 +221,11 @@ def test_powershell_literals_the_reader_follows():
     assert _words("x --format=%H 100% tests/x.py::t[1] a]b", "powershell") == [
         Word("x"), Word("--format=%H"), Word("100%"), Word("tests/x.py::t[1]"),
         Word("a]b")]
-    for text in ("x --% y", "x [int]", "x -k=a[x]"):
+    assert _words("x --cov=src.pkg -x:a.b -1.5 a-b.c", "powershell") == [
+        Word("x"), Word("--cov=src.pkg"), Word("-x:a.b"), Word("-1.5"),
+        Word("a-b.c")]
+    for text in ("x --% y", "x [int]", "x -k=a[x]", "x -Dfoo.bar=1",
+                 "x -k=a.b", "x -m.x"):
         with pytest.raises(Unparsed):
             _words(text, "powershell")
     for text in ("x --format=%H", "x a[0]"):

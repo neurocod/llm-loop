@@ -208,7 +208,10 @@ ADDS to the list for a worker; for everyone else (a reviewer, an agent without
 a role) it is still the only grant (`sandbox.escalation_pattern`). The regex
 must match each command of the line WHOLE (`command_escalate.escalate_refusal`),
 so arguments are its own words: `'npm test( .*)?'`, not `'^npm test'`; it
-never grants a worker's git (reads run inside the sandbox). Every
+never grants git (reads run inside the sandbox). A rule grants code
+execution to any program that reads config or scripts from the working
+directory (`node --import`, `python -m pytest`, …): keep rules to programs
+you would run on the agent's tree yourself. Every
 decision is written to `events.jsonl` with its reason, and a refusal shows in
 `logs`. An edit (apply_patch) that failed in the sandbox is retried outside it
 by `sandbox.file_change_judge`; a refusal is named by `logs` and the turn
