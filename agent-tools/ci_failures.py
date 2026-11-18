@@ -149,7 +149,7 @@ RED_CONCLUSIONS = frozenset({"failure", "cancelled", "timed_out", "startup_failu
 FAILED_STEP = frozenset({"failure", "timed_out", "cancelled"})
 
 
-class Failure(Exception):
+class NoAnswer(Exception):
     """A reason this tool cannot answer, with the exit code that names it."""
 
     def __init__(self, code: int, message: str):
@@ -157,7 +157,7 @@ class Failure(Exception):
         self.code = code
 
 
-class GhTimeout(Failure):
+class GhTimeout(NoAnswer):
     """A gh call that did not answer within its timeout."""
 
     def __init__(self, message: str):
@@ -230,17 +230,17 @@ NO_ACCESS_RE = re.compile(r"HTTP 403|Resource not accessible|SAML", re.IGNORECAS
 RATE_LIMIT_RE = re.compile(r"rate limit", re.IGNORECASE)
 
 
-def gh_failure(what: str, returncode: int, said: str, repo: str) -> Failure:
+def gh_failure(what: str, returncode: int, said: str, repo: str) -> NoAnswer:
     message = f"gh {what} failed (exit {returncode}): {said}"
     if RATE_LIMIT_RE.search(said):
-        return Failure(EXIT_GH_ERROR, message)
+        return NoAnswer(EXIT_GH_ERROR, message)
     if NO_ACCESS_RE.search(said):
-        return Failure(EXIT_NO_GH, f"{message}\nthe gh login cannot read {repo}: "
-                                   "log in with an account that can (`gh auth login`) or check the token's scopes")
+        return NoAnswer(EXIT_NO_GH, f"{message}\nthe gh login cannot read {repo}: "
+                                    "log in with an account that can (`gh auth login`) or check the token's scopes")
     if NOT_FOUND_RE.search(said):
-        return Failure(EXIT_NOT_FOUND, f"{message}\n(a private repository the gh login cannot read "
-                                       "is also answered with 404)")
-    return Failure(EXIT_GH_ERROR, message)
+        return NoAnswer(EXIT_NOT_FOUND, f"{message}\n(a private repository the gh login cannot read "
+                                        "is also answered with 404)")
+    return NoAnswer(EXIT_GH_ERROR, message)
 
 
 class Gh:
@@ -258,7 +258,7 @@ class Gh:
                 raise DeadlineHit(f"--timeout ran out during gh {what} ({bound:.0f} s were left)") from exc
             if exc.timed_out:
                 raise GhTimeout(f"gh did not answer within {bound:g} s: {what}") from exc
-            raise Failure(EXIT_GH_ERROR, f"{exc} (gh {what})") from exc
+            raise NoAnswer(EXIT_GH_ERROR, f"{exc} (gh {what})") from exc
         if proc.returncode != 0:
             said = (as_text(proc.stderr) or as_text(proc.stdout)).strip()
             raise gh_failure(what, proc.returncode, said, self.repo)
@@ -278,7 +278,7 @@ class Gh:
         try:
             return json.loads(out)
         except json.JSONDecodeError as exc:
-            raise Failure(EXIT_GH_ERROR, f"gh {' '.join(args)} returned invalid JSON: {exc}") from exc
+            raise NoAnswer(EXIT_GH_ERROR, f"gh {' '.join(args)} returned invalid JSON: {exc}") from exc
 
     def api_json(self, endpoint: str, jq: str):
         """`gh api endpoint --jq jq`, parsed (`gh api` takes no --repo: the
@@ -288,7 +288,7 @@ class Gh:
         try:
             return json.loads(out)
         except json.JSONDecodeError as exc:
-            raise Failure(EXIT_GH_ERROR, f"gh {what} returned invalid JSON: {exc}") from exc
+            raise NoAnswer(EXIT_GH_ERROR, f"gh {what} returned invalid JSON: {exc}") from exc
 
     def call_to_file(self, args: list, path: str, timeout: float = GH_TIMEOUT_S) -> int:
         return self._run_to_file([self.path, *args, "--repo", self.repo], " ".join(args), path, timeout)
@@ -304,7 +304,7 @@ class Gh:
         flag = "--allow-escape-sequences"
         try:
             return self._run_to_file([self.path, "api", endpoint, flag], f"api {endpoint}", path, timeout)
-        except Failure as exc:
+        except NoAnswer as exc:
             if "unknown flag" not in str(exc):
                 raise
         return self._run_to_file([self.path, "api", endpoint], f"api {endpoint}", path, timeout)
@@ -320,11 +320,11 @@ def check_auth(gh_path: str, deadline: float) -> None:
         if exc.timed_out and by_deadline:
             raise DeadlineHit(f"--timeout ran out during gh auth status ({bound:.0f} s were left)") from exc
         if exc.timed_out:
-            raise Failure(EXIT_GH_ERROR, f"gh auth status: {exc}") from exc
-        raise Failure(EXIT_NO_GH, f"{exc}; {INSTALL_HINT}") from exc
+            raise NoAnswer(EXIT_GH_ERROR, f"gh auth status: {exc}") from exc
+        raise NoAnswer(EXIT_NO_GH, f"{exc}; {INSTALL_HINT}") from exc
     if proc.returncode != 0:
         said = (proc.stderr or proc.stdout or "").strip()
-        raise Failure(EXIT_NO_GH, f"gh auth status failed: {said}\n{INSTALL_HINT}")
+        raise NoAnswer(EXIT_NO_GH, f"gh auth status failed: {said}\n{INSTALL_HINT}")
 
 
 def git(args: list, cwd: str | None) -> str | None:
@@ -350,10 +350,10 @@ def repo_from_remote(url: str) -> str | None:
 def derive_repo(cwd: str | None) -> str:
     url = git(["remote", "get-url", "origin"], cwd)
     if not url:
-        raise Failure(EXIT_USAGE, "no --repo given and the cwd has no git remote `origin`")
+        raise NoAnswer(EXIT_USAGE, "no --repo given and the cwd has no git remote `origin`")
     repo = repo_from_remote(url)
     if not repo:
-        raise Failure(EXIT_USAGE, f"no --repo given and origin is not a GitHub URL: {url}")
+        raise NoAnswer(EXIT_USAGE, f"no --repo given and origin is not a GitHub URL: {url}")
     return repo
 
 
@@ -372,16 +372,16 @@ def derive_sha(sha: str | None, cwd: str | None) -> str:
         if FULL_SHA_RE.fullmatch(sha):
             return sha.lower()
         if HEX_RE.fullmatch(sha) and len(sha) < MIN_SHA_CHARS:
-            raise Failure(EXIT_USAGE, f"--sha {sha} is shorter than {MIN_SHA_CHARS} hex characters")
+            raise NoAnswer(EXIT_USAGE, f"--sha {sha} is shorter than {MIN_SHA_CHARS} hex characters")
         full = git(["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"], cwd)
         if full and FULL_SHA_RE.fullmatch(full):
             return full.lower()
         if HEX_RE.fullmatch(sha):
             return sha.lower()
-        raise Failure(EXIT_USAGE, f"--sha {sha} is neither a commit git knows here nor a hex prefix")
+        raise NoAnswer(EXIT_USAGE, f"--sha {sha} is neither a commit git knows here nor a hex prefix")
     head = git(["rev-parse", "HEAD"], cwd)
     if not head:
-        raise Failure(EXIT_USAGE, "no --run/--sha given and the cwd is not a git repository")
+        raise NoAnswer(EXIT_USAGE, "no --run/--sha given and the cwd is not a git repository")
     return head
 
 
@@ -393,14 +393,14 @@ def resolve_commit(gh: Gh, prefix: str) -> str:
     try:
         # `{sha}`, not `.sha`: gh's --jq prints a bare string unquoted, not as JSON.
         data = gh.api_json(f"repos/{gh.repo}/commits/{prefix}", "{sha}")
-    except Failure as exc:
+    except NoAnswer as exc:
         if "No commit found" in str(exc) or "HTTP 422" in str(exc):
-            raise Failure(EXIT_NOT_FOUND, f"--sha {prefix}: no commit, or more than one, starts with it "
-                                          f"in {gh.repo} (GitHub does not tell which); give the full sha") from exc
+            raise NoAnswer(EXIT_NOT_FOUND, f"--sha {prefix}: no commit, or more than one, starts with it "
+                                           f"in {gh.repo} (GitHub does not tell which); give the full sha") from exc
         raise
     full = data.get("sha") if isinstance(data, dict) else None
     if not isinstance(full, str) or not FULL_SHA_RE.fullmatch(full):
-        raise Failure(EXIT_GH_ERROR, f"gh api repos/{gh.repo}/commits/{prefix} gave no sha: {full!r}")
+        raise NoAnswer(EXIT_GH_ERROR, f"gh api repos/{gh.repo}/commits/{prefix} gave no sha: {full!r}")
     return full.lower()
 
 
@@ -427,22 +427,22 @@ def runs_for_commit(gh: Gh, sha: str) -> list:
         batch = data.get("workflow_runs") if isinstance(data, dict) else None
         total = data.get("total_count") if isinstance(data, dict) else None
         if not isinstance(batch, list) or not isinstance(total, int):
-            raise Failure(EXIT_GH_ERROR, f"the run listing of {sha} is not the API's shape: {str(data)[:200]}")
+            raise NoAnswer(EXIT_GH_ERROR, f"the run listing of {sha} is not the API's shape: {str(data)[:200]}")
         if first_total is None:
             first_total = total
         elif total != first_total:
-            raise Failure(EXIT_INCOMPLETE, f"the run count of commit {sha} changed while paging ({first_total} "
-                                           f"on page 1, {total} on page {page}): a red one may be missing; "
-                                           "run again, or judge one with --run")
+            raise NoAnswer(EXIT_INCOMPLETE, f"the run count of commit {sha} changed while paging ({first_total} "
+                                            f"on page 1, {total} on page {page}): a red one may be missing; "
+                                            "run again, or judge one with --run")
         for r in batch:
             runs[r.get("id")] = r
         if len(runs) >= first_total or not batch or page * RUNS_PAGE >= RUNS_MAX:
             break
         page += 1
     if len(runs) != first_total:
-        raise Failure(EXIT_INCOMPLETE, f"commit {sha} has {first_total} runs and {len(runs)} distinct ones could "
-                                       f"be listed (the API serves {RUNS_MAX} at most): a red one may be missing; "
-                                       "judge one with --run")
+        raise NoAnswer(EXIT_INCOMPLETE, f"commit {sha} has {first_total} runs and {len(runs)} distinct ones could "
+                                        f"be listed (the API serves {RUNS_MAX} at most): a red one may be missing; "
+                                        "judge one with --run")
     return list(runs.values())
 
 
@@ -464,7 +464,7 @@ def select_runs(gh: Gh, sha: str, workflow: str | None) -> list:
         runs = [r for r in runs if workflow_matches(r, workflow)]
     if not runs:
         what = f" of workflow {workflow!r}" if workflow else ""
-        raise Failure(EXIT_NOT_FOUND, f"no run{what} for commit {full} in {gh.repo} (not pushed yet?)")
+        raise NoAnswer(EXIT_NOT_FOUND, f"no run{what} for commit {full} in {gh.repo} (not pushed yet?)")
     runs.sort(key=lambda r: (str(r.get("created_at") or ""), int(r.get("id") or 0)), reverse=True)
     chosen, seen = [], set()
     for r in runs:
@@ -1347,7 +1347,7 @@ def job_lines(gh: Gh, run: dict, job: dict, by_job: dict, path: str) -> JobLines
         return missing(f"{where} and no job id to read the job's own log")
     try:
         size = gh.job_log_to_file(job_id, path)
-    except Failure as exc:
+    except NoAnswer as exc:
         return missing(f"{where}; its own log could not be read: {exc}")
     if size > MAX_LOG_BYTES:
         return over_limit("the job's own log", size, path)
@@ -1430,7 +1430,7 @@ def answer(args: argparse.Namespace) -> int:
     gh_path = find_gh(args.gh)
     if gh_path is None:
         where = args.gh or f"PATH or {WINDOWS_GH}"
-        raise Failure(EXIT_NO_GH, f"gh not found in {where}; {INSTALL_HINT}")
+        raise NoAnswer(EXIT_NO_GH, f"gh not found in {where}; {INSTALL_HINT}")
     cwd = os.getcwd()
     repo = args.repo or derive_repo(cwd)
     check_auth(gh_path, deadline)
@@ -1477,7 +1477,7 @@ def main(argv: list | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return answer(args)
-    except Failure as exc:
+    except NoAnswer as exc:
         print(f"error: {exc}", file=sys.stderr)
         return exc.code
     except Exception:  # a defect here must not read as a red run

@@ -666,7 +666,7 @@ def test_sha_and_repo_come_from_git_in_the_cwd(monkeypatch):
 def test_a_too_short_sha_is_a_usage_error(monkeypatch):
     fake = Fake([("rev-parse", (0, "e" * 40 + "\n", ""))])
     monkeypatch.setattr(subprocess, "run", fake)
-    with pytest.raises(cf.Failure) as exc:
+    with pytest.raises(cf.NoAnswer) as exc:
         cf.derive_sha("0ca0ab", ".")
     assert exc.value.code == cf.EXIT_USAGE and fake.calls == []
 
@@ -674,17 +674,17 @@ def test_a_too_short_sha_is_a_usage_error(monkeypatch):
 def test_a_short_sha_git_does_not_know_stays_a_prefix(monkeypatch):
     monkeypatch.setattr(subprocess, "run", Fake([("rev-parse", (1, "", ""))]))
     assert cf.derive_sha("0CA0ABD", ".") == "0ca0abd"
-    with pytest.raises(cf.Failure) as exc:
+    with pytest.raises(cf.NoAnswer) as exc:
         cf.derive_sha("main~2", ".")
     assert exc.value.code == cf.EXIT_USAGE
 
 
 def test_no_git_is_a_usage_error_not_a_guess(monkeypatch):
     monkeypatch.setattr(subprocess, "run", Fake([("", (128, "", "fatal: not a git repository"))]))
-    with pytest.raises(cf.Failure) as exc:
+    with pytest.raises(cf.NoAnswer) as exc:
         cf.derive_sha(None, ".")
     assert exc.value.code == cf.EXIT_USAGE
-    with pytest.raises(cf.Failure) as exc:
+    with pytest.raises(cf.NoAnswer) as exc:
         cf.derive_repo(".")
     assert exc.value.code == cf.EXIT_USAGE
 
