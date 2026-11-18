@@ -86,6 +86,47 @@ def test_a_child_that_cannot_join_the_job_is_killed_never_run():
     assert started[0].poll() is not None, "a child outside the job was left running"
 
 
+def _interrupted_child_job(argv, popen):
+    job = ChildJob()
+    return job.close, lambda: job.start(argv, popen)
+
+
+def _interrupted_worker_job(argv, popen):
+    job = live_workers.WorkerJob.create()
+    return job.close, lambda: job.adopt(popen(argv, creationflags=job.creationflags))
+
+
+@pytest.mark.parametrize("make", [_interrupted_child_job, _interrupted_worker_job],
+                         ids=["ChildJob.start", "WorkerJob.adopt"])
+def test_a_ctrl_c_before_the_assignment_kills_the_suspended_child(monkeypatch, make):
+    """The caller holds no Popen yet: a suspended child left behind here
+    outlives everyone (a server in its own process group never sees the
+    Ctrl+C at all)."""
+    started = []
+
+    def popen(argv, **options):
+        started.append(subprocess.Popen(argv, **options))
+        return started[-1]
+
+    class Interrupting:
+        def AssignProcessToJobObject(self, job, process):
+            raise KeyboardInterrupt
+
+    close, begin = make([sys.executable, "-c", "import time; time.sleep(60)"], popen)
+    monkeypatch.setattr(win_job, "kernel32", Interrupting)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            begin()
+        assert started[0].poll() is not None, "the interrupted start left its child behind"
+    finally:
+        monkeypatch.undo()
+        close()
+        for child in started:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+
 @pytest.mark.parametrize("make", [_child_job, _cores_job, _worker_job],
                          ids=["ChildJob", "cores.Job", "WorkerJob"])
 def test_an_instantly_spawned_grandchild_dies_with_the_job(tmp_path, make):

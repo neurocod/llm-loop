@@ -91,22 +91,28 @@ def create(name: Optional[str], flags: int) -> int:
 
 def adopt(handle: int, child) -> None:
     """Assign a `Popen` started with CREATE_SUSPENDED to the job and resume
-    it; a child that cannot be assigned or resumed is killed, reaped, and the
-    error raised."""
+    it. ANY way out before the resume succeeded — a refusal, a Ctrl+C, any
+    BaseException — kills and reaps the child, then re-raises: the caller
+    has no Popen yet to clean up (`start` has not returned), and a suspended
+    child left behind, one in its own process group least of all, would
+    outlive everyone."""
     import ctypes
 
-    process = int(child._handle)
-    if not kernel32().AssignProcessToJobObject(handle, process):
-        error = ctypes.get_last_error()
-        child.kill()
+    try:
+        process = int(child._handle)
+        if not kernel32().AssignProcessToJobObject(handle, process):
+            raise ctypes.WinError(ctypes.get_last_error())
+        # NtResumeProcess: the one call that resumes a whole process from its
+        # handle (Popen keeps no thread handle to ResumeThread).
+        if ctypes.WinDLL("ntdll").NtResumeProcess(ctypes.c_void_p(process)) != 0:
+            raise OSError("cannot resume the child after putting it in the job")
+    except BaseException:
+        try:
+            child.kill()
+        except OSError:
+            pass  # it has exited already
         child.wait()
-        raise ctypes.WinError(error)
-    # NtResumeProcess: the one call that resumes a whole process from its
-    # handle (Popen keeps no thread handle to ResumeThread).
-    if ctypes.WinDLL("ntdll").NtResumeProcess(ctypes.c_void_p(process)) != 0:
-        child.kill()
-        child.wait()
-        raise OSError("cannot resume the child after putting it in the job")
+        raise
 
 
 def start(handle: int, argv: Sequence[str], popen=None, **options):
