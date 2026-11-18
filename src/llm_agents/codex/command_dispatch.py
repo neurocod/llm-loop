@@ -132,12 +132,8 @@ def _segment_refusal(segment: list[Token], cwd: Path,
             return f"`{token}` where a word was expected"
         if at == 0 and token.quoted:
             return "a quoted program name"
-        if '"' in token.value:
-            # PowerShell 5.1 passes such a word to a program unescaped, and
-            # the program splits it there: `'x" C:\\y'` arrives as two
-            # arguments, the second a path the judge never saw.
-            return (f"{token.value!r}: a `\"` inside an argument (PowerShell "
-                    f"5.1 hands it on unescaped, and the program splits it)")
+        # A `"` inside a word never gets here: the reader refuses it, as
+        # PowerShell 5.1 splits such a word (`command_shell._native_quoting_refusal`).
         words.append(token.value)
         at += 1
     for pipe in pipes[1:]:

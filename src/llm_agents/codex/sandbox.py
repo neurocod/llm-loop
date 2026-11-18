@@ -23,6 +23,7 @@ from .commands import (  # noqa: F401 — split_shell/unwrap_shell re-exported
     split_shell, unwrap_shell, within, worker_command_refusal,
 )
 from .command_escalate import escalate_refusal
+from .command_shell import unreadable_character
 from .file_renewal import renew_file  # re-exported for edit-judge callers
 from .gates import escalate_pattern
 from .paths import host_root, scratch_dir
@@ -385,8 +386,10 @@ def _escalation_briefing(pattern: str) -> str:
         f"these commands and declined for everything else) and read their "
         f"output as usual. Run them from your working directory or below it. "
         f"The regex must match each command WHOLE, as plain words: no "
-        f"redirect to a file, no `$`, `&` or parentheses, no typographic "
-        f"quotes; `2>&1` and a pipe into `Select-Object -Last N` or "
+        f"redirect to a file, no `$`, `&` or parentheses, no program given "
+        f"by a path, no character outside printable ASCII (typographic quotes "
+        f"and dashes, non-breaking spaces), no `\"` or line break inside a "
+        f"quoted string; `2>&1` and a pipe into `Select-Object -Last N` or "
         f"`Select-String` are read through."
     )
     if not _automatic():
@@ -423,15 +426,18 @@ def _worker_escalation_briefing(record: AgentRecord, extra: str) -> str:
         + f"), any command run under cmd rather than PowerShell, `node -e`, "
         f"`python -c`, "
         f"{policy.commands.reserved.text(record)}, and any `$`, backtick, `&`, "
-        f"parentheses, braces, `@`, `,` or wildcard outside quotes, and any "
-        f"typographic quote (‘ ’ “ ”) anywhere. A declined "
+        f"parentheses, braces, `@`, `,` or wildcard outside quotes, any "
+        f"character outside printable ASCII anywhere (typographic quotes ‘ ’ "
+        f"“ ”, dashes, non-breaking spaces), and a `\"` or line break inside a "
+        f"quoted string. A declined "
         f"escalation is that rule, not a person's answer: do not ask for "
         f"permission — run the step inside the sandbox, do it another way, or "
         f"name it in your final answer for the orchestrator."
     )
     if extra:
         text += (f" Also granted for this task: commands matching the regex "
-                 f"{extra!r} (each command of the line matched whole).")
+                 f"{extra!r} (each command of the line matched whole; never "
+                 f"git, whose reads run inside the sandbox).")
     return text
 
 
@@ -552,7 +558,7 @@ _VALUED_FLAGS = frozenset({"-erroraction", "-ea"})
 # correctly.
 _LITERAL_PATH = re.compile(r"^[A-Za-z0-9_.\\/:-]+$")
 _QUOTED_PATH = re.compile(r"^[A-Za-z0-9_.\\/: -]+$")
-_COMMAND_SEPARATORS = re.compile(r"[;&|`\n]|\$\(")
+_COMMAND_SEPARATORS = re.compile(r"[;&|`\r\n]|\$\(")
 
 
 def cleanup_targets(command: str, cwd: Path, workspace: Path) -> bool:
@@ -565,7 +571,7 @@ def cleanup_targets(command: str, cwd: Path, workspace: Path) -> bool:
     cost of a wrong "no" is one stray directory, the cost of a wrong "yes" is an
     un-sandboxed delete."""
     shell, inner = split_shell(command)
-    if _COMMAND_SEPARATORS.search(inner):
+    if _COMMAND_SEPARATORS.search(inner) or unreadable_character(inner):
         return False
     match = _DELETE_COMMAND.match(inner)
     if match is None:

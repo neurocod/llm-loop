@@ -14,8 +14,15 @@ _SHELL_WRAPPER = re.compile(
     r"""^\s*"?[^"\s]*(?P<shell>powershell|pwsh|cmd)(?:\.exe)?"?\s+"""
     r"""(?:(?:-NoProfile|-NonInteractive|-NoLogo|/d|/s|/q)\s+)*"""
     r"""(?:-Command|-c|/c)\s+(?P<inner>.*)$""", re.DOTALL | re.IGNORECASE)
-_ENCODING_PREAMBLE = re.compile(
-    r"^try\s*\{[^}]*OutputEncoding[^}]*\}\s*catch\s*\{\s*\}\s*;?\s*", re.DOTALL)
+# The ONE preamble Codex prepends to a PowerShell script, character for
+# character: `UTF8_OUTPUT_PREFIX` in codex-rs/shell-command/src/powershell.rs
+# (`prefix_powershell_script_with_utf8`, which also leaves a script already
+# starting with it alone). Only this text is taken off: a pattern for "any
+# `try { … OutputEncoding … } catch {}`" took `try { Write-Output
+# OutputEncoding } catch {}; npm test` for the wrapper's and granted the
+# agent's own code under a rule for `npm test` (Codex review of 2445).
+_ENCODING_PREAMBLE = (
+    "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n")
 _SHELL_NAMES = {"powershell": "powershell", "pwsh": "powershell", "cmd": "cmd"}
 _SHELL_OPTIONS = frozenset({"-noprofile", "-noninteractive", "-nologo", "/d",
                             "/s", "/q"})
@@ -40,6 +47,15 @@ def _shell_argv(argv: list[str]) -> Optional[tuple[str, str]]:
     return shell, " ".join(argv[at + 1:])
 
 
+def _without_preamble(script: str) -> str:
+    """`script` with Codex's own preamble (`_ENCODING_PREAMBLE`) taken off
+    the front, once, and stripped; anything else is the agent's code."""
+    script = script.lstrip()
+    if script.startswith(_ENCODING_PREAMBLE):
+        script = script[len(_ENCODING_PREAMBLE):]
+    return script.strip()
+
+
 def split_shell(command: str) -> tuple[str, str]:
     """The shell Codex wrapped the command in, and the command itself.
 
@@ -55,8 +71,8 @@ def split_shell(command: str) -> tuple[str, str]:
     three of a verification agent's requests came wrapped, and an anchored
     `^npm` matched none). The wrapper is the runner's, not the agent's, so the
     judge reads through it: the shell's own flags, the `-Command`/`/c` switch,
-    its quoting, and the `[Console]::OutputEncoding` preamble the sandbox
-    prepends.
+    its quoting, and the exact preamble Codex prepends
+    (`_ENCODING_PREAMBLE`).
 
     The quoting is POSIX shell quoting of the argv Codex starts (measured
     2026-11-03: 168 of 168 logged requests in 39 agents' events.jsonl split
@@ -76,7 +92,7 @@ def split_shell(command: str) -> tuple[str, str]:
     wrapped = _shell_argv(argv)
     if wrapped is not None:
         shell, inner = wrapped
-        return shell, _ENCODING_PREAMBLE.sub("", inner).strip()
+        return shell, _without_preamble(inner)
     match = _SHELL_WRAPPER.match(command)
     if match is None:
         return "", command
@@ -88,7 +104,7 @@ def split_shell(command: str) -> tuple[str, str]:
         if quote == "'":
             inner = inner.replace("''", "'")
     return ("cmd" if shell == "cmd" else "powershell",
-            _ENCODING_PREAMBLE.sub("", inner).strip())
+            _without_preamble(inner))
 
 
 def unwrap_shell(command: str) -> str:
@@ -135,10 +151,33 @@ _CMD_SPECIAL = frozenset("%^!()<'*?,;=@`")
 # nothing it cannot type in ASCII.
 _CURLY_QUOTES = frozenset("\u2018\u2019\u201a\u201b\u201c\u201d\u201e")
 # PowerShell's stop-parsing token: the rest of the line goes to the program
-# raw, `%VAR%` expanded and `;` no separator. PowerShell's dashes include the
-# en and em dash and the horizontal bar.
-_STOP_PARSING = re.compile("[-\u2013\u2014\u2015]{2}%")
+# raw, `%VAR%` expanded and `;` no separator. (PowerShell's other dashes \u2014
+# en, em, horizontal bar \u2014 never reach here: `unreadable_character`.)
+_STOP_PARSING = "--%"
 _UNKNOWN_SHELL_SPECIAL = frozenset("%[]")
+
+
+def unreadable_character(text: str) -> str:
+    """Why `text` holds a character no judge reads, or "".
+
+    Deny by default: only printable ASCII, a space, a tab and the line
+    breaks (`\\r` and `\\n`, separators to the reader) \u2014 anywhere, inside a
+    string too. PowerShell 5.1 gives meaning to characters a reader written
+    for ASCII takes as plain text: it splits words at NBSP, U+2003, U+3000,
+    `\\f`, `\\v`, U+0085 and U+2028 (`git<NBSP>-c<NBSP>\u2026` hid a git option
+    from the escalate rule's guard), takes the en dash as a parameter prefix
+    (`Select-Object \u2013First:1` passed the pipe filters' allowlist,
+    `\u2013Path:C:/outside/\u2026` made Select-String read a file) and closes a string
+    on a typographic quote (reviews of 2432 round 4 and of 2445). Listing
+    those is never finished; an agent loses nothing it cannot type in ASCII.
+    """
+    for char in text:
+        if char in _CURLY_QUOTES:
+            return f"a typographic quote {char!r}"
+        if not (" " <= char <= "~" or char in "\t\r\n"):
+            return (f"the character U+{ord(char):04X} (only printable ASCII, "
+                    f"spaces, tabs and line breaks are read)")
+    return ""
 
 
 def _bracket_literal(current: list[str]) -> bool:
@@ -155,6 +194,27 @@ def _bracket_literal(current: list[str]) -> bool:
     return bool(current) and current[0] != "-"
 
 
+def _native_quoting_refusal(literal: str) -> str:
+    """Why PowerShell 5.1 would not hand the quoted string `literal` to a
+    native program as ONE argument, or "".
+
+    Its legacy quoting writes the command line without escaping: it wraps a
+    value holding whitespace in `"…"` as is and drops an empty one.
+    Measured 2026-11-18 (Windows PowerShell 5.1, a Python program printing
+    its argv): `-k 'a\\" -p b'` arrives as `-k`, `a"`, `-p`, `b`;
+    `-k 'a b\\' -p evil` and `-k "a b\\" -p evil` as `-k`, `a b" -p evil`;
+    `-k '' -p evil` as `-k`, `-p`, `evil`. The reader's one word would be
+    the rule's or the judge's reading, not the program's."""
+    if '"' in literal:
+        return "a `\"` inside a quoted string (PowerShell 5.1 hands it on unescaped)"
+    if not literal:
+        return "an empty quoted string (PowerShell 5.1 drops it)"
+    if literal.endswith("\\") and re.search(r"[ \t]", literal):
+        return ("a quoted string with a space ending in `\\` (PowerShell 5.1 "
+                "quotes it into an escaped `\"`)")
+    return ""
+
+
 def _words(text: str, shell: str) -> list[Token]:
     """The words and operators of `text` under `shell` ("" reads as
     PowerShell without its measured relaxations, the strictest); raises
@@ -166,7 +226,10 @@ def _words(text: str, shell: str) -> list[Token]:
     commands, `|` (judged by `_pipe_refusal`), output redirection and
     `2>&1`. A quote glued to other text (`--x='a b'`, `'a'b`) is refused —
     PowerShell's rules for it differ by context, and guessing is how a
-    reader grants what the shell does not run.
+    reader grants what the shell does not run — and so is any character
+    outside printable ASCII (`unreadable_character`), a line break inside a
+    string, and a string PowerShell would not pass as one argument
+    (`_native_quoting_refusal`).
     """
     return [token for token, _ in _lexed(text, shell)]
 
@@ -179,9 +242,9 @@ def _lexed(text: str, shell: str) -> list[tuple[Token, str]]:
     # PowerShell wrapper only; with none the shell is unknown.
     special = (_CMD_SPECIAL if cmd else _PS_SPECIAL if shell == "powershell"
                else _PS_SPECIAL | _UNKNOWN_SHELL_SPECIAL)
-    curly = next((char for char in text if char in _CURLY_QUOTES), None)
-    if curly is not None:
-        raise Unparsed(f"a typographic quote {curly!r}")
+    unreadable = unreadable_character(text)
+    if unreadable:
+        raise Unparsed(unreadable)
     out: list[tuple[Token, str]] = []
     current: list[str] = []
     started = 0
@@ -191,7 +254,7 @@ def _lexed(text: str, shell: str) -> list[tuple[Token, str]]:
     def flush() -> None:
         if current:
             value = "".join(current)
-            if not cmd and _STOP_PARSING.fullmatch(value):
+            if not cmd and value == _STOP_PARSING:
                 raise Unparsed(f"`{value}` (PowerShell's stop-parsing token)")
             out.append((Word(value), text[started:at]))
             current.clear()
@@ -201,11 +264,14 @@ def _lexed(text: str, shell: str) -> list[tuple[Token, str]]:
 
     while at < end:
         char = text[at]
-        if char in " \t\r":
+        if char in " \t":
             flush()
             at += 1
             continue
-        if char == "\n":
+        if char in "\r\n":
+            # A lone CR ends a statement in PowerShell 5.1 as LF does: read
+            # as a space, `npm test\rSet-Content …` was granted by
+            # `npm test( .*)?` (both reviews of 2445).
             flush()
             operator(";")
             at += 1
@@ -225,12 +291,18 @@ def _lexed(text: str, shell: str) -> list[tuple[Token, str]]:
                         at += 2
                         continue
                     break
+                if text[at] in "\r\n":
+                    raise Unparsed("a line break inside a quoted string")
                 value.append(text[at])
                 at += 1
             literal = "".join(value)
             if char == '"' and re.search(r"[$`]" if not cmd else r"[%!]",
                                          literal):
                 raise Unparsed("a double-quoted string the shell expands")
+            if not cmd:
+                why = _native_quoting_refusal(literal)
+                if why:
+                    raise Unparsed(why)
             at += 1
             if at < end and text[at] not in " \t\r\n;|&>":
                 raise Unparsed("a quote glued to other text")

@@ -5,7 +5,6 @@ asks to run outside the sandbox (`sandbox.escalation_judge`)."""
 from __future__ import annotations
 
 import re
-from pathlib import PurePosixPath, PureWindowsPath
 from typing import Pattern
 
 from .command_dispatch import _pipe_refusal
@@ -32,20 +31,16 @@ _INDIRECT_PROGRAMS = frozenset({
     "wscript", "cscript", "mshta", "rundll32", "conhost", "forfiles",
     "%", "foreach", "foreach-object"})
 
-# What a worker's git may do on an escalate grant: read. Its commit and
-# rebase run only through the brokers (`commands` module docstring), and a
-# global option before the subcommand (`-c core.hooksPath=…`, `-C <dir>`,
-# `--git-dir`) is how a matching line would run the worker's hooks or
-# another tree. The arguments after the subcommand are the rule's own words.
-_WORKER_GIT_READS = frozenset({
-    "status", "log", "diff", "show", "rev-parse", "ls-files", "blame",
-    "describe", "shortlog", "cat-file"})
+_PROGRAM_SUFFIXES = (".exe", ".com", ".cmd", ".bat", ".ps1")
 
 
 def _program(word: str) -> str:
-    """`word` as a program name: its last path part, lower-case, no `.exe`."""
-    program = re.split(r"[\\/]", word)[-1].lower()
-    return program[:-4] if program.endswith(".exe") else program
+    """`word` as a program name: lower-case, no `.exe`-like suffix."""
+    program = word.lower()
+    for suffix in _PROGRAM_SUFFIXES:
+        if program.endswith(suffix):
+            return program[:-len(suffix)]
+    return program
 
 
 def _stages(lexed: list[tuple[Token, str]]) -> list[tuple[list[tuple[Token, str]], bool]]:
@@ -61,15 +56,6 @@ def _stages(lexed: list[tuple[Token, str]]) -> list[tuple[list[tuple[Token, str]
     return [(tokens, piped) for tokens, piped in stages if tokens or piped]
 
 
-def _git_refusal(words: list[str]) -> str:
-    """The second word must be a read: an option there (`-c`) is no read."""
-    if len(words) < 2 or words[1].lower() not in _WORKER_GIT_READS:
-        return (f"`{' '.join(words[:2])}`: a worker's git leaves the sandbox "
-                f"only to read, with no option before the subcommand, and "
-                f"commits and rebases through the brokers")
-    return ""
-
-
 def escalate_refusal(command: str, pattern: Pattern[str], worker: bool) -> str:
     """Why `pattern` does not grant `command`, or "" when it does.
 
@@ -81,8 +67,8 @@ def escalate_refusal(command: str, pattern: Pattern[str], worker: bool) -> str:
     2432's review). So:
 
     - the line is read through Codex's wrapper into literal words
-      (`command_shell._lexed`: no `$`, no `&` call, no `( )`, no
-      typographic quote), anything else refused;
+      (`command_shell._lexed`: no `$`, no `&` call, no `( )`, nothing
+      outside printable ASCII), anything else refused;
     - it is cut at `;`, `&&`, `||` and `|`, and EVERY command must match on
       its own — one written as its words' source text joined by single
       spaces (quotes kept as typed, `2>&1` matched with and without it); a
@@ -90,9 +76,17 @@ def escalate_refusal(command: str, pattern: Pattern[str], worker: bool) -> str:
       may end in (`command_dispatch._pipe_refusal`) instead;
     - no command redirects to a file, none is a program that runs a command
       it is handed (`_INDIRECT_PROGRAMS`), none is a program given by a
-      relative path (`.\\npm` is the file the agent left in its tree);
-    - a worker's git reads only (`_WORKER_GIT_READS`), whatever the rule
-      says: nothing after this function grants git, so the limit is final.
+      path: `.\\npm` or `C:\\<slot>\\git.exe` is a file the agent may have
+      written, and the rule has no roots to tell it from a trusted one —
+      a program is named and looked up on the PATH;
+    - a worker's git is refused whatever the rule says (nothing after this
+      function grants git, so the refusal is final). "Read-only"
+      subcommands are no limit: `status`, `diff`, `log -p`, `show`, `blame`
+      and `ls-files -m` run the fsmonitor, external diff or textconv
+      programs of a repository config the worker can plant under any cwd
+      of its workspace, and `diff --output=<path>` writes anywhere (both
+      reviews of 2445). Its reads run inside the sandbox; its commits and
+      rebases go through the brokers.
 
     An operator who wants arguments says so in the rule: `npm test( .*)?`.
     """
@@ -122,16 +116,14 @@ def _stage_refusal(tokens: list[tuple[Token, str]], piped: bool,
     if not words or words[0].quoted:
         return "a command with no plain program name"
     program = words[0].value
+    if re.search(r"[\\/:]", program):
+        return f"`{program}`: programs are named, not given by path"
     name = _program(program)
     if name in _INDIRECT_PROGRAMS:
         return f"`{program}` runs a command it is handed"
-    if (re.search(r"[\\/]", program) and not PureWindowsPath(program).is_absolute()
-            and not PurePosixPath(program).is_absolute()):
-        return f"`{program}`: a program given by a relative path"
     if worker and name == "git":
-        why = _git_refusal([word.value for word in words])
-        if why:
-            return why
+        return ("a worker's git does not leave the sandbox: its reads run "
+                "inside, its commits and rebases through the brokers")
     full = " ".join(source for _, source in tokens)
     bare = " ".join(source for token, source in tokens if token != _MERGE)
     if pattern.fullmatch(full) or pattern.fullmatch(bare):

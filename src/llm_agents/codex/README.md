@@ -207,7 +207,8 @@ online tasks only with `spawn --allow-online-probes`. `--escalate '<regex>'`
 ADDS to the list for a worker; for everyone else (a reviewer, an agent without
 a role) it is still the only grant (`sandbox.escalation_pattern`). The regex
 must match each command of the line WHOLE (`command_escalate.escalate_refusal`),
-so arguments are its own words: `'npm test( .*)?'`, not `'^npm test'`. Every
+so arguments are its own words: `'npm test( .*)?'`, not `'^npm test'`; it
+never grants a worker's git (reads run inside the sandbox). Every
 decision is written to `events.jsonl` with its reason, and a refusal shows in
 `logs`. An edit (apply_patch) that failed in the sandbox is retried outside it
 by `sandbox.file_change_judge`; a refusal is named by `logs` and the turn
