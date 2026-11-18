@@ -57,8 +57,10 @@ def _store_env(slot, directory):
     return kit_env(**{ENV: json.dumps({"workspace": str(slot), "directory": str(directory)})})
 
 
-@pytest.mark.parametrize("mismatch", [None, "admin", "owner"])
-def test_commit_rechecks_approved_identity(checkout, tmp_path, mismatch):
+@pytest.mark.parametrize("mismatch,reason", [
+    (None, ""), ("admin", "names a repository outside this slot"),
+    ("root", "approved root changed")])
+def test_commit_rechecks_approved_identity(checkout, tmp_path, mismatch, reason):
     slot, sub, _ = checkout
     directory = Path(git(slot, "rev-parse", "--absolute-git-dir")) / "approvals"
     directory.mkdir()
@@ -75,7 +77,7 @@ def test_commit_rechecks_approved_identity(checkout, tmp_path, mismatch):
     result = run_kit("commit", *args, cwd=slot, env=_store_env(slot, directory))
     if mismatch:
         assert result.returncode == 1, result.stdout + result.stderr
-        assert f"approved {mismatch} changed" in result.stderr
+        assert reason in result.stderr
         assert git(sub, "diff", "--cached", "--name-only") == ""
         assert git(sub, "show", "HEAD:work.txt") == "initial"
         assert message.exists()

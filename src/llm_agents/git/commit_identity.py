@@ -18,7 +18,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from ..gitlib import git
+from ..gitlib import Repository
+from .slots import registered_admin
 
 
 ENV = "CODEX_COMMIT_APPROVAL_STORE"
@@ -40,18 +41,30 @@ def approved_invocation(args: list[str]) -> Optional[dict]:
     config = json.loads(setting)
     workspace = Path(config["workspace"]).resolve()
     directory = Path(config["directory"]).resolve()
-    # Through gitlib: under the commit broker that is the bridge's pinned git.
-    result = git(["-C", str(workspace), "rev-parse", "--absolute-git-dir"],
-                 check=False)
-    admin = Path(result.stdout.strip()).resolve()
+    # The admin directory the MAIN clone registers for the slot, never the
+    # one the slot's `.git` file names: that file and a discovered
+    # repository's config are the worker's to plant (`gitlib.Repository`).
+    admin, why = registered_admin(workspace)
     # The inherited workspace must contain this invocation, and only its
     # linked-worktree admin directory can hold approvals outside worker writes.
-    if (result.returncode != 0 or not Path.cwd().resolve().is_relative_to(workspace)
-            or admin.parent.name != "worktrees" or admin.parent.parent.name != ".git"
+    if (admin is None or not Path.cwd().resolve().is_relative_to(workspace)
             or directory == admin or not directory.is_relative_to(admin)):
-        raise ValueError("commit.py: approval store is not under this slot's Git admin directory")
+        raise ValueError(f"commit.py: approval store is not under this slot's Git "
+                         f"admin directory{f' ({why})' if why else ''}")
     path = ticket_path(directory, Path.cwd(), args)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        identity = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ValueError("commit.py: no readable approval for this invocation") from exc
+    # The judge wrote both; a ticket naming a repository outside the slot's
+    # own admin tree is not one it wrote.
+    ticket_admin = Path(identity["admin"])
+    if ticket_admin != admin and not ticket_admin.is_relative_to(admin / "modules"):
+        raise ValueError("commit.py: the approval names a repository outside this slot")
+    return identity
+
+
+def bound_repository(identity: dict) -> Repository:
+    """The repository an approved invocation commits in: the ticket's
+    admin directory and work tree, named to git explicitly."""
+    return Repository(Path(identity["admin"]), Path(identity["root"]))

@@ -1,12 +1,14 @@
-"""The commit broker's pinned git (`commit_broker._FORCED` through
-`gitlib.pin`): each forced setting and the `GIT_*` strip, by its effect.
+"""The pinned git (`gitlib.Pinned` through `gitlib.pin`, as the commit
+broker sets it): each forced setting, the `GIT_*` strip and the binding to
+a named repository, by its effect.
 
 A repository the worker writes may name in its own config a program git
-starts on a commit's way (an fsmonitor, an external diff, an editor), and
-the environment may redirect git (`GIT_DIR`). Each test plants one of them,
-runs git through the pin, and asserts the planted program did not run or
-the redirect did not take; its control shows that the same fixture does run
-it with git unpinned."""
+starts on a commit's way (an fsmonitor, an external diff, a clean filter,
+an editor), a `.git` the worker writes may point discovery at such a
+repository, and the environment may redirect git (`GIT_DIR`). Each test
+plants one of them, runs git through the pin, and asserts the planted
+program did not run or the redirect did not take; its control shows that
+the same fixture does run it with git unpinned."""
 
 from pathlib import Path
 
@@ -38,16 +40,34 @@ def repo(tmp_path, monkeypatch):
 def _program(tmp_path: Path, marker: Path) -> str:
     """A shell script that records its start, as a config value git runs."""
     script = tmp_path / "planted.sh"
-    script.write_text(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\n",
+    script.write_text(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n",
                       encoding="utf-8", newline="\n")
     script.chmod(0o755)
     return script.as_posix()
 
 
-def _pin(tmp_path: Path) -> None:
+def _pin(tmp_path: Path, repository=None) -> None:
     hooks = tmp_path / "no-hooks"
     hooks.mkdir(exist_ok=True)
-    commit_broker._pin(commit_broker.Grant(Path("git"), hooks, hooks), hooks)
+    commit_broker._pin(commit_broker.Grant(Path("git"), hooks, hooks), hooks, repository)
+
+
+def _hijacked(work: Path, tmp_path: Path, marker: Path) -> gitlib.Repository:
+    """`work`'s own repository, moved where the worker cannot write (the
+    returned binding), and in its place a `.git` file pointing discovery at
+    a worker repository whose config names `marker`'s program as fsmonitor,
+    external diff and clean filter for every file (`.gitattributes`)."""
+    trusted = tmp_path / "trusted.git"
+    (work / ".git").rename(trusted)
+    planted = tmp_path / "planted.git"
+    gitlib.git(["init", "--quiet", "--bare", str(planted)], cwd=tmp_path)
+    program = _program(tmp_path, marker)
+    for key, value in (("core.bare", "false"), ("core.fsmonitor", program),
+                       ("diff.external", program), ("filter.evil.clean", program)):
+        gitlib.git(["config", "--file", str(planted / "config"), key, value], cwd=tmp_path)
+    (work / ".git").write_text(f"gitdir: {planted}\n", encoding="utf-8")
+    (work / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
+    return gitlib.Repository(trusted, work)
 
 
 def test_the_repository_s_fsmonitor_does_not_run(repo, tmp_path):
@@ -61,18 +81,26 @@ def test_the_repository_s_fsmonitor_does_not_run(repo, tmp_path):
     assert not marker.exists()
 
 
-def test_the_repository_s_external_diff_does_not_run(repo, tmp_path):
+@pytest.mark.parametrize("question", [
+    ["status", "--porcelain"],
+    ["ls-files", "-co", "--exclude-standard", "-z"],
+    ["diff"],
+    ["add", "a.txt"],
+])
+def test_a_bound_git_never_discovers_the_worker_s_git_file(repo, tmp_path, question):
+    """Item 2432, review A/C: a `.git` under a writable root (a submodule's)
+    is the worker's to repoint; bound, git reads the trusted repository."""
     work, marker = repo
-    gitlib.git(["config", "diff.external", _program(tmp_path, marker)], cwd=work)
-    gitlib.git(["diff"], cwd=work)
-    assert marker.exists()  # the control
+    trusted = _hijacked(work, tmp_path, marker)
+    gitlib.git(question, cwd=work, check=False)
+    assert marker.exists()  # the control: discovery runs the planted programs
     marker.unlink()
-    _pin(tmp_path)
-    # `diff.external=` does not switch the external diff off: git tries to
-    # start the empty program and dies (exit 128, measured 2026-11-18, Git
-    # for Windows 2.x) — closed, not open, which is what is pinned here.
-    gitlib.git(["diff"], cwd=work, check=False)
+    _pin(tmp_path, trusted)
+    done = gitlib.git(question, cwd=work, check=False)
+    assert done.returncode == 0, done.stderr
     assert not marker.exists()
+    where = gitlib.git(["rev-parse", "--absolute-git-dir"], cwd=work).stdout.strip()
+    assert Path(where).resolve() == trusted.git_dir.resolve()
 
 
 def test_the_repository_s_editor_is_not_the_editor(repo, tmp_path):

@@ -99,7 +99,7 @@ def trusted_python(name: str, roots: tuple[Path, ...],
 
     The worker types a NAME (`argv_refusal`: programs are named, not given
     by path), which PowerShell looks up on the PATH the bridge hands every
-    escalated command. Pinned like `rebase.trusted_git`, with one difference:
+    escalated command. Pinned like `gitlib.trusted_git`, with one difference:
     the bridge resolves git and runs it by its absolute path, while here the
     shell resolves the word, after the grant — so not only the first hit
     counts. Refused: any relative PATH entry (the cwd in disguise) and any

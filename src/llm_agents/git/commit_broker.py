@@ -18,10 +18,13 @@ under `-I`, no package is on `sys.path`: the file puts the `src/` folder it
 lies in first — the bridge's, since only its literal path is granted — and
 runs the kit's `commit.main` with:
 
-- git pinned for the whole process (`gitlib.pin`): the absolute git the
-  bridge resolved (`rebase.trusted_git`), `_FORCED` over the repository's
-  own configuration, no `GIT_*` from the environment, and no program
-  looked up in the current directory anywhere below (`NO_CWD_LOOKUP`);
+- git pinned for the whole process (`gitlib.pin`, `gitlib.Pinned`): the
+  absolute git the bridge resolved (`gitlib.trusted_git`), its forced
+  settings, no `GIT_*` from the environment, no program looked up in the
+  current directory anywhere below, and — once the ticket is read — every
+  git bound to the ticket's repository (`commit_identity.bound_repository`),
+  so no git of the commit, of its read-only questions or of the host's
+  checks discovers a repository through a `.git` the worker wrote;
 - the hooks the grant names: the host's folder in its MAIN checkout
   (`HostPolicy.commit_hooks`: the house rules a commit must pass) for the
   slot's own tree, an empty folder for a commit inside a submodule (which
@@ -32,11 +35,9 @@ runs the kit's `commit.main` with:
   the bridge's judge wrote when it granted the command: no ticket, no
   commit.
 
-Residual: the slot's `.git` FILE is the worker's to rewrite, and the kit's
-read-only questions (status, ls-files, diff --cached) discover the
-repository through it. Its writes do not: `run_indexing` passes the
-approved `--git-dir`/`--work-tree`, and `approved_identity_problems`
-refuses a slot whose discovery no longer names them.
+Before the ticket is read, git is pinned without a repository: the one
+question asked then (`approved_invocation`) reads the main clone's worktree
+registration as files, not through git.
 """
 
 from __future__ import annotations
@@ -52,21 +53,6 @@ from typing import Optional
 # The bridge's facts, as JSON: {"git", "hooks", "no_hooks", "host"}.
 ENV = "LLM_AGENTS_COMMIT_BROKER"
 
-# Configuration forced on every git of the broker, after (and so over) the
-# repository's own: the grant's hooks folder (`hooks` is substituted), and
-# the settings that would start a program of the repository's choosing
-# during a commit — an fsmonitor, an external diff, an editor.
-_FORCED = ("core.hooksPath={hooks}", "core.fsmonitor=false", "diff.external=",
-           "core.editor=true")
-
-# Set for the broker's whole process tree — git, the hooks it runs and what
-# they start. On Windows a program started by bare name (CreateProcess,
-# cmd, Node's libuv: a hook's `execFileSync("git")`) is looked up in the
-# current directory before the PATH unless this variable is set; a hook's
-# cwd is the committed tree's root, the worker's to write (review of 2432
-# reproduced a planted git.exe running from a real pre-commit hook). Ignored
-# elsewhere. A belt, not the pin: a host's hooks still start git by path.
-NO_CWD_LOOKUP = {"NoDefaultCurrentDirectoryInExePath": "1"}
 
 
 @dataclass(frozen=True)
@@ -90,9 +76,9 @@ class Grant:
                      Path(data["no_hooks"]), data.get("host", ""))
 
 
-def _pin(grant: Grant, hooks: Path) -> None:
+def _pin(grant: Grant, hooks: Path, repository=None) -> None:
     from llm_agents import gitlib
-    gitlib.pin(grant.git, tuple(setting.format(hooks=hooks) for setting in _FORCED))
+    gitlib.pin(gitlib.Pinned(grant.git, hooks, repository))
 
 
 def _load_host(spec: str):
@@ -125,11 +111,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     except (ValueError, KeyError, TypeError) as error:
         print(f"commit broker: unreadable {ENV}: {error}", file=sys.stderr)
         return 2
-    os.environ.update(NO_CWD_LOOKUP)
-    # No hooks until the ticket says whose tree this is; rev-parse runs none.
+    # No hooks and no repository until the ticket says whose tree this is.
     _pin(grant, grant.no_hooks)
     from llm_agents.git import commit
-    from llm_agents.git.commit_identity import approved_invocation
+    from llm_agents.git.commit_identity import approved_invocation, bound_repository
     try:
         expected = approved_invocation(argv)
     except (OSError, ValueError, KeyError) as error:
@@ -139,7 +124,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("commit broker: no approval store: this broker commits only what "
               "the bridge's judge approved", file=sys.stderr)
         return 2
-    _pin(grant, grant.no_hooks if expected.get("owner") else grant.hooks)
+    _pin(grant, grant.no_hooks if expected.get("owner") else grant.hooks,
+         bound_repository(expected))
     return commit.main(_load_host(grant.host))
 
 

@@ -15,7 +15,7 @@ Python 3.9+.
 | `branch_overlap.py` | Which files two diverged branches both touched, and which of ours the other side moved or deleted. |
 | `union_conflicts.py` | Resolves conflict hunks by keeping both sides, in a chosen order. |
 | `slots.py` | The pool's naming rule, shared with the Codex bridge's commit judge. |
-| `rebase.py` | The rebase broker a sandboxed Codex worker rebases its own slot through: run by path from the bridge's checkout, with the git, hooks folder and slot the bridge hands it. |
+| `rebase.py` | The rebase broker a sandboxed Codex worker rebases its own slot through: run by path from the bridge's checkout, with the git, hooks folder, slot and its registered admin directory the bridge hands it. |
 | `commit_broker.py` | The commit broker a sandboxed Codex worker commits in its slot through: `commit.py` run from the bridge's checkout, with the git, hooks and host rules the bridge hands it. |
 | `commit_identity.py` | The approval store that binds a sandboxed worker's commit to the checkout its judge approved. |
 

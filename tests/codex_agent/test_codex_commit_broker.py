@@ -261,7 +261,7 @@ def test_the_commit_runs_the_host_s_hooks_not_the_planted_ones(tmp_path, monkeyp
 
 
 def test_the_hooks_run_without_a_cwd_program_lookup(tmp_path, monkeypatch):
-    """`commit_broker.NO_CWD_LOOKUP` reaches the hooks even when the bridge's
+    """`gitlib.NO_CWD_LOOKUP` reaches the hooks even when the bridge's
     environment lacks it: on Windows a hook's bare-name start (Node's
     `execFileSync("git")`) would otherwise try the slot root first."""
     monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
@@ -361,3 +361,123 @@ def test_the_granted_line_runs_the_pinned_git_and_python(tmp_path, monkeypatch):
     assert again.returncode == 0, again.stdout + again.stderr
     assert f"core.hooksPath={grant.no_hooks}" in log.read_text(encoding="utf-8")
     assert not planted.exists()
+
+
+# --- the repository is named, never discovered (item 2432, 2435) -------------
+
+def _planted_gitdir(tmp_path: Path, sub: Path, marker: Path) -> Path:
+    """A copy of `sub`'s repository where the worker could write it (its
+    scratch) whose config names a program as fsmonitor and as the `evil`
+    clean filter; the program appends to `marker` and passes its input
+    through."""
+    import shutil
+    script = tmp_path / "scratch" / "planted.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(f"#!/bin/sh\necho ran >> '{marker.as_posix()}'\ncat\n",
+                      encoding="utf-8", newline="\n")
+    script.chmod(0o755)
+    real = git_in(sub, "rev-parse", "--absolute-git-dir").stdout.strip()
+    planted = tmp_path / "scratch" / "planted.git"
+    shutil.copytree(real, planted)
+    for key, value in (("core.worktree", sub.as_posix()), ("core.fsmonitor", script.as_posix()),
+                       ("filter.evil.clean", script.as_posix())):
+        git_in(tmp_path, "config", "--file", str(planted / "config"), key, value)
+    return planted
+
+
+def _point(git_file: Path, gitdir: Path) -> None:
+    # Git marks the file hidden on Windows; opening it with 'w' is refused.
+    with git_file.open("r+", encoding="utf-8") as stream:
+        stream.write(f"gitdir: {gitdir}\n")
+        stream.truncate()
+
+
+def test_the_judge_never_asks_git_through_a_submodule_s_git_file(tmp_path, monkeypatch):
+    """Review A: `<sub>/.git` is writable under Codex's sandbox (only each
+    root's top-level `.git` is protected); flipped to a worker repository
+    between the ownership check and the folder listing, a discovering
+    `ls-files` started that repository's fsmonitor with the user's rights."""
+    from llm_agents.codex import command_commit
+    slot, sub, _ = slot_with_submodule(tmp_path)
+    (sub / "src").mkdir()
+    (sub / "src/b.py").write_text("", encoding="utf-8")
+    marker = tmp_path / "fsmonitor.txt"
+    planted = _planted_gitdir(tmp_path, sub, marker)
+    listed = command_commit._commit_path_refusal
+
+    def flipped_first(*args, **kwargs):
+        _point(sub / ".git", planted)
+        return listed(*args, **kwargs)
+
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    monkeypatch.setattr(command_commit, "_commit_path_refusal", flipped_first)
+    verdict = ask(f"{RUN} -C {sub} -F {_message(tmp_path)} src")
+    assert not marker.exists(), verdict.reason
+    git_in(sub, "ls-files", "-co", "--exclude-standard")
+    assert marker.exists()  # the control: discovery through the flip runs it
+
+
+def test_the_approvals_live_in_the_registered_admin_not_the_git_file_s(tmp_path, monkeypatch):
+    """Review B: a slot `.git` naming the worker's own `<main>/.git/
+    worktrees/<slot>` (it passes `pool_slot`) must not move the approval
+    store or the empty hooks folder where the worker could forge a ticket
+    or plant a hook; both stay in the admin the MAIN clone registers."""
+    slot, _ = _slot(tmp_path)
+    fake = tmp_path / "scratch" / "main" / ".git" / "worktrees" / "main-wt1"
+    fake.mkdir(parents=True)
+    _point(slot / ".git", fake)
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    import json
+    store = Path(json.loads(ask.environment[APPROVALS])["directory"])
+    real = (tmp_path / "main" / ".git" / "worktrees" / "main-wt1").resolve()
+    assert real in store.parents, store
+    assert real in commit_broker.Grant.from_env(
+        ask.environment[commit_broker.ENV]).no_hooks.parents
+    assert not any(fake.iterdir())
+    # And the commit itself lands in the registered repository.
+    (slot / "src/a.ts").write_text("work\n", encoding="utf-8")
+    message = _message(tmp_path)
+    _granted(ask, f"{RUN} -F {message} src/a.ts")
+    done = _commit(ask, slot, "-F", str(message), "src/a.ts")
+    assert done.returncode == 0, done.stdout + done.stderr
+    head = subprocess.run(["git", "--git-dir", str(real), "log", "-1", "--format=%s"],
+                          capture_output=True, text=True, check=True).stdout
+    assert head.strip() == "Slot work"
+
+
+def test_no_broker_over_an_admin_directory_the_worker_may_write(tmp_path, monkeypatch):
+    """Review B: a writable root holding the main clone's `.git` makes the
+    registered admin the worker's too; no store, no grant."""
+    slot, _ = _slot(tmp_path)
+    ask = commit_judge(tmp_path, monkeypatch, slot, writable=[str(tmp_path / "main")])
+    assert APPROVALS not in ask.environment
+    _declined(ask, f"{RUN} -F {_message(tmp_path)} src/a.ts", "lies in your writable roots")
+
+
+@windows
+def test_every_git_after_the_ticket_is_bound_to_its_repository(tmp_path, monkeypatch):
+    """Review C: the post-commit `log` and `status` (a status runs the clean
+    filter `.gitattributes` names, from the config of whatever repository it
+    finds) ran after the last identity check, discovering through the
+    submodule's writable `.git`. A recording wrapper as the pinned git shows
+    every command after the ticket carrying the approved `--git-dir`."""
+    slot, sub, _ = slot_with_submodule(tmp_path)
+    git_in(sub, "config", "user.name", "t")
+    git_in(sub, "config", "user.email", "t@example.invalid")
+    ask = commit_judge(tmp_path, monkeypatch, slot)
+    (sub / "work.txt").write_text("sub work\n", encoding="utf-8")
+    message = _message(tmp_path)
+    _granted(ask, f"{RUN} -C {sub} -F {message} work.txt")
+    grant = commit_broker.Grant.from_env(ask.environment[commit_broker.ENV])
+    log = tmp_path / "pinned.txt"
+    wrapper = tmp_path / "pinned-git.cmd"
+    wrapper.write_text(f"@echo %*>>\"{log}\"\n@\"{grant.git}\" %*\n", encoding="utf-8")
+    pinned = {**ask.environment, commit_broker.ENV: replace(grant, git=wrapper).to_env()}
+    done = _commit(ask, slot, "-C", str(sub), "-F", str(message), "work.txt",
+                   environment=pinned)
+    assert done.returncode == 0, done.stdout + done.stderr
+    admin = (tmp_path / "main/.git/worktrees/main-wt1/modules/vendor").resolve()
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert any(" status " in line for line in lines), lines
+    unbound = [line for line in lines if f"--git-dir {admin}" not in line]
+    assert not unbound, unbound

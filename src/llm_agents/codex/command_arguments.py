@@ -47,9 +47,11 @@ class CommandContext:
     # The commit broker's facts, or None and why not (`command_commit._commit`).
     commit: Optional[CommitGrant] = None
     commit_refusal: str = ""
-    # The absolute git the bridge pinned (`rebase.trusted_git`) for the
-    # judges' own git questions (`command_commit._judge_git`).
-    git: Optional[Path] = None
+    # The admin directory the main clone registers for the worker's pool
+    # slot (`slots.registered_admin`, read at bridge start, outside every
+    # writable root), or None: what the commit judge binds its git questions
+    # and the approval to (`command_commit._tree_repository`).
+    slot_admin: Optional[Path] = None
     policy: HostPolicy = EMPTY
     host_flags: frozenset[str] = frozenset()
 

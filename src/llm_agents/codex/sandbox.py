@@ -27,11 +27,13 @@ from .gates import escalate_pattern
 from .paths import host_root, scratch_dir
 from .registry import AgentRecord
 from .roles import role_briefing
-from .command_commit import BROKER as COMMIT_BROKER, _git_admin
+from .command_commit import BROKER as COMMIT_BROKER
 from .command_rebase import BROKER
 from ..git import commit_broker
 from ..git import rebase as rebase_broker
 from ..git.commit_identity import ENV as COMMIT_APPROVAL_ENV
+from ..git.slots import registered_admin
+from ..gitlib import trusted_git
 from ..host_policy import EMPTY as EMPTY_POLICY
 from ..host_policy import active as host_policy
 from ..host_policy import explicit as explicit_grants
@@ -726,24 +728,22 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
     workspace = workspace_of(record).resolve()
     roots = tuple(root.resolve() for root in writable_roots(record))
     scratch = scratch_root(record)
-    # Git's admin directory is outside a slot worker's writable roots. A
-    # scratch file would let the process swapping a junction forge approval.
-    commit_store = (tempfile.TemporaryDirectory(prefix="commit-approvals-",
-                                               dir=_git_admin(workspace))
-                    if worker and pool_slot(workspace) else None)
+    # The approvals and the brokers' empty hooks folder live in the slot's
+    # admin directory: outside a slot worker's writable roots (a scratch
+    # file would let the process swapping a junction forge approval).
+    admin, admin_refusal = (_slot_admin(workspace, roots) if worker and pool_slot(workspace)
+                            else (None, "not a worker in a pool slot"))
+    commit_store = (tempfile.TemporaryDirectory(prefix="commit-approvals-", dir=admin)
+                    if admin is not None else None)
     policy = host_policy()
-    git, git_refusal = (rebase_broker.trusted_git(roots) if commit_store
-                        else (None, "not a worker in a pool slot"))
-    # The brokers' empty hooks folder, beside the approvals: outside every
-    # writable root, so the worker can plant no hook in it.
-    broker_store = (tempfile.TemporaryDirectory(prefix="brokers-",
-                                               dir=_git_admin(workspace))
+    git, git_refusal = (trusted_git(roots) if commit_store else (None, admin_refusal))
+    broker_store = (tempfile.TemporaryDirectory(prefix="brokers-", dir=admin)
                     if commit_store else None)
     no_hooks = Path(broker_store.name) / "no-hooks" if broker_store else None
     if no_hooks is not None:
         no_hooks.mkdir()
     grant, grant_refusal = _rebase_grant(
-        workspace, roots, policy.main_branch if commit_store else "",
+        workspace, admin, roots, policy.main_branch if commit_store else "",
         git, git_refusal, no_hooks)
     commit_grant, commit_refusal = _commit_grant(
         roots, policy, git, git_refusal, no_hooks)
@@ -753,7 +753,7 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
         allow_online_probes=record.allow_online_probes,
         commit_approvals=Path(commit_store.name) if commit_store else None,
         rebase=grant, rebase_refusal=grant_refusal,
-        commit=commit_grant, commit_refusal=commit_refusal, git=git,
+        commit=commit_grant, commit_refusal=commit_refusal, slot_admin=admin,
         policy=policy, host_flags=policy.commands.flags(roots))
     decline_tail = worker_decline_tail()
     automatic = _automatic()
@@ -803,20 +803,34 @@ def escalation_judge(record: AgentRecord) -> Optional[Callable[[dict], Verdict]]
     return judge
 
 
-def _rebase_grant(workspace: Path, roots: tuple[Path, ...], main: str,
-                  git: Optional[Path], git_refusal: str, no_hooks: Optional[Path]):
+def _slot_admin(workspace: Path, roots: tuple[Path, ...]) -> tuple[Optional[Path], str]:
+    """The slot's admin directory as the main clone registers it
+    (`slots.registered_admin`, not the slot's `.git` file), or None and why:
+    refused when it, or the repository it belongs to, lies in a writable
+    root — the approvals and every broker's git are bound to it."""
+    admin, why = registered_admin(workspace)
+    if admin is None:
+        return None, why
+    if within(admin, roots) or within(admin.parent.parent, roots):
+        return None, f"the slot's admin directory {admin} lies in your writable roots"
+    return admin, ""
+
+
+def _rebase_grant(workspace: Path, admin: Optional[Path], roots: tuple[Path, ...],
+                  main: str, git: Optional[Path], git_refusal: str,
+                  no_hooks: Optional[Path]):
     """(grant, why not) of the rebase broker for a worker in a pool slot on
-    a host naming `main`: the git the bridge's own PATH names
-    (`rebase.trusted_git`, never one inside the worker's roots) and the
-    brokers' empty hooks folder. The broker's file itself must lie outside
-    the roots too (`command_rebase`)."""
+    a host naming `main`: the slot's registered admin directory, the git
+    the bridge's own PATH names (`gitlib.trusted_git`, never one inside the
+    worker's roots) and the brokers' empty hooks folder. The broker's file
+    itself must lie outside the roots too (`command_rebase`)."""
     if not main:
         return None, "the host names no main branch to rebase onto"
     if within(BROKER, roots):
         return None, f"the bridge's broker {BROKER} lies in your writable roots"
-    if git is None or no_hooks is None:
+    if git is None or no_hooks is None or admin is None:
         return None, git_refusal
-    return rebase_broker.Grant(workspace, git, no_hooks, main), ""
+    return rebase_broker.Grant(workspace, admin, git, no_hooks, main), ""
 
 
 def _commit_grant(roots: tuple[Path, ...], policy, git: Optional[Path],

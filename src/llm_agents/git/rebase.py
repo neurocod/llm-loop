@@ -11,16 +11,20 @@ configuration-driven autostash, `updateRefs`, external diff and textconv
 drivers, or an interactive todo's `exec` lines. Instead the bridge grants
 this file, run from the BRIDGE'S OWN checkout (outside every writable root,
 so the worker cannot edit what runs), and hands it the facts it must not
-take from the worker through `ENV`: the slot, an absolute git the bridge
-resolved from its own PATH, an empty hooks folder it owns, the main branch.
+take from the worker through `ENV`: the slot, the admin directory the main
+clone registers for it (`slots.registered_admin`), an absolute git the
+bridge resolved from its own PATH, an empty hooks folder it owns, the main
+branch.
 
-Every git this broker runs is `_git_argv`: that git, hooks off, the
-configuration that widens a rebase forced off, a sanitized environment
-(`_environment`). Every request is checked by `refusal` — by the bridge's
-judge when it grants the command, and here again right before git runs.
+Every git this broker runs is `_pinned(grant)` (`gitlib.Pinned`): that git,
+hooks off, the configuration that widens a rebase forced off, a sanitized
+environment, and the slot's repository named explicitly — never found
+through the slot's `.git` (`gitlib.Repository`). Every request is checked
+by `refusal` — by the bridge's judge when it grants the command, and here
+again right before git runs.
 
-Standard library only: the file runs by path (`python <it> <op> ...`), with
-no package around it on `sys.path`.
+Run by path (`python -I <it> <op> ...`): `__main__` puts the `src/` folder
+the file lies in — the bridge's own — first on `sys.path`.
 
 Operations: `start` (rebase onto `refs/heads/<main>`), `continue`, `skip`,
 `abort`, `add <paths>` / `rm [--cached] <paths>` (only the conflict's
@@ -37,7 +41,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-# The bridge's facts, as JSON: {"workspace", "git", "hooks", "main"}.
+if __name__ == "__main__":
+    # `-I` put no script folder on sys.path: this file's own src/ goes first.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from llm_agents.gitlib import Pinned, Repository  # noqa: E402
+
+# The bridge's facts, as JSON: {"workspace", "admin", "git", "hooks", "main"}.
 ENV = "LLM_AGENTS_REBASE_BROKER"
 
 # Written by `start` into git's rebase-merge/ (the slot's admin directory,
@@ -47,16 +57,11 @@ ENV = "LLM_AGENTS_REBASE_BROKER"
 # (measured 2026-11-18, git 2.53), so that file proves nothing.
 MARKER = "llm-agents-broker"
 
-# Configuration forced on every git run here, after (and so over) the
-# repository's own: hooks off (`hooks` is substituted), and the settings
-# that let a plain rebase do more than replay the slot's commits —
-# `updateRefs` moves other branches, `autoStash` rewrites uncommitted work,
-# an fsmonitor or external diff is a program. `merge` backend: the only one
-# whose state `_resumable` reads.
-_FORCED = ("core.hooksPath={hooks}", "rebase.updateRefs=false",
-           "rebase.autoStash=false", "rebase.backend=merge",
-           "core.fsmonitor=false", "diff.external=", "core.editor=true",
-           "sequence.editor=true")
+# Configuration forced on every git run here over `gitlib.FORCED`: the
+# settings that let a plain rebase do more than replay the slot's commits —
+# `updateRefs` moves other branches, `autoStash` rewrites uncommitted work.
+# `merge` backend: the only one whose state `_resumable` reads.
+_FORCED = ("rebase.updateRefs=false", "rebase.autoStash=false", "rebase.backend=merge")
 
 # A git question or step of a fixture-sized slot takes well under a second
 # (measured 2026-11-18); a rebase of a long branch takes longer, and a hung
@@ -71,65 +76,36 @@ OPERATIONS = ("start", *_STEPS, "add", "rm", "status", "diff", "unmerged")
 
 @dataclass(frozen=True)
 class Grant:
-    """The bridge's facts for one worker: its slot (resolved), the absolute
-    git, the empty hooks folder, the pool's main branch."""
+    """The bridge's facts for one worker: its slot (resolved), the slot's
+    registered admin directory, the absolute git, the empty hooks folder,
+    the pool's main branch."""
     workspace: Path
+    admin: Path
     git: Path
     hooks: Path
     main: str
 
     def to_env(self) -> str:
-        return json.dumps({"workspace": str(self.workspace), "git": str(self.git),
-                           "hooks": str(self.hooks), "main": self.main})
+        return json.dumps({"workspace": str(self.workspace), "admin": str(self.admin),
+                           "git": str(self.git), "hooks": str(self.hooks),
+                           "main": self.main})
 
     @staticmethod
     def from_env(text: str) -> "Grant":
         data = json.loads(text)
-        return Grant(Path(data["workspace"]), Path(data["git"]),
+        return Grant(Path(data["workspace"]), Path(data["admin"]), Path(data["git"]),
                      Path(data["hooks"]), data["main"])
 
 
-def trusted_git(roots: tuple[Path, ...], path: Optional[str] = None) -> tuple[Optional[Path], str]:
-    """The git executable the bridge's own PATH names first, or None and why.
-
-    Absolute PATH entries only (a relative one is the cwd in disguise), and
-    on Windows `git.exe` only: a `git.cmd`/`git.bat` is a script anyone with
-    the folder may rewrite. Refused when it lies inside one of `roots` (the
-    worker's writable roots): that git would be the worker's program."""
-    names = ("git.exe",) if os.name == "nt" else ("git",)
-    for folder in (path if path is not None else os.environ.get("PATH", "")).split(os.pathsep):
-        folder = folder.strip().strip('"')
-        if not folder or not os.path.isabs(folder):
-            continue
-        for name in names:
-            candidate = Path(folder) / name
-            if candidate.is_file():
-                resolved = candidate.resolve()
-                if any(resolved == root or root in resolved.parents for root in roots):
-                    return None, f"the first git on PATH, {resolved}, lies in a writable root"
-                return resolved, ""
-    return None, "no git executable on the bridge's PATH"
-
-
-def _environment() -> dict[str, str]:
-    """The broker's environment for git: the inherited one without any
-    `GIT_*` variable (GIT_DIR, GIT_WORK_TREE, GIT_CONFIG_*, GIT_EXTERNAL_DIFF,
-    GIT_SEQUENCE_EDITOR, GIT_EXEC_PATH... each redirects or widens git), then
-    no editor and no prompt: nobody sits at this command's terminal."""
-    env = {key: value for key, value in os.environ.items()
-           if not key.upper().startswith("GIT_")}
-    env.update(GIT_EDITOR="true", GIT_SEQUENCE_EDITOR="true", GIT_TERMINAL_PROMPT="0")
-    return env
-
-
-def _git_argv(grant: Grant, *args: str) -> list[str]:
-    forced = [part for setting in _FORCED
-              for part in ("-c", setting.format(hooks=grant.hooks))]
-    return [str(grant.git), *forced, "--literal-pathspecs", "-C", str(grant.workspace), *args]
+def _pinned(grant: Grant) -> Pinned:
+    return Pinned(grant.git, grant.hooks, Repository(grant.admin, grant.workspace),
+                  _FORCED)
 
 
 def _run(grant: Grant, *args: str, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(_git_argv(grant, *args), env=_environment(),
+    # cwd the slot root: the pathspecs `add`/`rm` take are root-relative.
+    return subprocess.run(_pinned(grant).argv(["--literal-pathspecs", *args]),
+                          cwd=grant.workspace, env=Pinned.environment(),
                           capture_output=capture, text=True, encoding="utf-8",
                           errors="replace", timeout=_TIMEOUT_S,
                           stdin=subprocess.DEVNULL)
@@ -144,16 +120,9 @@ def _ask(grant: Grant, *args: str) -> Optional[str]:
     return done.stdout if done.returncode == 0 else None
 
 
-def _admin(grant: Grant) -> Optional[Path]:
-    text = _ask(grant, "rev-parse", "--path-format=absolute", "--git-dir")
-    return Path(text.strip()) if text else None
-
-
 def _state(grant: Grant) -> Optional[Path]:
     """git's rebase-merge/ of the slot when a rebase is in progress there."""
-    admin = _admin(grant)
-    if admin is None:
-        return None
+    admin = grant.admin
     for name in ("rebase-merge", "rebase-apply"):
         if (admin / name).is_dir():
             return admin / name

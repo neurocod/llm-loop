@@ -9,6 +9,7 @@ leave every worker refused, or worse, a judge that kept an older rule.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -48,6 +49,89 @@ def git_admin(workspace: Path) -> Optional[Path]:
     if key.strip() != "gitdir" or not value.strip():
         return None
     return (workspace / value.strip()).resolve()
+
+
+def _same(a: os.PathLike, b: os.PathLike) -> bool:
+    """Equal spellings, case and separators folded, `..` dropped — nothing
+    resolved: a link along a worker-written path must not make it equal."""
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def registered_admin(workspace: Path) -> tuple[Optional[Path], str]:
+    """The admin directory git registered for the pool slot `workspace`, or
+    None and why — read from the MAIN clone beside it, never from
+    `<workspace>/.git` (the worker's file: `git_admin` reads it).
+
+    The slot `<parent>/<main>-wtN` names its main clone `<parent>/<main>`;
+    git keeps every linked worktree's admin directory as
+    `<main>/.git/worktrees/<id>` with a `gitdir` file naming the worktree's
+    `.git` (measured 2026-11-18: `<id>` is the slot's directory name, as
+    `git worktree add` picks it). The one whose `gitdir` names
+    `<workspace>/.git` is the slot's; `commondir` must lead back to
+    `<main>/.git`."""
+    main_name, infix, number = workspace.name.rpartition(SLOT_INFIX)
+    if not infix or not main_name or not number.isdigit():
+        return None, f"{workspace} is not named `<main>{SLOT_INFIX}N`"
+    common = workspace.parent / main_name / ".git"
+    worktrees = common / "worktrees"
+    if not worktrees.is_dir():
+        return None, f"{common} registers no linked worktrees"
+    marker = workspace / ".git"
+    for admin in sorted(worktrees.iterdir()):
+        try:
+            gitdir = (admin / "gitdir").read_text(encoding="utf-8").strip()
+            commondir = (admin / "commondir").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not _same(gitdir, marker):
+            continue
+        if not _same(admin / commondir, common):
+            return None, f"{admin} does not belong to {common}"
+        return admin.resolve(), ""
+    return None, f"{common} registers no worktree at {workspace}"
+
+
+def registered_submodule(slot_admin: Path, slot: Path, path: str,
+                         name: str) -> tuple[Optional[Path], str]:
+    """The admin directory of the slot's submodule `name` checked out at
+    `path`, or None and why — `<slot_admin>/modules/<name>` (where `git
+    submodule` keeps a worktree's submodules, measured 2026-11-18), never
+    the `<slot>/<path>/.git` file the worker may rewrite. Both words come
+    from the worker's `.gitmodules`, so the answer must stay inside the
+    trusted `modules/` and its own `config` (which the worker cannot write)
+    must name `<slot>/<path>` as its work tree."""
+    modules = slot_admin / "modules"
+    admin = modules / name
+    if not name or os.path.isabs(name) or not _same(
+            os.path.commonpath([os.path.normpath(admin), os.path.normpath(modules)]),
+            modules) or _same(admin, modules):
+        return None, f"submodule name {name!r} leaves {modules}"
+    worktree = _config_value(admin / "config", "core", "worktree")
+    if worktree is None:
+        return None, f"{admin} is not an initialized submodule repository"
+    if not _same(admin / worktree, slot / path):
+        return None, f"{admin} names {worktree} as its work tree, not {slot / path}"
+    return admin, ""
+
+
+def _config_value(config: Path, section: str, key: str) -> Optional[str]:
+    """`<section>.<key>` of a git config file git itself wrote (a submodule
+    admin's `config`: plain `[core]` lines, no includes), or None — read
+    without git, which would look for a repository of its own first."""
+    try:
+        lines = config.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    current = ""
+    for line in lines:
+        text = line.strip()
+        if text.startswith("["):
+            current = text.strip("[]").strip().casefold()
+        elif current == section and "=" in text:
+            name, _, value = text.partition("=")
+            if name.strip().casefold() == key:
+                return value.strip().strip('"')
+    return None
 
 
 def pool_slot(workspace: Path) -> bool:

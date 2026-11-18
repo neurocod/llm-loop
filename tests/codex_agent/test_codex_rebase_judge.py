@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_agents import host_policy
+from llm_agents import gitlib, host_policy
 from llm_agents.codex import sandbox
 from llm_agents.codex.command_rebase import BROKER
 from llm_agents.codex.registry import AgentRecord
@@ -166,21 +166,21 @@ def test_the_broker_needs_a_host_that_names_its_main_branch(tmp_path, monkeypatc
 
 
 def test_a_git_inside_the_writable_roots_is_never_the_trusted_one(tmp_path, monkeypatch):
-    """The bridge pins git from its own PATH (`rebase.trusted_git`): absolute
+    """The bridge pins git from its own PATH (`gitlib.trusted_git`): absolute
     entries only, `git.exe` only on Windows, and never one inside the
     worker's roots — the judge then grants no broker at all."""
     slot = _with_trunk(tmp_path)
     name = "git.exe" if os.name == "nt" else "git"
     (slot / name).write_text("", encoding="utf-8")
     (slot / "git.cmd").write_text("", encoding="utf-8")
-    real = Path(broker.trusted_git(())[0]).parent
-    assert broker.trusted_git((slot.resolve(),), f"{slot}{os.pathsep}{real}")[0] is None
-    assert broker.trusted_git((), f".{os.pathsep}{real}")[0] == real / name
+    real = Path(gitlib.trusted_git(())[0]).parent
+    assert gitlib.trusted_git((slot.resolve(),), f"{slot}{os.pathsep}{real}")[0] is None
+    assert gitlib.trusted_git((), f".{os.pathsep}{real}")[0] == real / name
     if os.name == "nt":
         shim = tmp_path / "shim"
         shim.mkdir()
         (shim / "git.cmd").write_text("", encoding="utf-8")
-        assert broker.trusted_git((), f"{shim}{os.pathsep}{real}")[0] == real / name
+        assert gitlib.trusted_git((), f"{shim}{os.pathsep}{real}")[0] == real / name
     monkeypatch.setenv("PATH", f"{slot}{os.pathsep}{os.environ['PATH']}")
     ask = commit_judge(tmp_path, monkeypatch, slot)
     # No grant at all; the launch is refused first, on the same PATH entry
@@ -261,6 +261,10 @@ def test_the_broker_runs_the_pinned_git_not_one_from_the_cwd(tmp_path, monkeypat
     done = _broker(ask, slot, "status", environment=pinned)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "core.hooksPath=" in log.read_text(encoding="utf-8")
+    # Bound to the registered admin, never discovered through the slot's `.git`.
+    assert grant.admin == (tmp_path / "main/.git/worktrees/main-wt1").resolve()
+    assert all(f"--git-dir {grant.admin}" in line
+               for line in log.read_text(encoding="utf-8").splitlines())
 
 
 def test_the_broker_ignores_update_refs_and_autostash_config(tmp_path, monkeypatch):

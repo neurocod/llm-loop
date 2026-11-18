@@ -168,7 +168,8 @@ def is_staged_deletion(path: str) -> bool:
     records the deletion happily. Matching is delegated to git, so directory
     pathspecs and Windows backslashes work as they do everywhere else.
     """
-    staged = git(["diff", "--cached", "--name-only", "--diff-filter=D", "--", path],
+    staged = git(["diff", "--no-ext-diff", "--no-textconv", "--cached", "--name-only",
+                  "--diff-filter=D", "--", path],
                  capture_output=True)
     return staged.returncode == 0 and bool(staged.stdout.strip())
 
@@ -315,7 +316,17 @@ def remove_committed_message_file(
 
 
 def approved_identity_problems(expected: Optional[dict]) -> list[str]:
-    """Match checkout identity at approval and after chdir, before Git writes.
+    """Match the approved work tree with the one on disk, before Git writes.
+
+    Which REPOSITORY is written is no question to ask git here: under the
+    commit broker every git is bound to the ticket's admin directory
+    (`commit_identity.bound_repository`), and a discovery-based answer
+    (`--show-toplevel` without that binding, `--show-superproject-working-
+    tree`, which rediscovers from the folder above) would read a `.git` the
+    worker may have written. What can still change is the work tree's FOLDER:
+    a junction put where the approved one was would feed another tree's
+    files to `git add`. The approved spelling (resolved by the judge) must
+    still resolve to itself, and the cwd must be the approved one.
 
     Git can still re-resolve the work tree during its run, after our last
     recheck. That residual rename window is accepted: this boundary protects
@@ -323,16 +334,13 @@ def approved_identity_problems(expected: Optional[dict]) -> list[str]:
     """
     if expected is None:
         return []
-    for field, flag in (("root", "--show-toplevel"),
-                        ("admin", "--absolute-git-dir"),
-                        ("owner", "--show-superproject-working-tree")):
-        result = git(["rev-parse", flag], capture_output=True)
-        actual = result.stdout.strip()
+    cwd = Path.cwd().resolve()
+    for field, actual in (("root", Path(expected["root"]).resolve()), ("cwd", cwd)):
         wanted = expected[field]
-        # Compare captured strings, never re-resolve the approved path: that
-        # would follow the very junction replacement this check must detect.
-        if result.returncode != 0 or os.path.normcase(os.path.normpath(actual)) != os.path.normcase(os.path.normpath(wanted)):
+        if os.path.normcase(str(actual)) != os.path.normcase(os.path.normpath(wanted)):
             return [f"commit.py: approved {field} changed; refusing to write Git"]
+    if not cwd.is_relative_to(Path(expected["root"])):
+        return ["commit.py: approved root changed; refusing to write Git"]
     return []
 
 
@@ -485,7 +493,11 @@ def main(host: Optional[CommitHost] = None) -> int:
         remove_committed_message_file(
             message_file, message_bytes, message_identity)
 
-    git(["log", "-1", "--oneline", "--stat"])
+    # Read-only, but not harmless: `status` runs the clean filter a
+    # `.gitattributes` names and `log --stat` diffs. Under the broker both go
+    # to the bound repository (`gitlib.pin`), whose configuration — where a
+    # filter's program is named — the worker cannot write.
+    git(["log", "-1", "--oneline", "--stat", "--no-ext-diff", "--no-textconv"])
     status = git(["status", "--short"], capture_output=True)
     if status.stdout.strip():
         print("\nleft uncommitted (as intended):")
