@@ -277,16 +277,16 @@ def test_a_python_path_entry_in_the_roots_refuses_the_launch(tmp_path, monkeypat
 
 
 def test_the_sandbox_temp_folder_counts_as_a_writable_root(tmp_path, monkeypatch):
-    """Review 2 of 2432: Codex's workspaceWrite lets the worker write %TEMP%
-    beside its roots, so a `python` on the PATH there is the worker's."""
+    """Review 2 of 2432: the worker may write its temp folder beside its
+    roots, so a `python` on the PATH there is the worker's. That folder is
+    the scratch root the policy grants, never the bridge's own TEMP/TMP
+    (2470: Codex's grant of those is excluded)."""
+    from llm_agents.codex import paths
     from llm_agents.codex.registry import AgentRecord
-    temp, other = tmp_path / "t1", tmp_path / "t2"
-    monkeypatch.setenv("TEMP", str(temp))
-    monkeypatch.setenv("TMP", str(other))
-    monkeypatch.setenv("TMPDIR", str(temp))
+    for name in ("TEMP", "TMP", "TMPDIR"):
+        monkeypatch.setenv(name, str(tmp_path / "t1"))
     writer = AgentRecord(name="w", cwd=str(tmp_path), sandbox="workspace-write")
-    expected = [temp, other] if os.name == "nt" else [temp]
-    assert sandbox.sandbox_temp_dirs(writer) == expected
+    assert sandbox.sandbox_temp_dirs(writer) == [paths.scratch_dir("w")]
     assert sandbox.sandbox_temp_dirs(replace(writer, sandbox="read-only")) == []
     slot, _ = _slot(tmp_path)
     (tmp_path / "temp").mkdir(exist_ok=True)

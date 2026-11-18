@@ -3730,31 +3730,39 @@ def test_a_turn_holds_a_live_record_naming_its_tree_and_server(tmp_path, monkeyp
     assert live_workers.live_workers(tmp_path / "tree") == []
 
 
-def test_a_temp_folder_the_worker_may_write_is_one_of_its_roots(tmp_path, monkeypatch):
-    """Review of c390e64: Codex lets a `workspace-write` worker write its TEMP
-    beside the workspace, so a TEMP above a slot must hold that slot."""
+@pytest.mark.parametrize("mode", ["workspace-write", sandbox.SCRATCH_WRITE])
+def test_the_only_temp_folder_is_the_one_the_guard_holds(tmp_path, monkeypatch, mode):
+    """Reviews of c390e64: Codex grants the COMMAND environment's TEMP/TMP
+    and /tmp beside the roots, and the user's Codex config shapes that
+    environment, so a TEMP of `C:\\g` would grant sibling slots unseen. The
+    policy excludes both grants, and the app-server's TEMP names the scratch
+    folder, which is a root and is in the guard."""
     from llm_agents.git import live_workers
     shared = tmp_path / "shared"
     (shared / "repo-wt1").mkdir(parents=True)
     (tmp_path / "tree").mkdir()
-    name = "TEMP" if sys.platform == "win32" else "TMPDIR"
-    monkeypatch.setenv(name, str(shared))
-    if sys.platform == "win32":
-        monkeypatch.setenv("TMP", str(shared))
-    refused = []
+    for name in ("TEMP", "TMP", "TMPDIR"):
+        monkeypatch.setenv(name, str(shared))
+    held = []
     add = live_workers.LiveRecord.add_process
 
     def spy(record, pid):
         add(record, pid)
         try:
             live_workers.pool_guard(shared / "repo-wt1").release()
+            held.append(False)
         except live_workers.Busy:
-            refused.append(pid)
+            held.append(True)
 
     monkeypatch.setattr(live_workers.LiveRecord, "add_process", spy)
-    wire.run_fake_turn(tmp_path, monkeypatch, "plain", cwd=tmp_path / "tree",
-                       sandbox="workspace-write")
-    assert len(refused) == 1
+    wire.run_fake_turn(tmp_path, monkeypatch, "plain", cwd=tmp_path / "tree", sandbox=mode)
+    assert held == [False]
+    policy = wire.first_request(tmp_path, "turn/start")["params"]["sandboxPolicy"]
+    assert policy["excludeTmpdirEnvVar"] is True and policy["excludeSlashTmp"] is True
+    record = AgentRecord(name="w", cwd=str(tmp_path / "tree"), sandbox=mode)
+    scratch = str(paths.scratch_dir("w"))
+    assert set(sandbox.temp_environment(record).values()) == {scratch}
+    assert sandbox.sandbox_temp_dirs(record) == [Path(scratch)]
 
 
 def test_a_turn_is_refused_while_a_pool_command_holds_its_tree(tmp_path, monkeypatch):

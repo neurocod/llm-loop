@@ -784,15 +784,35 @@ def test_a_worker_starting_during_a_pool_command_is_refused(repos, monkeypatch):
         pass
 
 
-def test_new_does_not_install_under_a_worker(repos, monkeypatch):
+@pytest.mark.parametrize("install", [True, False])
+@pytest.mark.parametrize("root", ["slot", "parent"])
+def test_new_creates_nothing_under_a_worker(repos, monkeypatch, install, root):
+    """Review 4 of 2470: `new` took the guard only around npm, so a worker
+    allowed to write the new slot (or a parent of it) saw the tree created,
+    linked and given submodules; `--no-install` skipped the guard entirely."""
     main, slot, base = repos
     installed = []
     monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(
         main_branch="main", install=lambda path, admin: installed.append(path)))
-    with live_workers.recorded("early", [main.parent / "main-wt3"]):
+    new = main.parent / "main-wt3"
+    with live_workers.recorded("early", [new if root == "slot" else main.parent]):
         with pytest.raises(worktree.Fail, match=LIVE_REFUSAL):
-            command("new", "3", "--no-push")
-    assert installed == []
+            command("new", "3", "--no-push", *([] if install else ["--no-install"]))
+    assert installed == [] and not new.exists()
+
+
+def test_a_turn_cannot_start_in_a_slot_new_is_preparing(repos, monkeypatch):
+    main, slot, base = repos
+    late = []
+
+    def init_submodules(new_slot, which):
+        with pytest.raises(SystemExit, match="a worktree pool command is acting"):
+            with live_workers.recorded("late", [new_slot.path]):
+                late.append("started")
+
+    monkeypatch.setattr(worktree, "init_submodules", init_submodules)
+    assert command("new", "3", "--no-push", "--no-install") == 0
+    assert late == []
 
 
 @pytest.mark.parametrize("override", [False, True])

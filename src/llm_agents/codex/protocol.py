@@ -187,9 +187,10 @@ class AppServer:
     def __init__(self, cwd: Path, log: Optional[Callable[[dict], None]] = None,
                  approve: Optional[Callable[[dict], bool]] = None,
                  approve_files: Optional[Callable[[list[str]], bool]] = None,
-                 job=None):
+                 job=None, env: Optional[dict[str, str]] = None):
         """`job`: a `live_workers.WorkerJob` the server and every process it
-        starts run in, so none outlives the wrapper."""
+        starts run in, so none outlives the wrapper. `env`: variables over
+        the bridge's own (`sandbox.temp_environment`)."""
         self._log = log or (lambda _msg: None)
         # The exceptions to "refuse everything": a judge for command
         # approvals, given the request's params, saying whether THIS command
@@ -206,7 +207,7 @@ class AppServer:
         self.file_decisions: list[dict] = []
         proc = appserver.spawn(
             _server_argv(), cwd=str(cwd),
-            env={**os.environ, **getattr(approve, "environment", {})},
+            env={**os.environ, **(env or {}), **getattr(approve, "environment", {})},
             **({"creationflags": job.creationflags} if job is not None and job.creationflags
                else {}))
         if job is not None:

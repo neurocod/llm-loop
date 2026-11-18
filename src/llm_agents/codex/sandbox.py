@@ -135,16 +135,27 @@ def turn_sandbox_policy(record: AgentRecord) -> Optional[dict]:
     the scratch root: the operator's answer to "may this agent have one more
     directory" (asked 2026-09-13), and the protocol's only door for it — the
     mode string cannot name a directory. `check_writable_roots` says where
-    the flag is meaningless."""
+    the flag is meaningless.
+
+    Every write-capable mode gets the object, roots or not, for its two
+    `exclude*` fields: Codex otherwise grants the COMMAND environment's
+    TEMP/TMP (`excludeTmpdirEnvVar`) and `/tmp` (`excludeSlashTmp`) beside
+    the roots (codex-cli 0.169.0, `windows-sandbox-rs` `allow.rs`), and that
+    environment is the user's Codex config's to shape
+    (`shell_environment_policy`): a TEMP of `C:\\g` there would grant every
+    slot without the bridge knowing. Excluded, the only temp folder is
+    `temp_root`, which the app-server's TEMP/TMP name (`temp_environment`)
+    and which is a root already."""
+    if SANDBOX_MODES.get(record.effective_sandbox) != "workspace-write":
+        return None
     roots: list[str] = []
     scratch = scratch_root(record)
     if scratch is not None:
         roots.append(str(scratch))
     roots.extend(record.writable)
-    if not roots:
-        return None
     return {"type": "workspaceWrite", "writableRoots": roots,
-            "networkAccess": True}
+            "networkAccess": True, "excludeTmpdirEnvVar": True,
+            "excludeSlashTmp": True}
 
 
 def check_role_sandbox(record: AgentRecord) -> None:
@@ -950,33 +961,39 @@ def writable_roots(record: AgentRecord) -> list[Path]:
     return roots
 
 
-def sandbox_temp_dirs(record: AgentRecord) -> list[Path]:
-    """The temp folders Codex's `workspaceWrite` lets the agent write BESIDE
-    `writable_roots`: the command environment's `TEMP` and `TMP` on Windows
-    (`windows-sandbox-rs` `allow.rs`, `includes_tmp_env_vars_when_requested`;
-    `$TMPDIR` elsewhere) unless `excludeTmpdirEnvVar`, which this wrapper
-    never sends (`scratch_root`: workers' tools and pytest's default
-    `tmp_path` write there). Codex takes them from the COMMAND's completed
-    environment (`windows-sandbox-rs` `resolved_permissions.rs`,
-    `resolve_workload_temp_paths`, read at 0.166.0), never the host's; this
-    reads the bridge's own, which the app-server inherits (`protocol.AppServer`
-    adds no TEMP/TMP) and passes on to a command as long as no
-    `shell_environment_policy` of the user's Codex config sets or drops
-    them — an assumption, not a check: that config is not the bridge's to
-    read, and a TEMP set there would be a root this list misses. A worker's
-    `$env:TEMP = ...` inside its command changes nothing: the roots are
-    fixed when the sandbox starts the command.
-
-    Not one of `writable_roots` — the briefing does not offer them — but a
-    place the worker can write all the same, so every "outside the writable
-    roots" check of the escalation judge counts them (review 2 of 2432: a
-    `python` or `git` on the PATH, the host's hooks or commit rules, the
-    slot's admin, a broker's own file in %TEMP% passed those checks)."""
+def temp_root(record: AgentRecord) -> Optional[Path]:
+    """The one temp folder a write-capable agent has: its scratch directory
+    (`paths.scratch_dir`) -- the second root of `workspace-write`, the whole
+    workspace of `scratch-write`. Codex's own temp grants are switched off
+    (`turn_sandbox_policy`), so a tool that writes to %TEMP% finds this one
+    through `temp_environment`."""
     if SANDBOX_MODES.get(record.effective_sandbox) != "workspace-write":
-        return []
+        return None
+    return scratch_dir(record.name)
+
+
+def temp_environment(record: AgentRecord) -> dict[str, str]:
+    """TEMP/TMP (TMPDIR elsewhere) of the app-server, which its commands
+    inherit: `temp_root`, so tools and pytest's default `tmp_path` keep a temp
+    folder they may write. A user's `shell_environment_policy` may still
+    point a command elsewhere; that folder is then simply not writable,
+    since the policy excludes the variable from the grants."""
+    root = temp_root(record)
+    if root is None:
+        return {}
     names = ("TEMP", "TMP") if os.name == "nt" else ("TMPDIR",)
-    found = (os.environ.get(name, "").strip() for name in names)
-    return [Path(value) for value in dict.fromkeys(found) if value and os.path.isabs(value)]
+    return {name: str(root) for name in names}
+
+
+def sandbox_temp_dirs(record: AgentRecord) -> list[Path]:
+    """The temp folders the agent may write beside `writable_roots`: only
+    `temp_root` -- `turn_sandbox_policy` excludes Codex's grants of the
+    command environment's TEMP/TMP and of `/tmp`, which the user's Codex
+    config could point anywhere. Kept a separate list for the escalation
+    judge's "outside the writable roots" checks (review 2 of 2432) and for
+    `turn.worker_roots`; both now see the folder the policy grants."""
+    root = temp_root(record)
+    return [root] if root is not None else []
 
 
 def file_change_judge(record: AgentRecord) -> Callable[[list[str]], Verdict]:

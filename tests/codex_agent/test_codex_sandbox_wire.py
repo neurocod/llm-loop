@@ -84,7 +84,7 @@ def test_a_workspace_write_agent_gets_a_second_root_outside_the_tree(
     started = wire.first_request(tmp_path, "turn/start")["params"]
     assert started["sandboxPolicy"] == {
         "type": "workspaceWrite", "writableRoots": [str(scratch)],
-        "networkAccess": True}
+        "networkAccess": True, "excludeTmpdirEnvVar": True, "excludeSlashTmp": True}
     # Existed when the server took `turn/start`, not merely by the end: the
     # fake server records that moment (review 2026-09-13 — checked after the
     # turn, a root created too late stayed green).

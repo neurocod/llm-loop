@@ -1200,9 +1200,20 @@ def cmd_new(args: argparse.Namespace) -> int:
     if any(s.number == number for s in slots):
         raise Fail(f"wt{number} already exists")
     path = slot_path(number)
+    branch = slot_name(number)
+    slot = Slot(number, path, branch, "", False)
+    # Excluded before the path is even looked at, and held through creation,
+    # submodules, shared links and install: a worker allowed to write a
+    # parent of the new slot, or a turn started once `worktree add` made the
+    # folder, would otherwise write a tree the steps below treat as fresh.
+    with worker_excluded(slot):
+        return _new_slot(args, slot)
+
+
+def _new_slot(args: argparse.Namespace, slot: Slot) -> int:
+    path, branch = slot.path, slot.branch
     if path.exists():
         raise Fail(f"{path} exists but is not a registered worktree; move it away first")
-    branch = slot_name(number)
     if git(["rev-parse", "--verify", "--quiet", branch], cwd=main_dir(), check=False).returncode == 0:
         pending = unlanded_branch(branch)
         if pending:
@@ -1212,14 +1223,11 @@ def cmd_new(args: argparse.Namespace) -> int:
         git(["worktree", "add", str(path), branch], cwd=main_dir())
     else:
         git(["worktree", "add", "-b", branch, str(path), HOST.main_branch], cwd=main_dir())
-    slot = Slot(number, path, branch, "", False)
     print(f"created {slot.name} at {path}")
     share_dirs(path)
     init_submodules(slot, all_submodules() if args.submodules == "all" else list(HOST.default_submodules))
     if not args.no_install:
-        # A new slot has no worker yet, but a turn may already name its path.
-        with worker_excluded(slot):
-            HOST.install(path, slot.admin_dir())
+        HOST.install(path, slot.admin_dir())
     code = finish(args)
     for note in HOST.new_notes:
         print(note)

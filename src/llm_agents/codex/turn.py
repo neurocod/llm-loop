@@ -510,9 +510,9 @@ JOB_END_WAIT_S = 10.0
 
 def worker_roots(record: AgentRecord) -> list[Path]:
     """Every directory the worker starts in or may write, once: its cwd, the
-    sandbox's writable roots (workspace, scratch, `--writable`) and the temp
-    folders Codex lets it write beside them (`sandbox.sandbox_temp_dirs`: an
-    inherited TEMP of `C:\\g` would cover every slot). The guard, the record
+    sandbox's writable roots (workspace, scratch, `--writable`) and its temp
+    folder (`sandbox.sandbox_temp_dirs`, the one the policy grants and the
+    app-server's TEMP names). The guard, the record
     and the overlap check all take this set, so none can miss a root another
     one counts."""
     roots = [Path(record.cwd or host_root()), *map(Path, record.writable),
@@ -1030,7 +1030,8 @@ def _run_turn_logged(record: AgentRecord, prompt: str, resume_thread: str,
     caller stores it (`on_thread`), and a programmatic caller need not."""
     workspace, sandbox_policy = sandbox.prepare_workspace(record)
     server = AppServer(workspace, log=log, approve=sandbox.escalation_judge(record),
-                       approve_files=sandbox.file_change_judge(record), job=runner.job)
+                       approve_files=sandbox.file_change_judge(record), job=runner.job,
+                       env=sandbox.temp_environment(record))
     if runner.on_server is not None:
         runner.on_server(server.pid)
     wait = SubAgentWait(log=log, name=record.name)
