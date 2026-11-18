@@ -110,6 +110,108 @@ def test_the_child_runs_inside_the_named_job(wire):
     assert counter.sent[0]["job"] == job.name
 
 
+_LEAVES_A_GRANDCHILD = """
+import subprocess, sys
+grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+open(sys.argv[1], "w").write(str(grandchild.pid))
+"""
+
+# A kill-on-close exit measured 0.0053 s (claude_agent/test_claude_agent_protocol.py,
+# 2026-09-08): 10 s to die; a survivor is judged alive after 1 s.
+_DIES_MS = 10_000
+_SURVIVES_MS = 1_000
+_WAIT_TIMEOUT = 258
+
+
+def _grandchild(pid_file):
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x100000 | 0x0001, False, int(pid_file.read_text()))
+    assert handle, (f"the grandchild is gone already "
+                    f"({ctypes.WinError(ctypes.get_last_error())})")
+    return kernel, handle
+
+
+def _reap(grandchild):
+    kernel, handle = grandchild
+    if kernel.WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT:
+        kernel.TerminateProcess(handle, 1)
+    kernel.CloseHandle(handle)
+
+
+@windows_only
+def test_a_normal_exit_leaves_what_the_child_left_running(wire, tmp_path):
+    """MSBuild's reusable nodes and `mspdbsrv` outlive a successful build on
+    purpose, and another slot's build may be using them (`Job.disarm`)."""
+    pid_file = tmp_path / "grandchild.pid"
+    code = cores.run([sys.executable, "-c", _LEAVES_A_GRANDCHILD, str(pid_file)], want=2,
+                     **wire["options"](FakeCounter(_grant(2))))
+    assert code == 0
+    grandchild = _grandchild(pid_file)
+    try:
+        kernel, handle = grandchild
+        assert kernel.WaitForSingleObject(handle, _SURVIVES_MS) == _WAIT_TIMEOUT, \
+            "closing the job after a normal exit killed what the child left running"
+    finally:
+        _reap(grandchild)
+
+
+@windows_only
+def test_a_run_that_does_not_end_normally_ends_the_whole_tree(wire, tmp_path, monkeypatch):
+    pid_file = tmp_path / "grandchild.pid"
+    opened = []
+
+    def failing_wait(child, job, say):
+        child.wait()
+        opened.append(_grandchild(pid_file))  # held open: its pid cannot be reused
+        raise RuntimeError("the wrapper failed while the tree ran")
+    monkeypatch.setattr(cores, "_wait", failing_wait)
+    with pytest.raises(RuntimeError):
+        cores.run([sys.executable, "-c", _LEAVES_A_GRANDCHILD, str(pid_file)], want=2,
+                  **wire["options"](FakeCounter(_grant(2))))
+    grandchild = opened[0]
+    try:
+        kernel, handle = grandchild
+        assert kernel.WaitForSingleObject(handle, _DIES_MS) == 0, \
+            "a run that failed left the child's tree running"
+    finally:
+        _reap(grandchild)
+
+
+@windows_only
+@pytest.mark.parametrize("script, disarmed", [([3], ["disarm", "close"]),
+                                              ([KeyboardInterrupt, KeyboardInterrupt, 1],
+                                               ["terminate", "close"])],
+                         ids=["normal exit", "ended by a second Ctrl+C"])
+def test_only_a_child_that_exits_on_its_own_disarms_the_job(wire, script, disarmed):
+    calls = []
+
+    class FakeJob:
+        name = "Local\\fake"
+
+        def start(self, argv, env, popen):
+            return _Child(script)
+
+        def disarm(self):
+            calls.append("disarm")
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def close(self):
+            calls.append("close")
+
+    cores.run(["x"], want=2, make_job=lambda say: FakeJob(), **wire["options"](FakeCounter(_grant(2))))
+    assert calls == disarmed
+
+
 @windows_only
 def test_a_job_the_counter_cannot_open_is_said(wire):
     counter = FakeCounter(_grant(2, measured=False))

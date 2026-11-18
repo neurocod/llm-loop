@@ -19,6 +19,8 @@ wrapper closes the handle in the kernel, and the broker hands the cores to
 the next waiter. There is no "release" message to forget. And the child goes
 with it: `run` puts it in a kill-on-close job object (`Job`), so a wrapper
 killed without `/T` does not leave a child burning K cores nobody holds.
+Only a killed run ends the tree: after the child's normal exit the job is
+disarmed (`Job.disarm`) before it is closed.
 
 Nested runs do not lease again: an inner `run` (one whose environment already
 carries `LEASE_ENV`) takes min(want, outer K) of the OUTER lease. Several
@@ -107,6 +109,15 @@ class Job:
         that cannot be put in the job is killed and the error raised, so the
         caller can start it plainly instead."""
         return win_job.start(self._handle, argv, popen, env=env)
+
+    def disarm(self) -> None:
+        """Clear KILL_ON_JOB_CLOSE, keeping BREAKAWAY_OK, so closing the job
+        afterwards leaves what still runs in it alone. For a child that ended
+        NORMALLY and left processes running on purpose: MSBuild's reusable
+        nodes, or an `mspdbsrv.exe` another slot's build may be talking to —
+        killing those with the job breaks that build. OSError when Windows
+        refuses (the job then stays armed)."""
+        win_job.set_limits(self._handle, win_job.BREAKAWAY_OK)
 
     def terminate(self, code: int = INTERRUPTED_EXIT) -> None:
         win_job.kernel32().TerminateJobObject(self._handle, code)
@@ -327,15 +338,16 @@ def _create_job(say: Callable[[str], None]) -> Optional[Job]:
         return None
 
 
-def _wait(child, job: Optional[Job], say: Callable[[str], None]) -> int:
-    """The child's exit code, through any number of Ctrl+C. The first is the
-    child's to answer (the console delivered it there too); a second ends it
-    — the whole job — and the wait goes on until it has been reaped, because
-    returning first would release the lease under a child still running."""
+def _wait(child, job: Optional[Job], say: Callable[[str], None]) -> tuple[int, bool]:
+    """(The child's exit code, whether it exited on its own), through any
+    number of Ctrl+C. The first is the child's to answer (the console
+    delivered it there too); a second ends it — the whole job — and the wait
+    goes on until it has been reaped, because returning first would release
+    the lease under a child still running."""
     interrupts = 0
     while True:
         try:
-            return child.wait()
+            return child.wait(), interrupts < 2
         except KeyboardInterrupt:
             interrupts += 1
             if interrupts == 1:
@@ -384,7 +396,17 @@ def run(command: Sequence[str], want: int, minimum: int = 1, label: str = "",
                     except OSError as exc:
                         say(f"cannot start {command[0]}: {exc}")
                         return 127
-                return _wait(child, job if cores is not None else None, say)
+                code, on_its_own = _wait(child, job if cores is not None else None, say)
+                if job is not None and on_its_own:
+                    # A normal exit: what the child left running on purpose
+                    # (`Job.disarm`) outlives the close below. Any other way
+                    # out of here closes the job armed and ends its tree.
+                    try:
+                        job.disarm()
+                    except OSError as exc:
+                        say(f"the job of {label} could not be disarmed ({exc}): what it "
+                            f"left running ends now")
+                return code
         except KeyboardInterrupt:
             say(f"interrupted while waiting for cores; {label} did not start")
             return INTERRUPTED_EXIT
