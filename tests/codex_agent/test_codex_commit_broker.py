@@ -10,6 +10,7 @@ same fixture runs it without the broker."""
 
 from llm_agents.codex.testing.fixtures import bridge_path, no_badge  # noqa: F401 — see their docstrings
 import os
+import stat
 import subprocess
 import sys
 from dataclasses import replace
@@ -217,13 +218,25 @@ def test_the_broker_starts_only_as_python_typed_plainly(tmp_path, monkeypatch):
     _granted(ask, f"Python -I {BROKER} -F {message} src/a.ts")
 
 
+def _plain_python(tmp_path: Path) -> tuple[Path, str]:
+    """(folder, name) of a `python` no link leads to: this interpreter's own
+    folder on Windows; off Windows a plain executable file in a plain folder
+    (a tool cache's or a venv's `python` is a link its user owns, refused)."""
+    if os.name == "nt":
+        return Path(sys.executable).parent.resolve(), "python"
+    folder = (tmp_path / "plain-python").resolve()
+    folder.mkdir()
+    (folder / "python").write_bytes(b"#!/bin/sh\n")
+    (folder / "python").chmod(0o755)
+    return folder, "python"
+
+
 def test_python_is_pinned_on_the_path(tmp_path):
     """`trusted_python`: any relative PATH entry or entry inside a writable
     root refuses, wherever it stands; the first hit is the interpreter."""
-    real = Path(sys.executable).parent
+    real, name = _plain_python(tmp_path)
     root = tmp_path / "root"
     root.mkdir()
-    name = "python" if os.name == "nt" else Path(sys.executable).name
     found, why = command_brokers.trusted_python(name, (root,), f"{real}")
     assert found is not None and not why, why
     for path, reason in ((f".{os.pathsep}{real}", "is relative"),
@@ -260,8 +273,7 @@ def test_a_python_path_entry_through_a_junction_is_not_pinned(tmp_path):
 def test_a_doubled_separator_inside_a_python_path_entry_is_one_separator(tmp_path):
     """Only a LEADING doubled separator (a UNC share, POSIX `//`) refuses:
     inside an entry it names no link (a Windows runner's `C:\\\\ghcup\\bin`)."""
-    real = Path(sys.executable).parent.resolve()
-    name = "python" if os.name == "nt" else Path(sys.executable).name
+    real, name = _plain_python(tmp_path)
     doubled = f"{real.parent}{os.sep}{os.sep}{real.name}"
     found, why = command_brokers.trusted_python(name, (), doubled)
     assert found is not None and not why, (doubled, why)
@@ -270,31 +282,115 @@ def test_a_doubled_separator_inside_a_python_path_entry_is_one_separator(tmp_pat
     assert found is None and "starts with a doubled separator" in why, (leading, why)
 
 
-@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
-                    reason="POSIX symlinks under a folder the user may not write")
-def test_a_python_path_link_only_its_user_could_not_repoint_is_pinned(tmp_path):
-    """`/sbin -> usr/sbin` under a root-owned `/` (every usr-merged Linux):
-    with the user's rights the worker cannot repoint it, so the PATH entry
-    through it pins; the same link in a folder the user writes refuses, and
-    so does a fixed link whose target passes a writable one."""
-    real = Path(sys.executable).parent.resolve()
-    name = Path(sys.executable).name
-    fixed = tmp_path / "fixed"
-    fixed.mkdir()
-    (fixed / "bin").symlink_to(real)
-    loose = tmp_path / "loose"
-    loose.mkdir()
-    (loose / "bin").symlink_to(real)
-    (fixed / "via").symlink_to(loose / "bin")
-    fixed.chmod(0o555)
+posix_links = pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
+                                 reason="POSIX symlinks judged by owner and mode")
+
+
+def _as_root_s(monkeypatch, tmp: Path) -> None:
+    """Stand the tree under `tmp` in for root's: there the test's own uid
+    counts as root (same mode rule), and the folders above `tmp` (a sticky
+    `/tmp`) count as `/`. Everywhere else `_fixed` judges as written."""
+    original = command_brokers._fixed
+
+    def fixed(path, status):
+        if path == tmp or tmp in path.parents:
+            return status.st_uid == os.getuid() and (
+                stat.S_ISLNK(status.st_mode) or not status.st_mode & 0o022)
+        if path in tmp.parents:
+            return True
+        return original(path, status)
+
+    monkeypatch.setattr(command_brokers, "_fixed", fixed)
+
+
+def _folders(*paths: Path) -> None:
+    for path in paths:
+        path.mkdir(parents=True)
+        path.chmod(0o755)  # whatever the umask: not group- or other-writable
+
+
+def test_root_alone_means_uid_0_and_no_group_or_other_write():
+    """`_fixed`: a symlink's mode bits mean nothing, a folder's do."""
+    def status(mode, uid=0):
+        return os.stat_result((mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+    assert command_brokers._fixed(Path("/usr"), status(stat.S_IFDIR | 0o755))
+    assert command_brokers._fixed(Path("/sbin"), status(stat.S_IFLNK | 0o777))
+    for mode in (0o775, 0o757, 0o1777):
+        assert not command_brokers._fixed(Path("/x"), status(stat.S_IFDIR | mode)), oct(mode)
+    assert not command_brokers._fixed(Path("/x"), status(stat.S_IFDIR | 0o755, uid=1000))
+    assert not command_brokers._fixed(Path("/x"), status(stat.S_IFLNK | 0o777, uid=1000))
+
+
+@posix_links
+def test_a_link_chain_pins_only_if_root_alone_may_change_all_of_it(tmp_path, monkeypatch):
+    """Review of c704afd: a read-only parent does not fix a link. Root's
+    `/opt/python-bin` -> the worker's `/work/fixed/bin` (fixed 0555) ->
+    `/usr/bin`: the worker chmods `fixed` back and swaps `bin`, or renames
+    `fixed` through `/work`. Every component of the resolution — links,
+    their folders, their targets' folders — must be root's alone and
+    outside the writable roots."""
+    tmp = tmp_path.resolve()
+    system, opt, work = tmp / "usr-bin", tmp / "opt", tmp / "work"
+    _folders(system, opt, work / "fixed")
+    (system / "python").write_bytes(b"#!/bin/sh\n")
+    (system / "python").chmod(0o755)
+    (work / "fixed" / "bin").symlink_to(system)
+    (opt / "python-bin").symlink_to(work / "fixed" / "bin")
+    (work / "fixed").chmod(0o555)
+    entry = str(opt / "python-bin")
     try:
-        found, why = command_brokers.trusted_python(name, (), str(fixed / "bin"))
-        assert found is not None and not why, why
-        for entry in (loose / "bin", fixed / "via"):
-            found, why = command_brokers.trusted_python(name, (), str(entry))
-            assert found is None and "link or junction" in why, (entry, why)
+        # Owned by the test's uid, not root: refused as it stands.
+        found, why = command_brokers.trusted_python("python", (), entry)
+        assert found is None and "is not root's alone" in why, why
+        _as_root_s(monkeypatch, tmp)
+        # The control: root's from top to bottom and no root along it.
+        found, why = command_brokers.trusted_python("python", (), entry)
+        assert found == system / "python" and not why, why
+        # `/work` a writable root: the 0555 `fixed` in it changes all the same.
+        found, why = command_brokers.trusted_python("python", (work,), entry)
+        assert found is None and f"{work} lies in your writable roots" in why, why
+        # `/work` writable by others: `fixed` may be renamed away through it.
+        work.chmod(0o757)
+        found, why = command_brokers.trusted_python("python", (), entry)
+        assert found is None and f"{work} is not root's alone" in why, why
     finally:
-        fixed.chmod(0o755)
+        work.chmod(0o755)
+        (work / "fixed").chmod(0o755)
+
+
+@posix_links
+@pytest.mark.skipif(not Path("/sbin").is_symlink(), reason="no usr-merged /sbin here")
+def test_a_usr_merged_sbin_entry_is_pinned(tmp_path):
+    """`/sbin -> usr/sbin`, root's from `/` down (every usr-merged Linux)."""
+    name = next((entry.name for entry in sorted(Path("/sbin").iterdir())
+                 if not entry.is_symlink() and entry.is_file() and os.access(entry, os.X_OK)),
+                None)
+    if name is None:
+        pytest.skip("no plain program in /sbin")
+    found, why = command_brokers.trusted_python(name, (), "/sbin")
+    assert found is not None and not why, why
+
+
+@posix_links
+def test_a_python_that_is_a_link_is_judged_along_its_chain(tmp_path, monkeypatch):
+    """The program file is resolved like the folder: a `python` link in a
+    plain folder pins only if root alone may change what it leads through."""
+    tmp = tmp_path.resolve()
+    system, plain, work = tmp / "usr-bin", tmp / "plain", tmp / "work"
+    _folders(system, plain, work)
+    (system / "python3.12").write_bytes(b"#!/bin/sh\n")
+    (system / "python3.12").chmod(0o755)
+    (work / "python3.12").symlink_to(system / "python3.12")
+    (plain / "python").symlink_to(system / "python3.12")
+    found, why = command_brokers.trusted_python("python", (), str(plain))
+    assert found is None and "passes through a link" in why and "is not root's alone" in why, why
+    _as_root_s(monkeypatch, tmp)
+    found, why = command_brokers.trusted_python("python", (), str(plain))
+    assert found == system / "python3.12" and not why, why
+    (plain / "python").unlink()
+    (plain / "python").symlink_to(work / "python3.12")
+    found, why = command_brokers.trusted_python("python", (work,), str(plain))
+    assert found is None and "lies in your writable roots" in why, why
 
 
 @windows

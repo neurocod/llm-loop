@@ -38,10 +38,11 @@ def no_badge(monkeypatch):
     monkeypatch.delenv("CODEX_AGENTS_COUNTER", raising=False)
 
 
-def bridge_path_folders() -> list[str]:
-    """The folders of `bridge_path`: where this Python, git and (off
-    Windows) `sh`, `cat` and `env` lie, each resolved, so no entry passes
-    through a link; on Windows the system folders PowerShell runs from."""
+def bridge_path_folders(shim: Path | None = None) -> list[str]:
+    """The folders of `bridge_path`: `shim` first (off Windows), then where
+    this Python, git and (off Windows) `sh`, `cat` and `env` lie, each
+    resolved, so no entry passes through a link; on Windows the system
+    folders PowerShell runs from."""
     programs = [sys.executable, shutil.which("git")]
     if os.name == "nt":
         system = Path(os.environ.get("SystemRoot", r"C:\Windows"))
@@ -49,12 +50,31 @@ def bridge_path_folders() -> list[str]:
     else:
         programs += [shutil.which(name) for name in ("sh", "cat", "env")]
         extra = []
-    folders = [Path(program).parent.resolve() for program in programs if program] + extra
+    folders = ([shim] if shim is not None else []) + [
+        Path(program).parent.resolve() for program in programs if program] + extra
     return list(dict.fromkeys(str(folder) for folder in folders))
 
 
+_SHIMS: dict[str, Path] = {}
+
+
+def _python_shim(tmp_path_factory) -> Path:
+    """A folder holding `python` and `python3` as plain scripts that exec
+    this interpreter. Off Windows the `python` of a tool cache or a venv is
+    a link its user owns, which `trusted_python` refuses (only a chain root
+    alone may change pins); a plain file in a plain folder is pinned."""
+    if "shim" not in _SHIMS:
+        folder = tmp_path_factory.mktemp("bridge-python").resolve()
+        for name in ("python", "python3"):
+            script = folder / name
+            script.write_bytes(f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n".encode("utf-8"))
+            script.chmod(0o755)
+        _SHIMS["shim"] = folder
+    return _SHIMS["shim"]
+
+
 @pytest.fixture(autouse=True)
-def bridge_path(monkeypatch):
+def bridge_path(monkeypatch, tmp_path_factory):
     """PATH = `bridge_path_folders()` for every test of a module that imports
     this fixture.
 
@@ -63,7 +83,8 @@ def bridge_path(monkeypatch):
     PATH tests that machine's image, not the judge: a linked tool cache on a
     macOS runner refused every broker grant there (CI 2026-11-18). A test
     about one PATH entry prepends it to this PATH."""
-    monkeypatch.setenv("PATH", os.pathsep.join(bridge_path_folders()))
+    shim = None if os.name == "nt" else _python_shim(tmp_path_factory)
+    monkeypatch.setenv("PATH", os.pathsep.join(bridge_path_folders(shim)))
 
 
 @pytest.fixture

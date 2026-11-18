@@ -14,6 +14,7 @@ that nothing the worker controls runs before it: spelled literally
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -92,32 +93,65 @@ def _dotted_entry(folder: str) -> bool:
             or (len(parts) > 1 and parts[0] == "" and parts[1] == ""))
 
 
-def _swappable_link(path: Path, depth: int = 0) -> Optional[Path]:
-    """The first link or junction along `path` AS SPELLED, from the root
-    down, that this user could repoint, or None.
+def _fixed(path: Path, status: os.stat_result) -> bool:
+    """Whether nobody but root may change `path` (as `os.lstat` read it):
+    owned by uid 0 and, unless it is a symlink (whose mode bits mean
+    nothing), writable by neither its group nor others. A separate function
+    so that a test can stand a fixture tree in for root's."""
+    if status.st_uid != 0:
+        return False
+    return stat.S_ISLNK(status.st_mode) or not status.st_mode & 0o022
 
-    A link is as fixed as the folder holding it: escalated with the user's
-    rights, the worker can repoint only what the user may write. So a link
-    in a folder `os.access` says this user may not write — `/sbin ->
-    usr/sbin` under a root-owned `/`, on every usr-merged Linux — stays, and
-    its target is judged the same way (a `..` in it refuses: what it names
-    depends on links again). On Windows `os.access` reads no ACL, so every
-    junction there counts as swappable: the rule of the review of 2432
-    unchanged."""
-    for folder in (*reversed(path.parents), path):
-        if not is_link(folder):
-            continue
-        if os.name == "nt" or depth > 8 or os.access(folder.parent, os.W_OK):
-            return folder
+
+_MAX_LINKS = 40  # the kernel's own bound on a resolution (ELOOP)
+
+
+def _root_chain(path: Path, roots: tuple[Path, ...],
+                links: int = 0) -> tuple[Optional[Path], str]:
+    """`path` resolved by hand, one component at a time, or None and why
+    the resolution is not root's alone.
+
+    A read-only parent does not make a link immutable (review of c704afd):
+    the owner of a 0555 folder chmods it back and swaps the link, and whoever
+    may write a folder further up renames the whole subtree. So EVERY
+    component the resolution visits — each ancestor folder, each link and
+    each folder of every link's target — must be `_fixed` and outside the
+    writable roots. Holds for usr-merged Linux (`/sbin -> usr/sbin`, root's
+    from `/` down); refuses a link anyone but root owns, anywhere along it.
+    POSIX only: on Windows the callers refuse every link and junction."""
+    parts = path.parts
+    current = Path(parts[0])
+    try:
+        if not _fixed(current, os.lstat(current)):
+            return None, f"{current} is not root's alone"
+    except OSError as exc:
+        return None, f"{current}: {exc.strerror}"
+    for part in parts[1:]:
+        if part in (".", ".."):
+            return None, f"`{part}` in {path}: what it names depends on the links along it"
+        candidate = current / part
+        if within(candidate, roots):
+            return None, f"{candidate} lies in your writable roots"
         try:
-            target = Path(os.readlink(folder))
-        except OSError:
-            return folder
-        if not target.is_absolute():
-            target = folder.parent / target
-        if ".." in target.parts or _swappable_link(target, depth + 1) is not None:
-            return folder
-    return None
+            status = os.lstat(candidate)
+        except OSError as exc:
+            return None, f"{candidate}: {exc.strerror}"
+        if not _fixed(candidate, status):
+            return None, f"{candidate} is not root's alone (uid {status.st_uid}, " \
+                         f"mode {stat.filemode(status.st_mode)})"
+        if not stat.S_ISLNK(status.st_mode):
+            current = candidate
+            continue
+        if links >= _MAX_LINKS:
+            return None, f"more than {_MAX_LINKS} links resolving {path}"
+        links += 1
+        target = Path(os.readlink(candidate))
+        resolved, why = _root_chain(target if target.is_absolute() else current / target,
+                                    roots, links)
+        if resolved is None:
+            return None, why
+        current = resolved
+    return current, ""
 
 
 def _program_names(name: str) -> tuple[str, ...]:
@@ -164,10 +198,13 @@ def trusted_python(name: str, roots: tuple[Path, ...],
             return None, (f"PATH entry {folder} has `.`/`..` segments or starts with "
                           f"a doubled separator: what it names depends on the links "
                           f"along it")
-        link = _swappable_link(Path(folder))
+        link = _linked(Path(folder))
         if link is not None:
-            return None, (f"PATH entry {folder} passes through the link or junction "
-                          f"{link}: it may be swapped after the grant")
+            why = ("it may be swapped after the grant" if os.name == "nt"
+                   else _root_chain(Path(folder), roots)[1])
+            if why:
+                return None, (f"PATH entry {folder} passes through the link or junction "
+                              f"{link}: {why}")
         if within(Path(folder), roots) or within(Path(folder).resolve(), roots):
             return None, (f"PATH entry {folder} lies in your writable roots: a "
                           f"`{name}` planted there would run")
@@ -182,6 +219,13 @@ def trusted_python(name: str, roots: tuple[Path, ...],
         if os.name == "nt" and [hit.name.lower() for hit in hits] != [f"{name}.exe"]:
             return None, (f"`{name}` on PATH is {', '.join(hit.name for hit in hits)} "
                           f"in {folder}: only a lone {name}.exe is pinned")
+        # The program file is judged like the folder: a `python` that is a
+        # link resolves through components someone may swap after the grant.
+        if is_link(hits[0]):
+            why = ("a link or junction" if os.name == "nt"
+                   else _root_chain(hits[0], roots)[1])
+            if why:
+                return None, f"`{name}` on PATH, {hits[0]}, passes through a link: {why}"
         found = hits[0].resolve()
     if found is None:
         return None, f"no `{name}` on the bridge's PATH"
