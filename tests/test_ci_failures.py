@@ -232,7 +232,7 @@ def test_summary_entry_finds_its_block_by_class_and_by_error_title():
              "FAILED tests/x.py::TestK::test_a - assert 0",
              "ERROR tests/x.py::TestK::test_b - setup boom"]
     units, _ = cf.failure_units(lines, 10)
-    assert [(u["headline"], u["block"]) for u in units] == [
+    assert [(u.headline, u.block) for u in units] == [
         ("FAILED tests/x.py::TestK::test_a", ["assert 0"]),
         ("ERROR tests/x.py::TestK::test_b", ["setup boom"])]
 
@@ -247,7 +247,7 @@ def test_failed_in_call_and_error_in_teardown_keep_their_own_blocks():
              "ERROR tests/x.py::test_x - teardown boom",
              "ERROR tests/y.py - ImportError: no y"]
     units, _ = cf.failure_units(lines, 10)
-    assert [(u["headline"], u["block"]) for u in units] == [
+    assert [(u.headline, u.block) for u in units] == [
         ("FAILED tests/x.py::test_x", ["assert 1 == 2"]),
         ("ERROR tests/x.py::test_x", ["teardown boom"]),
         ("ERROR tests/y.py", ["ImportError: no y"])]
@@ -264,7 +264,7 @@ def test_pytest_lines_printed_by_a_test_stay_in_its_block():
              "FAILED tests/x.py::test_b - assert 3 == 4",
              "2 failed, 7 passed in 1.50s"]
     units, outcomes = cf.failure_units(lines, 10)
-    assert [(u["headline"], u["block"]) for u in units] == [
+    assert [(u.headline, u.block) for u in units] == [
         ("FAILED tests/x.py::test_a", ["assert child ok", "----- Captured stdout call -----",
                                        "===== x =====", "1 failed in 0.10s"]),
         ("FAILED tests/x.py::test_b", ["assert 3 == 4"])]
@@ -325,12 +325,12 @@ FAILED tests/test_outer.py::test_after_the_child - AssertionError: assert 'outer
 
 def test_a_child_pytest_session_in_captured_output_stays_in_its_block():
     units, outcomes = cf.failure_units(NESTED.split("\n"), 10)
-    assert [u["headline"] for u in units] == ["FAILED tests/test_outer.py::test_child_session_is_green",
+    assert [u.headline for u in units] == ["FAILED tests/test_outer.py::test_child_session_is_green",
                                               "FAILED tests/test_outer.py::test_after_the_child"]
-    child = units[0]["block"]
+    child = units[0].block
     assert child[-1] == "=================== 1 failed, 1 passed, 1 warning in 0.09s ====================="
     assert "FAILED test_inner.py::test_inner_fails - assert (2 + 2) == 5" in child
-    assert units[1]["block"][-1] == "tests/test_outer.py:16: AssertionError"
+    assert units[1].block[-1] == "tests/test_outer.py:16: AssertionError"
     assert outcomes == ["2 failed, 5 passed in 0.84s"]
 
 
@@ -341,9 +341,9 @@ def test_a_child_session_without_its_outcome_closes_nothing():
     cut = lines[:lines.index("platform linux -- Python 3.13.7, pytest-9.2.0, pluggy-1.6.0")]
     cut += ["Killed"] + lines[lines.index("_____________________________ test_after_the_child _____________________________"):]
     units, outcomes = cf.failure_units(cut, 10)
-    assert [u["headline"] for u in units] == ["FAILED tests/test_outer.py::test_child_session_is_green",
+    assert [u.headline for u in units] == ["FAILED tests/test_outer.py::test_child_session_is_green",
                                               "FAILED tests/test_outer.py::test_after_the_child"]
-    assert units[0]["block"][-1] == "Killed"
+    assert units[0].block[-1] == "Killed"
     assert outcomes == ["2 failed, 5 passed in 0.84s"]
 
 
@@ -373,9 +373,9 @@ def two_invocations(printed: list) -> list:
 ])
 def test_a_printed_session_banner_hides_no_outer_failure(printed):
     units, outcomes = cf.failure_units(two_invocations(printed), 10)
-    assert [u["headline"] for u in units][:3] == ["FAILED tests/x.py::test_a", "FAILED tests/x.py::test_b",
+    assert [u.headline for u in units][:3] == ["FAILED tests/x.py::test_a", "FAILED tests/x.py::test_b",
                                                   "FAILED tests/y.py::test_c"]
-    assert units[1]["block"] == ["E   assert 3 == 4", "tests/x.py:5: AssertionError"]
+    assert units[1].block == ["E   assert 3 == 4", "tests/x.py:5: AssertionError"]
     assert outcomes == ["2 failed in 0.10s", "1 failed in 0.05s"]
 
 
@@ -393,7 +393,7 @@ def test_a_printed_banner_without_a_sessions_shape_takes_no_outcome(printed, tit
              "=== test session starts ===", "platform linux -- Python 3.13.7, pytest-9.2.0, pluggy-1.6.0",
              "collected 1 item", "=== 1 passed in 0.05s ===", "##[error]Process completed with exit code 1."]
     units, outcomes = cf.failure_units(lines, 10)
-    assert [u["headline"] for u in units] == titles
+    assert [u.headline for u in units] == titles
     assert outcomes == ["2 failed in 0.10s", "1 passed in 0.05s"]
 
 
@@ -402,7 +402,7 @@ def test_quiet_outcome_line_right_after_the_blocks_is_the_outcome():
     lines = ["=== FAILURES ===", "___ test_a ___", "assert 0", "",
              "1 failed, 3 passed in 0.50s", "##[error]Process completed with exit code 1."]
     units, outcomes = cf.failure_units(lines, 10)
-    assert [(u["headline"], u["block"]) for u in units] == [("test_a", ["assert 0"])]
+    assert [(u.headline, u.block) for u in units] == [("test_a", ["assert 0"])]
     assert outcomes == ["1 failed, 3 passed in 0.50s"]
 
 
@@ -416,7 +416,7 @@ def test_stopping_after_line_does_not_join_the_last_summary_entry():
              "!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!",
              "1 failed in 0.20s"]
     units, outcomes = cf.failure_units(lines, 10)
-    assert [(u["headline"], u["block"]) for u in units] == [("FAILED tests/x.py::t - boom", ["  more of boom"])]
+    assert [(u.headline, u.block) for u in units] == [("FAILED tests/x.py::t - boom", ["  more of boom"])]
     assert outcomes == ["1 failed in 0.20s"]
 
 
@@ -460,9 +460,9 @@ DEPLOY_AFTER = ["=== FAILURES ===", "___ test_a ___", "assert 0",
 
 def test_a_failure_after_pytest_is_reported_too():
     units, _ = cf.failure_units(DEPLOY_AFTER, 10)
-    assert [u["kind"] for u in units] == ["pytest", "tail"]
-    assert "deploy: permission denied" in units[1]["block"]
-    assert units[1]["block"][-1] == "##[error]Process completed with exit code 2."
+    assert [u.kind for u in units] == ["pytest", "tail"]
+    assert "deploy: permission denied" in units[1].block
+    assert units[1].block[-1] == "##[error]Process completed with exit code 2."
 
 
 @pytest.mark.parametrize("after", [
@@ -472,14 +472,14 @@ def test_a_failure_after_pytest_is_reported_too():
 def test_a_crash_or_timeout_after_pytest_is_reported_too(after):
     lines = DEPLOY_AFTER[:6] + after
     units, _ = cf.failure_units(lines, 10)
-    assert units[-1]["kind"] == "tail" and units[-1]["block"][-1] == after[-1]
+    assert units[-1].kind == "tail" and units[-1].block[-1] == after[-1]
 
 
 def test_a_job_with_two_failed_steps_gets_its_tail_even_without_more_log():
     units, _ = cf.failure_units(DEPLOY_AFTER[:7], 10, failed_steps=2)
-    assert [u["kind"] for u in units] == ["pytest", "tail"] and "2 failed steps" in units[1]["headline"]
+    assert [u.kind for u in units] == ["pytest", "tail"] and "2 failed steps" in units[1].headline
     units, _ = cf.failure_units(DEPLOY_AFTER[:7], 10, failed_steps=1)
-    assert [u["kind"] for u in units] == ["pytest"]
+    assert [u.kind for u in units] == ["pytest"]
 
 
 def test_clean_strips_osc_sequences_ended_by_st():
@@ -490,11 +490,11 @@ def test_job_without_pytest_keeps_its_tail_up_to_the_runner_error():
     units, outcomes = units_of(OLD)
     assert outcomes == [] and len(units) == 1
     unit = units[0]
-    assert unit["kind"] == "tail" and "no pytest failures" in unit["headline"]
-    assert len(unit["block"]) == cf.TAIL_LINES
-    assert unit["block"][-1] == "##[error]Process completed with exit code 1."
-    assert unit["block"][-2].startswith("ERROR: Could not find a version")
-    assert "Post job cleanup." not in unit["block"]
+    assert unit.kind == "tail" and "no pytest failures" in unit.headline
+    assert len(unit.block) == cf.TAIL_LINES
+    assert unit.block[-1] == "##[error]Process completed with exit code 1."
+    assert unit.block[-2].startswith("ERROR: Could not find a version")
+    assert "Post job cleanup." not in unit.block
 
 
 # ------------------------------------------------------------ dedup
@@ -503,18 +503,18 @@ def test_job_without_pytest_keeps_its_tail_up_to_the_runner_error():
 def test_one_failure_on_three_platforms_is_one_group_shown_as_the_first_job():
     per_job = [(name, units_of(name)[0]) for name in (MAC, UBU, WIN)]
     groups = cf.group_failures(per_job)
-    assert [g["jobs"] for g in groups] == [[MAC, UBU, WIN], [MAC]]
+    assert [g.jobs for g in groups] == [[MAC, UBU, WIN], [MAC]]
     cpu = groups[0]
-    assert cpu["headline"] == "FAILED tests/test_cpu_load.py::test_stream_exits_0_when_its_reader_closes_the_pipe"
-    assert cpu["shownFrom"] == MAC
-    assert any("/Users/runner/work/llm-loop/llm-loop/agent-tools/cpu_load.py" in ln for ln in cpu["block"])
+    assert cpu.headline == "FAILED tests/test_cpu_load.py::test_stream_exits_0_when_its_reader_closes_the_pipe"
+    assert cpu.shown_from == MAC
+    assert any("/Users/runner/work/llm-loop/llm-loop/agent-tools/cpu_load.py" in ln for ln in cpu.block)
 
 
 def test_a_different_message_or_parameter_is_another_group():
     base = "E       AssertionError: assert 731.9999999999999 == 732.0"
-    a = {"kind": "pytest", "headline": "FAILED t.py::t[a]", "block": [base]}
-    b = {"kind": "pytest", "headline": "FAILED t.py::t[b]", "block": [base]}
-    c = {"kind": "pytest", "headline": "FAILED t.py::t[a]", "block": [base.replace("731", "730")]}
+    a = cf.Unit("pytest", "FAILED t.py::t[a]", [base])
+    b = cf.Unit("pytest", "FAILED t.py::t[b]", [base])
+    c = cf.Unit("pytest", "FAILED t.py::t[a]", [base.replace("731", "730")])
     groups = cf.group_failures([("j1", [a]), ("j2", [b]), ("j3", [c])])
     assert len(groups) == 3
 
@@ -600,10 +600,10 @@ def test_normalize_keeps_what_tells_failures_apart(left, right):
     ("t[5s]", "t[10s]"), ("test_hex[0x10]", "test_hex[0x20]"), ("t[12:30]", "t[12:45]"),
 ])
 def test_a_node_id_is_compared_exactly(left, right):
-    a = {"kind": "pytest", "headline": f"FAILED tests/x.py::{left}", "block": ["E   assert 0"]}
-    b = {"kind": "pytest", "headline": f"FAILED tests/x.py::{right}", "block": ["E   assert 0"]}
-    c = {"kind": "pytest", "headline": f"FAILED tests/x.py::{left} - took 5s", "block": []}
-    d = {"kind": "pytest", "headline": f"FAILED tests/x.py::{right} - took 5s", "block": []}
+    a = cf.Unit("pytest", f"FAILED tests/x.py::{left}", ["E   assert 0"])
+    b = cf.Unit("pytest", f"FAILED tests/x.py::{right}", ["E   assert 0"])
+    c = cf.Unit("pytest", f"FAILED tests/x.py::{left} - took 5s", [])
+    d = cf.Unit("pytest", f"FAILED tests/x.py::{right} - took 5s", [])
     assert len(cf.group_failures([("j1", [a]), ("j2", [b]), ("j3", [c]), ("j4", [d])])) == 4
 
 
@@ -791,6 +791,9 @@ def test_json_output(monkeypatch, capsys, gh, tmp_path):
     assert set(run["failures"][0]) == {"kind", "headline", "jobs", "shownFrom", "block", "savedLog"}
     assert run["exit"] == cf.EXIT_RED
     assert [f["jobs"] for f in run["failures"]][0] == [MAC, UBU, WIN]
+    first = run["failures"][0]
+    assert (first["kind"], first["shownFrom"], first["savedLog"]) == ("pytest", MAC, None)
+    assert first["headline"].startswith("FAILED tests/test_cpu_load.py::") and first["block"]
     assert {j["name"]: j["failedSteps"] for j in run["jobs"]}[OLD] == ["Install"]
 
 

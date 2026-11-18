@@ -64,6 +64,7 @@ import sys
 import tempfile
 import time
 import traceback
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 # Exit codes. 0 and 1 answer the question (green / red, report printed); every
@@ -825,14 +826,25 @@ def fails_after_pytest(lines: list, end: int) -> bool:
     return len(errors) > 1 or bool(other) or not EXIT_LINE_RE.match(errors[0])
 
 
+@dataclass
+class Unit:
+    """One failure of one job. `kind`: "pytest" (a summary entry and/or its
+    block), "tail" (the job's last lines) or "missing" (why its log could not
+    be parsed); `saved_log` the file holding that unparsed log."""
+    kind: str
+    headline: str
+    block: list
+    saved_log: str | None = None
+
+
 def failure_units(lines: list, tail: int, failed_steps: int = 1, source: str = "log") -> tuple[list, list]:
     """(units, outcome lines) of one failed job's cleaned lines.
 
-    A unit is {"kind", "headline", "block"}: a summary entry with its block,
-    a block without an entry, an entry without a block -- or, when the job has
-    no pytest failures at all, one "tail" unit of its last lines. A job whose
-    log goes on failing after pytest, or with more than one failed step, gets
-    a tail unit of what follows pytest as well."""
+    A unit is a summary entry with its block, a block without an entry, an
+    entry without a block -- or, when the job has no pytest failures at all,
+    one "tail" unit of its last lines. A job whose log goes on failing after
+    pytest, or with more than one failed step, gets a tail unit of what
+    follows pytest as well."""
     blocks, entries, outcomes, end = parse_pytest(lines)
     units, used = [], set()
     for entry in entries:
@@ -840,20 +852,20 @@ def failure_units(lines: list, tail: int, failed_steps: int = 1, source: str = "
         index = next((i for i, (title, _) in enumerate(blocks)
                       if i not in used and block_matches(title, nodeid, kind)), None)
         if index is None:
-            units.append({"kind": "pytest", "headline": entry[0], "block": entry[1:]})
+            units.append(Unit("pytest", entry[0], entry[1:]))
         else:
             used.add(index)
-            units.append({"kind": "pytest", "headline": f"{kind} {nodeid}", "block": blocks[index][1]})
+            units.append(Unit("pytest", f"{kind} {nodeid}", blocks[index][1]))
     for i, (title, body) in enumerate(blocks):
         if i not in used:
-            units.append({"kind": "pytest", "headline": title, "block": body})
+            units.append(Unit("pytest", title, body))
     if not units:
-        units.append({"kind": "tail", "headline": f"no pytest failures in this job's {source}; its last lines",
-                      "block": tail_before_error(lines, tail)})
+        units.append(Unit("tail", f"no pytest failures in this job's {source}; its last lines",
+                          tail_before_error(lines, tail)))
     elif failed_steps > 1 or fails_after_pytest(lines, end):
         why = f"{failed_steps} failed steps" if failed_steps > 1 else "an error after pytest's outcome"
-        units.append({"kind": "tail", "headline": f"the job's {source} after pytest ({why}); its last lines",
-                      "block": tail_before_error(lines[end + 1:], tail) or tail_before_error(lines, tail)})
+        units.append(Unit("tail", f"the job's {source} after pytest ({why}); its last lines",
+                          tail_before_error(lines[end + 1:], tail) or tail_before_error(lines, tail)))
     return units, outcomes
 
 
@@ -1022,36 +1034,42 @@ def normalize(text: str) -> str:
     return "\n".join(out)
 
 
-def group_key(unit: dict) -> str:
+def group_key(unit: Unit) -> str:
     """A unit's identity: its kind and node id (or block title) exactly, the
     rest of its headline and its block through `normalize`."""
-    head, rest = unit["headline"], ""
+    head, rest = unit.headline, ""
     parts = entry_parts(head)
-    if unit["kind"] == "pytest" and parts:
+    if unit.kind == "pytest" and parts:
         ident = " ".join(parts)
         head, rest = ident, head[len(ident):]
     # Apart: the block's first line is its first entry's head (`normalize`);
     # the rest (` - message`) starts with a space, so it is never an argument line.
     # A saved log is per job: two jobs' unparsed logs are two groups, each with its path.
-    return "\0".join([unit["kind"], head, normalize(rest), normalize("\n".join(unit["block"])),
-                      unit.get("savedLog") or ""])
+    return "\0".join([unit.kind, head, normalize(rest), normalize("\n".join(unit.block)), unit.saved_log or ""])
+
+
+@dataclass
+class Group(Unit):
+    """Identical units of several jobs: the text is `shown_from`'s, the
+    first job with it; `jobs` in order of appearance."""
+    jobs: list = field(default_factory=list)
+    shown_from: str | None = None
 
 
 def group_failures(per_job: list) -> list:
-    """[(job, units)] -> groups of identical units: {"headline", "block",
-    "kind", "jobs", "shownFrom"}, the most widespread first, ties in order of
-    first appearance."""
+    """[(job, units)] -> Groups of identical units, the most widespread
+    first, ties in order of first appearance."""
     groups: dict = {}
     for job, units in per_job:
         for unit in units:
             key = group_key(unit)
             group = groups.get(key)
             if group is None:
-                groups[key] = group = {**unit, "jobs": [], "shownFrom": job}
-            if job not in group["jobs"]:
-                group["jobs"].append(job)
+                groups[key] = group = Group(unit.kind, unit.headline, unit.block, unit.saved_log, shown_from=job)
+            if job not in group.jobs:
+                group.jobs.append(job)
     ordered = list(groups.values())
-    ordered.sort(key=lambda g: -len(g["jobs"]))  # stable: first appearance breaks ties
+    ordered.sort(key=lambda g: -len(g.jobs))  # stable: first appearance breaks ties
     return ordered
 
 
@@ -1138,8 +1156,8 @@ def cut_headline(headline: str, cap: bool) -> str:
     return headline
 
 
-def group_jobs(group: dict, labels: dict) -> str:
-    return ", ".join(labels.get(j, j) for j in group["jobs"])
+def group_jobs(group: Group, labels: dict) -> str:
+    return ", ".join(labels.get(j, j) for j in group.jobs)
 
 
 def failed_labels(run: dict) -> tuple[list, dict]:
@@ -1147,18 +1165,18 @@ def failed_labels(run: dict) -> tuple[list, dict]:
     return failed, short_names(failed)
 
 
-def saved_log_line(group: dict, indent: str) -> list:
+def saved_log_line(group: Group, indent: str) -> list:
     """A path the reader acts on, on its own line: never inside a headline,
     which the print cuts at HEADLINE_CHARS."""
-    return [f"{indent}saved log: {group['savedLog']}"] if group.get("savedLog") else []
+    return [f"{indent}saved log: {group.saved_log}"] if group.saved_log else []
 
 
-def render_group(index: int, group: dict, labels: dict, cap: bool, report_path: str) -> list:
-    out = [f"[{index}] {cut_headline(group['headline'], cap)} -- {group_jobs(group, labels)}"]
+def render_group(index: int, group: Group, labels: dict, cap: bool, report_path: str) -> list:
+    out = [f"[{index}] {cut_headline(group.headline, cap)} -- {group_jobs(group, labels)}"]
     out.extend(saved_log_line(group, "    "))
-    block = group["block"]
-    if len(group["jobs"]) > 1:
-        out.append(f"    (text from {labels.get(group['shownFrom'], group['shownFrom'])})")
+    block = group.block
+    if len(group.jobs) > 1:
+        out.append(f"    (text from {labels.get(group.shown_from, group.shown_from)})")
     if cap and len(block) > BLOCK_HEAD + BLOCK_TAIL:
         omitted = len(block) - BLOCK_HEAD - BLOCK_TAIL
         block = (block[:BLOCK_HEAD] + [f"... {omitted} lines omitted, full block in {report_path}"]
@@ -1167,36 +1185,48 @@ def render_group(index: int, group: dict, labels: dict, cap: bool, report_path: 
     return out
 
 
-def render_head(rep: dict, raw_dir: str, cap: bool) -> list:
+@dataclass
+class RunReport:
+    """One judged run: gh's view of it (`run`), its own exit code and the
+    note saying why it is not green, and what `analyse` found."""
+    run: dict
+    code: int
+    note: str | None
+    outcomes: dict    # {job name: pytest outcome lines}
+    groups: list      # [Group]
+    raw: dict         # {job name: path of its saved whole log}
+
+
+def render_head(rep: RunReport, raw_dir: str, cap: bool) -> list:
     """One run's jobs, its note, the index of its distinct failures and its
     saved logs -- the part of the report the print never cuts."""
-    run = rep["run"]
+    run = rep.run
     out = [run_title(run), str(run.get("url", ""))]
     for job in run.get("jobs") or []:
-        out.append(job_line(job, rep["outcomes"].get(job.get("name"))))
-    if rep["note"]:
-        out.append(rep["note"])
-    groups = rep["groups"]
+        out.append(job_line(job, rep.outcomes.get(job.get("name"))))
+    if rep.note:
+        out.append(rep.note)
+    groups = rep.groups
     if groups:
         failed, labels = failed_labels(run)
         out.append("")
         out.append(f"{len(groups)} distinct failure(s) in {len(failed)} failed job(s):")
         for i, group in enumerate(groups, 1):
-            out.append(f"  [{i}] {cut_headline(group['headline'], cap)} -- {group_jobs(group, labels)}")
+            out.append(f"  [{i}] {cut_headline(group.headline, cap)} -- {group_jobs(group, labels)}")
             out.extend(saved_log_line(group, "      "))
-    if rep["raw"]:
-        out.append("raw logs: " + ", ".join(os.path.basename(p) for p in rep["raw"].values()))
+    if rep.raw:
+        out.append("raw logs: " + ", ".join(os.path.basename(p) for p in rep.raw.values()))
         out.append(f"  in {raw_dir}")
     return out
 
 
-def render_blocks(rep: dict, report_path: str, cap: bool, titled: bool) -> list:
+def render_blocks(rep: RunReport, report_path: str, cap: bool, titled: bool) -> list:
     """One run's failure blocks, numbered as in its index."""
-    groups = rep["groups"]
+    groups = rep.groups
     if not groups:
         return []
-    _, labels = failed_labels(rep["run"])
-    out = [f"-- the failures of run {rep['run'].get('databaseId')}"] if titled else []
+    _, labels = failed_labels(rep.run)
+    out = [f"-- the failures of run {rep.run.get('databaseId')}"] if titled else []
     for i, group in enumerate(groups, 1):
         if out:
             out.append("")
@@ -1210,9 +1240,9 @@ def render(reports: list, raw_dir: str, report_path: str, cap: bool) -> tuple[li
     print; `emit` cuts the detail only."""
     head = []
     if len(reports) > 1:
-        sha = str(reports[0]["run"].get("headSha", ""))[:8]
+        sha = str(reports[0].run.get("headSha", ""))[:8]
         head.append(f"{len(reports)} runs for commit {sha}:")
-        head.extend("  " + run_title(rep["run"]) for rep in reports)
+        head.extend("  " + run_title(rep.run) for rep in reports)
     for rep in reports:
         if head:
             head.append("")
@@ -1226,14 +1256,16 @@ def render(reports: list, raw_dir: str, report_path: str, cap: bool) -> tuple[li
     return head, detail
 
 
-def run_json(rep: dict) -> dict:
-    run = rep["run"]
+def run_json(rep: RunReport) -> dict:
+    """The one mapping of a RunReport into `--json`'s run object (the
+    module docstring's shape; JSON_SCHEMA names it)."""
+    run = rep.run
     return {"run": {k: run.get(k) for k in ("databaseId", "workflowName", "event", "headSha", "status",
                                             "conclusion", "url", "displayTitle", "attempt")},
-            "exit": rep["code"], "note": rep["note"],
-            "jobs": [job_json(j, rep["outcomes"], rep["raw"]) for j in run.get("jobs") or []],
-            "failures": [{k: g.get(k) for k in ("kind", "headline", "jobs", "shownFrom", "block", "savedLog")}
-                         for g in rep["groups"]]}
+            "exit": rep.code, "note": rep.note,
+            "jobs": [job_json(j, rep.outcomes, rep.raw) for j in run.get("jobs") or []],
+            "failures": [{"kind": g.kind, "headline": g.headline, "jobs": g.jobs, "shownFrom": g.shown_from,
+                          "block": g.block, "savedLog": g.saved_log} for g in rep.groups]}
 
 
 def job_json(job: dict, outcomes: dict, raw: dict) -> dict:
@@ -1267,7 +1299,7 @@ def over_limit(what: str, size: int, path: str) -> list:
 
 
 def missing(headline: str, saved_log: str | None = None) -> list:
-    return [{"kind": "missing", "headline": headline, "block": [], "savedLog": saved_log}]
+    return [Unit("missing", headline, [], saved_log)]
 
 
 def log_failed(gh: Gh, run: dict, raw_dir: str, prefix: str) -> tuple[dict, list | None]:
@@ -1339,8 +1371,8 @@ def analyse(gh: Gh, run: dict, raw_dir: str, tail: int, prefix: str, taken: set)
         got = job_lines(gh, run, job, by_job, os.path.join(raw_dir, safe_name(prefix + str(name), taken)))
         if not isinstance(got, JobLines):
             # Only the job's own log, saved but over the limit, names a path here.
-            if got[0]["savedLog"]:
-                raw[name] = got[0]["savedLog"]
+            if got[0].saved_log:
+                raw[name] = got[0].saved_log
             per_job.append((name, got))
             continue
         raw[name] = got.path
@@ -1421,9 +1453,8 @@ def answer(args: argparse.Namespace) -> int:
             note += f" after waiting {args.timeout:g} s" if args.wait else "; pass --wait to wait"
         prefix = f"{run.get('databaseId')}_" if len(runs) > 1 else ""
         outcomes, groups, raw = analyse(gh, run, raw_dir, args.tail, prefix, taken)
-        reports.append({"run": run, "code": code, "note": note, "outcomes": outcomes,
-                        "groups": groups, "raw": raw})
-    code = combined_code([rep["code"] for rep in reports])
+        reports.append(RunReport(run, code, note, outcomes, groups, raw))
+    code = combined_code([rep.code for rep in reports])
     head, detail = render(reports, raw_dir, report_path, cap=False)
     with open(report_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(head + detail) + "\n")
