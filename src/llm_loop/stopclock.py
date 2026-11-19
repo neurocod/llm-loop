@@ -1,0 +1,87 @@
+"""The deadline of the ending in progress, for the waits that cannot be handed it.
+
+`runlifecycle.StopBudget` is one budget per ending, and every wait of that
+ending must take what is LEFT of it. Most of those waits sit several calls
+below the ending — the quota server's stop inside `CodexUsageSource.close`,
+the HTTP read behind `LimitPolicy.log_snapshot`, the `procend` escalation
+behind either — and their callers' signatures are a protocol a dozen test
+fakes implement. So the ending publishes its deadline here, for the thread
+that runs it, and each wait caps its own limit with `within`. A wait outside
+any ending — a turn's reap, a status-line read — sees no deadline and keeps
+its limit.
+
+Thread-local by construction (`contextvars`: a new thread starts with no
+deadline): the ending's thread is the one whose waits make the stop long, and
+a worker or a refresher that outlives the ending is not waited for by it.
+
+A leaf on purpose — standard library only — so `procend`, `usage` and
+`codex_usage` reach it without importing the run's lifecycle.
+
+What a deadline here cannot cure, named because both look like waits:
+
+  * a print into a console that has stopped draining (a selection freezing a
+    Windows console, a pipe nobody reads). The write blocks the very thread
+    that would ask `within`, and the stream has no timeout to give it; a
+    thread to print on only moves the hang to the interpreter's exit flush.
+    The run's console owner bounds what IT writes (`parallel._close_console`),
+    and nothing bounds the ending's own lines;
+  * the DNS lookup of the Claude usage snapshot. `urlopen`'s timeout covers
+    the connect and the reads, not `getaddrinfo`, which has no timeout in the
+    standard library and ends on the OS resolver's own retries. A spent
+    budget never STARTS the read (`usage.UsageSource.query_usage_json`), and
+    a lookup already under way runs past it; curing that means not waiting
+    for the reading thread at all — an abandoned thread per read — which no
+    stop has yet been seen to need.
+"""
+
+import contextlib
+import contextvars
+import time
+from typing import Iterator, Optional
+
+_DEADLINE: "contextvars.ContextVar[Optional[float]]" = contextvars.ContextVar(
+    "llm_loop_ending_deadline", default=None)
+
+
+@contextlib.contextmanager
+def ending(deadline: Optional[float]) -> Iterator[None]:
+    """Publish `deadline` (`time.monotonic()` seconds, None for none) as this
+    thread's ending deadline for the block. An inner ending may only shorten
+    an outer one: a budget once announced is never extended under it."""
+    outer = _DEADLINE.get()
+    if outer is not None and (deadline is None or deadline > outer):
+        deadline = outer
+    token = _DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def left() -> Optional[float]:
+    """Seconds left to this thread's ending, 0.0 once spent, None without one."""
+    deadline = _DEADLINE.get()
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def within(limit: Optional[float]) -> Optional[float]:
+    """`limit` capped by what is left of the ending; None only when both are.
+
+    A wait's own limit stays its limit outside an ending; inside one, the
+    smaller of the two. 0.0 means "do not wait": the caller still does what
+    needs no waiting (a kill, a flag), and skips what does.
+    """
+    remaining = left()
+    if remaining is None:
+        return limit
+    if limit is None:
+        return remaining
+    return min(limit, remaining)
+
+
+def spent() -> bool:
+    """True once this thread's ending deadline has passed."""
+    remaining = left()
+    return remaining is not None and remaining <= 0

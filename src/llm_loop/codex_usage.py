@@ -17,13 +17,15 @@ import threading
 import time
 from typing import Callable, List, Optional
 
-from . import appserver, wire
+from . import appserver, stopclock, wire
 from .console import print_line
 from .procend import REAP_GRACE_S, end_process_tree
 from .usage import EMPTY_READING, EMPTY_USAGE, Usage, UsageReading, summary_line
 
 # The bound on one request — the handshake of a fresh server included. A wait
-# that runs out kills the server; the next query starts another.
+# that runs out kills the server; the next query starts another. Inside an
+# ending it is capped by what the ending's budget has left (`stopclock`), the
+# wait for a query in flight on another thread included.
 APP_SERVER_TIMEOUT = 15.0
 USAGE_CACHE_TTL = 30.0
 LONG_WINDOW_MINUTES = 24 * 60
@@ -176,7 +178,7 @@ class _QuotaServer:
         proc = self.proc
         self.connection.close_input()
         try:
-            proc.wait(timeout=REAP_GRACE_S)
+            proc.wait(timeout=stopclock.within(REAP_GRACE_S))
         except subprocess.TimeoutExpired:
             end_process_tree(proc)
         except OSError:
@@ -270,7 +272,10 @@ class CodexUsageSource:
         return server
 
     def _query_locked(self) -> Optional[dict]:
-        deadline = time.monotonic() + self.timeout
+        if stopclock.spent():
+            # No time left to start a server, let alone hear it answer.
+            return _no_figures("the stop budget is spent")
+        deadline = time.monotonic() + stopclock.within(self.timeout)
         for attempt in (1, 2):
             previous = self._server
             try:
@@ -297,8 +302,20 @@ class CodexUsageSource:
                 return _no_figures(exc)
         return None
 
+    def _acquire(self) -> bool:
+        """Take the lock — blocking outside an ending, inside one for at most
+        what its budget has left: the holder is a query on another thread
+        (the status line's refresher), bounded only by its own `timeout`."""
+        wait = stopclock.within(None)
+        if wait is None:
+            return self._lock.acquire()
+        return self._lock.acquire(timeout=wait)
+
     def get_usage(self, cache_value: bool = True) -> Usage:
-        with self._lock:
+        if not self._acquire():
+            _no_figures("the stop budget ran out waiting for a query in flight")
+            return self._cached or EMPTY_USAGE
+        try:
             now = time.time()
             if (cache_value and self._cached is not None
                     and now - self._cached_ts < self.cache_ttl):
@@ -307,12 +324,18 @@ class CodexUsageSource:
                 # A status-line poll racing the epilogue keeps the last figures.
                 return self._cached or EMPTY_USAGE
             data = self._query_locked()
+            if self._closed:
+                # Closed while this query held the lock (`close` under a spent
+                # budget): the server is this query's to stop.
+                self._drop_server()
             if data is None:
                 return EMPTY_USAGE
             snapshot = parse_rate_limits(data)
             self._cached = snapshot
             self._cached_ts = now
             return snapshot
+        finally:
+            self._lock.release()
 
     def invalidate(self) -> None:
         with self._lock:
@@ -323,9 +346,18 @@ class CodexUsageSource:
         """Stop the quota server; later queries read nothing. Idempotent.
 
         Waits for a query in flight (bounded by `timeout`) rather than
-        killing the process under it.
+        killing the process under it — inside an ending, for no longer than
+        its budget has left. A close that cannot wait marks the source closed
+        and leaves the server to that query, which stops it as it returns;
+        the source stays in `_open_sources` so the exit hook still reaps it
+        should the query outlive the ending.
         """
-        with self._lock:
+        if not self._acquire():
+            self._closed = True
+            return
+        try:
             self._closed = True
             self._drop_server()
+        finally:
+            self._lock.release()
         _open_sources.discard(self)

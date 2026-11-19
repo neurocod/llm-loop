@@ -54,6 +54,7 @@ from .console import fmt_moment, print_line
 # One event of the provider stream reaches this module — the rate-limit verdict —
 # and the word the stream calls it by lives with the rest of that vocabulary.
 from . import wire
+from . import stopclock
 
 # The usage endpoint, and the OAuth credentials the CLI stores for its own calls.
 # ANTHROPIC_BASE_URL / CLAUDE_CONFIG_DIR are the CLI's own environment overrides,
@@ -63,6 +64,10 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 CREDENTIALS_FILENAME = ".credentials.json"
 HTTP_TIMEOUT = 10        # seconds — the CLI uses 5s; a little slack for a busy box
 HTTP_ATTEMPTS = 2        # one retry: a dropped connection shouldn't blind the gate
+# Inside an ending (`stopclock`) each attempt's timeout and the pause between
+# them take at most what the ending's budget has left, and a spent budget
+# starts no further attempt. The DNS lookup is outside `urlopen`'s timeout —
+# see `stopclock` for why the budget does not cure it.
 
 # The reading is cheap (no tokens, ~0.3s), so the cache exists only to collapse
 # the several reads that happen at one instant (limit check + log snapshot) into
@@ -383,8 +388,12 @@ class UsageSource:
         })
         last = ""
         for attempt in range(HTTP_ATTEMPTS):
+            if stopclock.spent():
+                last = last or "the stop budget is spent"
+                break
             try:
-                with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as resp:
+                with urllib.request.urlopen(
+                        request, timeout=stopclock.within(HTTP_TIMEOUT)) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as e:
                 if e.code == 401:
@@ -396,7 +405,7 @@ class UsageSource:
             except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
                 last = str(e)
             if attempt + 1 < HTTP_ATTEMPTS:
-                time.sleep(1)
+                time.sleep(stopclock.within(1))
         print_line(f"  · no usage figures: {self._url()} did not answer ({last})")
         return None
 

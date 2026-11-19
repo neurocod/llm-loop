@@ -1,6 +1,6 @@
 """Ending a child process tree: the escalation every owner of a child shares.
 
-A leaf module on purpose — standard library only — so both the turn runner
+A leaf module on purpose — standard library and the leaf `stopclock` only — so both the turn runner
 (`providers`) and the quota server (`codex_usage`, which `providers` imports)
 can reach it without an import running against that direction. Each caller
 keeps only its own prologue (which pipe to close first, whether the child gets
@@ -10,12 +10,18 @@ an EOF to exit on) and hands the rest to `end_process_tree`.
 import os
 import subprocess
 
+from . import stopclock
+
 # How long a provider child gets after being told to end before it is killed
 # outright, and the ceiling on the `taskkill` call itself. The bound is what
 # keeps the reaping from becoming a second hang inside the guard that exists to
 # end the first one: the parallel runner calls it from a thread that is ALREADY
 # dying, so nothing above it is left to notice a wait that never returns.
 REAP_GRACE_S = 2.0
+#
+# Inside an ending (`stopclock`) each of those waits takes at most what is left
+# of the ending's budget. A spent budget still ENDS the tree — `taskkill` and
+# the kill are issued — and only the waiting is skipped.
 
 
 def ask_agent_process_to_end(proc) -> None:
@@ -41,9 +47,17 @@ def ask_agent_process_to_end(proc) -> None:
     mid-write) is charged on Windows whichever spelling is used.
     """
     if os.name == "nt":
+        argv = ["taskkill", "/F", "/T", "/PID", str(proc.pid)]
+        grace = stopclock.within(REAP_GRACE_S)
         try:
-            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                  capture_output=True, timeout=REAP_GRACE_S)
+            if grace <= 0:
+                # The ending's budget is spent: start the tree's ending and do
+                # not wait for it. `run` with no time left would kill the
+                # taskkill it started before it acted, ending only the shim.
+                subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                return
+            done = subprocess.run(argv, capture_output=True, timeout=grace)
             if done.returncode == 0:
                 return
             # Non-zero means the tree was NOT ended (no such pid, access
@@ -76,14 +90,15 @@ def end_process_tree(proc) -> None:
     """Ask the child (tree) to end, wait, kill, wait — bounded, never raises.
 
     At most `REAP_GRACE_S` for the ask's `taskkill` plus two waits of
-    `REAP_GRACE_S` each. `OSError` from `wait` means the OS has already
+    `REAP_GRACE_S` each, and inside an ending no more than its budget has
+    left (`stopclock.within`). `OSError` from `wait` means the OS has already
     reclaimed the handle (Windows raises it there), so there is nothing left to
     end; `KeyboardInterrupt` is NOT absorbed here — that is the caller's call
     (`providers.reap_agent_process`).
     """
     ask_agent_process_to_end(proc)
     try:
-        proc.wait(timeout=REAP_GRACE_S)
+        proc.wait(timeout=stopclock.within(REAP_GRACE_S))
     except OSError:
         return
     except subprocess.TimeoutExpired:
@@ -92,7 +107,7 @@ def end_process_tree(proc) -> None:
         except OSError:
             pass  # gone between the wait and here — `wait` below collects it
         try:
-            proc.wait(timeout=REAP_GRACE_S)
+            proc.wait(timeout=stopclock.within(REAP_GRACE_S))
         except OSError:
             return
         except subprocess.TimeoutExpired:

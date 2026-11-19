@@ -48,7 +48,7 @@ from typing import (Any, Callable, Dict, Iterable, List, NamedTuple, NoReturn,
                     Optional, Tuple)
 
 from . import (clispec, console, ctrlc, diaglog, exitlog, limits, operator,
-               projectroot, statusline, stopchannel)
+               projectroot, statusline, stopchannel, stopclock)
 from .gitpush import (
     GIT_PUSH_POLICY,
     GIT_PUSH_SETTING,
@@ -330,6 +330,11 @@ class RunUsage:
         place of it: a mixed-provider run closes one usage per account under the
         same ending, and two bare `at end (interrupted)` lines would not say
         which account each figure belongs to.
+
+        A network read, so under the ending's budget: the source caps its
+        waits by what is left (`stopclock`; `usage.HTTP_TIMEOUT`,
+        `codex_usage.APP_SERVER_TIMEOUT`) and, once it is spent, reads
+        nothing and says so — the line still answers `at start`.
         """
         label = self.name if ending is None else f"{self.name}: {ending}"
         self.policy.log_snapshot(self.source, f"at end ({label})",
@@ -449,7 +454,22 @@ def close_run(ctx: RunContext, *,
     `driver.final_summary` included — still comes here, once. What exits before
     any usage is open (the waits for a stale stop file and for `--start-in`)
     has nothing to answer and leaves on its own `sys.exit`.
+
+    `budget` bounds the WHOLE housekeeping, not the push alone: it is
+    published as the thread's ending deadline (`stopclock`) for the closing
+    snapshots, the quota server's stop and every `procend` wait under them —
+    so the ending lasts no longer than the budget its push announces. What a
+    budget cannot bound is named in `stopclock`.
     """
+    with stopclock.ending(None if budget is None else budget.deadline):
+        _close_run(ctx, usages=usages, ending=ending, mailbox=mailbox,
+                   pusher=pusher, push_abort=push_abort, budget=budget,
+                   heard=heard)
+
+
+def _close_run(ctx: RunContext, *, usages, ending, mailbox, pusher,
+               push_abort, budget, heard) -> None:
+    """The body of `close_run`, under its ending's deadline."""
     usages = list(usages)           # walked twice: snapshots, then sources
     abort = push_abort or PushAbort()
     interrupt = ctrlc.current()
@@ -481,7 +501,7 @@ def close_run(ctx: RunContext, *,
         # lock is never held across a call.
         abort.set()
         if pusher is not None:
-            pusher.close(timeout=EXIT_PUSH_POLL_S)
+            pusher.close(timeout=stopclock.within(EXIT_PUSH_POLL_S))
         _say_push_given_up(PushWait.ABANDONED if abandoned()
                            else PushWait.DEADLINE, budget)
     else:
@@ -545,8 +565,10 @@ class StopBudget:
     bounds set one per wait add up behind each other, and each of them was
     found by a separate review (llm-loop 2255e6f, ce11713) — one budget is
     one number to read and one place to change. Spent, no wait begins any
-    more: no further git starts, and the rest of the ending (the snapshots,
-    the notes) is done without waiting. `seconds` None is no budget: an
+    more: no further git starts, the closing snapshots read nothing, a child
+    still to end is killed without being waited for, and the notes are
+    reported. The waits several calls below the ending read it through
+    `stopclock` (`close_run` publishes it). `seconds` None is no budget: an
     ending with the operator present, who gives a wait up with Ctrl+C.
     """
 
@@ -554,6 +576,12 @@ class StopBudget:
         self.seconds = seconds
         self._deadline = (None if seconds is None
                           else time.monotonic() + seconds)
+
+    @property
+    def deadline(self) -> Optional[float]:
+        """The `time.monotonic()` instant it is spent at; None without one —
+        what `stopclock.ending` publishes to the waits below the ending."""
+        return self._deadline
 
     def left(self) -> Optional[float]:
         """Seconds still to spend, 0.0 once spent, None without a budget."""
@@ -621,9 +649,10 @@ def _wait_for_exit_push(pusher: OwnerThread, push,
 # The StopBudget of an ending nobody may be watching: one no runner wrote — an
 # exception or an exit unwinding the run past its doors (`RunBoundary.unwind`)
 # — and the runner's own `RunBoundary.exit` (the driver stopping the run, five
-# provider errors in a row: endings of a run left going overnight). In practice
-# what it bounds is the exit push, the one wait such an ending has; the closing
-# usage snapshots are network reads with their own timeouts, outside it. Bounded because
+# provider errors in a row: endings of a run left going overnight). It bounds
+# the whole ending — the console's drain, the exit push, the closing usage
+# snapshots and the quota server's stop (`close_run`, `stopclock`); the push is
+# what spends it in practice. Bounded because
 # nobody may be there to press Ctrl+C: a batch run unwinding an exception
 # otherwise sat out a push in flight and the whole `final_git_push` behind it
 # (a 300 s subprocess timeout per `git push`, and on Windows a git descendant
@@ -634,7 +663,8 @@ def _wait_for_exit_push(pusher: OwnerThread, push,
 # normal exit push and a periodic one in flight ahead of it; past it the push
 # is taken to be stuck. What is lost is that push only: no further git starts
 # (`PushAbort`), the one running finishes on its own as a daemon, and the
-# snapshots and the notes still follow. The interrupt's door has no budget:
+# snapshots and the notes still follow — a snapshot the push left no time for
+# reads nothing and says so. The interrupt's door has no budget:
 # there an operator is present to give the push up with Ctrl+C again.
 UNWIND_PUSH_DEADLINE_S = 60.0
 
@@ -811,28 +841,43 @@ class RunBoundary:
         self._releases = contextlib.ExitStack()
         self._held = contextlib.ExitStack()
         self.closed = False
+        # The budget of an ending that unwinds the block, once `__exit__` has
+        # taken it; `unwind` spends the same one rather than starting anew.
+        self._unwind_budget: Optional[StopBudget] = None
 
     def __enter__(self) -> "RunBoundary":
         return self
 
     def __exit__(self, exc_type, error, traceback_) -> bool:
-        try:
+        # An ending that unwinds the block takes its budget HERE, before the
+        # held resources are released: their release is part of the ending
+        # (the parallel console's drain, CONSOLE_CLOSE_TIMEOUT_S), and a
+        # budget taken after it would announce less than the stop lasts.
+        if (error is not None and not self.closed
+                and not isinstance(error, KeyboardInterrupt)):
+            self._unwind_budget = StopBudget(UNWIND_PUSH_DEADLINE_S)
+        budget = self._unwind_budget
+        with stopclock.ending(None if budget is None else budget.deadline):
             try:
-                self.release_held()
-            except BaseException as released:
-                # Raised past the original, as a nested `with` would have: the
-                # region's own teardown failing (a Ctrl+C in its bounded waits)
-                # is the ending the block now unwinds with.
-                if not self.closed:
-                    self.unwind(released)
-                raise
-            if error is not None and not self.closed:
-                self.unwind(error)
-        finally:
-            if self.pusher is not None:
-                # A short wait, not 0: close takes the owner's lock with this
-                # timeout, and a zero try can miss it and leave the pusher OPEN.
-                self.pusher.close(timeout=0.5)
+                try:
+                    self.release_held()
+                except BaseException as released:
+                    # Raised past the original, as a nested `with` would
+                    # have: the region's own teardown failing (a Ctrl+C in its
+                    # bounded waits) is the ending the block now unwinds with.
+                    if not self.closed:
+                        self.unwind(released)
+                    raise
+                if error is not None and not self.closed:
+                    self.unwind(error)
+            finally:
+                if self.pusher is not None:
+                    # A short wait, not 0: close takes the owner's lock with
+                    # this timeout, and a zero try can miss it and leave the
+                    # pusher OPEN. Under a spent budget it is that try — the
+                    # process is leaving, and close_run has closed the pusher
+                    # on every ending that got that far.
+                    self.pusher.close(timeout=stopclock.within(0.5))
         return False
 
     def hold(self, resource):
@@ -936,8 +981,10 @@ class RunBoundary:
             return
         if isinstance(error, KeyboardInterrupt):
             self.interrupt()
-        # Taken once, here: everything this ending waits for spends it.
-        budget = StopBudget(UNWIND_PUSH_DEADLINE_S)
+        # Taken once: everything this ending waits for spends it — the one
+        # `__exit__` took before the release, or a fresh one when `unwind` is
+        # called by hand.
+        budget = self._unwind_budget or StopBudget(UNWIND_PUSH_DEADLINE_S)
         if isinstance(error, SystemExit):
             code = 0 if error.code is None else error.code
             # The first line only: `sys.exit("message")` may carry a paragraph.

@@ -58,6 +58,7 @@ from . import runlifecycle
 from . import statusline
 from . import statlog
 from . import stopchannel
+from . import stopclock
 from . import textwidth
 # BY NAME, not through the module, and that is the repair of a real defect: this
 # function used to reach `usage.rate_limit_event_from` while its codex branch
@@ -155,11 +156,17 @@ INTERRUPT_ANNOUNCEMENT = ("\nInterrupted by user (Ctrl+C) — "
 
 
 def _close_console() -> None:
-    """Close `_console` within CONSOLE_CLOSE_TIMEOUT_S, naming what it left."""
-    if _console.close(CONSOLE_CLOSE_TIMEOUT_S):
+    """Close `_console` within CONSOLE_CLOSE_TIMEOUT_S, naming what it left.
+
+    Inside an ending (`stopclock`: an exception unwinding the run, see
+    `RunBoundary.__exit__`) for no longer than its budget has left: the drain
+    is the first wait of that ending, ahead of the exit push it announces.
+    """
+    wait = stopclock.within(CONSOLE_CLOSE_TIMEOUT_S)
+    if _console.close(wait):
         return
     print(f"  ⚠ {_console.name}: {_console.backlog} line(s) still unwritten "
-          f"after {CONSOLE_CLOSE_TIMEOUT_S:g} s — reporting without them.",
+          f"after {wait:.3g} s — reporting without them.",
           file=sys.stderr)
 
 
