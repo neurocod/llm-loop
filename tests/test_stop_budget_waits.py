@@ -7,16 +7,18 @@ bounded so that a mutation reverting the wiring fails on the elapsed time in
 seconds, not by hanging the suite.
 """
 
+import io
 import os
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
 from llm_loop import (codex_usage, ownership, parallel, procend, runlifecycle,
-                      stopclock, usage)
+                      stopclock, termio, usage)
 
 # What "did not wait" means below. A spent budget's step costs a few
 # milliseconds (a `taskkill` started, a lock tried); every wait it replaces is
@@ -91,48 +93,63 @@ def test_ending_a_process_tree_on_a_spent_budget_does_not_wait(monkeypatch):
         f"(waits {child.waits})")
 
 
-# A child that starts a grandchild sharing its stdout, says so, and sleeps:
-# the shape of an npm shim in front of the provider CLI.
+# A child that starts a grandchild sharing its stdout, marks the file in
+# argv[1] once it has, and sleeps: the shape of an npm shim in front of the
+# provider CLI.
 _TREE = ("import subprocess, sys, time\n"
-         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
-         "print('grandchild up', flush=True)\n"
+         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],"
+         " stdout=sys.stdout)\n"
+         "open(sys.argv[1], 'w').close()\n"
          "time.sleep(60)\n")
 
-# How long the tree may take to end once its ending was started: a
-# `taskkill /T` over two processes, well under a second on an idle machine;
-# ten times that for a loaded one.
+# The run: starts the tree on its own stdout, ends it on a spent budget, and
+# leaves AT ONCE (`os._exit`: no shutdown, no thread finishes) — the moment
+# an unattended run's ending is spent and it exits.
+_RUN = ("import os, subprocess, sys, time\n"
+        "from llm_loop import procend, stopclock\n"
+        "marker, tree = sys.argv[1], sys.argv[2]\n"
+        "child = subprocess.Popen([sys.executable, '-c', tree, marker],"
+        " stdout=sys.stdout)\n"
+        "while not os.path.exists(marker):\n"
+        "    time.sleep(0.05)\n"
+        "with stopclock.ending(time.monotonic()):\n"
+        "    procend.end_process_tree(child)\n"
+        "print('left', flush=True)\n"
+        "os._exit(0)\n")
+
+# How long the tree may take to end once the run has left: a `taskkill /T`
+# over two processes, well under a second on an idle machine; ten times that
+# for a loaded one.
 TREE_END_S = 10.0
 
 
-@pytest.mark.skipif(os.name != "nt", reason="the tree is ended by taskkill /T")
-def test_a_spent_budget_still_ends_the_whole_tree():
-    """Only the waiting is skipped: the grandchild is ended too.
+@pytest.mark.skipif(os.name != "nt", reason="the tree is ended by taskkill /T; "
+                    "the POSIX reaper ends the child alone, as _end_tree does")
+def test_a_run_that_leaves_on_a_spent_budget_leaves_no_descendant(tmp_path):
+    """The tree is ended by a process the OS owns, not by a thread of the run.
 
-    Killing the root before `taskkill /T` has walked its children orphans
-    them, and the orphan keeps the child's stdout open — the pipe's EOF is
-    the proof that nobody holding it is left."""
-    child = subprocess.Popen([sys.executable, "-c", _TREE],
-                             stdout=subprocess.PIPE)
+    The run, its child and the grandchild all hold one pipe: its EOF is the
+    proof that none of them is left. A daemon handed the ending dies with the
+    run before it starts anything; a root killed before `taskkill /T` walked
+    the tree orphans the grandchild — either keeps the pipe open."""
+    source = str(Path(procend.__file__).resolve().parents[1])
+    env = dict(os.environ, PYTHONPATH=source)
+    run = subprocess.Popen([sys.executable, "-c", _RUN,
+                            str(tmp_path / "tree-up"), _TREE],
+                           stdout=subprocess.PIPE, env=env)
+    out = []
+    reader = threading.Thread(target=lambda: out.append(run.stdout.read()),
+                              daemon=True)
+    reader.start()
+    # The run's own start included: the whole test took 3.5 s, measured
+    # 2026-11-19 under three other slots' load.
+    reader.join(TREE_END_S + 30)
     try:
-        assert child.stdout.readline().strip() == b"grandchild up"
-        started = time.monotonic()
-        with spent():
-            procend.end_process_tree(child)
-        elapsed = time.monotonic() - started
-        assert elapsed < NO_WAIT_S, (
-            f"the escalation waited on a spent budget: {elapsed:.2f} s")
-        rest = []
-        reader = threading.Thread(target=lambda: rest.append(child.stdout.read()),
-                                  daemon=True)
-        reader.start()
-        reader.join(TREE_END_S)
         assert not reader.is_alive(), (
-            "a descendant outlived the ending and still holds the pipe")
+            "a descendant outlived the run and still holds the pipe")
+        assert out and b"left" in out[0], out
     finally:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(child.pid)],
-                       capture_output=True)
-        child.kill()
-        child.wait()
+        run.wait(timeout=10)
 
 
 class _HeldLock:
@@ -270,6 +287,83 @@ def test_a_close_that_cannot_wait_hands_the_stop_to_the_holder(monkeypatch):
     assert source not in codex_usage._open_sources
 
 
+class _SlowServer:
+    """A server whose stop is under way until `release` is set."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def stop(self):
+        self.started.set()
+        self.release.wait(timeout=30)
+
+
+def test_a_close_during_a_holder_s_stop_waits_for_it(monkeypatch):
+    """The window after the holder detached the server and let the lock go,
+    before its stop is done: a second close then finds no server, and must
+    still neither return early nor drop the source from the exit hook's
+    registry — the stop is not done yet."""
+    source = _codex_source([])
+    server = source._server = _SlowServer()
+    finish = threading.Event()
+    holding = threading.Event()
+
+    def query():
+        holding.set()
+        finish.wait(timeout=30)
+        return None
+
+    monkeypatch.setattr(source, "_query_locked", query)
+    holder = threading.Thread(target=lambda: source.get_usage(cache_value=False),
+                              daemon=True)
+    holder.start()
+    closer = None
+    try:
+        assert holding.wait(timeout=5)
+        with spent():
+            source.close()                  # cannot wait: hands the stop over
+        finish.set()
+        assert server.started.wait(timeout=5), "the holder began no stop"
+        # Inside the window. A spent close returns, keeping the registry:
+        with spent():
+            source.close()
+        assert source in codex_usage._open_sources, (
+            "a spent close dropped a source whose stop is still under way")
+        # An unbudgeted close waits for the stop.
+        closer = threading.Thread(target=source.close, daemon=True)
+        closer.start()
+        closer.join(timeout=0.5)
+        assert closer.is_alive(), "close returned while the stop was under way"
+        assert source in codex_usage._open_sources
+    finally:
+        finish.set()
+        server.release.set()
+        holder.join(timeout=5)
+        if closer is not None:
+            closer.join(timeout=5)
+    assert not closer.is_alive()
+    assert source not in codex_usage._open_sources
+
+
+def test_the_input_reader_s_join_on_a_spent_budget_does_not_wait():
+    """`termio.TerminalInput.stop`'s 1 s join, staged as a reader that never
+    comes back."""
+    reader = termio.TerminalInput(stream=io.StringIO())
+    stuck = threading.Event()
+    reader._thread = threading.Thread(target=stuck.wait, args=(30,), daemon=True)
+    reader._thread.start()
+    try:
+        started = time.monotonic()
+        with spent():
+            reader.stop()
+        elapsed = time.monotonic() - started
+    finally:
+        stuck.set()
+    assert elapsed < NO_WAIT_S, (
+        f"the input reader was joined on a spent budget: {elapsed:.2f} s")
+
+
 def test_the_claude_snapshot_on_a_spent_budget_makes_no_request(monkeypatch):
     """`usage.HTTP_TIMEOUT` x HTTP_ATTEMPTS and the pause between them."""
     requests = []
@@ -287,7 +381,8 @@ def test_the_claude_snapshot_on_a_spent_budget_makes_no_request(monkeypatch):
 
 class _TricklingResponse:
     """A body that arrives a byte at a time, each well inside a per-socket
-    timeout: no single operation ever times out, the whole read takes 3 s."""
+    timeout — no single operation ever times out — and then breaks off: an
+    attempt takes 1 s, both with the pause between them 3 s."""
 
     def __enter__(self):
         return self
@@ -296,9 +391,9 @@ class _TricklingResponse:
         return False
 
     def read(self):
-        for _ in range(30):
+        for _ in range(10):
             time.sleep(0.1)
-        return b"{}"
+        raise OSError("staged: the body broke off")
 
 
 def test_the_claude_snapshot_is_bounded_whole_not_per_socket_operation(
@@ -313,7 +408,12 @@ def test_the_claude_snapshot_is_bounded_whole_not_per_socket_operation(
     assert elapsed < 0.3 + NO_WAIT_S, (
         f"the snapshot outlasted its budget on a trickling body: {elapsed:.2f} s")
     assert data is None
-    assert "within the stop budget" in capsys.readouterr().out
+    # The abandoned read fails late, on its own: it must say nothing then.
+    for reader in [t for t in threading.enumerate() if t.name == "usage-read"]:
+        reader.join(timeout=10)
+    out = capsys.readouterr().out
+    assert "within the stop budget" in out
+    assert "broke off" not in out, f"the abandoned read spoke up late:\n{out}"
 
 
 def test_the_console_drain_on_a_spent_budget_does_not_wait(monkeypatch, capsys):

@@ -28,7 +28,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from . import console, ctrlc, diaglog
+from . import console, ctrlc, diaglog, stopclock
 
 __all__ = [
     "CSI_KEYS",
@@ -497,7 +497,8 @@ class TerminalInput(InputSource):
         self._stop.set()
         thread, self._thread = self._thread, None
         if thread is not None:
-            thread.join(timeout=1.0)
+            # Inside an ending, no longer than its budget has left (`stopclock`).
+            thread.join(timeout=stopclock.within(1.0))
         self.restore_tty()   # the thread normally did it; make sure of it here
 
     def restore_tty(self):

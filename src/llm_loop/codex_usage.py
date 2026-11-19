@@ -242,6 +242,10 @@ class CodexUsageSource:
         self._lock = threading.Lock()
         # Guards the close mark against the lock's release (`_release`).
         self._handoff = threading.Lock()
+        # Stops a holder has begun and not finished, and their end's signal:
+        # the source leaves `_open_sources` only once this is back to zero.
+        self._stopping = 0
+        self._settled = threading.Condition(self._handoff)
         # The deadline of the ending whose `close` could not wait, kept for
         # the exit hook's close; None when no close has had to give up.
         self._close_deadline: Optional[float] = None
@@ -334,13 +338,22 @@ class CodexUsageSource:
         with self._handoff:
             closed = self._closed
             server = None
-            if closed:
+            if closed and self._server is not None:
                 server, self._server = self._server, None
+                # Counted BEFORE the lock goes: a close that gets the lock
+                # next must see a stop still under way, not "no server".
+                self._stopping += 1
             self._lock.release()
-        if closed:
-            if server is not None:
-                server.stop()
-            _open_sources.discard(self)
+        if server is None:
+            return
+        try:
+            server.stop()
+        finally:
+            with self._handoff:
+                self._stopping -= 1
+                self._settled.notify_all()
+                if self._stopping == 0:
+                    _open_sources.discard(self)
 
     def get_usage(self, cache_value: bool = True) -> Usage:
         if not self._acquire():
@@ -390,3 +403,12 @@ class CodexUsageSource:
             self._close_deadline = stopclock.deadline()
             return
         self._release()
+        # A stop a holder began is not done because the server is detached:
+        # wait for it (within the ending), and leave the registry to it.
+        with self._handoff:
+            settled = self._settled.wait_for(lambda: self._stopping == 0,
+                                             stopclock.within(None))
+            if settled:
+                _open_sources.discard(self)
+        if not settled:
+            self._close_deadline = stopclock.deadline()

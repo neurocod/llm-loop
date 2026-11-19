@@ -9,7 +9,7 @@ an EOF to exit on) and hands the rest to `end_process_tree`.
 
 import os
 import subprocess
-import threading
+import sys
 
 from . import stopclock
 
@@ -86,26 +86,73 @@ def end_process_tree(proc) -> None:
     end; `KeyboardInterrupt` is NOT absorbed here — that is the caller's call
     (`providers.reap_agent_process`).
 
-    Inside an ending (`stopclock`) the caller waits no longer than the budget
-    has left, but the sequence is NOT cut short: a daemon worker runs it whole,
-    each step on its own limit, and the caller joins it for what is left. The
-    steps cannot be shortened in place — `taskkill /T` finds the tree through
-    the root's parent links, so killing the root before taskkill has walked
-    them (a wait cut to zero) orphans the descendants still holding the
-    child's pipes, and a `taskkill` given a fraction of its limit is killed
-    mid-walk. A `taskkill` the worker started finishes on its own even if the
-    process exits under it, being a process; a worker the exit catches
-    BEFORE it started one leaves the tree running — the price of not waiting,
-    paid only when the budget has under a few milliseconds left.
+    Inside an ending (`stopclock`) the ending is handed to a REAPER PROCESS
+    (`_start_reaper`) before this returns, and the caller then waits for the
+    child no longer than the budget has left. The steps cannot be shortened
+    in place: `taskkill /T` finds the tree through the root's parent links, so
+    killing the root before taskkill has walked them orphans the descendants
+    still holding the child's pipes, and a `taskkill` given a fraction of its
+    limit is killed mid-walk. Nor can a thread own them: a daemon the
+    interpreter exits under — at once, on a spent budget — may not have
+    started anything yet. A process the OS has created runs to its end
+    whatever this one does next, so the tree is ended however soon the run
+    leaves.
     """
     remaining = stopclock.left()
     if remaining is None:
         _end_tree(proc)
         return
-    worker = threading.Thread(target=_end_tree, args=(proc,),
-                              name="end-process-tree", daemon=True)
-    worker.start()
-    worker.join(remaining)
+    if not _start_reaper(proc):
+        # No reaper could be started: end the tree here, unbudgeted — a
+        # stop that overruns beats a tree left running.
+        _end_tree(proc)
+        return
+    try:
+        proc.wait(timeout=remaining)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+# The reaper on POSIX: the same ask, grace and kill as `_end_tree`, by pid,
+# in a process of its own session so the run's exit does not take it along.
+_POSIX_REAPER = """\
+import os, signal, sys, time
+pid, grace = int(sys.argv[1]), float(sys.argv[2])
+try:
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        os.kill(pid, 0)
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+except OSError:
+    pass
+"""
+
+
+def _start_reaper(proc) -> bool:
+    """Start a process that ends `proc`'s tree on its own; True once started.
+
+    On Windows that process is `taskkill /F /T` itself — forced already, so
+    there is no grace to escalate from — never timed and never followed by a
+    kill of the root, which is what would race its walk of the tree. On
+    POSIX a small Python reaper runs `_end_tree`'s SIGTERM, grace, SIGKILL.
+    Either is left to finish unwatched; its exit status is not read.
+    """
+    if os.name == "nt":
+        argv = ["taskkill", "/F", "/T", "/PID", str(proc.pid)]
+        options = {}
+    else:
+        argv = [sys.executable, "-c", _POSIX_REAPER, str(proc.pid),
+                str(REAP_GRACE_S)]
+        options = {"start_new_session": True}
+    try:
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, **options)
+    except OSError:
+        return False
+    return True
 
 
 def _end_tree(proc) -> None:
