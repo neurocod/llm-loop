@@ -9,7 +9,7 @@ import pytest
 
 from llm_loop import (appserver, codex_usage, compactline, console, ctrlc, cyclecore,
                       limits, parallel, providers, statusline, streamrender,
-                      textwidth, wire)
+                      textwidth, win_job, wire)
 from llm_loop.agentwork import AgentCommand, Driver
 from llm_loop.providers import (build_agent_argv, provider_spec,
                                    runtime_argv, start_agent_process,
@@ -250,7 +250,7 @@ def test_codex_process_starts_an_app_server_thread_and_turn(monkeypatch):
     argv, kwargs, raw_proc = created[0]
     assert argv[-2:] == ["app-server", "--stdio"]
     assert kwargs["stdin"] is subprocess.PIPE
-    assert kwargs.get("creationflags", 0) == _OWN_CONSOLE
+    assert kwargs.get("creationflags", 0) == _OWN_CONSOLE_IN_A_JOB
     requests = [json.loads(line) for line in raw_proc.stdin.text.splitlines()]
     assert [request["method"] for request in requests] == [
         "initialize", "initialized", "thread/start", "turn/start"]
@@ -469,12 +469,15 @@ def test_claude_process_keeps_prompt_out_of_stdin(monkeypatch, no_live_messages)
     assert launched[1:] == argv[1:]
     assert "stdin" not in kwargs
     assert proc.stdin is None
-    assert kwargs.get("creationflags", 0) == _OWN_CONSOLE
+    assert kwargs.get("creationflags", 0) == _OWN_CONSOLE_IN_A_JOB
 
 
 # What keeps a provider off the runner's console, whose one input queue the CLI
 # would otherwise read keys from (`providers._console_isolation`).
 _OWN_CONSOLE = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+# ... started suspended, so that it is in its job before it runs
+# (`procend.start_tree`).
+_OWN_CONSOLE_IN_A_JOB = _OWN_CONSOLE | (win_job.CREATE_SUSPENDED if os.name == "nt" else 0)
 
 
 def test_sequential_codex_runner_forwards_prompt_to_stdin_transport(monkeypatch):

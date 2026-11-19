@@ -27,7 +27,8 @@ from typing import Iterator, Optional, Protocol
 from . import appserver, ctrlc, operator, wire
 from .codex_usage import CodexUsageSource
 from .operator import user_message_line
-from .procend import ask_agent_process_to_end, end_unless_exited
+from .procend import (ask_agent_process_to_end, end_unless_exited, share_tree,
+                      start_tree)
 from .usage import UsageSource
 
 
@@ -302,7 +303,9 @@ def _console_isolation() -> dict:
 
     What it costs: Ctrl+C here no longer reaches the child as a console event.
     It never had to — but only because every turn ends its own tree from the
-    press (`taskkill /T`): its stream is read through `ended_on_press`.
+    press (its job, `procend.start_tree`): its stream is read through
+    `ended_on_press`. On POSIX the same holds for another reason: the child
+    leads a session of its own, out of the terminal's foreground group.
     """
     if os.name != "nt":
         return {}
@@ -318,7 +321,7 @@ def _start_codex_app_server(argv: list, prompt: str, project_dir: str):
     options = argv if isinstance(argv, _CodexArgv) else None
     app_argv = [argv[0], "app-server", "--stdio"]
     proc = appserver.spawn(runtime_argv(app_argv, "codex"), cwd=project_dir,
-                           merge_stderr=True, **_console_isolation())
+                           merge_stderr=True, owned=True, **_console_isolation())
     connection = None
     buffered = []
 
@@ -343,7 +346,9 @@ def _start_codex_app_server(argv: list, prompt: str, project_dir: str):
         turn_id = wire.codex_app_turn_id(turn)
         if not turn_id:
             raise RuntimeError("codex app-server returned no turn id")
-        return _CodexAppProcess(connection, buffered, thread_id, turn_id)
+        process = _CodexAppProcess(connection, buffered, thread_id, turn_id)
+        share_tree(process, proc)
+        return process
     except BaseException:
         # Not `reap_agent_process`: it closes stdout first, and with the pump
         # inside `readline` that close blocks (`appserver._pump_stdout`).
@@ -427,6 +432,9 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
     diagnostics) for every shape, plus already-decoded ``dict`` events for the
     codex app-server shape; a consumer must accept both item types.
 
+    The child is started by `procend.start_tree`, so its whole tree is ended
+    by identity — its job, its process group — and within a stop budget.
+
     Everything after `Popen` runs with a child alive and is therefore inside a
     guard of its own, ending it if the function does not get to return. Both
     runners wrap their whole render loop in `try/finally: reap_agent_process`,
@@ -453,7 +461,7 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
     if on_stdin:
         kwargs["stdin"] = subprocess.PIPE
 
-    proc = subprocess.Popen(runtime_argv(argv, provider), **kwargs)
+    proc = start_tree(runtime_argv(argv, provider), **kwargs)
     try:
         if on_stdin:
             payload = user_message_line(prompt)
@@ -593,8 +601,8 @@ def reap_agent_process(proc) -> None:
     Ctrl+C raises nothing (`ctrlc`); outside one — an embedder calling
     `streamrender.run_agent_streaming` itself — this runs on the MAIN thread,
     the one Ctrl+C lands on, inside the handler for the first Ctrl+C, and the
-    ending it performs can take a few seconds (`procend.REAP_GRACE_S` twice over, plus
-    `taskkill`). A second press during that window would otherwise escape the
+    ending it performs can take a few seconds (`procend.REAP_GRACE_S` twice
+    over outside a stop budget). A second press during that window would otherwise escape the
     `finally` and replace the first press's interrupt with a traceback — while
     the child it interrupted stays alive, which is precisely what the
     impatient second press was asking to end. So it is absorbed: the caller is

@@ -29,7 +29,7 @@ import time
 from typing import Callable, Optional, Union
 
 from . import wire
-from .procend import end_unless_exited
+from .procend import end_unless_exited, start_tree
 
 # The bound on each startup request that starts nothing of its own: the
 # handshake (`initialize`, timed from the spawn, so the CLI's own start through
@@ -86,14 +86,18 @@ class RpcError(RuntimeError):
 
 
 def spawn(argv: list, *, cwd: Optional[str] = None, env: Optional[dict] = None,
-          merge_stderr: bool = False, **options) -> subprocess.Popen:
+          merge_stderr: bool = False, owned: bool = False,
+          **options) -> subprocess.Popen:
     """Start an app-server child with UTF-8 text pipes on all three streams.
 
     `merge_stderr` folds stderr into stdout, where it reaches the reader as raw
     lines (the loop's renderer shows them); otherwise `Connection` drains it
     into `stderr_lines` for the error that reports the server's death.
-    `options` go to `Popen` as given (`creationflags`)."""
-    return subprocess.Popen(
+    `owned` starts it under a lifetime the OS owns (`procend.start_tree`), for
+    a caller that puts it in no job of its own. `options` go to `Popen` as
+    given (`creationflags`)."""
+    start = start_tree if owned else subprocess.Popen
+    return start(
         argv, cwd=cwd, env=env,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,

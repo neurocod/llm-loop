@@ -143,7 +143,7 @@ class _QuotaServer:
 
     def __init__(self, argv: List[str], first_id: int):
         self.connection = appserver.Connection(
-            appserver.spawn(argv, merge_stderr=True), first_id=first_id)
+            appserver.spawn(argv, merge_stderr=True, owned=True), first_id=first_id)
         self.proc = self.connection.proc
         self.started = time.monotonic()
 
@@ -171,7 +171,7 @@ class _QuotaServer:
 
         On Windows `proc` is usually the npm shim's `cmd.exe` and the CLI a
         grandchild, so the escalation goes through the shared tree-aware
-        `procend.end_process_tree` (`taskkill /T`), not the shim-only
+        `procend.end_process_tree` (the server's own job), not the shim-only
         `terminate`. stdout is the connection's pump's to close
         (`appserver.Connection._pump_stdout`).
         """

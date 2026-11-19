@@ -61,36 +61,38 @@ _TREE = ("import subprocess, sys, time\n"
 
 # The run: starts the tree on its own stdout, ends it on a spent budget, and
 # leaves AT ONCE (`os._exit`: no shutdown, no thread finishes) — the moment
-# an unattended run's ending is spent and it exits.
-_RUN = ("import os, subprocess, sys, time\n"
+# an unattended run's ending is spent and it exits. It prints how long the
+# ending took.
+_RUN = ("import os, sys, time\n"
         "from llm_loop import procend, stopclock\n"
         "marker, tree = sys.argv[1], sys.argv[2]\n"
-        "child = subprocess.Popen([sys.executable, '-c', tree, marker],"
+        "child = procend.start_tree([sys.executable, '-c', tree, marker],"
         " stdout=sys.stdout)\n"
         "while not os.path.exists(marker):\n"
         "    time.sleep(0.05)\n"
+        "started = time.monotonic()\n"
         "with stopclock.ending(time.monotonic()):\n"
         "    procend.end_process_tree(child)\n"
-        "print('left', flush=True)\n"
+        "print('left', round(time.monotonic() - started, 3), flush=True)\n"
         "os._exit(0)\n")
 
-# How long the tree may take to end once the run has left: a `taskkill /T`
-# over two processes, well under a second on an idle machine; ten times that
-# for a loaded one.
+# How long the tree may take to end once the run has left: a job's
+# termination or a group's SIGKILL over two processes, well under a second
+# on an idle machine; ten times that for a loaded one.
 TREE_END_S = 10.0
 
 
-@pytest.mark.skipif(os.name != "nt", reason="the tree is ended by taskkill /T; "
-                    "on POSIX the escalation ends the child alone")
 def test_a_run_that_leaves_on_a_spent_budget_leaves_no_descendant(tmp_path):
-    """A spent budget does not cut the tree's ending short: it is NOT
-    budget-bounded (`procend.end_process_tree` says why), so the run that
-    leaves right after it leaves no descendant behind.
+    """A spent budget ends a `procend.start_tree` tree without waiting — its
+    job (Windows) or its process group (POSIX) is ended by identity, so
+    nothing is handed to a reaper that could outlive the run — and the run
+    that leaves right after it leaves no descendant behind.
 
     The run, its child and the grandchild all hold one pipe: its EOF is the
-    proof that none of them is left. A daemon handed the ending dies with the
-    run before it starts anything; a root killed before `taskkill /T` walked
-    the tree orphans the grandchild — either keeps the pipe open."""
+    proof that none of them is left. A root killed alone orphans the
+    grandchild, which keeps the pipe open. (On Windows the job's closing at
+    the run's exit would end the tree too; `test_procend_tree.py` pins the
+    ending itself, in process.)"""
     source = str(Path(procend.__file__).resolve().parents[1])
     env = dict(os.environ, PYTHONPATH=source)
     run = subprocess.Popen([sys.executable, "-c", _RUN,
@@ -107,6 +109,8 @@ def test_a_run_that_leaves_on_a_spent_budget_leaves_no_descendant(tmp_path):
         assert not reader.is_alive(), (
             "a descendant outlived the run and still holds the pipe")
         assert out and b"left" in out[0], out
+        took = float(out[0].split(b"left", 1)[1].split()[0])
+        assert took < NO_WAIT_S, f"the ending waited on a spent budget: {took} s"
     finally:
         run.wait(timeout=10)
 

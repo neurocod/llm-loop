@@ -20,19 +20,12 @@ An HTTP read, whose timeout restarts per socket operation and skips the DNS
 lookup, cannot be cut short in place: it runs whole on a daemon worker the
 ending joins for what is left (`usage.UsageSource.query_usage_json`).
 
-What a deadline here does NOT bound:
-
-  * ending a child's process tree (`procend.end_process_tree`): up to the
-    grace twice plus `taskkill`, 6 s per tree past the budget at worst. A
-    hand-off that does not wait kills by numeric pid, which can hit a reused
-    pid; the safe fix is a process lifetime the OS owns, not built yet (see
-    there);
-  * a print into a console that has stopped draining (a selection freezing a
-    Windows console, a pipe nobody reads). The write blocks the very thread
-    that would ask `within`, and the stream has no timeout to give it; a
-    thread to print on only moves the hang to the interpreter's exit flush.
-    The run's console owner bounds what IT writes (`parallel._close_console`),
-    and nothing bounds the ending's own lines.
+What a deadline here does NOT bound: a print into a console that has stopped
+draining (a selection freezing a Windows console, a pipe nobody reads). The
+write blocks the very thread that would ask `within`, and the stream has no
+timeout to give it; a thread to print on only moves the hang to the
+interpreter's exit flush. The run's console owner bounds what IT writes
+(`parallel._close_console`), and nothing bounds the ending's own lines.
 """
 
 import contextlib
