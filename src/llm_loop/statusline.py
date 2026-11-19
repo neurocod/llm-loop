@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence,
                     Tuple)
 
-from . import (cmdline, console, diaglog, gitpush, stopchannel,
+from . import (cmdline, console, diaglog, gitpush, stopchannel, stopclock,
                termio, textwidth, wire)
 
 from .painter import (CONSOLE_SNAPSHOT_TICKS, INPUT_REFRESH_SECONDS,
@@ -2279,7 +2279,8 @@ class QuotaRefresher:
         self._wake.set()
         thread, self._thread = self._thread, None
         if thread is not None:
-            thread.join(timeout=1.0)
+            # Inside an ending, no longer than its budget has left (`stopclock`).
+            thread.join(timeout=stopclock.within(1.0))
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -2687,7 +2688,8 @@ class StatusApp:
         steps = [self._remove_emergency_restore,
                  *(functools.partial(stop_service, s) for s in self._services),
                  self._stop_input,
-                 lambda: self.painter.close(PAINTER_JOIN_SECONDS)]
+                 lambda: self.painter.close(
+                     stopclock.within(PAINTER_JOIN_SECONDS))]
         first: Optional[BaseException] = None
         for step in steps:
             try:

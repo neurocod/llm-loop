@@ -39,11 +39,12 @@ tests/test_package_privacy.py.
 
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
 
 # The one thing this module prints rather than computes: a reset MOMENT in the
 # same wording every other line of the run uses for one. `_fmt_reset` below is
@@ -64,10 +65,8 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 CREDENTIALS_FILENAME = ".credentials.json"
 HTTP_TIMEOUT = 10        # seconds — the CLI uses 5s; a little slack for a busy box
 HTTP_ATTEMPTS = 2        # one retry: a dropped connection shouldn't blind the gate
-# Inside an ending (`stopclock`) each attempt's timeout and the pause between
-# them take at most what the ending's budget has left, and a spent budget
-# starts no further attempt. The DNS lookup is outside `urlopen`'s timeout —
-# see `stopclock` for why the budget does not cure it.
+# Inside an ending the whole read is bounded by its budget instead
+# (`UsageSource.query_usage_json`).
 
 # The reading is cheap (no tokens, ~0.3s), so the cache exists only to collapse
 # the several reads that happen at one instant (limit check + log snapshot) into
@@ -386,28 +385,54 @@ class UsageSource:
             "anthropic-beta": "oauth-2025-04-20",
             "User-Agent": "llm-loop",
         })
+        remaining = stopclock.left()
+        if remaining is None:
+            data, failure = self._fetch(request)
+        elif remaining <= 0:
+            data, failure = None, self._no_answer("the stop budget is spent")
+        else:
+            # Inside an ending the WHOLE read is bounded, not each socket
+            # operation: `urlopen`'s timeout restarts at every connect, header
+            # and body chunk, and does not cover the DNS lookup at all. The
+            # read runs on a daemon worker joined for what is left; one that
+            # outlives the join is abandoned and ends on its own limits
+            # (a socket timeout, the resolver's retries), its result unread.
+            box = []
+            worker = threading.Thread(
+                target=lambda: box.append(self._fetch(request)),
+                name="usage-read", daemon=True)
+            worker.start()
+            worker.join(remaining)
+            data, failure = box[0] if box else (
+                None, self._no_answer(f"no answer within the stop budget's "
+                                      f"{remaining:.3g} s"))
+        if failure is not None:
+            print_line(failure)
+        return data
+
+    def _no_answer(self, last: str) -> str:
+        return f"  · no usage figures: {self._url()} did not answer ({last})"
+
+    def _fetch(self, request) -> Tuple[Optional[dict], Optional[str]]:
+        """Every attempt at `request`, each on its own limits: `(data, None)`,
+        or `(None, the line saying why not)` — returned, not printed, so a
+        read the ending gave up on says nothing after it."""
         last = ""
         for attempt in range(HTTP_ATTEMPTS):
-            if stopclock.spent():
-                last = last or "the stop budget is spent"
-                break
             try:
-                with urllib.request.urlopen(
-                        request, timeout=stopclock.within(HTTP_TIMEOUT)) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as resp:
+                    return json.loads(resp.read().decode("utf-8")), None
             except urllib.error.HTTPError as e:
                 if e.code == 401:
-                    print_line("  · no usage figures: the stored OAuth token "
-                               "was rejected (401) — it should refresh on the "
-                               "next `claude` run.")
-                    return None
+                    return None, ("  · no usage figures: the stored OAuth token "
+                                  "was rejected (401) — it should refresh on the "
+                                  "next `claude` run.")
                 last = f"HTTP {e.code} {e.reason}"
             except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
                 last = str(e)
             if attempt + 1 < HTTP_ATTEMPTS:
-                time.sleep(stopclock.within(1))
-        print_line(f"  · no usage figures: {self._url()} did not answer ({last})")
-        return None
+                time.sleep(1)
+        return None, self._no_answer(last)
 
     def get_usage(self, cache_value: bool = True) -> Usage:
         """Return the current Usage snapshot, reusing a cached reading when fresh.

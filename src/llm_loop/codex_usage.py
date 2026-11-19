@@ -196,7 +196,11 @@ _open_sources: "set[CodexUsageSource]" = set()
 @atexit.register
 def _close_open_sources() -> None:
     for source in list(_open_sources):
-        source.close()
+        # Under the deadline of the ending that already gave this close up,
+        # if one did: interpreter exit is that ending's last step, not a new
+        # unbounded wait for the query it would not wait for.
+        with stopclock.ending(source._close_deadline):
+            source.close()
 
 
 def _no_figures(reason) -> None:
@@ -236,6 +240,11 @@ class CodexUsageSource:
         self._cached: Optional[Usage] = None
         self._cached_ts = 0.0
         self._lock = threading.Lock()
+        # Guards the close mark against the lock's release (`_release`).
+        self._handoff = threading.Lock()
+        # The deadline of the ending whose `close` could not wait, kept for
+        # the exit hook's close; None when no close has had to give up.
+        self._close_deadline: Optional[float] = None
         self._server: Optional[_QuotaServer] = None
         self._next_id = 0
         self._closed = False
@@ -311,6 +320,28 @@ class CodexUsageSource:
             return self._lock.acquire()
         return self._lock.acquire(timeout=wait)
 
+    def _release(self) -> None:
+        """Release the lock — and, once the source is closed, take its server
+        and stop it: EVERY path that held the lock comes here, so a `close`
+        that could not wait for the holder hands the stop to it.
+
+        The hand-off is atomic: `close` marks the source closed under
+        `_handoff`, and the holder reads that mark and lets the lock go under
+        it too. Either the holder sees the mark and stops the server, or it
+        had let go before the mark and `close` then gets the lock itself;
+        nothing slips between a check and a release.
+        """
+        with self._handoff:
+            closed = self._closed
+            server = None
+            if closed:
+                server, self._server = self._server, None
+            self._lock.release()
+        if closed:
+            if server is not None:
+                server.stop()
+            _open_sources.discard(self)
+
     def get_usage(self, cache_value: bool = True) -> Usage:
         if not self._acquire():
             _no_figures("the stop budget ran out waiting for a query in flight")
@@ -324,10 +355,6 @@ class CodexUsageSource:
                 # A status-line poll racing the epilogue keeps the last figures.
                 return self._cached or EMPTY_USAGE
             data = self._query_locked()
-            if self._closed:
-                # Closed while this query held the lock (`close` under a spent
-                # budget): the server is this query's to stop.
-                self._drop_server()
             if data is None:
                 return EMPTY_USAGE
             snapshot = parse_rate_limits(data)
@@ -335,29 +362,31 @@ class CodexUsageSource:
             self._cached_ts = now
             return snapshot
         finally:
-            self._lock.release()
+            self._release()
 
     def invalidate(self) -> None:
-        with self._lock:
+        self._lock.acquire()
+        try:
             self._cached = None
             self._cached_ts = 0.0
+        finally:
+            self._release()
 
     def close(self) -> None:
         """Stop the quota server; later queries read nothing. Idempotent.
 
         Waits for a query in flight (bounded by `timeout`) rather than
         killing the process under it — inside an ending, for no longer than
-        its budget has left. A close that cannot wait marks the source closed
-        and leaves the server to that query, which stops it as it returns;
-        the source stays in `_open_sources` so the exit hook still reaps it
-        should the query outlive the ending.
+        its budget has left. A close that cannot wait leaves the stop to the
+        holder (`_release`) and keeps the ending's deadline, so the exit hook
+        that closes it again does not wait past that ending either. Should
+        the holder be a daemon the exit freezes first, the server still ends:
+        its stdin closes with this process, and it exits on EOF
+        (`_QuotaServer.stop`).
         """
+        with self._handoff:
+            self._closed = True
         if not self._acquire():
-            self._closed = True
+            self._close_deadline = stopclock.deadline()
             return
-        try:
-            self._closed = True
-            self._drop_server()
-        finally:
-            self._lock.release()
-        _open_sources.discard(self)
+        self._release()

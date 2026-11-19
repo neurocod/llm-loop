@@ -7,6 +7,7 @@ bounded so that a mutation reverting the wiring fails on the elapsed time in
 seconds, not by hanging the suite.
 """
 
+import os
 import subprocess
 import sys
 import threading
@@ -90,30 +91,56 @@ def test_ending_a_process_tree_on_a_spent_budget_does_not_wait(monkeypatch):
         f"(waits {child.waits})")
 
 
-def test_a_spent_budget_still_ends_the_tree():
-    """Only the waiting is skipped: the child is ended all the same."""
-    child = subprocess.Popen([sys.executable, "-c",
-                              "import time; time.sleep(60)"])
+# A child that starts a grandchild sharing its stdout, says so, and sleeps:
+# the shape of an npm shim in front of the provider CLI.
+_TREE = ("import subprocess, sys, time\n"
+         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+         "print('grandchild up', flush=True)\n"
+         "time.sleep(60)\n")
+
+# How long the tree may take to end once its ending was started: a
+# `taskkill /T` over two processes, well under a second on an idle machine;
+# ten times that for a loaded one.
+TREE_END_S = 10.0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the tree is ended by taskkill /T")
+def test_a_spent_budget_still_ends_the_whole_tree():
+    """Only the waiting is skipped: the grandchild is ended too.
+
+    Killing the root before `taskkill /T` has walked its children orphans
+    them, and the orphan keeps the child's stdout open — the pipe's EOF is
+    the proof that nobody holding it is left."""
+    child = subprocess.Popen([sys.executable, "-c", _TREE],
+                             stdout=subprocess.PIPE)
     try:
+        assert child.stdout.readline().strip() == b"grandchild up"
         started = time.monotonic()
         with spent():
             procend.end_process_tree(child)
         elapsed = time.monotonic() - started
         assert elapsed < NO_WAIT_S, (
             f"the escalation waited on a spent budget: {elapsed:.2f} s")
-        # Still ENDED, only not waited for: the kill was issued.
-        assert child.wait(timeout=10) is not None
+        rest = []
+        reader = threading.Thread(target=lambda: rest.append(child.stdout.read()),
+                                  daemon=True)
+        reader.start()
+        reader.join(TREE_END_S)
+        assert not reader.is_alive(), (
+            "a descendant outlived the ending and still holds the pipe")
     finally:
-        if child.poll() is None:
-            child.kill()
-            child.wait()
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(child.pid)],
+                       capture_output=True)
+        child.kill()
+        child.wait()
 
 
 class _HeldLock:
     """Holds `lock` on another thread until released — a query in flight."""
 
-    def __init__(self, lock):
+    def __init__(self, lock, hold_s=30.0):
         self._lock = lock
+        self._hold_s = hold_s
         self._release = threading.Event()
         self._held = threading.Event()
         self._thread = threading.Thread(target=self._hold, daemon=True)
@@ -121,7 +148,7 @@ class _HeldLock:
     def _hold(self):
         with self._lock:
             self._held.set()
-            self._release.wait(timeout=30)
+            self._release.wait(timeout=self._hold_s)
 
     def __enter__(self):
         self._thread.start()
@@ -182,6 +209,67 @@ def test_closing_the_codex_source_does_not_wait_for_a_query_in_flight():
     source.close()                            # the exit hook's second close
 
 
+def test_the_exit_hook_keeps_the_deadline_of_a_close_that_gave_up():
+    """The source a spent close left open is closed again at interpreter exit
+    (`_close_open_sources`); that close must not wait for the query in flight
+    the ending would not wait for. The query is held 3 s, so a hook that
+    waits fails on time rather than hanging."""
+    source = _codex_source([])
+    try:
+        with _HeldLock(source._lock, hold_s=3.0):
+            with spent():
+                source.close()
+            started = time.monotonic()
+            codex_usage._close_open_sources()
+            elapsed = time.monotonic() - started
+        assert elapsed < NO_WAIT_S, (
+            f"the exit hook waited for the query in flight: {elapsed:.2f} s")
+    finally:
+        codex_usage._open_sources.discard(source)
+
+
+class _Server:
+    """A quota server stand-in that records being stopped."""
+
+    def __init__(self):
+        self.stopped = threading.Event()
+
+    def stop(self):
+        self.stopped.set()
+
+
+def test_a_close_that_cannot_wait_hands_the_stop_to_the_holder(monkeypatch):
+    """The query in flight stops the server as it lets go of the lock, after
+    a spent-budget close marked the source closed — on the release itself,
+    whichever path the holder took, so no check-then-release window leaves
+    the server running."""
+    source = _codex_source([])
+    server = source._server = _Server()
+    holding = threading.Event()
+    finish = threading.Event()
+
+    def query():
+        holding.set()
+        finish.wait(timeout=30)
+        return None
+
+    monkeypatch.setattr(source, "_query_locked", query)
+    holder = threading.Thread(target=lambda: source.get_usage(cache_value=False),
+                              daemon=True)
+    holder.start()
+    try:
+        assert holding.wait(timeout=5)
+        with spent():
+            source.close()
+        assert not server.stopped.is_set(), "closed under the holder"
+    finally:
+        finish.set()
+        holder.join(timeout=5)
+    assert server.stopped.wait(timeout=5), (
+        "the holder let go of the lock and left the server running")
+    assert source not in codex_usage._open_sources
+
+
 def test_the_claude_snapshot_on_a_spent_budget_makes_no_request(monkeypatch):
     """`usage.HTTP_TIMEOUT` x HTTP_ATTEMPTS and the pause between them."""
     requests = []
@@ -197,18 +285,35 @@ def test_the_claude_snapshot_on_a_spent_budget_makes_no_request(monkeypatch):
     assert requests == [], "a usage request was made on a spent budget"
 
 
-def test_the_claude_snapshot_is_given_only_what_is_left(monkeypatch):
-    timeouts = []
+class _TricklingResponse:
+    """A body that arrives a byte at a time, each well inside a per-socket
+    timeout: no single operation ever times out, the whole read takes 3 s."""
 
-    def refuse(request, timeout):
-        timeouts.append(timeout)
-        raise OSError("staged: refused")
+    def __enter__(self):
+        return self
 
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        for _ in range(30):
+            time.sleep(0.1)
+        return b"{}"
+
+
+def test_the_claude_snapshot_is_bounded_whole_not_per_socket_operation(
+        monkeypatch, capsys):
     monkeypatch.setattr(usage, "oauth_token", lambda: "token")
-    monkeypatch.setattr(usage.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(usage.urllib.request, "urlopen",
+                        lambda request, timeout: _TricklingResponse())
+    started = time.monotonic()
     with stopclock.ending(time.monotonic() + 0.3):
-        usage.UsageSource().query_usage_json()
-    assert timeouts and all(t <= 0.3 for t in timeouts), timeouts
+        data = usage.UsageSource().query_usage_json()
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.3 + NO_WAIT_S, (
+        f"the snapshot outlasted its budget on a trickling body: {elapsed:.2f} s")
+    assert data is None
+    assert "within the stop budget" in capsys.readouterr().out
 
 
 def test_the_console_drain_on_a_spent_budget_does_not_wait(monkeypatch, capsys):
@@ -291,3 +396,56 @@ def test_the_pusher_closes_on_a_spent_budget_without_waiting(monkeypatch,
     assert pusher.timeouts and all(t == 0 for t in pusher.timeouts), (
         f"the pusher was waited for on a spent budget: {pusher.timeouts}")
     assert "did not finish within 0 s" in capsys.readouterr().err
+
+
+def test_an_explicit_exit_keeps_its_budget_through_the_teardown(monkeypatch):
+    """`boundary.exit` reaches `__exit__` as its own SystemExit, with the run
+    already closed: the releases and the last pusher close there still spend
+    the exit's budget rather than running unbounded after it."""
+    monkeypatch.setattr(runlifecycle, "UNWIND_PUSH_DEADLINE_S", 0.0)
+    seen = []
+
+    class _Held:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            seen.append(stopclock.left())
+
+    pusher = _Pusher()
+    boundary = runlifecycle.RunBoundary(_ctx(), counts=lambda: (0, 0),
+                                        pusher=pusher)
+    with pytest.raises(SystemExit):
+        with boundary:
+            boundary.hold(_Held())
+            boundary.exit(3, ending="staged stop", reason="staged stop")
+    assert seen == [0.0], (
+        f"the held resources were released outside the exit's budget: {seen}")
+    assert pusher.timeouts and all(t == 0 for t in pusher.timeouts), (
+        f"the pusher was waited for past the exit's budget: {pusher.timeouts}")
+
+
+@pytest.fixture
+def stuck_push(monkeypatch):
+    """An exit push that never comes back on its own (held 5 s at most)."""
+    release = threading.Event()
+    monkeypatch.setattr(runlifecycle.projectroot, "project_dir", lambda: ".")
+    monkeypatch.setattr(runlifecycle, "final_git_push",
+                        lambda *args, **kwargs: release.wait(timeout=5))
+    yield
+    release.set()
+
+
+@pytest.mark.parametrize("inner", [None, 30.0], ids=["no budget", "longer"])
+def test_an_inner_close_run_never_outwaits_an_outer_ending(stuck_push, inner,
+                                                           capsys):
+    """The push waits for the EFFECTIVE deadline: an outer ending of 0.3 s
+    bounds an inner `close_run` that has no budget, or a longer one."""
+    budget = None if inner is None else runlifecycle.StopBudget(inner)
+    started = time.monotonic()
+    with stopclock.ending(time.monotonic() + 0.3):
+        runlifecycle.close_run(_ctx(), usages=[], budget=budget)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.3 + NO_WAIT_S, (
+        f"the inner push outwaited the outer ending: {elapsed:.2f} s")
+    assert "did not finish within" in capsys.readouterr().err

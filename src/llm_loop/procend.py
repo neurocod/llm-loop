@@ -9,6 +9,7 @@ an EOF to exit on) and hands the rest to `end_process_tree`.
 
 import os
 import subprocess
+import threading
 
 from . import stopclock
 
@@ -18,10 +19,8 @@ from . import stopclock
 # end the first one: the parallel runner calls it from a thread that is ALREADY
 # dying, so nothing above it is left to notice a wait that never returns.
 REAP_GRACE_S = 2.0
-#
-# Inside an ending (`stopclock`) each of those waits takes at most what is left
-# of the ending's budget. A spent budget still ENDS the tree — `taskkill` and
-# the kill are issued — and only the waiting is skipped.
+# Inside an ending the caller waits for no more than its budget has left, and
+# the tree is still ended whole (`end_process_tree` says how).
 
 
 def ask_agent_process_to_end(proc) -> None:
@@ -47,17 +46,9 @@ def ask_agent_process_to_end(proc) -> None:
     mid-write) is charged on Windows whichever spelling is used.
     """
     if os.name == "nt":
-        argv = ["taskkill", "/F", "/T", "/PID", str(proc.pid)]
-        grace = stopclock.within(REAP_GRACE_S)
         try:
-            if grace <= 0:
-                # The ending's budget is spent: start the tree's ending and do
-                # not wait for it. `run` with no time left would kill the
-                # taskkill it started before it acted, ending only the shim.
-                subprocess.Popen(argv, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                return
-            done = subprocess.run(argv, capture_output=True, timeout=grace)
+            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                  capture_output=True, timeout=REAP_GRACE_S)
             if done.returncode == 0:
                 return
             # Non-zero means the tree was NOT ended (no such pid, access
@@ -90,15 +81,38 @@ def end_process_tree(proc) -> None:
     """Ask the child (tree) to end, wait, kill, wait — bounded, never raises.
 
     At most `REAP_GRACE_S` for the ask's `taskkill` plus two waits of
-    `REAP_GRACE_S` each, and inside an ending no more than its budget has
-    left (`stopclock.within`). `OSError` from `wait` means the OS has already
+    `REAP_GRACE_S` each. `OSError` from `wait` means the OS has already
     reclaimed the handle (Windows raises it there), so there is nothing left to
     end; `KeyboardInterrupt` is NOT absorbed here — that is the caller's call
     (`providers.reap_agent_process`).
+
+    Inside an ending (`stopclock`) the caller waits no longer than the budget
+    has left, but the sequence is NOT cut short: a daemon worker runs it whole,
+    each step on its own limit, and the caller joins it for what is left. The
+    steps cannot be shortened in place — `taskkill /T` finds the tree through
+    the root's parent links, so killing the root before taskkill has walked
+    them (a wait cut to zero) orphans the descendants still holding the
+    child's pipes, and a `taskkill` given a fraction of its limit is killed
+    mid-walk. A `taskkill` the worker started finishes on its own even if the
+    process exits under it, being a process; a worker the exit catches
+    BEFORE it started one leaves the tree running — the price of not waiting,
+    paid only when the budget has under a few milliseconds left.
     """
+    remaining = stopclock.left()
+    if remaining is None:
+        _end_tree(proc)
+        return
+    worker = threading.Thread(target=_end_tree, args=(proc,),
+                              name="end-process-tree", daemon=True)
+    worker.start()
+    worker.join(remaining)
+
+
+def _end_tree(proc) -> None:
+    """The body of `end_process_tree`, every step on its own limit."""
     ask_agent_process_to_end(proc)
     try:
-        proc.wait(timeout=stopclock.within(REAP_GRACE_S))
+        proc.wait(timeout=REAP_GRACE_S)
     except OSError:
         return
     except subprocess.TimeoutExpired:
@@ -107,7 +121,7 @@ def end_process_tree(proc) -> None:
         except OSError:
             pass  # gone between the wait and here — `wait` below collects it
         try:
-            proc.wait(timeout=stopclock.within(REAP_GRACE_S))
+            proc.wait(timeout=REAP_GRACE_S)
         except OSError:
             return
         except subprocess.TimeoutExpired:

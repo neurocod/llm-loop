@@ -17,21 +17,17 @@ a worker or a refresher that outlives the ending is not waited for by it.
 A leaf on purpose — standard library only — so `procend`, `usage` and
 `codex_usage` reach it without importing the run's lifecycle.
 
-What a deadline here cannot cure, named because both look like waits:
+A step that cannot be cut short in place — a `taskkill` walking a tree, an
+HTTP read whose timeout restarts per socket operation and skips the DNS
+lookup — runs whole on a daemon worker the ending joins for what is left
+(`procend.end_process_tree`, `usage.UsageSource.query_usage_json`).
 
-  * a print into a console that has stopped draining (a selection freezing a
-    Windows console, a pipe nobody reads). The write blocks the very thread
-    that would ask `within`, and the stream has no timeout to give it; a
-    thread to print on only moves the hang to the interpreter's exit flush.
-    The run's console owner bounds what IT writes (`parallel._close_console`),
-    and nothing bounds the ending's own lines;
-  * the DNS lookup of the Claude usage snapshot. `urlopen`'s timeout covers
-    the connect and the reads, not `getaddrinfo`, which has no timeout in the
-    standard library and ends on the OS resolver's own retries. A spent
-    budget never STARTS the read (`usage.UsageSource.query_usage_json`), and
-    a lookup already under way runs past it; curing that means not waiting
-    for the reading thread at all — an abandoned thread per read — which no
-    stop has yet been seen to need.
+What a deadline here cannot cure: a print into a console that has stopped
+draining (a selection freezing a Windows console, a pipe nobody reads). The
+write blocks the very thread that would ask `within`, and the stream has no
+timeout to give it; a thread to print on only moves the hang to the
+interpreter's exit flush. The run's console owner bounds what IT writes
+(`parallel._close_console`), and nothing bounds the ending's own lines.
 """
 
 import contextlib
@@ -56,6 +52,12 @@ def ending(deadline: Optional[float]) -> Iterator[None]:
         yield
     finally:
         _DEADLINE.reset(token)
+
+
+def deadline() -> Optional[float]:
+    """This thread's ending deadline (`time.monotonic()`), None without one —
+    for a step deferred past the ending that must keep its bound."""
+    return _DEADLINE.get()
 
 
 def left() -> Optional[float]:

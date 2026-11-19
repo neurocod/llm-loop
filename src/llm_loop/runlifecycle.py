@@ -493,8 +493,12 @@ def _close_run(ctx: RunContext, *, usages, ending, mailbox, pusher,
 
     if ctx.dry_run:
         if pusher is not None:
-            pusher.close()
-    elif abandoned() or (budget is not None and budget.expired):
+            pusher.close(timeout=stopclock.within(None))
+    # The EFFECTIVE deadline, not `budget` alone: `close_run` published the
+    # smaller of its own and any outer ending's (`stopclock.ending`), so an
+    # inner close_run with no budget, or a longer one, cannot outwait an
+    # outer ending; a normal `end` with none waits unbounded.
+    elif abandoned() or stopclock.spent():
         # Closed so its own clock starts no further check; a git call it has
         # in flight finishes on its own as a daemon, and `abort` keeps
         # anything queued behind that from starting git. Bounded: an owner's
@@ -603,12 +607,22 @@ class PushWait(Enum):
     ABANDONED = "abandoned"     # the operator's Ctrl+C gave it up
 
 
+def _effective_left(budget: Optional[StopBudget]) -> Optional[float]:
+    """What is left of `budget` and of the thread's ending (`stopclock`),
+    whichever is less; None only when neither bounds the wait."""
+    bounds = [left for left in (None if budget is None else budget.left(),
+                                stopclock.left()) if left is not None]
+    return min(bounds) if bounds else None
+
+
 def _say_push_given_up(outcome: PushWait,
                        budget: Optional[StopBudget]) -> None:
     if outcome is PushWait.ABANDONED:
         print(ABANDONED_PUSH)
         return
-    print(f"  ⚠ the exit push did not finish within {budget.seconds:g} s "
+    within = ("the stop budget" if budget is None or budget.seconds is None
+              else f"{budget.seconds:g} s")
+    print(f"  ⚠ the exit push did not finish within {within} "
           f"and is abandoned: no further git starts, the one running "
           f"finishes on its own — what is still local stays local.",
           file=sys.stderr)
@@ -622,7 +636,8 @@ def _wait_for_exit_push(pusher: OwnerThread, push,
 
     Queued behind a push the owner has in flight, and waited for in short
     slices (EXIT_PUSH_POLL_S) so `abandoned` — the operator's Ctrl+C — is asked
-    at least that often, and never past what is left of `budget`. A wait that
+    at least that often, and never past what is left of `budget` or of an
+    outer ending (`_effective_left`). A wait that
     outlasts its first slice under a budget says so, since nobody may be
     watching to know why the run has gone quiet.
     """
@@ -633,7 +648,7 @@ def _wait_for_exit_push(pusher: OwnerThread, push,
         if abandoned():
             return PushWait.ABANDONED
         slice_s = EXIT_PUSH_POLL_S
-        left = None if budget is None else budget.left()
+        left = _effective_left(budget)
         if left is not None:
             if left <= 0:
                 return PushWait.DEADLINE
@@ -841,9 +856,13 @@ class RunBoundary:
         self._releases = contextlib.ExitStack()
         self._held = contextlib.ExitStack()
         self.closed = False
-        # The budget of an ending that unwinds the block, once `__exit__` has
-        # taken it; `unwind` spends the same one rather than starting anew.
-        self._unwind_budget: Optional[StopBudget] = None
+        # The budget of the ending under way, kept on the boundary so the
+        # steps after the door — the releases and the last pusher close in
+        # `__exit__`, reached by the door's own SystemExit — spend the same
+        # one: set by `_door` (the `exit` door, an unwound SystemExit) or by
+        # `__exit__` for an ending that unwinds the block; `unwind` spends it
+        # rather than starting anew. None for `end` and `interrupt`.
+        self._ending_budget: Optional[StopBudget] = None
 
     def __enter__(self) -> "RunBoundary":
         return self
@@ -855,8 +874,8 @@ class RunBoundary:
         # budget taken after it would announce less than the stop lasts.
         if (error is not None and not self.closed
                 and not isinstance(error, KeyboardInterrupt)):
-            self._unwind_budget = StopBudget(UNWIND_PUSH_DEADLINE_S)
-        budget = self._unwind_budget
+            self._ending_budget = StopBudget(UNWIND_PUSH_DEADLINE_S)
+        budget = self._ending_budget
         with stopclock.ending(None if budget is None else budget.deadline):
             try:
                 try:
@@ -930,18 +949,22 @@ class RunBoundary:
     def _door(self, code, *, ending: str, reason: str,
               budget: Optional[StopBudget] = None,
               heard: Optional[int] = None) -> NoReturn:
+        if budget is not None:
+            self._ending_budget = budget
         # This ending's own presses, read BEFORE the releases and the record:
         # a press during either is past them, and gives up the exit push.
         if heard is None:
             heard = ctrlc.current().presses
-        self._begin_ending()
-        iterations, completed = self.counts()
-        counts = (self.ctx.progress.record_counts(iterations, completed)
-                  if self.ctx.progress is not None else
-                  dict(iterations=iterations, completed=completed))
-        exitlog.set_reason(reason, **counts)
-        exit_run(self.ctx, code, ending=ending, budget=budget, heard=heard,
-                 **self._close_kwargs())
+        # The releases `on_ending` holds are this ending's first waits.
+        with stopclock.ending(None if budget is None else budget.deadline):
+            self._begin_ending()
+            iterations, completed = self.counts()
+            counts = (self.ctx.progress.record_counts(iterations, completed)
+                      if self.ctx.progress is not None else
+                      dict(iterations=iterations, completed=completed))
+            exitlog.set_reason(reason, **counts)
+            exit_run(self.ctx, code, ending=ending, budget=budget, heard=heard,
+                     **self._close_kwargs())
 
     def end(self, result: RunResult) -> RunResult:
         """The normal ending: `end_run` — or `interrupt`, once Ctrl+C was
@@ -984,7 +1007,7 @@ class RunBoundary:
         # Taken once: everything this ending waits for spends it — the one
         # `__exit__` took before the release, or a fresh one when `unwind` is
         # called by hand.
-        budget = self._unwind_budget or StopBudget(UNWIND_PUSH_DEADLINE_S)
+        budget = self._ending_budget or StopBudget(UNWIND_PUSH_DEADLINE_S)
         if isinstance(error, SystemExit):
             code = 0 if error.code is None else error.code
             # The first line only: `sys.exit("message")` may carry a paragraph.
