@@ -599,8 +599,10 @@ def _parser() -> argparse.ArgumentParser:
                       help=f"seconds to wait for --min before holding it anyway (default {DEFAULT_WAIT_S:.0f})")
     cap = sub.add_parser("budget", help="cap all leases together at N cores, or lift the cap (off); "
                                         "without an argument print it")
-    cap.add_argument("cores", nargs="?", type=_budget_arg, default=argparse.SUPPRESS,
-                     help="N >= 1, or off")
+    # Parsed in `main`, not by `type=`: Python before 3.11 runs the type on
+    # an absent optional positional's default too, so no default can mean
+    # "not given" there.
+    cap.add_argument("cores", nargs="?", default=None, help="N >= 1, or off")
     return parser
 
 
@@ -615,7 +617,12 @@ def main(argv: Optional[Sequence[str]] = None, *, policy: Optional[host_policy.H
         if args.action == "status":
             return status()
         if args.action == "budget":
-            return budget(getattr(args, "cores", None), change=hasattr(args, "cores"))
+            if args.cores is None:
+                return budget(None, change=False)
+            try:
+                return budget(_budget_arg(args.cores))
+            except argparse.ArgumentTypeError as exc:
+                parser.error(f"budget: {exc}")
         if args.action == "hold":
             if args.want < 1 or not 1 <= args.minimum <= args.want or args.wait_s < 0:
                 parser.error("hold: need --want >= 1, 1 <= --min <= --want, --wait >= 0")

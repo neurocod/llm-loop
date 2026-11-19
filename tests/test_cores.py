@@ -535,7 +535,7 @@ def test_a_counter_that_refuses_the_budget_fails_with_one_line(answer, said):
 
 def test_the_command_line_hands_budget_its_figure(monkeypatch):
     seen = []
-    monkeypatch.setattr(cores, "budget", lambda cores_, change: seen.append((cores_, change)) or 0)
+    monkeypatch.setattr(cores, "budget", lambda cores_, change=True: seen.append((cores_, change)) or 0)
     assert cores.main(["budget", "2"]) == 0
     assert cores.main(["budget", "off"]) == 0
     assert cores.main(["budget"]) == 0
