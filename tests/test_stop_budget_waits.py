@@ -112,27 +112,31 @@ def test_a_run_that_leaves_on_a_spent_budget_leaves_no_descendant(tmp_path):
     run = subprocess.Popen([sys.executable, "-c", _RUN,
                             str(tmp_path / "tree-up"), _TREE],
                            stdout=subprocess.PIPE, env=env)
-    out = []
-    reader = threading.Thread(target=lambda: out.append(run.stdout.read()),
-                              daemon=True)
-    reader.start()
-    # The run's own start included: the whole test took 3.5 s, measured
-    # 2026-11-19 under three other slots' load.
-    reader.join(TREE_END_S + 30)
     held = None
     try:
+        # The handle is announced first, before the tree starts, and kept
+        # before any wait: whatever fails below, `finally` closes it, so a
+        # regressed termination cannot leave the job (and the tree) alive.
+        first = run.stdout.readline()
+        assert first.startswith(b"held "), first
+        held = int(first.split()[1])
+        out = []
+        reader = threading.Thread(target=lambda: out.append(run.stdout.read()),
+                                  daemon=True)
+        reader.start()
+        # The run's own start included: the whole test took 3.5 s, measured
+        # 2026-11-19 under three other slots' load.
+        reader.join(TREE_END_S + 30)
         assert not reader.is_alive(), (
             "a descendant outlived the run and still holds the pipe")
         text = out[0] if out else b""
-        assert b"held" in text and b"left" in text, out
-        held = int(text.split(b"held", 1)[1].split()[0])
+        assert b"left" in text, out
         took = float(text.split(b"left", 1)[1].split()[0])
         assert took < NO_WAIT_S, f"the ending waited on a spent budget: {took} s"
     finally:
-        if held is None and reader.is_alive():
-            run.kill()  # it holds the job: its exit lets the tree go
         if held:
             ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(held))
+        run.kill()  # gone already on the good path (os._exit)
         run.wait(timeout=10)
 
 

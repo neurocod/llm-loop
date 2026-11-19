@@ -154,14 +154,24 @@ def test_a_ctrl_c_hook_re_entering_the_ending_neither_deadlocks_nor_uses_a_close
     first press's `ask`, or the ending's `close`. Run in a thread joined with
     a timeout, so a deadlock fails instead of hanging the suite."""
     tree = procend._JobTree(4242)
-    kernel = _ReenteringKernel(at, lambda: tree.ask(None))
+    reentered = []
+
+    def hook():
+        tree.ask(None)
+        reentered.append(True)
+
+    kernel = _ReenteringKernel(at, hook)
     monkeypatch.setattr(win_job, "kernel32", lambda: kernel)
     first = (lambda: tree.ask(None)) if at == "terminate" else tree.close
     worker = threading.Thread(target=first, daemon=True)
     worker.start()
     worker.join(5)
     assert not worker.is_alive(), f"a re-entered ending deadlocked: {kernel.calls}"
-    if at == "close":
+    assert reentered == [True], f"the staged re-entry never ran: {kernel.calls}"
+    if at == "terminate":
+        assert kernel.calls == [("terminate", 4242), ("terminate", 4242)], (
+            f"the first ask and the re-entered one did not both terminate: {kernel.calls}")
+    else:
         assert kernel.calls == [("close", 4242)], (
             f"the re-entered ask used a handle being closed: {kernel.calls}")
     tree.close()
