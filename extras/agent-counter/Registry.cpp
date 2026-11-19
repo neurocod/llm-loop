@@ -264,7 +264,11 @@ CoreSummary Registry::cores() const {
 }
 
 bool Registry::idle() const {
-	return count() == 0 && m_broker.leases().isEmpty() && m_broker.queue().isEmpty();
+	// A set budget is state only this process holds: retiring would drop it
+	// silently, and the next run would take the whole machine the operator
+	// asked to keep free.
+	return count() == 0 && m_broker.leases().isEmpty() && m_broker.queue().isEmpty()
+	       && m_broker.budget() == 0;
 }
 
 bool Registry::retireIfIdle() {
@@ -447,6 +451,8 @@ void Registry::handleLine(QLocalSocket* socket, const QByteArray& line) {
 		socket->disconnectFromServer();
 	} else if (op == QLatin1String("lease")) {
 		handleLease(socket, obj);
+	} else if (op == QLatin1String("budget")) {
+		handleBudget(socket, obj);
 	} else if (op == QLatin1String("quit")) {
 		emit quitRequested();
 	} else {
@@ -502,8 +508,10 @@ void Registry::handleLease(QLocalSocket* socket, const QJsonObject& obj) {
 	request.label = obj.value(QStringLiteral("label")).toString().left(kMaxLabelChars);
 	if (request.label.isEmpty())
 		request.label = QStringLiteral("lease");
-	request.want = std::min(*want, m_broker.total());
-	request.min = std::min(*min, m_broker.total());
+	// To the machine only: the budget's clamp is applied when the request is
+	// decided (CoreBroker::settle), so a budget changed while it waits counts.
+	request.want = std::min(*want, m_broker.machine());
+	request.min = std::min(*min, m_broker.machine());
 	request.asked = QDateTime::currentDateTime();
 	request.waitMs = static_cast<qint64>(std::min(waitS, kMaxWaitS) * 1000.0);
 	client.leaseId = request.id;
@@ -524,6 +532,50 @@ void Registry::handleLease(QLocalSocket* socket, const QJsonObject& obj) {
 		break;
 	}
 	emit changed();
+}
+
+// The budget, on the wire:
+//   -> {"op":"budget","cores":2}       a ceiling on all leases together
+//   -> {"op":"budget","cores":null}    none (the whole machine again)
+//   -> {"op":"budget"}                 only asks
+//   <- {"op":"budget","budget":2,"total":2,"machine":16,"leased":5}
+// `budget` is null when none is set; a figure above the machine is kept as
+// asked and `total` says what it means. The connection is closed after the
+// answer, as `status` is: a budget is the counter's state, not a connection's,
+// and it lasts until it is lifted or the counter exits (a set budget keeps the
+// counter from retiring idle, `idle`, so it does not vanish between runs).
+void Registry::handleBudget(QLocalSocket* socket, const QJsonObject& obj) {
+	if (m_clients[socket].leaseId != 0) {
+		// A leasing connection is kept open by `refuse`; the budget's
+		// close-after-answer would return its cores.
+		refuse(socket, QStringLiteral("lease-held"), {});
+		return;
+	}
+	const QJsonValue value = obj.value(QStringLiteral("cores"));
+	if (!value.isUndefined()) {
+		const std::optional<int> cores = positiveInt(value);
+		if (!value.isNull() && !cores) {
+			refuse(socket, QStringLiteral("bad-budget"),
+			       {{QStringLiteral("detail"),
+			         QStringLiteral("cores is a whole number >= 1, or null for no budget")}});
+			return;
+		}
+		m_broker.setBudget(cores.value_or(0));
+		// A lifted or raised budget may let the queue's head in now.
+		settleLeases();
+	}
+	reply(socket, {{QStringLiteral("op"), QStringLiteral("budget")},
+	               {QStringLiteral("budget"), budgetValue()},
+	               {QStringLiteral("total"), m_broker.total()},
+	               {QStringLiteral("machine"), m_broker.machine()},
+	               {QStringLiteral("leased"), m_broker.leased()}});
+	socket->disconnectFromServer();
+	// The idle timer in main.cpp is re-armed or stopped only on `changed`.
+	emit changed();
+}
+
+QJsonValue Registry::budgetValue() const {
+	return m_broker.budget() > 0 ? QJsonValue(m_broker.budget()) : QJsonValue(QJsonValue::Null);
 }
 
 void Registry::reply(QLocalSocket* socket, const QJsonObject& message) {
@@ -613,6 +665,8 @@ QJsonObject Registry::coreStatus() const {
 		                           static_cast<double>(request.asked.secsTo(now))}});
 	return QJsonObject{
 	    {QStringLiteral("total"), m_broker.total()},
+	    {QStringLiteral("machine"), m_broker.machine()},
+	    {QStringLiteral("budget"), budgetValue()},
 	    {QStringLiteral("leased"), m_broker.leased()},
 	    {QStringLiteral("free"), m_broker.freeCores()},
 	    {QStringLiteral("measured"), m_broker.measured()},

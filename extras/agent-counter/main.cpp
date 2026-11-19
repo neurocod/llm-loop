@@ -113,9 +113,10 @@ int runClient(bool wantStatus, bool jsonStatus = false) {
 	// read as they always did.
 	const QJsonObject cores = answer.value(QStringLiteral("cores")).toObject();
 	if (!cores.isEmpty()) {
-		printf("cores %d/%d leased, %d free, %.1f foreign\n",
+		printf("cores %d/%d leased%s, %d free, %.1f foreign\n",
 		       cores.value(QStringLiteral("leased")).toInt(),
 		       cores.value(QStringLiteral("total")).toInt(),
+		       cores.value(QStringLiteral("budget")).isDouble() ? " (budget)" : "",
 		       cores.value(QStringLiteral("free")).toInt(),
 		       cores.value(QStringLiteral("foreign")).toDouble());
 		for (const QJsonValue& value : cores.value(QStringLiteral("leases")).toArray()) {

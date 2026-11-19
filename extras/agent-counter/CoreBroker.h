@@ -13,13 +13,17 @@
 //     its head only — `settle`;
 //   * a running lease is never shrunk — `settle`;
 //   * the head, when it cannot get its `min`, waits up to its own `wait` and
-//     then is granted `min` anyway, marked forced — `settle`.
+//     then is granted `min` anyway, marked forced — `settle`;
+//   * an optional budget caps what all leases together may hold, without
+//     taking back what is already held — `setBudget`.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #include <QDateTime>
 #include <QString>
 #include <QVector>
+
+#include <algorithm>
 
 // One running lease. `cores` never changes after the grant.
 struct CoreLease {
@@ -59,9 +63,23 @@ public:
 	// for last minutes, so reacting within 5 s costs them nothing.
 	static constexpr int kWindowSamples = 5;
 
-	explicit CoreBroker(int totalCores);
+	explicit CoreBroker(int machineCores);
 
-	int total() const { return m_total; }
+	// The cores leases may share: the budget when one is set, else the
+	// machine. Every grant, clamp and badge figure reads this one.
+	int total() const { return m_budget > 0 ? std::min(m_budget, m_machine) : m_machine; }
+	// The machine's logical cores: what the meter's idle fraction is OF.
+	int machine() const { return m_machine; }
+	// The operator's ceiling on all leases together, 0 = none (`/testSlow`:
+	// the human is using the machine, heavy runs keep to 2 cores). It is a cap
+	// on LEASES, not a smaller machine: foreign load is still measured against
+	// the whole machine, because the human's own load is exactly what the
+	// budget makes room for — subtracting it from 2 as well would leave
+	// nothing and force every run. A budget below what is already leased
+	// takes nothing back (a lease is baked into a child's `-j`, `settle`); it
+	// only grants nothing until the leases fall under it.
+	void setBudget(int cores) { m_budget = std::max(0, cores); }
+	int budget() const { return m_budget; }
 
 	// One meter interval: the idle fraction of the whole machine, in [0, 1]
 	// (clamped: a meter rounding past either end must not mint or destroy
@@ -92,7 +110,8 @@ public:
 	// lease's use BEYOND its size). 0 when unmeasured.
 	double foreignCores() const;
 	int leased() const;
-	// floor(total - leased - foreign), never below 0. A lease is reserved
+	// floor(min(machine - foreign, total) - leased), never below 0: without a
+	// budget, floor(machine - leased - foreign). A lease is reserved
 	// WHOLE, whatever it burns right now: a leaseholder between phases will
 	// burn what it holds again, and a just-granted child has not started at
 	// all. So an 8-core lease using 1 core beside 4 cores of foreign load
@@ -100,8 +119,9 @@ public:
 	// is kept back for the human in v1: nothing has measured one.
 	int freeCores() const;
 
-	// Queue a request (validated by the caller: 1 <= min <= want, both
-	// already clamped to total). Grants happen only in `settle`.
+	// Queue a request (validated by the caller: 1 <= min <= want). Its
+	// counts are clamped to `total` when it is decided, not here: a budget set
+	// or lifted while it waits applies to it. Grants happen only in `settle`.
 	void request(const CoreRequest& request);
 	// The client left: its lease or its place in the queue goes.
 	void release(quint64 id);
@@ -112,8 +132,9 @@ public:
 	const QVector<CoreRequest>& queue() const { return m_queue; }
 
 private:
-	int m_total;
-	QVector<double> m_idle;     // idle fractions, oldest first
+	int m_machine;
+	int m_budget = 0;
+	QVector<double> m_idle;    // idle fractions, oldest first
 	QVector<double> m_foreign;  // foreign cores of the same intervals
 	QVector<CoreLease> m_leases;
 	QVector<CoreRequest> m_queue;

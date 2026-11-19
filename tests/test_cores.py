@@ -494,7 +494,57 @@ def test_the_command_line_hands_hold_its_ask(monkeypatch):
     assert seen == [(3, 1, "hold", cores.DEFAULT_WAIT_S), (3, 2, "probe x", 50.0)]
 
 
+def _budget(counter, cores_, change=True, handle=object()):
+    out, lines = io.StringIO(), []
+    code = cores.budget(cores_, change=change, connect=lambda: handle,
+                        transport_of=lambda _: counter, say=lines.append, out=out)
+    return code, out.getvalue(), lines
+
+
+def test_a_budget_is_sent_and_its_answer_printed():
+    counter = FakeCounter(None, {"op": "budget", "budget": 2, "total": 2, "machine": 16, "leased": 0})
+    code, out, lines = _budget(counter, 2)
+    assert (code, counter.sent, lines) == (0, [{"op": "budget", "cores": 2}], [])
+    assert out == "budget: 2; leases share 2 of 16 cores, 0 leased now\n"
+    assert counter.closed
+
+
+def test_off_lifts_the_budget_as_null_and_a_bare_budget_only_asks():
+    lifted = FakeCounter({"op": "budget", "budget": None, "total": 16, "machine": 16, "leased": 3})
+    code, out, _ = _budget(lifted, None)
+    assert code == 0 and lifted.sent == [{"op": "budget", "cores": None}]
+    assert out.startswith("budget: none; leases share 16 of 16")
+    asked = FakeCounter({"op": "budget", "budget": None, "total": 16, "machine": 16, "leased": 0})
+    assert _budget(asked, None, change=False)[0] == 0 and asked.sent == [{"op": "budget"}]
+
+
+def test_lifting_without_a_counter_is_no_budget_not_a_failure():
+    code, out, _ = _budget(FakeCounter(), None, handle=None)
+    assert code == 0 and out == "budget: none (no counter is running)\n"
+
+
+@pytest.mark.parametrize("answer, said", [
+    ({"op": "error", "error": "unknown-op", "got": "budget"}, "predates budgets"),
+    ({"op": "error", "error": "bad-budget", "detail": "x"}, "refused the budget (bad-budget"),
+    (cores.Closed, "budget failed"),
+])
+def test_a_counter_that_refuses_the_budget_fails_with_one_line(answer, said):
+    code, out, lines = _budget(FakeCounter(answer), 2)
+    assert code == 1 and out == "" and len(lines) == 1 and said in lines[0], lines
+
+
+def test_the_command_line_hands_budget_its_figure(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cores, "budget", lambda cores_, change: seen.append((cores_, change)) or 0)
+    assert cores.main(["budget", "2"]) == 0
+    assert cores.main(["budget", "off"]) == 0
+    assert cores.main(["budget"]) == 0
+    assert seen == [(2, True), (None, True), (None, False)]
+
+
 @pytest.mark.parametrize("argv", [
+    ["budget", "0"],
+    ["budget", "two"],
     ["run", "--want", "0", "--", "x"],
     ["run", "--want", "2", "--min", "3", "--", "x"],
     ["run", "--want", "2"],

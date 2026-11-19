@@ -9,7 +9,7 @@
 #include <windows.h>
 #endif
 
-CoreBroker::CoreBroker(int totalCores) : m_total(std::max(1, totalCores)) {}
+CoreBroker::CoreBroker(int machineCores) : m_machine(std::max(1, machineCores)) {}
 
 namespace {
 
@@ -26,9 +26,9 @@ double mean(const QVector<double>& values) {
 
 void CoreBroker::addSample(double idleFraction, double ownCores) {
 	const double idle = std::clamp(idleFraction, 0.0, 1.0);
-	const double busy = m_total * (1.0 - idle);
+	const double busy = m_machine * (1.0 - idle);
 	m_idle.append(idle);
-	m_foreign.append(std::clamp(busy - ownCores, 0.0, static_cast<double>(m_total)));
+	m_foreign.append(std::clamp(busy - ownCores, 0.0, static_cast<double>(m_machine)));
 	while (m_idle.size() > kWindowSamples) {
 		m_idle.removeFirst();
 		m_foreign.removeFirst();
@@ -36,7 +36,7 @@ void CoreBroker::addSample(double idleFraction, double ownCores) {
 }
 
 double CoreBroker::idleCores() const {
-	return m_total * mean(m_idle);
+	return m_machine * mean(m_idle);
 }
 
 double CoreBroker::foreignCores() const {
@@ -55,7 +55,8 @@ int CoreBroker::freeCores() const {
 		return 0;
 	// A hair of float noise (a mean of five 0.2-core samples = 0.2000...1)
 	// must not cost a whole core, hence the epsilon before the floor.
-	const double free = std::floor(m_total - leased() - foreignCores() + 1e-6);
+	const double room = std::min(m_machine - foreignCores(), static_cast<double>(total()));
+	const double free = std::floor(room - leased() + 1e-6);
 	return std::max(0, static_cast<int>(free));
 }
 
@@ -110,12 +111,16 @@ QVector<CoreGrant> CoreBroker::settle(const QDateTime& now) {
 	while (!m_queue.isEmpty()) {
 		const CoreRequest head = m_queue.first();
 		const int free = freeCores();
-		if (measured() && free >= head.min) {
+		// Clamped here, not on arrival (`request`): a min above a budget set
+		// while it waited could otherwise never fit and would only ever run
+		// forced, over the budget it was meant to respect.
+		const int min = std::min(head.min, total());
+		if (measured() && free >= min) {
 			m_queue.removeFirst();
-			grant(head, std::min(head.want, free), false, free);
+			grant(head, std::min({head.want, total(), free}), false, free);
 		} else if (head.asked.msecsTo(now) >= head.waitMs) {
 			m_queue.removeFirst();
-			grant(head, head.min, true, free);
+			grant(head, min, true, free);
 		} else {
 			break;
 		}

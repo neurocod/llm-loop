@@ -277,6 +277,43 @@ void brokerRules() {
 		      "a request that fits is served, never forced for asking no wait");
 	}
 	{
+		// The budget (`/testSlow`): a ceiling on leases, not a smaller machine.
+		CoreBroker broker(16);
+		broker.addIdleSample(0.5);
+		broker.setBudget(2);
+		check(broker.total() == 2 && broker.machine() == 16 && broker.freeCores() == 2,
+		      "a budget caps the free cores, while foreign load is still measured on the machine");
+		broker.request(coreRequest(1, 8, 1, t0));
+		QVector<CoreGrant> grants = broker.settle(t0);
+		check(grants.size() == 1 && grants[0].cores == 2 && broker.freeCores() == 0,
+		      "a budget cuts a grant to what it leaves");
+		broker.setBudget(1);
+		broker.request(coreRequest(2, 4, 1, t0));
+		check(broker.settle(t0).isEmpty() && broker.leased() == 2 && broker.leases()[0].cores == 2,
+		      "a budget below the running leases takes nothing back and grants nothing new");
+		broker.setBudget(0);
+		grants = broker.settle(t0);
+		check(broker.total() == 16 && grants.size() == 1 && grants[0].cores == 4 && !grants[0].forced,
+		      "lifting the budget serves the waiter from the whole machine again");
+		broker.setBudget(40);
+		check(broker.total() == 16, "a budget above the machine is the machine");
+	}
+	{
+		// A request queued before the budget: its min is judged against the
+		// budget when it is decided, so it fits instead of running forced.
+		CoreBroker broker(16);
+		broker.addIdleSample(1.0);
+		broker.request(coreRequest(1, 12, 12, t0));
+		broker.settle(t0);
+		broker.request(coreRequest(2, 8, 6, t0, 5000));
+		broker.setBudget(4);
+		check(broker.settle(t0).isEmpty(), "under a budget the leased 12 keep the waiter out");
+		broker.release(1);
+		const QVector<CoreGrant> grants = broker.settle(t0);
+		check(grants.size() == 1 && grants[0].cores == 4 && !grants[0].forced,
+		      "a min above a budget set while it waited is clamped to the budget, not forced");
+	}
+	{
 		CpuMeter meter;
 		check(meter.sample() < 0.0, "the meter's first sample has no interval: no figure");
 		pumpFor(200);
@@ -498,6 +535,55 @@ void selfTestLeases(const QString& base) {
 		hasty->abort();
 		check(waitFor([&] { return registry.cores().leased == 4; }), "and its return");
 	}
+	{
+		// The budget over the pipe: 4 leased on an 8-core machine, budget 2.
+		QByteArray setLines, waitLines, statusLines, offLines;
+		auto setter = connectClient(name);
+		say(setter.get(), R"({"op":"budget","cores":2})");
+		answer = readLine(setter.get(), setLines, "a budget is answered");
+		check(answer.value(QStringLiteral("op")).toString() == QLatin1String("budget")
+		          && answer.value(QStringLiteral("budget")).toInt() == 2
+		          && answer.value(QStringLiteral("total")).toInt() == 2
+		          && answer.value(QStringLiteral("machine")).toInt() == 8
+		          && answer.value(QStringLiteral("leased")).toInt() == 4,
+		      "the budget's answer names the ceiling, the machine and what is leased");
+		check(waitFor([&] { return setter->state() != QLocalSocket::ConnectedState; })
+		          && registry.cores().leased == 4 && registry.cores().total == 2,
+		      "the budget connection closes, the running lease is kept, the badge shows the ceiling");
+		auto waiter = connectClient(name);
+		say(waiter.get(), R"({"op":"lease","want":2,"label":"under-budget","wait_s":60})");
+		check(readLine(waiter.get(), waitLines, "a lease under a full budget is answered")
+		              .value(QStringLiteral("op")).toString() == QLatin1String("queued"),
+		      "with the budget held a new lease waits, though the machine has room");
+		auto probe = connectClient(name);
+		say(probe.get(), R"({"op":"budget"})");
+		answer = readLine(probe.get(), statusLines, "a budget query is answered");
+		check(answer.value(QStringLiteral("budget")).toInt() == 2 && registry.m_broker.budget() == 2,
+		      "a budget op without cores only asks");
+		auto off = connectClient(name);
+		say(off.get(), R"({"op":"budget","cores":null})");
+		answer = readLine(off.get(), offLines, "lifting the budget is answered");
+		check(answer.value(QStringLiteral("budget")).isNull()
+		          && answer.value(QStringLiteral("total")).toInt() == 8,
+		      "null lifts the budget");
+		answer = readLine(waiter.get(), waitLines, "the waiter hears once the budget is lifted");
+		check(answer.value(QStringLiteral("op")).toString() == QLatin1String("grant")
+		          && answer.value(QStringLiteral("cores")).toInt() == 2,
+		      "a lifted budget serves the queue at once");
+		waiter->abort();
+		check(waitFor([&] { return registry.cores().leased == 4; }), "the budget waiter returns");
+		for (const QByteArray& bad : {QByteArray(R"({"op":"budget","cores":0})"),
+		                              QByteArray(R"({"op":"budget","cores":"two"})"),
+		                              QByteArray(R"({"op":"budget","cores":1.5})")}) {
+			QByteArray lines;
+			auto client = connectClient(name);
+			say(client.get(), bad);
+			answer = readLine(client.get(), lines, "a malformed budget is answered");
+			check(answer.value(QStringLiteral("error")).toString() == QLatin1String("bad-budget")
+			          && registry.m_broker.budget() == 0,
+			      "a malformed budget is refused and sets nothing");
+		}
+	}
 
 #ifdef Q_OS_WIN
 	{
@@ -554,6 +640,11 @@ void selfTestLeases(const QString& base) {
 	hold.start();
 	check(waitFor([&] { return !registry.cores().shown; }) && hold.elapsed() >= kCoresHoldMs / 2,
 	      "and then hides: no CPU block on an idle machine (kCoresHoldMs)");
+
+	registry.m_broker.setBudget(2);
+	check(!registry.idle(), "a set budget keeps the counter from retiring: it would be lost");
+	registry.m_broker.setBudget(0);
+	check(registry.idle(), "and a lifted one lets it go");
 }
 
 int runSelfTest() {

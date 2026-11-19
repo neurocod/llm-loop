@@ -3,6 +3,7 @@
     python -m llm_agents.cores run --want 8 --min 2 -- npm test
     python -m llm_agents.cores status
     python -m llm_agents.cores hold --want 3 [--min M] [--wait S] [--label L]
+    python -m llm_agents.cores budget [N|off]
 
 A test suite, a compiler and a probe batch started side by side each take
 every core, none knowing of the others, and a timeout under that load stops
@@ -490,6 +491,90 @@ def status() -> int:
         transport.close()
 
 
+def _ask(transport, message: dict, *, clock: Callable[[], float] = time.monotonic,
+         sleep: Callable[[float], None] = time.sleep) -> Optional[dict]:
+    """Send one line and return the first answer, or None within 5 s."""
+    transport.send(message)
+    deadline = clock() + 5.0
+    while clock() < deadline:
+        answer = transport.poll()
+        if answer is not None:
+            return answer
+        sleep(POLL_S)
+    return None
+
+
+def budget(cores: Optional[int], *, change: bool = True,
+           connect: Optional[Callable[[], Optional[object]]] = None,
+           transport_of: Callable[[object], object] = PipeTransport,
+           say: Callable[[str], None] = _say, out=None) -> int:
+    """Set (`cores` >= 1), lift (`cores` None) or, with `change=False`, only
+    read the broker's budget: a ceiling on all leases together
+    (`CoreBroker::setBudget` has the rule). Prints one line, returns 0 when
+    the counter answered.
+
+    Setting one STARTS a counter if none runs — the budget lives in that
+    process, and the counter does not retire while one is set. Lifting or
+    reading never starts one: no counter means no budget."""
+    out = sys.stdout if out is None else out
+    if connect is not None:
+        handle = connect()
+    elif os.name != "nt":
+        say("no counter off Windows: no budget")
+        return 1
+    elif change and cores is not None:
+        reasons: list[str] = []
+        handle = agent_counter._open_or_start(reasons.append)
+        if handle is None:
+            say(f"no counter to hold the budget ({reasons[0] if reasons else 'none started'})")
+            return 1
+    else:
+        handle = agent_counter._connect()
+    if handle is None:
+        print("budget: none (no counter is running)", file=out, flush=True)
+        return 0
+    transport = transport_of(handle)
+    try:
+        message: dict = {"op": "budget"}
+        if change:
+            message["cores"] = cores
+        answer = _ask(transport, message)
+    except (Closed, OSError, ValueError) as exc:
+        say(f"budget failed: {exc}")
+        return 1
+    finally:
+        transport.close()
+    if answer is None:
+        say("the counter did not answer the budget")
+        return 1
+    if answer.get("op") == "error":
+        if answer.get("error") == "unknown-op":
+            say("the running counter predates budgets: let it retire or `AgentCounter --quit` it, "
+                "then ask again")
+        else:
+            say(f"the counter refused the budget ({answer.get('error')}: {answer.get('detail', '')})")
+        return 1
+    if answer.get("op") != "budget":
+        say(f"unexpected answer from the counter: {answer!r}")
+        return 1
+    held = answer.get("budget")
+    print(f"budget: {held if held is not None else 'none'}; leases share {answer.get('total')} "
+          f"of {answer.get('machine')} cores, {answer.get('leased')} leased now", file=out, flush=True)
+    return 0
+
+
+def _budget_arg(raw: str) -> Optional[int]:
+    if raw == "off":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise argparse.ArgumentTypeError("a whole number of cores >= 1, or off")
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m llm_agents.cores", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="action", required=True)
@@ -512,6 +597,10 @@ def _parser() -> argparse.ArgumentParser:
     keep.add_argument("--label", default="hold", help="the name the badge's status shows")
     keep.add_argument("--wait", type=float, default=DEFAULT_WAIT_S, dest="wait_s",
                       help=f"seconds to wait for --min before holding it anyway (default {DEFAULT_WAIT_S:.0f})")
+    cap = sub.add_parser("budget", help="cap all leases together at N cores, or lift the cap (off); "
+                                        "without an argument print it")
+    cap.add_argument("cores", nargs="?", type=_budget_arg, default=argparse.SUPPRESS,
+                     help="N >= 1, or off")
     return parser
 
 
@@ -525,6 +614,8 @@ def main(argv: Optional[Sequence[str]] = None, *, policy: Optional[host_policy.H
     with host_policy.installed(policy or host_policy.EMPTY, root):
         if args.action == "status":
             return status()
+        if args.action == "budget":
+            return budget(getattr(args, "cores", None), change=hasattr(args, "cores"))
         if args.action == "hold":
             if args.want < 1 or not 1 <= args.minimum <= args.want or args.wait_s < 0:
                 parser.error("hold: need --want >= 1, 1 <= --min <= --want, --wait >= 0")

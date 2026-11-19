@@ -31,8 +31,9 @@ current count. Set `AGENT_COUNTER_ENABLED=0` to keep the badge off the screen.
 `python -m llm_agents.cores status` prints the leases, the queue and the
 measured load; `python -m llm_agents.cores hold --want 3` answers one line
 `LLM_CORES=<K>` and holds the lease until its stdin closes, for a parent
-that is not Python. Without the counter the command runs as it would have, with
-one line on stderr.
+that is not Python; `python -m llm_agents.cores budget 2` caps all leases
+together at 2 cores until `budget off`. Without the counter the command runs as
+it would have, with one line on stderr.
 
 **Icons.** No provider logo ships here: by default the badge paints neutral
 marks of its own (a disc with a letter). To show real icons, configure with

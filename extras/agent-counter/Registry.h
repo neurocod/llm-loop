@@ -101,7 +101,8 @@ public:
 	QVector<AgentEntry> entries() const;
 	QVector<AgentGroup> groups() const;
 	CoreSummary cores() const;
-	// Nothing to serve: no agent counted, no lease held, nobody queued.
+	// Nothing to serve: no agent counted, no lease held, nobody queued, no
+	// budget set.
 	bool idle() const;
 
 	// Stop listening and answer whether the process may exit now.
@@ -177,6 +178,9 @@ private:
 	void readFrom(QLocalSocket* socket);
 	void handleLine(QLocalSocket* socket, const QByteArray& line);
 	void handleLease(QLocalSocket* socket, const QJsonObject& obj);
+	void handleBudget(QLocalSocket* socket, const QJsonObject& obj);
+	// The broker's budget as the wire spells it: a number, or null for none.
+	QJsonValue budgetValue() const;
 	// Answer `{"op":"error","error":<error>,...}` and close once it is
 	// written — the reply to an op this build does not know or a lease it
 	// cannot take. Not `dropClient`: a client that asked something and was
