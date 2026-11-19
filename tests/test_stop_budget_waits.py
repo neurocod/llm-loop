@@ -59,15 +59,29 @@ _TREE = ("import subprocess, sys, time\n"
          "open(sys.argv[1], 'w').close()\n"
          "time.sleep(60)\n")
 
-# The run: starts the tree on its own stdout, ends it on a spent budget, and
-# leaves AT ONCE (`os._exit`: no shutdown, no thread finishes) — the moment
-# an unattended run's ending is spent and it exits. It prints how long the
-# ending took.
-_RUN = ("import os, sys, time\n"
+# The run: starts the tree on its own stdout, hands its parent (the test) a
+# second handle to the tree's job — so the job outlives the run, and only the
+# explicit termination can end the tree — ends it on a spent budget, and
+# leaves AT ONCE (`os._exit`: no shutdown, no thread finishes): the moment an
+# unattended run's ending is spent and it exits. It prints the handle and how
+# long the ending took.
+_RUN = ("import ctypes, os, sys, time\n"
+        "from ctypes import wintypes\n"
         "from llm_loop import procend, stopclock\n"
         "marker, tree = sys.argv[1], sys.argv[2]\n"
         "child = procend.start_tree([sys.executable, '-c', tree, marker],"
         " stdout=sys.stdout)\n"
+        "k = ctypes.WinDLL('kernel32', use_last_error=True)\n"
+        "k.GetCurrentProcess.restype = wintypes.HANDLE\n"
+        "k.OpenProcess.restype = wintypes.HANDLE\n"
+        "k.DuplicateHandle.argtypes = [wintypes.HANDLE] * 3 + ["
+        "ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD, wintypes.BOOL,"
+        " wintypes.DWORD]\n"
+        "parent = k.OpenProcess(0x0040, False, os.getppid())\n"  # PROCESS_DUP_HANDLE
+        "held = wintypes.HANDLE()\n"
+        "assert k.DuplicateHandle(k.GetCurrentProcess(), procend._trees[child]._handle,"
+        " parent, ctypes.byref(held), 0, False, 2)\n"
+        "print('held', held.value, flush=True)\n"
         "while not os.path.exists(marker):\n"
         "    time.sleep(0.05)\n"
         "started = time.monotonic()\n"
@@ -77,22 +91,22 @@ _RUN = ("import os, sys, time\n"
         "os._exit(0)\n")
 
 # How long the tree may take to end once the run has left: a job's
-# termination or a group's SIGKILL over two processes, well under a second
-# on an idle machine; ten times that for a loaded one.
+# termination over two processes, well under a second on an idle machine;
+# ten times that for a loaded one.
 TREE_END_S = 10.0
 
 
+@pytest.mark.skipif(os.name != "nt", reason="a tree is budget-bounded only in its "
+                    "job; on POSIX the ending keeps its own limits")
 def test_a_run_that_leaves_on_a_spent_budget_leaves_no_descendant(tmp_path):
     """A spent budget ends a `procend.start_tree` tree without waiting — its
-    job (Windows) or its process group (POSIX) is ended by identity, so
-    nothing is handed to a reaper that could outlive the run — and the run
-    that leaves right after it leaves no descendant behind.
+    job is terminated by identity, so nothing is handed to a reaper that
+    could outlive the run — and the run that leaves right after it leaves no
+    descendant behind, although the job itself lives on in the test's handle.
 
     The run, its child and the grandchild all hold one pipe: its EOF is the
-    proof that none of them is left. A root killed alone orphans the
-    grandchild, which keeps the pipe open. (On Windows the job's closing at
-    the run's exit would end the tree too; `test_procend_tree.py` pins the
-    ending itself, in process.)"""
+    proof that none of them is left."""
+    import ctypes
     source = str(Path(procend.__file__).resolve().parents[1])
     env = dict(os.environ, PYTHONPATH=source)
     run = subprocess.Popen([sys.executable, "-c", _RUN,
@@ -105,13 +119,20 @@ def test_a_run_that_leaves_on_a_spent_budget_leaves_no_descendant(tmp_path):
     # The run's own start included: the whole test took 3.5 s, measured
     # 2026-11-19 under three other slots' load.
     reader.join(TREE_END_S + 30)
+    held = None
     try:
         assert not reader.is_alive(), (
             "a descendant outlived the run and still holds the pipe")
-        assert out and b"left" in out[0], out
-        took = float(out[0].split(b"left", 1)[1].split()[0])
+        text = out[0] if out else b""
+        assert b"held" in text and b"left" in text, out
+        held = int(text.split(b"held", 1)[1].split()[0])
+        took = float(text.split(b"left", 1)[1].split()[0])
         assert took < NO_WAIT_S, f"the ending waited on a spent budget: {took} s"
     finally:
+        if held is None and reader.is_alive():
+            run.kill()  # it holds the job: its exit lets the tree go
+        if held:
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(held))
         run.wait(timeout=10)
 
 

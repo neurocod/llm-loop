@@ -570,7 +570,9 @@ class StopBudget:
     found by a separate review (llm-loop 2255e6f, ce11713) — one budget is
     one number to read and one place to change. Spent, no wait begins any
     more: no further git starts, the closing snapshots read nothing, and the
-    notes are reported. The waits several calls below the ending read it through
+    notes are reported. A child's process tree on POSIX is the exception,
+    ended on its own limits (`procend.end_process_tree` says why). The waits
+    several calls below the ending read it through
     `stopclock` (`close_run` publishes it). `seconds` None is no budget: an
     ending with the operator present, who gives a wait up with Ctrl+C.
     """
@@ -665,8 +667,9 @@ def _wait_for_exit_push(pusher: OwnerThread, push,
 # — and the runner's own `RunBoundary.exit` (the driver stopping the run, five
 # provider errors in a row: endings of a run left going overnight). It bounds
 # the whole ending — the console's drain, the exit push, the closing usage
-# snapshots and the quota server's close (`close_run`, `stopclock`); the push
-# is what spends it in practice. Bounded because
+# snapshots and the quota server's close (`close_run`, `stopclock`), all but
+# a child's process tree on POSIX (`procend.end_process_tree`); the push is
+# what spends it in practice. Bounded because
 # nobody may be there to press Ctrl+C: a batch run unwinding an exception
 # otherwise sat out a push in flight and the whole `final_git_push` behind it
 # (a 300 s subprocess timeout per `git push`, and on Windows a git descendant

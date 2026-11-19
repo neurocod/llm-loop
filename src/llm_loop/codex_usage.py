@@ -19,7 +19,7 @@ from typing import Callable, List, Optional
 
 from . import appserver, stopclock, wire
 from .console import print_line
-from .procend import REAP_GRACE_S, end_process_tree
+from .procend import REAP_GRACE_S, end_process_tree, release_exited
 from .usage import EMPTY_READING, EMPTY_USAGE, Usage, UsageReading, summary_line
 
 # The bound on one request — the handshake of a fresh server included. A wait
@@ -181,8 +181,12 @@ class _QuotaServer:
             proc.wait(timeout=stopclock.within(REAP_GRACE_S))
         except subprocess.TimeoutExpired:
             end_process_tree(proc)
+            return
         except OSError:
             pass
+        # Exited on the EOF: a descendant it left may still hold stdout (and
+        # the pump with it); its job goes now, not when the Popen is collected.
+        release_exited(proc)
 
 
 # Every source that may own a live server, so the endings that never reach
