@@ -2,10 +2,9 @@
 
 `runlifecycle.StopBudget` is one budget per ending, and every wait of that
 ending must take what is LEFT of it. Most of those waits sit several calls
-below the ending — the quota server's stop inside `CodexUsageSource.close`,
-the HTTP read behind `LimitPolicy.log_snapshot`, the `procend` escalation
-behind either — and their callers' signatures are a protocol a dozen test
-fakes implement. So the ending publishes its deadline here, for the thread
+below the ending — the quota server's lock and EOF wait inside
+`CodexUsageSource.close`, the HTTP read behind `LimitPolicy.log_snapshot` —
+and their callers' signatures are a protocol a dozen test fakes implement. So the ending publishes its deadline here, for the thread
 that runs it, and each wait caps its own limit with `within`. A wait outside
 any ending — a turn's reap, a status-line read — sees no deadline and keeps
 its limit.
@@ -14,20 +13,26 @@ Thread-local by construction (`contextvars`: a new thread starts with no
 deadline): the ending's thread is the one whose waits make the stop long, and
 a worker or a refresher that outlives the ending is not waited for by it.
 
-A leaf on purpose — standard library only — so `procend`, `usage` and
-`codex_usage` reach it without importing the run's lifecycle.
+A leaf on purpose — standard library only — so `usage` and `codex_usage`
+reach it without importing the run's lifecycle.
 
-A step that cannot be cut short in place — a `taskkill` walking a tree, an
-HTTP read whose timeout restarts per socket operation and skips the DNS
-lookup — runs whole on a daemon worker the ending joins for what is left
-(`procend.end_process_tree`, `usage.UsageSource.query_usage_json`).
+An HTTP read, whose timeout restarts per socket operation and skips the DNS
+lookup, cannot be cut short in place: it runs whole on a daemon worker the
+ending joins for what is left (`usage.UsageSource.query_usage_json`).
 
-What a deadline here cannot cure: a print into a console that has stopped
-draining (a selection freezing a Windows console, a pipe nobody reads). The
-write blocks the very thread that would ask `within`, and the stream has no
-timeout to give it; a thread to print on only moves the hang to the
-interpreter's exit flush. The run's console owner bounds what IT writes
-(`parallel._close_console`), and nothing bounds the ending's own lines.
+What a deadline here does NOT bound:
+
+  * ending a child's process tree (`procend.end_process_tree`): up to the
+    grace twice plus `taskkill`, 6 s per tree past the budget at worst. A
+    hand-off that does not wait kills by numeric pid, which can hit a reused
+    pid; the safe fix is a process lifetime the OS owns, not built yet (see
+    there);
+  * a print into a console that has stopped draining (a selection freezing a
+    Windows console, a pipe nobody reads). The write blocks the very thread
+    that would ask `within`, and the stream has no timeout to give it; a
+    thread to print on only moves the hang to the interpreter's exit flush.
+    The run's console owner bounds what IT writes (`parallel._close_console`),
+    and nothing bounds the ending's own lines.
 """
 
 import contextlib

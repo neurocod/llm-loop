@@ -21,7 +21,7 @@ from llm_loop import (codex_usage, ownership, parallel, procend, runlifecycle,
                       stopclock, termio, usage)
 
 # What "did not wait" means below. A spent budget's step costs a few
-# milliseconds (a `taskkill` started, a lock tried); every wait it replaces is
+# milliseconds (a lock tried, a thread started); every wait it replaces is
 # a second or more, so half a second tells the two apart either way.
 NO_WAIT_S = 0.5
 
@@ -48,49 +48,6 @@ def test_a_thread_outside_the_ending_keeps_its_own_limit():
         worker.start()
         worker.join()
     assert seen == [2.0]
-
-
-class _UnendingChild:
-    """A child no ask and no kill ends — a stuck handle — whose `wait` takes
-    all the time it is given; `taskkill` against it hangs as well."""
-
-    pid = 4242
-
-    def __init__(self):
-        self.waits = []
-
-    def poll(self):
-        return None
-
-    def wait(self, timeout=None):
-        self.waits.append(timeout)
-        time.sleep(timeout)
-        raise subprocess.TimeoutExpired("child", timeout)
-
-    def terminate(self):
-        pass
-
-    def kill(self):
-        pass
-
-
-def test_ending_a_process_tree_on_a_spent_budget_does_not_wait(monkeypatch):
-    """`procend.end_process_tree`: REAP_GRACE_S twice plus `taskkill`, unwaited."""
-    def hanging_taskkill(argv, timeout=None, **kwargs):
-        time.sleep(timeout)
-        raise subprocess.TimeoutExpired(argv, timeout)
-
-    monkeypatch.setattr(procend.subprocess, "run", hanging_taskkill)
-    monkeypatch.setattr(procend.subprocess, "Popen",
-                        lambda *args, **kwargs: None)
-    child = _UnendingChild()
-    started = time.monotonic()
-    with spent():
-        procend.end_process_tree(child)
-    elapsed = time.monotonic() - started
-    assert elapsed < NO_WAIT_S, (
-        f"the escalation waited on a spent budget: {elapsed:.2f} s "
-        f"(waits {child.waits})")
 
 
 # A child that starts a grandchild sharing its stdout, marks the file in
@@ -124,9 +81,11 @@ TREE_END_S = 10.0
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the tree is ended by taskkill /T; "
-                    "the POSIX reaper ends the child alone, as _end_tree does")
+                    "on POSIX the escalation ends the child alone")
 def test_a_run_that_leaves_on_a_spent_budget_leaves_no_descendant(tmp_path):
-    """The tree is ended by a process the OS owns, not by a thread of the run.
+    """A spent budget does not cut the tree's ending short: it is NOT
+    budget-bounded (`procend.end_process_tree` says why), so the run that
+    leaves right after it leaves no descendant behind.
 
     The run, its child and the grandchild all hold one pipe: its EOF is the
     proof that none of them is left. A daemon handed the ending dies with the
@@ -390,17 +349,22 @@ class _TricklingResponse:
     def __exit__(self, *exc):
         return False
 
+    def __init__(self, failures):
+        self._failures = failures
+
     def read(self):
         for _ in range(10):
             time.sleep(0.1)
+        self._failures.append(time.monotonic())
         raise OSError("staged: the body broke off")
 
 
 def test_the_claude_snapshot_is_bounded_whole_not_per_socket_operation(
         monkeypatch, capsys):
+    failures = []
     monkeypatch.setattr(usage, "oauth_token", lambda: "token")
     monkeypatch.setattr(usage.urllib.request, "urlopen",
-                        lambda request, timeout: _TricklingResponse())
+                        lambda request, timeout: _TricklingResponse(failures))
     started = time.monotonic()
     with stopclock.ending(time.monotonic() + 0.3):
         data = usage.UsageSource().query_usage_json()
@@ -408,12 +372,23 @@ def test_the_claude_snapshot_is_bounded_whole_not_per_socket_operation(
     assert elapsed < 0.3 + NO_WAIT_S, (
         f"the snapshot outlasted its budget on a trickling body: {elapsed:.2f} s")
     assert data is None
-    # The abandoned read fails late, on its own: it must say nothing then.
-    for reader in [t for t in threading.enumerate() if t.name == "usage-read"]:
-        reader.join(timeout=10)
-    out = capsys.readouterr().out
-    assert "within the stop budget" in out
-    assert "broke off" not in out, f"the abandoned read spoke up late:\n{out}"
+    first = capsys.readouterr()
+    assert "within the stop budget" in first.out
+    assert first.err == "", first.err
+    # The abandoned read goes on to fail on its own — every attempt, and the
+    # worker then ends; 3 s of it (two 1 s attempts and the 1 s pause), so
+    # 10 s is room on a loaded machine.
+    workers = [t for t in threading.enumerate() if t.name == "usage-read"]
+    assert workers, "no worker read the snapshot"
+    for worker in workers:
+        worker.join(timeout=10)
+    assert not any(w.is_alive() for w in workers), "the late read never ended"
+    assert len(failures) == usage.HTTP_ATTEMPTS, (
+        f"the late read did not fail every attempt: {len(failures)}")
+    late = capsys.readouterr()
+    assert late.out == "" and late.err == "", (
+        f"the abandoned read spoke up after the budget's line:\n"
+        f"out: {late.out!r}\nerr: {late.err!r}")
 
 
 def test_the_console_drain_on_a_spent_budget_does_not_wait(monkeypatch, capsys):

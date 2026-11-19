@@ -457,9 +457,9 @@ def close_run(ctx: RunContext, *,
 
     `budget` bounds the WHOLE housekeeping, not the push alone: it is
     published as the thread's ending deadline (`stopclock`) for the closing
-    snapshots, the quota server's stop and every `procend` wait under them —
-    so the ending lasts no longer than the budget its push announces. What a
-    budget cannot bound is named in `stopclock`.
+    snapshots and the quota server's close. What it cannot bound — ending a
+    child's process tree, a print into a stuck console — is named in
+    `stopclock`.
     """
     with stopclock.ending(None if budget is None else budget.deadline):
         _close_run(ctx, usages=usages, ending=ending, mailbox=mailbox,
@@ -569,9 +569,9 @@ class StopBudget:
     bounds set one per wait add up behind each other, and each of them was
     found by a separate review (llm-loop 2255e6f, ce11713) — one budget is
     one number to read and one place to change. Spent, no wait begins any
-    more: no further git starts, the closing snapshots read nothing, a child
-    still to end is killed without being waited for, and the notes are
-    reported. The waits several calls below the ending read it through
+    more: no further git starts, the closing snapshots read nothing, and the
+    notes are reported. A child's process tree is the exception, ended on
+    its own limits (`procend.end_process_tree` says why). The waits several calls below the ending read it through
     `stopclock` (`close_run` publishes it). `seconds` None is no budget: an
     ending with the operator present, who gives a wait up with Ctrl+C.
     """
@@ -666,7 +666,8 @@ def _wait_for_exit_push(pusher: OwnerThread, push,
 # — and the runner's own `RunBoundary.exit` (the driver stopping the run, five
 # provider errors in a row: endings of a run left going overnight). It bounds
 # the whole ending — the console's drain, the exit push, the closing usage
-# snapshots and the quota server's stop (`close_run`, `stopclock`); the push is
+# snapshots and the quota server's close (`close_run`, `stopclock`), all but
+# a child's process tree (`procend.end_process_tree`); the push is
 # what spends it in practice. Bounded because
 # nobody may be there to press Ctrl+C: a batch run unwinding an exception
 # otherwise sat out a push in flight and the whole `final_git_push` behind it
