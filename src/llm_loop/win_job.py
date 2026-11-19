@@ -1,5 +1,7 @@
-"""Windows job-object primitives shared by every job in this package:
-`child_job.ChildJob`, `cores.Job` and `git.live_workers.WorkerJob`.
+"""Windows job-object primitives shared by every job in both packages:
+`llm_agents.child_job.ChildJob`, `llm_agents.cores.Job` and
+`llm_agents.git.live_workers.WorkerJob`. A leaf of `llm_loop` — standard
+library only — so `llm_agents` imports it without `llm_loop` importing back.
 
 The one step all three need the same way is getting a child INTO the job:
 `start` (or `adopt`, for a caller that runs its own `Popen`) creates it

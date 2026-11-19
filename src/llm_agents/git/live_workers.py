@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
 
-from .. import win_job
+from llm_loop import win_job
 
 LIVE_DIR_ENV = "LLM_AGENTS_LIVE_DIR"
 RECORD_SUFFIX = ".live.json"

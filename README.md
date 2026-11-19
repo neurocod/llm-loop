@@ -242,7 +242,6 @@ src/llm_agents/      the bridges and what they share:
   host_policy.py     what a project adds, handed over explicitly
   answer_contract.py the `## Coverage` contract and its follow-up
   child_job.py       a Windows Job Object that ends a child's tree with its owner
-  win_job.py         the job-object primitives: a child started suspended, in the job
   agent_counter.py   the client of the optional counter
   gitlib.py          the git runner the kit and the bridges share
 examples/            the loop wrappers, the playbook, host_rules.py

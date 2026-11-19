@@ -19,7 +19,7 @@ import os
 import subprocess
 from typing import Sequence
 
-from . import win_job
+from llm_loop import win_job
 
 
 class ChildJob:

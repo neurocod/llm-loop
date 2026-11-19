@@ -14,9 +14,10 @@ import time
 
 import pytest
 
-from llm_agents import cores, win_job
+from llm_agents import cores
 from llm_agents.child_job import ChildJob
 from llm_agents.git import live_workers
+from llm_loop import win_job
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="job objects are Windows'")
 

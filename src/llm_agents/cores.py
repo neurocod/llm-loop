@@ -54,7 +54,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence
 
-from . import agent_counter, host_policy, win_job
+from llm_loop import win_job
+
+from . import agent_counter, host_policy
 
 # The variable the child reads its lease from: a whole number >= 1.
 LEASE_ENV = "LLM_CORES"

@@ -197,6 +197,7 @@ src/
     providers.py     Claude/Codex executable flags, argv construction, and the
                      ending owed to a provider child
     procend.py       ending a child process tree: ask, wait, kill, wait
+    win_job.py       the job-object primitives: a child started suspended, in the job
     appserver.py     JSON-RPC over a `codex app-server` child's stdio, for
                      the provider process, `codex_usage` and `llm_agents.codex`
     drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)
