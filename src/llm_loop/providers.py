@@ -304,7 +304,10 @@ def _console_isolation() -> dict:
     What it costs: Ctrl+C here no longer reaches the child as a console event.
     It never had to — but only because every turn ends its own tree from the
     press (its job, `procend.start_tree`): its stream is read through
-    `ended_on_press`.
+    `ended_on_press`. POSIX needs no option for it: `start_tree` puts the
+    child in a process group of its own, off the terminal's foreground
+    group, which costs the terminal's Ctrl+C the same way and is paid back
+    by the same hook.
     """
     if os.name != "nt":
         return {}
@@ -431,8 +434,9 @@ def start_agent_process(argv: list[str], provider: str, prompt: str,
     diagnostics) for every shape, plus already-decoded ``dict`` events for the
     codex app-server shape; a consumer must accept both item types.
 
-    The child is started by `procend.start_tree`, so on Windows its whole
-    tree is ended by identity — its job — and within a stop budget.
+    The child is started by `procend.start_tree`, so its whole tree is ended
+    by identity — its job, or its process group's keeper — and within a
+    stop budget.
 
     Everything after `Popen` runs with a child alive and is therefore inside a
     guard of its own, ending it if the function does not get to return. Both

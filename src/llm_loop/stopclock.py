@@ -22,11 +22,10 @@ ending joins for what is left (`usage.UsageSource.query_usage_json`).
 
 What a deadline here does NOT bound:
 
-  * ending a child's process tree on POSIX (and a Windows child no job could
-    hold), `procend.end_process_tree`: up to the grace twice (plus
-    `taskkill` on Windows) per tree past the budget. Cutting it short safely needs the tree owned
-    by identity, which on POSIX needs exclusive reaping of the child (see
-    there); a Windows `procend.start_tree` child IS bounded, by its job;
+  * ending a child's process tree that `procend.start_tree` could not own
+    (no job on Windows, no keeper on POSIX), `procend.end_process_tree`: up
+    to the grace twice (plus `taskkill` on Windows) per tree past the
+    budget. An owned tree IS bounded, by its job or its keeper;
   * a print into a console that has stopped draining (a selection freezing a
     Windows console, a pipe nobody reads). The write blocks the very thread
     that would ask `within`, and the stream has no timeout to give it; a

@@ -96,8 +96,8 @@ _RUN = ("import ctypes, os, sys, time\n"
 TREE_END_S = 10.0
 
 
-@pytest.mark.skipif(os.name != "nt", reason="a tree is budget-bounded only in its "
-                    "job; on POSIX the ending keeps its own limits")
+@pytest.mark.skipif(os.name != "nt", reason="the job handle is Windows'; POSIX's "
+                    "keeper is pinned in test_procend_group.py")
 def test_a_run_that_leaves_on_a_spent_budget_leaves_no_descendant(tmp_path):
     """A spent budget ends a `procend.start_tree` tree without waiting — its
     job is terminated by identity, so nothing is handed to a reaper that

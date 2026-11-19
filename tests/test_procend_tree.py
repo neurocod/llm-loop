@@ -185,10 +185,10 @@ _EXITS_LEAVING_A_HOLDER = (
     "sys.stdin.read()\n")
 
 
-@windows
 def test_a_quota_server_that_exits_on_eof_leaves_no_holder_of_its_stdout():
     """The server exits on its stdin's close, inside the grace, and leaves a
-    descendant holding stdout: the stop still ends the job, so the pump sees
+    descendant holding stdout: the stop still ends the tree (its job, or its
+    group through the keeper on POSIX), so the pump sees
     EOF now rather than when the descendant dies on its own."""
     server = codex_usage._QuotaServer([sys.executable, "-c", _EXITS_LEAVING_A_HOLDER], 0)
     try:

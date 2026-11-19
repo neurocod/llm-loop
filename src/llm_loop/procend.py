@@ -25,12 +25,39 @@ it would take the child OUT of the outer job, whose closing must still end
 it. A job Windows will not make or join leaves the child unowned, started
 again plainly (it never ran: it was suspended).
 
-POSIX, and an unowned Windows child, get the pid-based sequence of
-`end_process_tree`, which is NOT bounded by the stop budget (see there).
+On POSIX a tree started with `start_tree` lives in a process group of its
+own, and the group is signalled only by a KEEPER: a `/bin/sh` that leads
+the group, ignores SIGINT/SIGTERM/SIGHUP and reads a pipe only this process
+holds the write end of. A line on the pipe makes the keeper send SIGTERM
+(and SIGCONT, so a member stopped by SIGTTIN hears it) to its own group;
+the pipe's EOF — `close`, or the OS closing it when this process dies in any
+way — makes it send SIGKILL. `kill(0, ...)` from inside the group names the
+group by the keeper's own membership, never by a number, so the group's
+ending needs no pinned id and no exclusive reaping: any `poll()`/`wait()` on
+the provider (`streamrender`, `parallel`, `codex_usage`, the runners' own)
+may reap the leader at any time, and SIGCHLD=SIG_IGN changes nothing (the
+keeper's death only loses the group kill, see `_GroupTree`). No pidfd, no
+`os.waitid` — the same sequence runs on every Python the package supports.
+
+What the group costs, said aloud: the tree is a new process GROUP in the
+runner's session — `start_new_session` would drop the controlling terminal
+as well, and is not used. A group that is not the terminal's foreground one
+no longer hears the terminal's Ctrl+C (nor Ctrl+Z or Ctrl+\\), just as the
+Windows child under CREATE_NO_WINDOW does not; the run's press ends the turn
+through `providers.ended_on_press`, whose hook is `ask_agent_process_to_end`
+— the keeper's SIGTERM. A member that reads the terminal is stopped by
+SIGTTIN where it used to read the operator's keys; the ending's SIGKILL ends
+a stopped member too. A descendant that leaves the group itself (`setsid`,
+`setpgid`) leaves the ending with it — what Windows' job would still hold.
+
+An unowned child — a job Windows will not make, a keeper POSIX cannot start,
+a stand-in `Popen` — gets the pid-based sequence of `end_process_tree`.
 """
 
+import functools
 import os
 import subprocess
+import sys
 import threading
 import weakref
 
@@ -77,12 +104,166 @@ class _JobTree:
             pass  # reclaimed, or not yet collected: the job is ended either way
         self.close()
 
-    def close(self) -> None:
-        """Close the job, ending whatever is left in it. Idempotent."""
+    def close(self, wait: bool = True) -> None:
+        """Close the job, ending whatever is left in it. Idempotent; `wait`
+        is `_GroupTree.close`'s — closing a handle has nothing to wait for."""
         with self._lock:
             handle, self._handle = self._handle, None
             if handle:
                 win_job.kernel32().CloseHandle(handle)
+
+
+# The keeper (see the module docstring). Every `kill` names group 0 — the
+# keeper's own — and the keeper ignores the polite signals it sends, so it
+# is still there for the next line and for the EOF. `read` fails on the EOF
+# (and on a partial last line), which ends the loop into the SIGKILL.
+_KEEPER = ("trap '' INT TERM HUP\n"
+           "while read line; do kill -s TERM 0; kill -s CONT 0; done\n"
+           "kill -s KILL 0\n")
+
+# The real class, taken before any test stands a fake in for
+# `subprocess.Popen`: the keeper is always a real process, and a provider
+# `Popen` that is not one of these is a stand-in left unowned.
+_Popen = subprocess.Popen
+
+# Keepers told to end by a finalizer, which does not wait for them: reaped by
+# the next `start_tree`, so none stays a zombie for the run's life.
+_unreaped: list = []
+_unreaped_lock = threading.Lock()
+
+
+def _reap_released() -> None:
+    with _unreaped_lock:
+        _unreaped[:] = [keeper for keeper in _unreaped if _still_running(keeper)]
+
+
+def _still_running(keeper) -> bool:
+    try:
+        return keeper.poll() is None
+    except OSError:
+        return False
+
+
+def _joining(pgid: int) -> dict:
+    """Popen options that start a child in process group `pgid` (0: a new
+    group it leads). `process_group` from 3.11; before it the same
+    `setpgid` runs as `preexec_fn` — the call `process_group` was added to
+    replace, a single system call between fork and exec."""
+    if sys.version_info >= (3, 11):
+        return {"process_group": pgid}
+    return {"preexec_fn": functools.partial(os.setpgid, 0, pgid)}
+
+
+class _GroupTree:
+    """A POSIX child's group, ended through its keeper's pipe (module
+    docstring). Reentrant for the same reason as `_JobTree`, and `close`
+    detaches the keeper before closing its pipe the same way.
+
+    A keeper that died (killed from outside) takes the group's ending with
+    it: a write to its pipe fails, and the ending falls back to the leader's
+    own `Popen`, which signals it only while unreaped."""
+
+    def __init__(self, keeper) -> None:
+        self._keeper = keeper
+        self._lock = threading.RLock()
+
+    def _tell(self, line: bytes) -> bool:
+        """Write `line` to the keeper; False when there is none to hear it."""
+        with self._lock:
+            keeper = self._keeper
+            if keeper is None:
+                return False
+            try:
+                os.write(keeper.stdin.fileno(), line)
+                return True
+            except (OSError, ValueError):
+                return False  # the keeper is gone, or its pipe already closed
+
+    def ask(self, proc) -> None:
+        """SIGTERM (then SIGCONT) to every process in the group; without a
+        live keeper, SIGTERM to the leader alone."""
+        if not self._tell(b"\n") and proc is not None:
+            _signal_leader(proc, kill=False)
+
+    def end(self, proc) -> None:
+        self.ask(proc)
+        if _waited(proc):
+            self.close()
+            return
+        self.close()  # the EOF: SIGKILL to the group
+        if _waited(proc):
+            return
+        # No keeper heard the EOF (or the kill is not through yet): the
+        # leader by its own Popen, so a provider never outlives the ending.
+        _signal_leader(proc, kill=True)
+        _waited(proc)
+
+    def close(self, wait: bool = True) -> None:
+        """Close the keeper's pipe, ending whatever is left in the group.
+        Idempotent. `wait` reaps the keeper within the stop budget; a
+        finalizer passes False and leaves it to `_reap_released`."""
+        with self._lock:
+            keeper, self._keeper = self._keeper, None
+            if keeper is None:
+                return
+            try:
+                keeper.stdin.close()
+            except OSError:
+                pass
+        if wait:
+            try:
+                keeper.wait(timeout=stopclock.within(REAP_GRACE_S))
+                return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        with _unreaped_lock:
+            _unreaped.append(keeper)
+
+
+def _waited(proc) -> bool:
+    """Whether `proc` exited within what the stop budget leaves of the grace;
+    True also for a handle the OS has already reclaimed."""
+    try:
+        proc.wait(timeout=stopclock.within(REAP_GRACE_S))
+        return True
+    except OSError:
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _signal_leader(proc, kill: bool) -> None:
+    try:
+        proc.kill() if kill else proc.terminate()
+    except OSError:
+        pass  # it died between the poll and here
+
+
+def _start_group(argv, options):
+    """`start_tree`'s POSIX half: the keeper first, then the child in its
+    group. A caller's own group or session options leave the child
+    unowned, as does a keeper `/bin/sh` will not start."""
+    _reap_released()
+    if ({"preexec_fn", "process_group"} & options.keys()
+            or options.get("start_new_session")):
+        return subprocess.Popen(argv, **options)
+    try:
+        keeper = _Popen(["/bin/sh", "-c", _KEEPER], stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        bufsize=0, **_joining(0))
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.Popen(argv, **options)
+    tree = _GroupTree(keeper)
+    try:
+        proc = subprocess.Popen(argv, **dict(options, **_joining(keeper.pid)))
+    except BaseException:
+        tree.close()
+        raise
+    if not isinstance(proc, _Popen):
+        tree.close()
+        return proc
+    _own(proc, tree)
+    return proc
 
 
 # Process (or a wrapper standing for it, `share_tree`) -> its job. Weak, so a
@@ -91,9 +272,10 @@ class _JobTree:
 _trees: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 
-def _own(proc, tree: _JobTree) -> None:
+def _own(proc, tree) -> None:
     _trees[proc] = tree
-    finalizer = weakref.finalize(proc, tree.close)
+    # Not waiting: a finalizer runs inside whatever the collector interrupted.
+    finalizer = weakref.finalize(proc, tree.close, False)
     # Not at interpreter exit: the job's closing would kill a quota server
     # before its owner's own exit hook closes it politely; the OS closes the
     # handle after every hook has run anyway.
@@ -108,7 +290,8 @@ def _tree(proc):
 
 
 def owns(proc) -> bool:
-    """Whether `proc` was started by `start_tree` in a job of its own."""
+    """Whether `proc` was started by `start_tree` in a job (Windows) or a
+    kept group (POSIX) of its own."""
     return _tree(proc) is not None
 
 
@@ -121,22 +304,23 @@ def share_tree(wrapper, proc) -> None:
 
 
 def release_exited(proc) -> None:
-    """After `proc` has exited: close its job, ending what it left in it (a
-    descendant still holding its stdout). Nothing for an unowned child."""
+    """After `proc` has exited: close its job or its keeper's pipe, ending
+    what it left (a descendant still holding its stdout). Nothing for an
+    unowned child."""
     tree = _tree(proc)
     if tree is not None:
         tree.close()
 
 
 def start_tree(argv, **options):
-    """`subprocess.Popen(argv, **options)`, on Windows in a job of its own
-    (see the module docstring); the caller's own `creationflags` are kept.
-    POSIX: a plain `Popen`.
+    """`subprocess.Popen(argv, **options)`, on Windows in a job of its own,
+    on POSIX in a kept process group of its own (see the module docstring);
+    the caller's own `creationflags` are kept.
 
-    A stand-in `Popen` (a test's) without an OS handle behind it is returned
-    unowned."""
+    A stand-in `Popen` (a test's) without an OS process behind it is
+    returned unowned."""
     if os.name != "nt":
-        return subprocess.Popen(argv, **options)
+        return _start_group(argv, options)
     try:
         handle = win_job.create(None, win_job.KILL_ON_JOB_CLOSE)
     except OSError:
@@ -173,8 +357,9 @@ def ask_agent_process_to_end(proc) -> None:
     and still printing over whatever the terminal does next — which is the whole
     symptom being fixed, so the Windows branch has to reach the tree: the job
     of a `start_tree` child, `taskkill /T` of any other. On POSIX an npm bin is
-    the executable itself (a shebang script), so the handle IS the provider and
-    SIGTERM lands where it is aimed.
+    the executable itself (a shebang script), so the handle IS the provider;
+    a `start_tree` child's SIGTERM goes to its whole group (its keeper's),
+    any other's to the child alone.
 
     ASYMMETRY WORTH KNOWING, because the two halves do NOT offer the same deal:
     POSIX gets a real request — SIGTERM, which a CLI can catch and use to close
@@ -213,7 +398,7 @@ def end_unless_exited(proc) -> None:
 
     `poll()` is guarded too: on Windows it raises `OSError` on a handle the OS
     has already reclaimed, and then there is nothing left to end. An exited
-    `start_tree` child's job is closed (`release_exited`). Never raises
+    `start_tree` child's tree is closed (`release_exited`). Never raises
     `OSError`, like the escalation it fronts.
     """
     try:
@@ -229,22 +414,19 @@ def end_unless_exited(proc) -> None:
 def end_process_tree(proc) -> None:
     """Ask the child (tree) to end, wait, kill, wait — never raises.
 
-    A `start_tree` child (Windows): its job is terminated, and the one wait
+    A `start_tree` child: its job is terminated (Windows), or its group is
+    asked and, past the grace, killed through the keeper (POSIX); every wait
     for the child takes what is left of the ending's stop budget
-    (`stopclock.within`, at most `REAP_GRACE_S`); a spent budget does not wait.
+    (`stopclock.within`, at most `REAP_GRACE_S`), and a spent budget does
+    not wait. What is not waited for still lands: the job's termination, the
+    keeper's SIGKILL on its pipe's EOF — neither needs this process alive.
 
-    Any other child — every POSIX one — gets the pid-based sequence: at most
-    `REAP_GRACE_S` for the ask's `taskkill` plus two waits of `REAP_GRACE_S`
-    each, NOT bounded by the stop budget, 6 s per tree past it at worst.
-    Cutting it short hands the tree to something that outlives the wait — a
-    daemon thread the exiting interpreter freezes, or a reaper working from
-    the numeric pid, which can kill an unrelated process once the pid is
-    reused. POSIX has no job to own the tree by; a process group would need
-    the group id pinned (the leader unreaped) until `killpg`, and that needs
-    exclusive reaping across every `poll()`/`wait()` caller of the child
-    (`streamrender`, `parallel`, `codex_usage`), defined behaviour under
-    SIGCHLD=SIG_IGN, and a fallback where neither `os.pidfd_open` nor
-    `os.waitid` exists (macOS before Python 3.13) — not built.
+    Any other child gets the pid-based sequence: at most `REAP_GRACE_S` for
+    the ask's `taskkill` plus two waits of `REAP_GRACE_S` each, NOT bounded
+    by the stop budget, 6 s per tree past it at worst. Cutting it short
+    hands the tree to something that outlives the wait — a daemon thread the
+    exiting interpreter freezes, or a reaper working from the numeric pid,
+    which can kill an unrelated process once the pid is reused.
 
     `OSError` from `wait` means the OS has already reclaimed the handle
     (Windows raises it there), so there is nothing left to end;
