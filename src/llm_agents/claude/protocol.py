@@ -21,7 +21,7 @@ import uuid
 
 from functools import partial
 
-from llm_loop.procend import end_process_tree
+from llm_loop import procend
 
 from .. import host_policy
 from ..answer_contract import REVIEWER_BRIEFING
@@ -236,23 +236,45 @@ def child_environment(*, review: bool = False) -> dict[str, str]:
     return env
 
 
-def _end_child(proc: subprocess.Popen) -> None:
+def _start_child(argv, **options):
+    """Start the CLI child: `(proc, job, session)`.
+
+    Windows: in a `ChildJob`, off the console (CREATE_NO_WINDOW). POSIX:
+    `procend.start_tree`'s kept process group, which ends the tree by the
+    keeper's membership — the leader may be reaped any number of times
+    first (`run_turn` polls it) — and on this process's death. It used to
+    lead a session of its own (`start_new_session`) for a `killpg` by the
+    leader's pid, which named a group that the leader's reaping had already
+    released. The kept group is off the terminal's foreground group the same
+    way, and the worker runs in its own session anyway (`worker.launch`).
+    `session` is True only on a Python without kept groups
+    (`procend.POSIX_GROUPS`, before 3.11), where the old session start and
+    its `killpg` remain, with that race (`_end_child`)."""
+    if os.name == "nt":
+        job = ChildJob()
+        return (job.start(argv, creationflags=subprocess.CREATE_NO_WINDOW, **options),
+                job, False)
+    if not procend.POSIX_GROUPS:
+        return subprocess.Popen(argv, start_new_session=True, **options), None, True
+    return procend.start_tree(argv, **options), None, False
+
+
+def _end_child(proc: subprocess.Popen, session: bool = False) -> None:
     """End the CLI child owned by this live Popen, never a persisted PID:
-    bounded and never raising (`finally` blocks call it). The escalation is
-    `llm_loop.procend.end_process_tree`, as in `procend.end_unless_exited`; this
-    keeps only its own prologue. On POSIX the child leads its own session
-    (`start_new_session`), and a tool holding stdout can outlive a leader
-    that already exited: `killpg` reaches the group either way. On Windows
-    the job object (`ChildJob`) ends the descendants. A child that has
-    exited is then left alone."""
-    if os.name != "nt":
+    bounded and never raising (`finally` blocks call it), safe to call
+    again. An owned tree (`procend.start_tree`) is ended by identity — a tool
+    holding stdout after its leader exited included — through
+    `procend.end_unless_exited`. On Windows the job object (`ChildJob`)
+    ends the descendants. `session` (`_start_child`): the pre-3.11 POSIX
+    child leads a session, and `killpg` by its pid reaches the group — but
+    only while no process has the leader's pid as its group id afresh, which
+    an earlier reaping of the leader no longer guarantees."""
+    if session:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass  # the group is gone, or was never ours to signal
-    if proc.poll() is not None:
-        return
-    end_process_tree(proc)
+    procend.end_unless_exited(proc)
 
 
 RATE_LIMIT_EVENT = "rate_limit_event"
@@ -307,6 +329,7 @@ def run_turn(agent: dict, turn: dict, directory: Path,
     writer = None
     write_errors = []
     job = None
+    session = False
     events: queue.Queue = queue.Queue()
     context = ContextTracker(agent.get("context"))
     opts = agent["options"]
@@ -318,14 +341,11 @@ def run_turn(agent: dict, turn: dict, directory: Path,
         try:
             if opts.get("profile", "review") == "review":
                 verify_review_gate()
-            job = ChildJob()
-            proc = job.start(
+            proc, job, session = _start_child(
                 command(agent, turn["resume"]), cwd=agent["cwd"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
                 text=True, encoding="utf-8", errors="replace", bufsize=1,
-                env=child_environment(review=opts.get("profile", "review") == "review"),
-                **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt"
-                   else {"start_new_session": True}))
+                env=child_environment(review=opts.get("profile", "review") == "review"))
 
             def read_stream():
                 try:
@@ -359,8 +379,9 @@ def run_turn(agent: dict, turn: dict, directory: Path,
                     # A finished CLI can leave a tool holding stdout open.
                     # Release descendants before waiting for the reader's EOF,
                     # otherwise the default unlimited turn never completes.
-                    _end_child(proc)
-                    job.close()
+                    _end_child(proc, session)
+                    if job:
+                        job.close()
                     reaped_descendants = True
                 if cancelled():
                     status, failure = "interrupted", "Interrupted by caller"
@@ -410,7 +431,7 @@ def run_turn(agent: dict, turn: dict, directory: Path,
             failure = f"{type(exc).__name__}: {exc}"
         finally:
             if proc is not None:
-                _end_child(proc)
+                _end_child(proc, session)
                 if job:
                     job.close()
                 if writer:

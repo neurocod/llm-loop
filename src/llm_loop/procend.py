@@ -37,15 +37,26 @@ ending needs no pinned id and no exclusive reaping: any `poll()`/`wait()` on
 the provider (`streamrender`, `parallel`, `codex_usage`, the runners' own)
 may reap the leader at any time, and SIGCHLD=SIG_IGN changes nothing (the
 keeper's death only loses the group kill, see `_GroupTree`). No pidfd, no
-`os.waitid` — the same sequence runs on every Python the package supports.
+`os.waitid`.
+
+Python 3.11 or newer only (`POSIX_GROUPS`): joining the keeper's group
+needs `setpgid` between fork and exec, which is `Popen(process_group=)`
+from 3.11 and before it only `preexec_fn` — Python code in a forked child
+of a threaded runner, which can deadlock on a lock another thread held at
+the fork. 3.9 and 3.10 (both past end of life) keep the pre-2496 ending: a
+plain `Popen` in the runner's own group, the pid-based sequence outside the
+stop budget, a descendant outliving the leader left on its pipe, and no
+ending on the owner's death.
 
 What the group costs, said aloud: the tree is a new process GROUP in the
 runner's session — `start_new_session` would drop the controlling terminal
 as well, and is not used. A group that is not the terminal's foreground one
 no longer hears the terminal's Ctrl+C (nor Ctrl+Z or Ctrl+\\), just as the
 Windows child under CREATE_NO_WINDOW does not; the run's press ends the turn
-through `providers.ended_on_press`, whose hook is `ask_agent_process_to_end`
-— the keeper's SIGTERM. A member that reads the terminal is stopped by
+through `providers.ended_on_press`, whose hook asks the tree to end (the
+keeper's SIGTERM) and arms `end_after_grace` — the reader may be blocked on
+a child that prints nothing, so the escalation cannot wait for the stream
+to notice the press. A member that reads the terminal is stopped by
 SIGTTIN where it used to read the operator's keys; the ending's SIGKILL ends
 a stopped member too. A descendant that leaves the group itself (`setsid`,
 `setpgid`) leaves the ending with it — what Windows' job would still hold.
@@ -54,7 +65,6 @@ An unowned child — a job Windows will not make, a keeper POSIX cannot start,
 a stand-in `Popen` — gets the pid-based sequence of `end_process_tree`.
 """
 
-import functools
 import os
 import subprocess
 import sys
@@ -62,6 +72,9 @@ import threading
 import weakref
 
 from . import stopclock, win_job
+
+# Whether `start_tree` owns a POSIX tree on this Python (module docstring).
+POSIX_GROUPS = os.name != "nt" and sys.version_info >= (3, 11)
 
 # How long a provider child gets after being told to end before it is killed
 # outright, and the ceiling on the `taskkill` call itself. The bound is what
@@ -126,32 +139,19 @@ _KEEPER = ("trap '' INT TERM HUP\n"
 # `Popen` that is not one of these is a stand-in left unowned.
 _Popen = subprocess.Popen
 
-# Keepers told to end by a finalizer, which does not wait for them: reaped by
-# the next `start_tree`, so none stays a zombie for the run's life.
-_unreaped: list = []
-_unreaped_lock = threading.Lock()
-
-
-def _reap_released() -> None:
-    with _unreaped_lock:
-        _unreaped[:] = [keeper for keeper in _unreaped if _still_running(keeper)]
-
-
-def _still_running(keeper) -> bool:
-    try:
-        return keeper.poll() is None
-    except OSError:
-        return False
-
-
-def _joining(pgid: int) -> dict:
-    """Popen options that start a child in process group `pgid` (0: a new
-    group it leads). `process_group` from 3.11; before it the same
-    `setpgid` runs as `preexec_fn` — the call `process_group` was added to
-    replace, a single system call between fork and exec."""
-    if sys.version_info >= (3, 11):
-        return {"process_group": pgid}
-    return {"preexec_fn": functools.partial(os.setpgid, 0, pgid)}
+def _reap_later(keeper) -> None:
+    """Reap a keeper whose EOF was not waited for (a finalizer, a spent
+    budget) as soon as it exits, on a daemon thread of its own: a blocking
+    `wait` on that one pid — it signals nothing — so no keeper stays a
+    zombie until some later launch. A keeper exits within milliseconds of
+    its EOF; one that will not (stopped from outside) keeps its thread, and
+    the interpreter's exit does not wait for it."""
+    def reap():
+        try:
+            keeper.wait()
+        except OSError:
+            pass  # reaped already: SIGCHLD=SIG_IGN
+    threading.Thread(target=reap, name="procend-keeper-reap", daemon=True).start()
 
 
 class _GroupTree:
@@ -201,7 +201,8 @@ class _GroupTree:
     def close(self, wait: bool = True) -> None:
         """Close the keeper's pipe, ending whatever is left in the group.
         Idempotent. `wait` reaps the keeper within the stop budget; a
-        finalizer passes False and leaves it to `_reap_released`."""
+        finalizer passes False. What is not reaped here, `_reap_later`
+        reaps."""
         with self._lock:
             keeper, self._keeper = self._keeper, None
             if keeper is None:
@@ -214,10 +215,11 @@ class _GroupTree:
             try:
                 keeper.wait(timeout=stopclock.within(REAP_GRACE_S))
                 return
-            except (OSError, subprocess.TimeoutExpired):
+            except OSError:
+                return  # reaped already: SIGCHLD=SIG_IGN
+            except subprocess.TimeoutExpired:
                 pass
-        with _unreaped_lock:
-            _unreaped.append(keeper)
+        _reap_later(keeper)
 
 
 def _waited(proc) -> bool:
@@ -242,20 +244,20 @@ def _signal_leader(proc, kill: bool) -> None:
 def _start_group(argv, options):
     """`start_tree`'s POSIX half: the keeper first, then the child in its
     group. A caller's own group or session options leave the child
-    unowned, as does a keeper `/bin/sh` will not start."""
-    _reap_released()
-    if ({"preexec_fn", "process_group"} & options.keys()
+    unowned, as does a Python before 3.11 (`POSIX_GROUPS`) or a keeper
+    `/bin/sh` will not start."""
+    if (not POSIX_GROUPS or {"preexec_fn", "process_group"} & options.keys()
             or options.get("start_new_session")):
         return subprocess.Popen(argv, **options)
     try:
         keeper = _Popen(["/bin/sh", "-c", _KEEPER], stdin=subprocess.PIPE,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        bufsize=0, **_joining(0))
+                        bufsize=0, process_group=0)
     except (OSError, subprocess.SubprocessError):
         return subprocess.Popen(argv, **options)
     tree = _GroupTree(keeper)
     try:
-        proc = subprocess.Popen(argv, **dict(options, **_joining(keeper.pid)))
+        proc = subprocess.Popen(argv, **dict(options, process_group=keeper.pid))
     except BaseException:
         tree.close()
         raise
@@ -391,6 +393,52 @@ def ask_agent_process_to_end(proc) -> None:
         proc.terminate()
     except OSError:
         pass  # it died between the poll and here; `wait` below collects it
+
+
+# Children `end_after_grace` is already escalating: one watchdog per child,
+# however many presses (and a `wake=True` hook runs twice per press).
+_escalating: "weakref.WeakSet" = weakref.WeakSet()
+_escalating_lock = threading.Lock()
+
+
+def end_after_grace(proc) -> None:
+    """After an ask nothing else will follow up — a Ctrl+C hook, whose turn
+    reader may be blocked on a child that prints nothing and ignores
+    SIGTERM, so the stream never comes round to notice the press — end the
+    tree once `REAP_GRACE_S` (capped by the caller's stop budget) has
+    passed without the child exiting. Its killing closes the child's
+    stdout, which is what unblocks the reader.
+
+    From a daemon thread, which only ever acts by identity on an owned
+    tree (the job, the keeper's EOF) — a thread the exiting interpreter
+    freezes leaves nothing half-done that the OS will not finish (the
+    handle's or the pipe's closing). An unowned child gets `Popen.kill`,
+    which signals only an unreaped child. Never raises; once per child.
+    """
+    try:
+        with _escalating_lock:
+            if proc in _escalating:
+                return
+            _escalating.add(proc)
+    except TypeError:
+        pass  # not weak-referenceable: armed every time, which is harmless
+    deadline = stopclock.deadline()
+
+    def escalate():
+        try:
+            with stopclock.ending(deadline):
+                if _waited(proc):
+                    return
+                tree = _tree(proc)
+                if tree is not None:
+                    tree.close()
+                else:
+                    _signal_leader(proc, kill=True)
+        except Exception:  # noqa: BLE001 - a watchdog must not die loudly
+            pass
+
+    threading.Thread(target=escalate, name="procend-press-escalation",
+                     daemon=True).start()
 
 
 def end_unless_exited(proc) -> None:

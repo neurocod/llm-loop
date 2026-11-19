@@ -27,8 +27,8 @@ from typing import Iterator, Optional, Protocol
 from . import appserver, ctrlc, operator, wire
 from .codex_usage import CodexUsageSource
 from .operator import user_message_line
-from .procend import (ask_agent_process_to_end, end_unless_exited, share_tree,
-                      start_tree)
+from .procend import (ask_agent_process_to_end, end_after_grace,
+                      end_unless_exited, share_tree, start_tree)
 from .usage import UsageSource
 
 
@@ -563,12 +563,23 @@ def ended_on_press(proc) -> Iterator[TurnStream]:
     line then ends the stream from the key reader's thread — and a press made
     before the hook went in is asked for once it is in (`Interrupt.on_press`).
 
+    The ask alone is not the ending: a CLI that ignores SIGTERM and prints
+    nothing leaves the stream blocked in its read, where neither the press
+    nor the runner's escalation after `proc.wait()` is ever reached. So the
+    press also arms `procend.end_after_grace`, which kills the tree once
+    the grace has passed; the killing closes the stream.
+
     Opened INSIDE `note_channel`, so the hook is gone before the pipe closes.
     """
     interrupt = ctrlc.current()
-    with interrupt.on_press(lambda: ask_agent_process_to_end(proc), wake=True):
+
+    def end():
+        ask_agent_process_to_end(proc)
+        end_after_grace(proc)
+
+    with interrupt.on_press(end, wake=True):
         if interrupt.requested:
-            ask_agent_process_to_end(proc)
+            end()
         yield TurnStream(proc, interrupt)
 
 

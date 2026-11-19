@@ -917,6 +917,47 @@ def test_a_turn_s_stream_stops_at_the_first_line_after_a_press(monkeypatch):
     assert ended == [proc]
 
 
+# A CLI that ignores SIGTERM and SIGINT, says it is up, and then prints
+# nothing: its reader blocks, so only an escalation the press arms itself
+# can end it (`procend.end_after_grace`).
+_SILENT_STUBBORN_CLI = ("import signal, time\n"
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+                        "print('up', flush=True)\n"
+                        "time.sleep(60)\n")
+
+
+def test_one_press_ends_a_silent_cli_that_ignores_sigterm():
+    """One press, nothing read after it: the CLI is ended within the grace
+    (plus a loaded machine's slack), and the stream closes with it. A
+    failsafe kills it at 30 s, so a regression fails on the time instead of
+    hanging the suite."""
+    from llm_loop import procend
+    import time
+    proc = procend.start_tree([sys.executable, "-c", _SILENT_STUBBORN_CLI],
+                              stdout=subprocess.PIPE, text=True)
+    failsafe = threading.Timer(30, proc.kill)
+    failsafe.start()
+    took = None
+    try:
+        with pytest.raises(SystemExit):
+            with ctrlc.captured() as interrupt:
+                with providers.ended_on_press(proc) as stream:
+                    lines = iter(stream)
+                    assert next(lines) == "up\n"
+                    pressed = time.monotonic()
+                    threading.Timer(0.1, interrupt.press).start()
+                    assert list(lines) == []
+                    took = time.monotonic() - pressed
+        # The grace, and 10 s for a loaded machine (TREE_END_S in
+        # test_procend_tree.py).
+        assert took is not None and took < procend.REAP_GRACE_S + 10, took
+    finally:
+        failsafe.cancel()
+        proc.kill()
+        proc.wait(timeout=30)
+
+
 def test_codex_events_render_message_commands_and_usage(capsys):
     streamrender._render_codex_event({
         "type": "item.started",

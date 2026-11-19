@@ -185,6 +185,8 @@ _EXITS_LEAVING_A_HOLDER = (
     "sys.stdin.read()\n")
 
 
+@pytest.mark.skipif(os.name != "nt" and not procend.POSIX_GROUPS,
+                    reason="POSIX owns a tree from Python 3.11")
 def test_a_quota_server_that_exits_on_eof_leaves_no_holder_of_its_stdout():
     """The server exits on its stdin's close, inside the grace, and leaves a
     descendant holding stdout: the stop still ends the tree (its job, or its

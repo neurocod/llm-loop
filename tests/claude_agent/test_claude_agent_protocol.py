@@ -11,6 +11,7 @@ import pytest
 
 from llm_agents import host_policy
 from llm_agents.claude import protocol
+from llm_loop import procend
 
 
 FAKE_CLAUDE = r'''
@@ -219,6 +220,21 @@ def test_completed_parent_does_not_wait_for_descendant_stdout(fake_cli):
     outcome = run("inherited_stdout")
     assert outcome["status"] == "completed", outcome
     assert outcome["answer"] == "FINAL ANSWER"
+
+
+@pytest.mark.skipif(not procend.POSIX_GROUPS, reason="a kept group: POSIX, Python 3.11+")
+def test_a_reaped_leader_s_descendants_end_without_a_group_number(fake_cli, monkeypatch):
+    """`run_turn` reaps the leader (its poll) before ending the descendant
+    holding stdout: the kept group ends it by the keeper's membership, so no
+    `killpg` by the reaped leader's pid is sent — on that pid's reuse it
+    would name somebody else's group."""
+    def refuse(pgid, signum):
+        raise AssertionError(f"killpg({pgid}, {signum}) by number")
+    monkeypatch.setattr(os, "killpg", refuse)
+    run, _, agent = fake_cli
+    agent["options"]["turn_timeout"] = 10  # as the inherited-stdout test above
+    outcome = run("inherited_stdout")
+    assert outcome["status"] == "completed", outcome
 
 
 def test_interrupt_can_cancel_a_large_prompt_before_stdin_drains(fake_cli):

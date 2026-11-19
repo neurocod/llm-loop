@@ -21,6 +21,8 @@ import pytest
 from llm_loop import procend, stopclock
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX'")
+owned = pytest.mark.skipif(not procend.POSIX_GROUPS,
+                           reason="kept groups need Popen(process_group=), 3.11+")
 
 # The same bounds as test_procend_tree.py's Windows pins: an ending that does
 # not wait is a write and a close; a killed tree lets go of its pipe well
@@ -97,6 +99,7 @@ def no_group_numbers(monkeypatch):
     monkeypatch.setattr(os, "killpg", refuse)
 
 
+@owned
 def test_a_stubborn_tree_on_a_spent_budget_ends_at_once(tmp_path, no_group_numbers):
     proc, reader, pids = _start(tmp_path)
     try:
@@ -111,20 +114,57 @@ def test_a_stubborn_tree_on_a_spent_budget_ends_at_once(tmp_path, no_group_numbe
         _cleanup(proc, pids)
 
 
-def test_a_stubborn_tree_without_a_budget_ends_after_one_grace(tmp_path, no_group_numbers):
-    """No budget: the ask, one grace for the leader (it ignores SIGTERM),
-    then the keeper's SIGKILL — not the old two graces."""
+@owned
+def test_a_stubborn_tree_without_a_budget_ends_after_one_grace(tmp_path, no_group_numbers,
+                                                               monkeypatch):
+    """No budget: the ask, one grace the leader sits out (it ignores
+    SIGTERM), then the keeper's SIGKILL, after which the next wait finds it
+    gone — read off the waits' own outcomes, not a clock: the old sequence,
+    or a keeper that does not kill, times the second wait out as well."""
+    outcomes = []
+    real = procend._waited
+
+    def waited(proc):
+        outcomes.append(real(proc))
+        return outcomes[-1]
+
+    monkeypatch.setattr(procend, "_waited", waited)
     proc, reader, pids = _start(tmp_path)
     try:
-        started = time.monotonic()
         procend.end_process_tree(proc)
-        took = time.monotonic() - started
-        assert took < procend.REAP_GRACE_S + TREE_END_S / 2, f"took {took:.2f} s"
+        assert outcomes == [False, True], f"wait outcomes: {outcomes}"
         _assert_ended(reader, pids)
     finally:
         _cleanup(proc, pids)
 
 
+@owned
+def test_a_keeper_not_waited_for_is_reaped_without_another_launch(tmp_path):
+    """A finalizer's close does not wait for the keeper; it is reaped once it
+    exits all the same, with no later `start_tree` to do it."""
+    proc, reader, pids = _start(tmp_path)
+    try:
+        keeper = procend._trees[proc]._keeper
+        procend._trees[proc].close(False)
+        deadline = time.monotonic() + TREE_END_S
+        while keeper.returncode is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert keeper.returncode is not None, "the keeper was left a zombie"
+        _assert_ended(reader, pids)
+    finally:
+        _cleanup(proc, pids)
+
+
+@pytest.mark.skipif(procend.POSIX_GROUPS, reason="the pre-3.11 fallback")
+def test_before_python_3_11_a_tree_is_left_unowned(tmp_path):
+    proc, reader, pids = _start(tmp_path, then="exit")
+    try:
+        assert not procend.owns(proc)
+    finally:
+        _cleanup(proc, pids)
+
+
+@owned
 def test_a_leader_reaped_by_another_waiter_still_takes_its_group(tmp_path,
                                                                 no_group_numbers):
     """The leader exits first and a stray `wait()` reaps it — the move that
@@ -139,6 +179,7 @@ def test_a_leader_reaped_by_another_waiter_still_takes_its_group(tmp_path,
         _cleanup(proc, pids)
 
 
+@owned
 def test_the_ask_reaches_every_member(tmp_path, no_group_numbers):
     """The terminal's Ctrl+C reaches no member (the group is not the
     foreground one); the press's hook, `ask_agent_process_to_end`, does."""
@@ -150,6 +191,7 @@ def test_the_ask_reaches_every_member(tmp_path, no_group_numbers):
         _cleanup(proc, pids)
 
 
+@owned
 def test_an_unrelated_process_is_untouched(tmp_path, no_group_numbers):
     """Every ending entry, on a live tree and on an exited one: a process
     outside the tree — its own group, the test's sibling — lives on."""
@@ -173,6 +215,7 @@ def test_an_unrelated_process_is_untouched(tmp_path, no_group_numbers):
         bystander.wait(timeout=TREE_END_S)
 
 
+@owned
 def test_sigchld_ignored_changes_nothing(tmp_path, no_group_numbers):
     """SIGCHLD=SIG_IGN auto-reaps every child the moment it exits — the
     leader and the keeper included. Nothing here waits on a zombie, so the
@@ -192,6 +235,7 @@ def test_sigchld_ignored_changes_nothing(tmp_path, no_group_numbers):
             _cleanup(proc, pids)
 
 
+@owned
 def test_a_dead_keeper_still_ends_the_leader(tmp_path):
     """A keeper killed from outside takes the group's ending with it; the
     leader is still ended, by its own Popen."""
@@ -219,6 +263,7 @@ _RUN = ("import os, sys, time\n"
         "os._exit(0)\n")
 
 
+@owned
 def test_the_owner_s_death_ends_its_tree(tmp_path):
     """The keeper's pipe closes with its owner: what Windows' kill-on-close
     does for a job."""
