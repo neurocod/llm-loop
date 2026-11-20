@@ -18,7 +18,8 @@ from llm_loop.agentwork import NeedsHuman
 from llm_loop.drivers import MAX_ATTEMPTS, ListFileDriver, Settled
 from llm_loop.stopchannel import RunStopReason
 
-from _runfixtures import MemListDriver, isolated_run, par_args, seq_args
+from _runfixtures import (MemListDriver, StubPolicy, isolated_run, par_args,
+                          seq_args)
 
 
 @pytest.fixture(autouse=True)
@@ -127,6 +128,70 @@ def test_failed_attempts_are_counted_per_key(tmp_path, monkeypatch):
     assert len(calls) == MAX_ATTEMPTS, calls
 
 
+class _DriftingKeyDriver(MemListDriver):
+    """An `item_key` whose answer changes after the claim (`drift`)."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.salt = 0
+
+    def item_key(self, line):
+        return (line, self.salt)
+
+
+@pytest.mark.parametrize("ending", ["settled", "released", "failed"])
+def test_the_key_taken_at_claim_is_the_one_given_back(ending):
+    """Every step after the claim uses the claim's key: a recomputed one that
+    differs would leave the claimed key in `in_progress` (and `running`) for
+    ever, so the run never reads as drained."""
+    driver = _DriftingKeyDriver(["products/a.md"])
+    shared = parallel.Shared(driver, type("S", (), {"max_runs": None})())
+
+    line = shared.claim()
+    driver.salt += 1                       # the key drifts mid-item
+    shared.start_turn(line)
+    if ending == "settled":
+        shared.finish(line, True, settling=True)
+        shared.settle(line, None)
+    elif ending == "released":
+        shared.release(line)
+    else:
+        shared.finish(line, False)
+
+    assert shared.in_progress == set(), "the claimed key was never given back"
+    assert shared.running == set()
+    if ending == "failed":
+        assert shared.attempts == {("products/a.md", 0): 1}, \
+            "the failure was counted against a key nobody claimed"
+
+
+@pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_status_row_that_throws_on_finish_does_not_hang_the_run(
+        tmp_path, monkeypatch):
+    """`job.finish` sits between the guard and `shared.finish`: a raise there
+    must still record the outcome and give the key up."""
+    from llm_loop import statusline
+    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    real_finish = statusline.JobHandle.finish
+    thrown = []
+
+    def finish(self):
+        if not thrown:
+            thrown.append(1)
+            raise RuntimeError("the status line broke")
+        real_finish(self)
+
+    monkeypatch.setattr(statusline.JobHandle, "finish", finish)
+    driver = MemListDriver(["products/only.md"])
+
+    result = _run_parallel(driver, par_args(tmp_path, jobs=2))
+
+    assert thrown, "the throwing finish was never reached"
+    assert driver.pending_lines() == [], "the finished turn was not recorded"
+    assert result.completed == 1
+
+
 # --- 2. the line a command served ---------------------------------------------
 
 class _RecordingDriver(MemListDriver):
@@ -232,6 +297,25 @@ def test_a_refused_turn_is_parked_in_the_sequential_loop(tmp_path, monkeypatch):
     assert result.reason is RunStopReason.NO_WORK
     assert len(calls) == MAX_ATTEMPTS + 1
     assert driver.pending_lines() == ["products/bad.md"]
+    # The fleet's count (see its twin above): only ok.md is done.
+    assert result.completed == 1, "a refused turn was counted as done"
+
+
+def test_the_sequential_refusal_budget_is_per_runner_call(
+        tmp_path, monkeypatch):
+    """A wrapper that reuses its driver gets a fresh budget each call, as the
+    fleet's fresh `Shared` gives it one per `run_parallel`."""
+    calls = []
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda *args, **kwargs: calls.append(1) or 0)
+    driver = _RefusingDriver(["products/bad.md"], "products/bad.md")
+
+    for _ in range(2):
+        cyclecore.run_loop(driver, _seq(tmp_path),
+                           app_name="pytest-ownership", wait_on_start=False)
+
+    assert len(calls) == 2 * MAX_ATTEMPTS, \
+        "the second call found the item parked by the first"
 
 
 # --- 4. "a human is needed" ---------------------------------------------------
@@ -343,6 +427,86 @@ def test_needs_human_with_exit_0_is_returned(tmp_path, monkeypatch, runner):
     assert result.reason is RunStopReason.NEEDS_HUMAN
 
 
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_needs_human_from_item_started_ends_the_run(
+        tmp_path, monkeypatch, runner, reasons):
+    """The start hook's answer: this turn still runs (it is claimed), nothing
+    new starts, and the run exits with the human's code."""
+    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda *args, **kwargs: 0)
+
+    class Driver(MemListDriver):
+        def item_started(self, command):
+            return NeedsHuman("the licence server is down", exit_code=3)
+
+    driver = Driver(["products/a.md", "products/b.md"])
+    if runner == "parallel":
+        outcome = _run_parallel(driver, par_args(tmp_path, jobs=1,
+                                                 no_statusline=True))
+    else:
+        try:
+            outcome = cyclecore.run_loop(driver, _seq(tmp_path),
+                                         app_name="pytest-ownership",
+                                         wait_on_start=False)
+        except SystemExit as exc:
+            outcome = exc
+
+    assert isinstance(outcome, SystemExit), f"the run returned {outcome!r}"
+    assert outcome.code == 3
+    assert driver.pending_lines() == ["products/b.md"]
+    assert any(r.startswith("the driver needs a human (exit 3)")
+               for r in reasons), reasons
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_needs_human_outranks_the_cap_it_lands_on(tmp_path, monkeypatch,
+                                                  runner):
+    """The last item the cap allows asks for a human: the run reads
+    NEEDS_HUMAN, not LIMIT_REACHED. In the fleet the cap is latched FIRST: the
+    second worker reads it while the first one's turn runs. (A stop latched
+    around it goes through the same `_handback_locked` / end-of-loop door;
+    staging one per runner needs a stop file timed between two hooks, so it
+    stays with the unit pins.)"""
+    capped = threading.Event()
+
+    def job(job_id, command, mailbox=None):
+        # The idle worker backs off 2 s between claims; it reads the cap on
+        # its first one, which runs beside this turn.
+        capped.wait(5)
+        return 0, 0.0, 0.01
+
+    monkeypatch.setattr(parallel, "run_job", job)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda *args, **kwargs: 0)
+
+    class Driver(MemListDriver):
+        def item_finished(self, command, returncode):
+            return NeedsHuman("look at this", exit_code=0)
+
+    driver = Driver(["products/a.md", "products/b.md"])
+    if runner == "parallel":
+        real_exhausted = parallel.Shared._exhausted
+
+        def exhausted(self, pending):
+            answer = real_exhausted(self, pending)
+            if self.stop_reason is RunStopReason.LIMIT_REACHED:
+                capped.set()
+            return answer
+
+        monkeypatch.setattr(parallel.Shared, "_exhausted", exhausted)
+        result = _run_parallel(driver, par_args(tmp_path, jobs=2, max=1,
+                                                no_statusline=True))
+        assert capped.is_set(), "the cap was never latched before the human"
+    else:
+        result = cyclecore.run_loop(
+            driver, seq_args(tmp_path, max=1, no_statusline=True),
+            app_name="pytest-ownership", wait_on_start=False)
+
+    assert result.reason is RunStopReason.NEEDS_HUMAN
+    assert driver.pending_lines() == ["products/b.md"]
+
+
 def test_a_human_outranks_a_pause_latched_before_it():
     handback = stopchannel.DriverHandback()
     assert handback.latch("pause first") is True
@@ -387,3 +551,45 @@ def test_replace_line_edits_removes_and_reports_a_missing_line(tmp_path):
     assert driver.settle("c.md") is Settled.STRUCK
     assert driver.settle("c.md") is Settled.GONE
     assert path.read_text(encoding="utf-8") == "# done b.md\n"
+
+
+def test_a_fleet_on_a_real_list_file_with_hooks_rewriting_it(
+        tmp_path, monkeypatch):
+    """The real `pending_lines` / `replace_line` / `_list_lock` under a fleet:
+    workers strike their lines (under `Shared.lock`) while every
+    `item_finished` rewrites a comment line from its worker thread, outside
+    that lock. A read beside a truncating rewrite would lose lines — a work
+    line run twice or never, or a comment left unrewritten."""
+    count = 24
+    work = [f"products/p{i:02}.md" for i in range(count)]
+    path = tmp_path / "list.md"
+    path.write_text("".join(f"{w}\n# {w}: pending\n" for w in work),
+                    encoding="utf-8")
+    ran = []
+    lock = threading.Lock()
+
+    def job(job_id, command, mailbox=None):
+        with lock:
+            ran.append(command.item)
+        time.sleep(0.01)
+        return 0, 0.0, 0.01
+
+    class Driver(_FileDriver):
+        pick_order = "list"
+
+        def item_finished(self, command, returncode):
+            assert self.replace_line(f"# {command.item}: pending",
+                                     f"# {command.item}: done"), command.item
+            return None
+
+    monkeypatch.setattr(parallel, "run_job", job)
+    driver = Driver(path)
+    driver.limit_policy = StubPolicy()
+
+    result = _run_parallel(driver, par_args(tmp_path, jobs=6,
+                                            no_statusline=True), timeout=60.0)
+
+    assert sorted(ran) == work, "a line ran twice or never"
+    assert result.completed == count
+    assert path.read_text(encoding="utf-8") == "".join(
+        f"# {w}: done\n" for w in work)
