@@ -77,6 +77,8 @@ from . import (clispec, console, costlog, ctrlc, exitlog, operator,
 # takes all six straight from `agentwork` — so re-importing them here would only
 # create second addresses for names this file never mentions again.
 from .agentwork import Driver, LoopStop, build_agent_argv
+# The one list-driver fact this loop owns: its REFUSED budget is per call.
+from .drivers import ListFileDriver
 # What the run PRINTS, and the mirror log that is the second copy of it, are
 # `console` (see its header for why those are one module). The line helpers are
 # imported by name because this module calls them on nearly every path; the
@@ -425,6 +427,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # `runlifecycle.begin_run` is the prologue both runners share.
     ctx = runlifecycle.begin_run(driver, args, app_name, progress,
                                  setup_logging=setup_logging)
+    # "Parked for the rest of this run" means THIS call, as the fleet's fresh
+    # `Shared` makes it mean for `run_parallel`: a wrapper that reuses the
+    # driver for another call must not find its items parked already.
+    if isinstance(driver, ListFileDriver):
+        driver.forget_refusals()
     provider, spec = ctx.provider, ctx.spec
     progress = ctx.progress
     # The live knobs (see RunSettings): read where they are USED, never
@@ -882,9 +889,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
             if returncode == 0:
                 consecutive_errors = 0
-                completed += 1
+                # Completed only if the driver took the turn as done: a list
+                # driver's `Settled.REFUSED` answers False (see
+                # Driver.on_success), as the fleet counts it in `Shared.finish`.
+                if driver.on_success(returncode) is not False:
+                    completed += 1
                 exitlog.note(**progress.record_counts(iteration, completed))
-                driver.on_success(returncode)
                 # on_success recorded the item, so the driver's own count now
                 # says how far the invocation has got.
                 remaining = driver.pending_total()

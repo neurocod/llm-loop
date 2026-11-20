@@ -251,7 +251,10 @@ class ListFileDriver(Driver):
         # parallel runner takes `Shared.lock` BEFORE this one, never after.
         self._list_lock = threading.RLock()
         # The sequential runner's per-key REFUSED counts (see MAX_ATTEMPTS);
-        # the fleet keeps its own in `parallel.Shared.attempts`.
+        # the fleet keeps its own in `parallel.Shared.attempts`. Per runner
+        # CALL, like the fleet's (a fresh `Shared` each `run_parallel`):
+        # `run_loop` empties it on entry (`forget_refusals`), so a wrapper that
+        # reuses one driver for several calls gets a fresh budget each time.
         self._refused: dict = {}
         if jobs is not None:
             self.jobs = jobs
@@ -399,20 +402,28 @@ class ListFileDriver(Driver):
         return self.command_for(self._current_line)._replace(
             item=self._current_line)
 
-    def on_success(self, returncode: int) -> None:
+    def forget_refusals(self) -> None:
+        """Start a fresh REFUSED budget: the sequential runner's run boundary
+        (`run_loop` calls it on entry; see `_refused`)."""
+        self._refused.clear()
+
+    def on_success(self, returncode: int) -> Optional[bool]:
         """Settle the just-processed line (the list is the source of truth for
-        what is left to do); a refusal counts against its key."""
+        what is left to do); a refusal counts against its key and answers
+        False, so the runner does not count the turn as completed."""
         line, self._current_line = self._current_line, None
         if line is None:
-            return
-        if self.settle(line) is Settled.REFUSED:
-            key = self.item_key(line)
-            self._refused[key] = self._refused.get(key, 0) + 1
-            parked = self._refused[key] >= MAX_ATTEMPTS
-            print(f"  ✗ {os.path.basename(line.strip())}: refused by the "
-                  f"driver ({self._refused[key]}/{MAX_ATTEMPTS})"
-                  + (" — parked for the rest of this run" if parked
-                     else " — will retry"))
+            return None
+        if self.settle(line) is not Settled.REFUSED:
+            return True
+        key = self.item_key(line)
+        self._refused[key] = self._refused.get(key, 0) + 1
+        parked = self._refused[key] >= MAX_ATTEMPTS
+        print(f"  ✗ {os.path.basename(line.strip())}: refused by the "
+              f"driver ({self._refused[key]}/{MAX_ATTEMPTS})"
+              + (" — parked for the rest of this run" if parked
+                 else " — will retry"))
+        return False
 
     def final_summary(self) -> Optional[str]:
         remaining = len(self.pending_lines())

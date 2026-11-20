@@ -236,9 +236,14 @@ class Driver:
         """
         return None
 
-    def on_success(self, returncode: int) -> None:
+    def on_success(self, returncode: int) -> Optional[bool]:
         """Called after an iteration whose provider CLI exited 0 — record progress
-        here (mark a file done, advance a cursor). Default: nothing to do."""
+        here (mark a file done, advance a cursor). Default: nothing to do.
+
+        Return False when the driver would not take the turn as done (its
+        output is missing): the sequential runner then does not count it as
+        completed. Any other answer, None included, counts it — so a driver
+        that returns nothing keeps the count it always had."""
 
     # --- the two boundaries of one unit of work -------------------------------
     # `on_success` records what the driver's OWN queue did; these two are about
