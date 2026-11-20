@@ -72,9 +72,11 @@ def test_write_failure_keeps_sources(archiver, tmp_path, monkeypatch):
     assert cli(tmp_path) == 1
     assert (tmp_path / "one").is_dir()
     assert (tmp_path / "registry.json").read_bytes() == b"{}"
+    assert not list(tmp_path.glob("*.zip"))
+    assert not list(tmp_path.glob("*.partial"))
 
 
-def test_delete_failure_keeps_registry(archiver, tmp_path, monkeypatch):
+def test_delete_failure_keeps_registry(archiver, tmp_path, monkeypatch, capsys):
     cli, namespace = archiver
     (tmp_path / "one").mkdir()
     (tmp_path / "registry.json").write_bytes(b"{}")
@@ -85,3 +87,71 @@ def test_delete_failure_keeps_registry(archiver, tmp_path, monkeypatch):
     monkeypatch.setattr(namespace["shutil"], "rmtree", fail)
     assert cli(tmp_path) == 1
     assert (tmp_path / "registry.json").read_bytes() == b"{}"
+    assert "folder locked" in capsys.readouterr().err
+    archive, = tmp_path.glob("*.zip")
+    with ZipFile(archive) as saved:
+        assert saved.read("registry.json") == b"{}"
+
+
+@pytest.mark.parametrize("failure", ["archive", "source", "inventory"])
+def test_verification_failure_keeps_sources(archiver, tmp_path, monkeypatch, failure):
+    cli, namespace = archiver
+    folder = tmp_path / "one"
+    folder.mkdir()
+    log = folder / "events.jsonl"
+    log.write_bytes(b"event")
+    (tmp_path / "registry.json").write_bytes(b"{}")
+    original = namespace["digest"]
+
+    def changed_digest(stream):
+        value = original(stream)
+        if getattr(stream, "name", None) == "one/events.jsonl":
+            if failure == "archive":
+                return b"corrupt"
+            if failure == "source":
+                log.write_bytes(b"changed")
+            if failure == "inventory":
+                (folder / "new-file").write_bytes(b"new")
+        return value
+
+    monkeypatch.setitem(namespace, "digest", changed_digest)
+    assert cli(tmp_path) == 1
+    assert folder.is_dir()
+    assert (tmp_path / "registry.json").exists()
+    assert not list(tmp_path.glob("*.zip"))
+    assert not list(tmp_path.glob("*.partial"))
+
+
+def test_name_collision_preserves_previous_archive(archiver, tmp_path, monkeypatch):
+    cli, namespace = archiver
+    folder = tmp_path / "one"
+    folder.mkdir()
+    archive = tmp_path / "2001.02.03-04.05.06-1.zip"
+    archive.write_bytes(b"previous archive")
+
+    moment = namespace["datetime"](2001, 2, 3, 4, 5, 6)
+
+    class FixedDate:
+        @staticmethod
+        def now():
+            return moment
+
+    monkeypatch.setitem(namespace, "datetime", FixedDate)
+    assert cli(tmp_path) == 1
+    assert archive.read_bytes() == b"previous archive"
+    assert folder.is_dir()
+
+
+def test_reparse_point_refused(archiver, tmp_path, monkeypatch):
+    cli, namespace = archiver
+    folder = tmp_path / "one"
+    folder.mkdir()
+    original = Path.lstat
+
+    class ReparseStat:
+        st_file_attributes = namespace["stat"].FILE_ATTRIBUTE_REPARSE_POINT
+
+    monkeypatch.setattr(Path, "lstat", lambda path: ReparseStat() if path == folder else original(path))
+    assert cli(tmp_path) == 1
+    assert folder.is_dir()
+    assert not list(tmp_path.glob("*.zip"))
