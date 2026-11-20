@@ -631,6 +631,12 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # that will never come. Held there, `p` would keep the caller from
             # getting control back until somebody released it, and the gate
             # would keep it until the quota window reset.
+            if handback.human is not None:
+                # The closing door is after the loop (see there), so the
+                # driver's final_summary is printed first.
+                print(f"  ✗ {handback.human.reason} — "
+                      f"{stopchannel.NEEDS_HUMAN_CLAUSE}")
+                break
             if handback.pending:
                 print(f"  ⏸ {handback.reason} — "
                       f"{stopchannel.DRIVER_HANDBACK_CLAUSE}")
@@ -945,6 +951,11 @@ def run_loop(driver: Driver, args: argparse.Namespace,
 
             # Session is under the limit — this was a transient failure, not token
             # exhaustion. Retry, but don't spin forever if something is truly broken.
+            # A `NeedsHuman` latched on this turn goes to the head instead: the
+            # error door below would exit with the provider's code, not the
+            # driver's.
+            if handback.human is not None:
+                continue
             if consecutive_errors < 5:
                 if usage_source is None:
                     print("  ↻ Provider quota status is unavailable — retrying immediately.")
@@ -975,6 +986,17 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         summary = driver.final_summary()
         if summary:
             print(f"\n{summary}")
+        # A hook's `NeedsHuman` ends the run whatever broke the loop around
+        # it (a stop, the cap): the work is stuck, and that is what the exit
+        # code and the record must say. The fleet decides the same way.
+        human = handback.human
+        if human is not None:
+            stop_reason = stopchannel.RunStopReason.NEEDS_HUMAN
+            if human.exit_code:
+                boundary.exit(
+                    human.exit_code,
+                    ending=stopchannel.STOP_REASON_TEXT[stop_reason],
+                    reason=stopchannel.needs_human_exit_reason(human))
         # The exit push follows every check queued while agents were running.
         return boundary.end(
             stopchannel.RunResult(stop_reason, iteration, completed))

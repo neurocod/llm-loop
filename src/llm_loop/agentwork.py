@@ -27,6 +27,8 @@ from typing import NamedTuple, Optional
 from . import projectroot
 from . import stopchannel
 from .providers import build_agent_argv as provider_argv
+# Re-exported: it is part of the Driver contract (what a hook may return).
+from .stopchannel import NeedsHuman  # noqa: F401
 
 
 class AgentCommand(NamedTuple):
@@ -38,12 +40,19 @@ class AgentCommand(NamedTuple):
     its configured default, which is the common case.
     In the sequential loop an explicit `provider` selects this command's CLI;
     an empty provider uses the launch default, even after a provider switch.
+
+    `item` is the raw list line this command was built for, stamped by the
+    runner that claimed it (`ListFileDriver.next_command`, the parallel
+    worker) AFTER `command_for`, so an override of `command_for` gets it
+    without setting it; "" for a command that serves no list line. It is what
+    a hook reads to know which line finished — not `label`, which is display.
     """
     prompt: str
     model: str = ""
     label: str = ""
     provider: str = ""
     sandbox_mode: str = ""
+    item: str = ""
 
 
 ClaudeCommand = AgentCommand
@@ -260,6 +269,11 @@ class Driver:
     # which is what a wrapper alternating two kinds of run needs, and what it
     # otherwise has to fake by slicing the work into fixed-size batches.
     #
+    # Returning `stopchannel.NeedsHuman(reason, exit_code)` instead winds down
+    # the same way and then ENDS THE INVOCATION with that exit code — the
+    # hooks' `LoopStop`, which neither of them may raise (a raising hook ends
+    # its own worker thread, not the run).
+    #
     # THREAD SAFETY: the parallel runner calls both from its worker threads,
     # several at once. Keep them cheap and re-entrant (a listdir, a counter
     # under a lock); anything that mutates driver state has to guard it.
@@ -278,8 +292,14 @@ class Driver:
 
         Called for failures as well as successes, and after `on_success` when
         there was one, so the driver's own queue is already up to date here.
+        `command.item` is the list line it served ("" when none).
         Return a short reason to ask the run to hand control back once the work
-        still in flight has finished; None to carry on.
+        still in flight has finished, a `NeedsHuman` to end the invocation;
+        None to carry on.
+
+        In the parallel runner the item still counts as in flight until this
+        returns: no worker can read the queue as drained in between, so what
+        it answers is the ending, not a late request racing NO_WORK.
         """
         return None
 

@@ -134,7 +134,8 @@ _home("gitpush", "GitPushPolicy")
 # The stop/pause vocabulary moved out of cyclecore into its own module; the
 # front door is unchanged on purpose, since an embedder asks the PACKAGE for
 # `pending_stop`, not the module that used to hold it.
-_home("stopchannel", "REQUESTED_STOP_REASONS", "RunResult", "RunStopReason",
+_home("stopchannel", "NeedsHuman", "REQUESTED_STOP_REASONS", "RunResult",
+      "RunStopReason",
       "StopSource", "commit_stop", "confirm_stop_request", "latched_stop",
       "pause_requested", "pending_stop", "stop_file_for", "wait_while_paused")
 _home("providers", "PROVIDER_NAMES", "PROVIDERS", "ProviderSpec", "provider_spec",
@@ -156,7 +157,7 @@ _home("statusline", "Action", "InvocationProgress", "Job", "JobHandle",
       "LoopStatus", "Mode",
       "NumberSetting", "PercentSetting", "QuotaRefresher", "Setting",
       "SettingsRegistry", "StatusApp", "push_quotas", "quota_rows", "render_rows")
-_home("drivers", "ListFileDriver", "StateFileDriver")
+_home("drivers", "ListFileDriver", "Settled", "StateFileDriver")
 _home("parallel", "run_parallel")
 _FRONT_DOOR["parse_parallel_args"] = ("parallel", "parse_args")
 _home("notifications", "SettingsError", "completion_sound_enabled",

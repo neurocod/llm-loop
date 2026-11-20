@@ -20,7 +20,9 @@ root, set from --project-dir / cwd), so the same code drives any host project.
 import os
 import random
 import re
-from typing import Optional, Tuple
+import threading
+from enum import Enum
+from typing import Hashable, Optional, Tuple
 
 from . import projectroot
 from .providers import model_selection
@@ -161,6 +163,37 @@ def _write_list_lines(list_path: str, lines: list) -> None:
             f.write("\n")
 
 
+# Per-KEY retry budget (`ListFileDriver.item_key`), both runners: an item whose
+# turns fail — a non-zero exit in the fleet, a `Settled.REFUSED` in either
+# runner — this many times is parked for the rest of the run (and reported)
+# instead of being retried forever. Per key, not per line, so two lines of one
+# item share one budget rather than doubling it.
+MAX_ATTEMPTS = 3
+
+
+class Settled(Enum):
+    """What became of an item whose turn exited 0 (`ListFileDriver.settle`).
+
+    Three answers where `strike`'s bool has two, because "the line was not
+    there" means two opposite things and only the driver can tell them apart:
+
+      * STRUCK  — the line came off the list: done.
+      * GONE    — the line was already gone (edited out by hand, or a twin
+                  struck it): nothing left to do or retry. Counted as done,
+                  exactly as the runners counted every exit 0 before this
+                  verdict existed, so a driver that never refuses sees no
+                  change.
+      * REFUSED — the driver would not take the turn as done (the output it
+                  checks for is missing): a FAILED attempt against the item's
+                  key (MAX_ATTEMPTS), the line stays listed, and the run never
+                  reports it as done.
+    """
+
+    STRUCK = "struck"
+    GONE = "gone"
+    REFUSED = "refused"
+
+
 class ListFileDriver(Driver):
     """Hand out files from a list file one at a time, striking each out of the
     list once its command succeeds.
@@ -210,6 +243,16 @@ class ListFileDriver(Driver):
 
     def __init__(self, jobs: Optional[int] = None):
         self._current_line: Optional[str] = None  # raw list line being processed
+        # Serialises every read and rewrite of the list file this driver makes
+        # (`pending_lines`, `replace_line`): a rewrite truncates the file
+        # before writing it, so a read beside it — the fleet's claim against a
+        # hook's `replace_line` outside `Shared.lock` — would see a half-empty
+        # list. Reentrant so an override may call either under it. The
+        # parallel runner takes `Shared.lock` BEFORE this one, never after.
+        self._list_lock = threading.RLock()
+        # The sequential runner's per-key REFUSED counts (see MAX_ATTEMPTS);
+        # the fleet keeps its own in `parallel.Shared.attempts`.
+        self._refused: dict = {}
         if jobs is not None:
             self.jobs = jobs
         # Validated once, at construction: a typo here would otherwise pass
@@ -245,9 +288,23 @@ class ListFileDriver(Driver):
         return source + self.target_suffix
 
     def pending_lines(self) -> list:
-        """All raw list lines still naming work to do (re-read each call)."""
-        return [ln for ln in _read_list_lines(self.list_path())
-                if self.is_pending(ln)]
+        """All raw list lines still naming work to do (re-read each call,
+        under the list lock — see `replace_line`)."""
+        with self._list_lock:
+            lines = _read_list_lines(self.list_path())
+        return [ln for ln in lines if self.is_pending(ln)]
+
+    def item_key(self, line: str) -> Hashable:
+        """The identity of the ITEM a list line names. Default: the line.
+
+        Two lines with one key are one item to both runners: never in flight
+        at once (the fleet will not claim a line whose key it holds), and one
+        retry budget between them (MAX_ATTEMPTS counts per key). Override it
+        when distinct spellings name one piece of work — a product slug, a
+        normalised path. Must be pure and cheap: the fleet calls it under
+        `Shared.lock`, on every pending line of every claim.
+        """
+        return line
 
     def pending_total(self) -> int:
         """The list itself is the total (see Driver.pending_total)."""
@@ -264,23 +321,51 @@ class ListFileDriver(Driver):
                             self.model(), label, self.provider,
                             self.sandbox_mode)
 
-    def strike(self, line: str) -> bool:
-        """Remove the first list entry exactly matching `line`; rewrite the file.
+    def replace_line(self, line: str, new: Optional[str]) -> bool:
+        """Replace the first list entry exactly matching `line` with `new`, or
+        remove it when `new` is None; rewrite the file.
 
-        Returns True if a line was removed, False if it was already gone (e.g.
-        hand-edited out). The list's single source of truth — both runners go
-        through here so the file always keeps the same shape.
+        True if the entry was found, False if it was already gone (nothing is
+        written then). The one writer of the list — `strike` is its None case —
+        so the file keeps one shape (BOM dropped, newline-joined, trailing
+        newline iff non-empty). `line` is a raw line as `pending_lines` handed
+        it out. Thread-safe on its own: the read-modify-write runs under the
+        list lock, so a hook may call it from a worker thread (e.g. to comment
+        a line out) without the fleet's lock.
         """
-        list_path = self.list_path()
-        lines = _read_list_lines(list_path)
-        for i, ln in enumerate(lines):
-            if ln == line:
-                del lines[i]
-                break
-        else:
-            return False
-        _write_list_lines(list_path, lines)
-        return True
+        with self._list_lock:
+            list_path = self.list_path()
+            lines = _read_list_lines(list_path)
+            for i, ln in enumerate(lines):
+                if ln == line:
+                    if new is None:
+                        del lines[i]
+                    else:
+                        lines[i] = new
+                    break
+            else:
+                return False
+            _write_list_lines(list_path, lines)
+            return True
+
+    def strike(self, line: str) -> bool:
+        """Remove `line` from the list: `replace_line(line, None)`.
+
+        True if it was removed, False if it was already gone (e.g. hand-edited
+        out). A REFUSAL is not spelled here — that is `settle`'s verdict.
+        """
+        return self.replace_line(line, None)
+
+    def settle(self, line: str) -> Settled:
+        """The verdict on `line` once its turn exited 0; both runners ask it.
+
+        Default: strike it — STRUCK, or GONE when it was already off the list.
+        Override to check what the turn was meant to produce and return
+        `Settled.REFUSED` (saying why) when it is missing, else
+        `super().settle(line)`. Called under `Shared.lock` in the fleet, so it
+        may read state `pick` wrote; keep it to the item's own files.
+        """
+        return Settled.STRUCK if self.strike(line) else Settled.GONE
 
     def pick(self, pending: list) -> str:
         """Choose the next line to hand out from the still-pending ones.
@@ -303,20 +388,31 @@ class ListFileDriver(Driver):
         return pending[0] if self.pick_order == "list" else random.choice(pending)
 
     def next_command(self) -> Optional[AgentCommand]:
-        pending = self.pending_lines()
+        """The sequential runner's claim: a pending line whose key has not
+        spent its REFUSED budget, stamped as the command's `item`."""
+        pending = [ln for ln in self.pending_lines()
+                   if self._refused.get(self.item_key(ln), 0) < MAX_ATTEMPTS]
         if not pending:
             self._current_line = None
             return None
         self._current_line = self.pick(pending)
-        return self.command_for(self._current_line)
+        return self.command_for(self._current_line)._replace(
+            item=self._current_line)
 
     def on_success(self, returncode: int) -> None:
-        """Remove the just-processed path from the list (the list is the source of
-        truth for what is left to do)."""
-        if self._current_line is None:
+        """Settle the just-processed line (the list is the source of truth for
+        what is left to do); a refusal counts against its key."""
+        line, self._current_line = self._current_line, None
+        if line is None:
             return
-        if self.strike(self._current_line):
-            self._current_line = None
+        if self.settle(line) is Settled.REFUSED:
+            key = self.item_key(line)
+            self._refused[key] = self._refused.get(key, 0) + 1
+            parked = self._refused[key] >= MAX_ATTEMPTS
+            print(f"  ✗ {os.path.basename(line.strip())}: refused by the "
+                  f"driver ({self._refused[key]}/{MAX_ATTEMPTS})"
+                  + (" — parked for the rest of this run" if parked
+                     else " — will retry"))
 
     def final_summary(self) -> Optional[str]:
         remaining = len(self.pending_lines())

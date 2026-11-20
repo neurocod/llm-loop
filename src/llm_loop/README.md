@@ -426,10 +426,9 @@ returns `RunStopReason.DRIVER_PAUSE` once everything in flight has finished: no
 turn is cancelled and nothing is lost from the queue. It is the same close
 `--max-runs` uses (new claims refused, work in flight untouched) rather than the
 `s` key's — a pause cannot be taken back, so unlike `s` a claim that has not
-started yet goes back to the queue instead of being held. A run whose LAST item
-asks for the pause may report either `DRIVER_PAUSE` or `NO_WORK`, depending on
-which worker got there first; a caller has to treat both as "come back and ask
-again". It is the ending for a wrapper that alternates two kinds of run — "this runner call is over, ask me again" — as opposed to
+started yet goes back to the queue instead of being held. Return a
+`NeedsHuman(reason, exit_code)` instead to wind down the same way and end the
+invocation with that exit code. A pause is the ending for a wrapper that alternates two kinds of run — "this runner call is over, ask me again" — as opposed to
 `next_command() -> None` (the queue is empty) and `LoopStop` (abort, a human is
 wanted). A host wrapper that slices its work into fixed-size batches to get an
 inter-batch boundary usually wants this instead: the run then ends when the

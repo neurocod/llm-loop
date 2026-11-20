@@ -52,6 +52,11 @@ class RunStopReason(Enum):
     # a wrapper that treats it as an ending would silently drop the rest of the
     # queue, and one that treats DRIVER_STOP as this would loop on an abort.
     DRIVER_PAUSE = "driver_pause"
+    # A per-item hook answered `NeedsHuman` (see there): the work itself is
+    # stuck, so neither "ask me again" (DRIVER_PAUSE) nor "the queue is empty"
+    # (NO_WORK) may be what the caller reads. A runner RETURNS it only for an
+    # exit code of 0; any other code leaves through the exit door with it.
+    NEEDS_HUMAN = "needs_human"
     DRY_RUN = "dry_run"
     # Only the parallel runner can reach this one, and only since its workers
     # started handing their claims back as they die (Shared.abandon): a run whose
@@ -100,6 +105,7 @@ STOP_REASON_TEXT = {
     RunStopReason.NO_WORK: "no more work in the queue",
     RunStopReason.DRIVER_STOP: "the driver stopped the run",
     RunStopReason.DRIVER_PAUSE: "the driver asked to hand control back",
+    RunStopReason.NEEDS_HUMAN: "the driver needs a human",
     RunStopReason.DRY_RUN: "dry run finished",
     RunStopReason.WORKERS_DIED: "every worker died before the queue drained",
 }
@@ -295,6 +301,35 @@ DRIVER_HANDBACK_CLAUSE = ("the driver asked to hand control back; nothing new "
                           "will be started and whatever is running finishes "
                           "first.")
 
+# The same promise for a `NeedsHuman` answer, which winds down the same way
+# and ends the invocation instead of the runner call.
+NEEDS_HUMAN_CLAUSE = ("the driver needs a human; nothing new will be started "
+                      "and whatever is running finishes first.")
+
+
+class NeedsHuman(NamedTuple):
+    """What a per-item hook returns, instead of a bare reason, when the work
+    cannot go on without a person — the hook-side twin of `LoopStop`.
+
+    Winds down exactly like a hand-back (claims close, nothing in flight is
+    cancelled), and then BOTH runners end with `exit_code` and a run-ended
+    reason that says "needs a human" — never DRIVER_PAUSE or NO_WORK, whichever
+    of those got latched around it. `exit_code` 0 returns
+    `RunStopReason.NEEDS_HUMAN` instead of exiting, for a wrapper that decides
+    the exit itself.
+    """
+
+    reason: str
+    exit_code: int = 1
+
+
+def needs_human_exit_reason(human: NeedsHuman) -> str:
+    """The exit record's line for a `NeedsHuman` ending, one wording for both
+    runners. The first line only, as `LoopStop`'s: a paragraph of diagnosis
+    must not become the one-line ending."""
+    first = (human.reason.splitlines() or [""])[0]
+    return f"the driver needs a human (exit {human.exit_code}): {first}"
+
 
 class DriverHandback:
     """The latch a driver hook's hand-back request lands in (see
@@ -319,22 +354,41 @@ class DriverHandback:
     fleet already latched (`parallel.Shared.request_driver_handback`) — is the
     caller's coupling to decide under the caller's lock; this class knows
     nothing about claims or stop reasons.
+
+    The one exception to first-wins is `NeedsHuman`: it outranks a plain
+    pause latched before it (the first human answer wins among humans), since
+    a pause read where a human was asked for restarts a stuck run. `human`
+    holds it; `reason` stays the first reason latched, of either kind.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._reason: Optional[str] = None
+        self._human: Optional[NeedsHuman] = None
 
-    def latch(self, reason: Optional[str]) -> bool:
-        """Record `reason` unless one is already latched. True for the caller
-        whose reason is now the latched one — the one that announces it."""
+    def latch(self, reason) -> bool:
+        """Record `reason` (a str or a `NeedsHuman`) unless one of its rank is
+        already latched. True for the caller whose answer is now the latched
+        one — the one that announces it."""
         if not reason:
             return False
         with self._lock:
+            if isinstance(reason, NeedsHuman):
+                if self._human is not None:
+                    return False
+                self._human = reason
+                if self._reason is None:
+                    self._reason = reason.reason
+                return True
             if self._reason is not None:
                 return False
             self._reason = reason
             return True
+
+    @property
+    def human(self) -> Optional[NeedsHuman]:
+        """The latched `NeedsHuman`, or None while no hook asked for one."""
+        return self._human
 
     @property
     def reason(self) -> Optional[str]:

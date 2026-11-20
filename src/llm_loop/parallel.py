@@ -41,7 +41,7 @@ import os
 import sys
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 from uuid import uuid4
 
 from . import clispec
@@ -84,10 +84,12 @@ from .console import print_markup, route_through
 # a run down and therefore the one place that decides how the exit push is
 # guarded.
 from .gitpush import PushAbort, maybe_git_push
-from .stopchannel import RunResult, RunStopReason
+from .stopchannel import STOP_REASON_TEXT, RunResult, RunStopReason
 from .providers import (ended_on_press, note_channel, provider_spec,
                         reap_agent_process, start_agent_process)
-from .drivers import ListFileDriver
+# MAX_ATTEMPTS is the list drivers' per-key budget, shared with the sequential
+# runner's refusals rather than restated here (see drivers.MAX_ATTEMPTS).
+from .drivers import MAX_ATTEMPTS, ListFileDriver, Settled
 
 # How many of a failed job's discarded non-JSON lines are kept as its failure
 # explanation. The reason a dying CLI gives is in its last lines, and the bound
@@ -112,11 +114,6 @@ PUSH_PUMP_INTERVAL_S = 60
 # exit kills, its CLI's tree ended at the press, not by the reap it never gets
 # to.
 INTERRUPT_JOIN_TIMEOUT_S = 5
-
-# Per-file retry budget: a path that fails this many times in a row is parked in
-# the `failed` set so it stops blocking the queue (and is reported at the end)
-# instead of being retried forever.
-MAX_ATTEMPTS = 3
 
 # How many pending items an uncapped `--dry-run` lists before summarising the
 # rest. One item is one argv line with a whole prompt in it, so this is roughly
@@ -722,11 +719,19 @@ def run_job(job_id: int, command: AgentCommand, mailbox=None) -> tuple:
 
 # --- shared queue state, guarded by one lock -----------------------------------
 
+class Finished(NamedTuple):
+    """What `Shared.finish` reports back to the worker that finished an item."""
+
+    done: int                      # items done this run, across all workers
+    remaining: int                 # still pending in the list
+    verdict: Optional[Settled]     # the driver's verdict; None for a failed turn
+
+
 class Shared:
     """Cross-worker state behind a single lock: the list cursor and run stats.
 
     The list file (owned by `driver`) is the source of truth for what remains;
-    `in_progress` keeps workers from claiming the same line, `failed` parks lines
+    `in_progress` keeps workers from claiming the same item, `failed` parks items
     that exhausted their retry budget, and the counters bound/report the run. All
     access to THAT state is under `lock`.
 
@@ -746,15 +751,24 @@ class Shared:
         # the value the editor writes, at the moment it claims. See `max_items`.
         self.settings = settings
         self.lock = threading.Lock()
-        self.in_progress = set()      # raw lines a worker is currently handling
+        # Everything below is per ITEM KEY (`driver.item_key`, the raw line by
+        # default), never per raw line: a key in `in_progress` keeps every line
+        # with that key unclaimable, so two spellings of one item never run at
+        # once, and they share one retry budget.
+        #
+        # Keys a worker is handling — claimed, running, or still SETTLING: a
+        # finished turn's key leaves only in `settle`, after `item_finished`
+        # has answered (see `finish`).
+        self.in_progress = set()
         # The subset of those whose provider turn is actually in flight. Not the
         # same question as `in_progress`, and the difference is what a pending
         # stop turns on: a worker parked on the usage gate holds a claim but is
         # not doing anything a stop would interrupt, so it must not be counted as
         # work in flight — see busy().
         self.running = set()
-        self.failed = set()           # raw lines parked after MAX_ATTEMPTS
-        self.attempts = {}            # raw line -> failed-attempt count
+        self.failed = {}              # key -> its last line, parked after MAX_ATTEMPTS
+        self.attempts = {}            # key -> failed-attempt count
+        self._lines = {}              # key in `in_progress` -> the line claimed
         self.claimed = 0              # files claimed this run (for --max-runs)
         self.started = 0              # provider turns started, including interrupted ones
         self.done = 0                 # files processed successfully
@@ -791,10 +805,21 @@ class Shared:
         """
         return self.settings.max_runs
 
+    def key(self, line: str):
+        """The item key of `line` (`ListFileDriver.item_key`; the line itself
+        for a driver without one)."""
+        item_key = getattr(self.driver, "item_key", None)
+        return line if item_key is None else item_key(line)
+
     def _pending(self) -> list:
-        """Lines nobody holds and nobody gave up on (call under `lock`)."""
-        return [ln for ln in self.driver.pending_lines()
-                if ln not in self.in_progress and ln not in self.failed]
+        """Lines whose key nobody holds and nobody gave up on (call under
+        `lock`)."""
+        pending = []
+        for ln in self.driver.pending_lines():
+            key = self.key(ln)
+            if key not in self.in_progress and key not in self.failed:
+                pending.append(ln)
+        return pending
 
     def _exhausted(self, pending: list) -> bool:
         """Has this run run out of work to give? (call under `lock`)
@@ -853,10 +878,12 @@ class Shared:
             # it sets pick_order = "list"); we are already under the lock, which
             # is the thread-safety pick() is documented to expect.
             line = self.driver.pick(pending)
-            self.in_progress.add(line)
+            key = self.key(line)
+            self.in_progress.add(key)
+            self._lines[key] = line
             self.claimed += 1
             in_flight = sorted(os.path.basename(ln.strip())
-                               for ln in self.in_progress)
+                               for ln in self._lines.values())
             claimed, done = self.claimed, self.done
             counts = (self.progress.count_fields()
                       if self.progress is not None else
@@ -878,18 +905,24 @@ class Shared:
         reservation so the count reflects only files actually processed.
         """
         with self.lock:
-            self.in_progress.discard(line)
+            key = self.key(line)
+            self._drop_locked(key)
             # A turn Ctrl+C cut short is released too (`worker`), after its
             # `start_turn`: a release that left the line in `running` would
             # make busy() true forever and hang every later stop request.
-            self.running.discard(line)
+            self.running.discard(key)
             if self.claimed > 0:
                 self.claimed -= 1
+
+    def _drop_locked(self, key) -> None:
+        """The key is no longer in flight (call under `lock`)."""
+        self.in_progress.discard(key)
+        self._lines.pop(key, None)
 
     def start_turn(self, line: str) -> None:
         """This claim is about to become a running provider turn (see busy())."""
         with self.lock:
-            self.running.add(line)
+            self.running.add(self.key(line))
             self.started += 1
             if self.progress is not None:
                 self.progress.record_counts(self.started, self.done)
@@ -940,27 +973,65 @@ class Shared:
         """
         return self.stop.is_set() or stopchannel.pending_stop(app) is not None
 
-    def finish(self, line: str, ok: bool) -> tuple:
-        """Record an item's outcome: strike it on success, or count/park a fail.
+    def finish(self, line: str, ok: bool, *, settling: bool = False
+               ) -> "Finished":
+        """Record an item's outcome: settle it on success, or count/park a fail.
 
-        Returns (done, remaining): files processed this run (across all workers)
-        and how many are still pending — so the caller can report progress.
+        Success is the driver's verdict, not the exit code's: `ok` asks
+        `driver.settle(line)`, and a `Settled.REFUSED` is counted exactly like
+        a failed turn — an attempt against the key, parked at MAX_ATTEMPTS,
+        not "done". GONE (the line was already off the list) is done: nothing
+        is left to retry.
+
+        `settling` keeps the key in `in_progress` until `settle` — the worker's
+        way of making `item_finished`'s answer part of the completion (see
+        `settle`); without it the key is dropped here, as for a dying worker
+        (`abandon`).
+
+        Returns `Finished(done, remaining, verdict)`: files done this run
+        (across all workers), how many are still pending, and the driver's
+        verdict (None for a failed turn).
         """
         with self.lock:
-            self.in_progress.discard(line)
-            self.running.discard(line)
-            if ok:
-                self.done += 1
-                if self.progress is not None:
-                    self.progress.record_counts(self.started, self.done)
-                self.driver.strike(line)
-                self.attempts.pop(line, None)
-            else:
-                self.attempts[line] = self.attempts.get(line, 0) + 1
-                if self.attempts[line] >= MAX_ATTEMPTS:
-                    self.failed.add(line)
-            remaining = self.driver.pending_total()
-            return self.done, remaining
+            key = self.key(line)
+            if not settling:
+                self._drop_locked(key)
+            self.running.discard(key)
+            try:
+                verdict = self.driver.settle(line) if ok else None
+                if verdict is not None and verdict is not Settled.REFUSED:
+                    self.done += 1
+                    if self.progress is not None:
+                        self.progress.record_counts(self.started, self.done)
+                    self.attempts.pop(key, None)
+                else:
+                    self.attempts[key] = self.attempts.get(key, 0) + 1
+                    if self.attempts[key] >= MAX_ATTEMPTS:
+                        self.failed[key] = line
+                remaining = self.driver.pending_total()
+            except BaseException:
+                # No `settle` follows a `finish` that raised (the worker never
+                # reaches its `try`), so the key goes now or the run can never
+                # read as drained.
+                self._drop_locked(key)
+                raise
+            return Finished(self.done, remaining, verdict)
+
+    def settle(self, line: str, answer) -> bool:
+        """The end of a `finish(..., settling=True)`: drop the key from
+        `in_progress` and latch `item_finished`'s `answer`, in ONE section of
+        `lock`. True for the worker that should announce the answer.
+
+        One section because the two used to be apart, and the run's ending
+        depended on who won the gap: with the last key already dropped, a
+        worker in the back-off read the queue as drained and latched NO_WORK,
+        which then refused the hand-back — so a driver asking for a human got
+        NO_WORK (or DRIVER_PAUSE) depending on timing. Now nothing can read
+        the run as drained while a hook is still answering.
+        """
+        with self.lock:
+            self._drop_locked(self.key(line))
+            return self._handback_locked(answer)
 
     # --- the stop request: closing claims is not the same as ending the run ----
 
@@ -1049,11 +1120,28 @@ class Shared:
         reopenable), and a pause arriving a moment later must not relabel them.
         """
         with self.lock:
-            if self.claims_closed.is_set() or not self.handback.latch(reason):
+            return self._handback_locked(reason)
+
+    def _handback_locked(self, answer) -> bool:
+        """`request_driver_handback`'s body (call under `lock`).
+
+        A `NeedsHuman` is the exception to "a close already in place wins": it
+        latches whatever was latched before it (the cap, the drained queue, a
+        pause), since it is about the work being stuck, which those endings
+        say nothing about. A stop channel's reason is overwritten too — the
+        exit code is what a script reads, and it must say "stuck".
+        """
+        if isinstance(answer, stopchannel.NeedsHuman):
+            if not self.handback.latch(answer):
                 return False
-            self.stop_reason = RunStopReason.DRIVER_PAUSE
+            self.stop_reason = RunStopReason.NEEDS_HUMAN
             self.claims_closed.set()
             return True
+        if self.claims_closed.is_set() or not self.handback.latch(answer):
+            return False
+        self.stop_reason = RunStopReason.DRIVER_PAUSE
+        self.claims_closed.set()
+        return True
 
     def note_pause(self, paused: bool) -> bool:
         """True for the worker that should announce this pause (or its release).
@@ -1148,9 +1236,19 @@ def note_driver_handback(job_id: int, shared: Shared, reason: Optional[str]) -> 
     """
     if not reason:
         return
-    if shared.request_driver_handback(reason):
+    announce_handback(job_id, reason, shared.request_driver_handback(reason))
+
+
+def announce_handback(job_id: int, answer, latched: bool) -> None:
+    """The line for a hook's answer, once it has been latched (`latched`)."""
+    if not latched:
+        return
+    if isinstance(answer, stopchannel.NeedsHuman):
         job_lines(job_id).line(
-            f"⏸ {reason} — {stopchannel.DRIVER_HANDBACK_CLAUSE}", "yellow")
+            f"✗ {answer.reason} — {stopchannel.NEEDS_HUMAN_CLAUSE}", "bold red")
+        return
+    job_lines(job_id).line(
+        f"⏸ {answer} — {stopchannel.DRIVER_HANDBACK_CLAUSE}", "yellow")
 
 
 def worker(job_id: int, shared: Shared, source: Optional[object],
@@ -1310,7 +1408,8 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # move one and the other has to move with it.
             shared.start_turn(line)
             turn_started = True
-            command = shared.driver.command_for(line)
+            # Stamped after `command_for`, so an override need not set it.
+            command = shared.driver.command_for(line)._replace(item=line)
             # Notes typed while this worker had no turn in flight ride its next
             # prompt. Every worker has a separate mailbox, so another worker can
             # neither consume nor receive them.
@@ -1364,11 +1463,12 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             raise
         # Recording the outcome is deliberately OUTSIDE the guard, and it is the
         # one place that does it: were it inside, a `finish` that raised half-way
-        # (its `strike`/`pending_total` are file I/O on a real driver) would be
+        # (its `settle`/`pending_total` are file I/O on a real driver) would be
         # followed by the guard's `abandon` calling `finish` a second time, and
         # the line would be both struck and counted as a failed attempt. It needs
-        # no guard: `finish` discards `in_progress` first thing under the lock,
-        # so whatever happens after that, the run can still read as drained.
+        # no guard of this one: a `finish` that raises gives the key up itself,
+        # and everything after it is inside the `finally` that calls `settle`,
+        # so whatever happens the run can still read as drained.
         job.finish()
         if rc != 0 and interrupt.requested:
             # Cut short by Ctrl+C (`run_job`), not failed: no attempt counted
@@ -1377,35 +1477,48 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # next run to take.
             shared.release(line)
             break
-        ok = rc == 0
-        done_total, remaining = shared.finish(line, ok)
-        # The summary counter moves on COMPLETION, not on the claim: a claimed
-        # file is in flight, and counting it as progress would report N jobs'
-        # worth of work that nothing has finished yet.
-        progress.note_remaining(remaining)
-        exitlog.note(**progress.count_fields())
-        app.update(**progress.summary_fields())
+        # From here to `shared.settle` the key stays in flight (`settling`),
+        # and the `finally` below is what gives it up whatever raises between.
+        finished = shared.finish(line, rc == 0, settling=True)
+        answer = None
+        try:
+            _report_finished(out, shared, app, progress, line, command, rc,
+                             cost_usd, dur, finished)
+            # The end-of-item hook (Driver.item_finished). Outside the guard
+            # above for the same reason `shared.finish` is — the outcome is
+            # already recorded, so a hook that raises ends its own thread
+            # without taking the run with it.
+            answer = shared.driver.item_finished(command, rc)
+        finally:
+            announce_handback(job_id, answer, shared.settle(line, answer))
 
-        bits = []
-        if dur is not None:
-            bits.append(f"{dur:.1f}s")
-        if cost_usd is not None:
-            bits.append(f"${cost_usd:.4f}")
-        suffix = f" ({', '.join(bits)})" if bits else ""
-        if ok:
-            out.line(f"✓ {command.label}{suffix}  "
-                     f"[{done_total} done this run, {remaining} left]", "green")
-        else:
-            parked = line in shared.failed
-            tail = " — parked after repeated failures" if parked else " — will retry"
-            out.line(f"✗ {command.label} (exit {rc}){suffix}{tail}", "bold red")
 
-        # The end-of-item hook (Driver.item_finished). Outside the guard above
-        # for the same reason `shared.finish` is — the claim is already given
-        # back, so a hook that raises ends its own thread without taking the
-        # run with it.
-        note_driver_handback(job_id, shared,
-                             shared.driver.item_finished(command, rc))
+def _report_finished(out, shared: Shared, app, progress, line: str,
+                     command: AgentCommand, rc: int, cost_usd, dur,
+                     finished: Finished) -> None:
+    """The worker's counters and verdict line for one finished item."""
+    done_total, remaining, verdict = finished
+    # The summary counter moves on COMPLETION, not on the claim: a claimed
+    # file is in flight, and counting it as progress would report N jobs'
+    # worth of work that nothing has finished yet.
+    progress.note_remaining(remaining)
+    exitlog.note(**progress.count_fields())
+    app.update(**progress.summary_fields())
+
+    bits = []
+    if dur is not None:
+        bits.append(f"{dur:.1f}s")
+    if cost_usd is not None:
+        bits.append(f"${cost_usd:.4f}")
+    suffix = f" ({', '.join(bits)})" if bits else ""
+    if verdict is not None and verdict is not Settled.REFUSED:
+        out.line(f"✓ {command.label}{suffix}  "
+                 f"[{done_total} done this run, {remaining} left]", "green")
+        return
+    parked = shared.key(line) in shared.failed
+    tail = " — parked after repeated failures" if parked else " — will retry"
+    why = "refused by the driver" if verdict is Settled.REFUSED else f"exit {rc}"
+    out.line(f"✗ {command.label} ({why}){suffix}{tail}", "bold red")
 
 
 @stopchannel.stop_file_lifecycle()
@@ -1721,7 +1834,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         if shared.failed:
             print(f"  ⚠ {len(shared.failed)} file(s) parked after "
                   f"{MAX_ATTEMPTS} failed attempts:")
-            for line in sorted(shared.failed):
+            for line in sorted(shared.failed.values()):
                 print(f"      {os.path.basename(line.strip())}")
 
         if interrupt.requested:
@@ -1745,6 +1858,18 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
             # abandons the exit push (`close_run` says how), keeps the rest of
             # the epilogue, and still leaves with 130.
             boundary.interrupt()
+
+        # A hook's `NeedsHuman` is the run's ending whatever else got latched
+        # around it (`Shared._handback_locked`), and its exit code is the
+        # process's — a door like `LoopStop`'s, after the closing report.
+        human = shared.handback.human
+        if human is not None:
+            print(f"  ✗ the driver needs a human: {human.reason}")
+            if human.exit_code:
+                boundary.exit(human.exit_code,
+                              ending=STOP_REASON_TEXT[RunStopReason.NEEDS_HUMAN],
+                              reason=stopchannel.needs_human_exit_reason(human))
+            shared.stop_reason = RunStopReason.NEEDS_HUMAN
 
         # `stop_reason` unset means no worker ever reached a verdict about the run:
         # every one of the endings — the cap, the drained queue, a latched stop —
