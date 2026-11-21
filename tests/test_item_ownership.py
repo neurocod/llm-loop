@@ -111,6 +111,7 @@ def test_human_ending_is_announced_once(tmp_path, monkeypatch, capsys, runner, s
     assert len([line for line in output.splitlines() if "✗" in line]) == 1
     assert output.count("still pending") == 1
     assert "\n\n1 item(s) still pending" in output
+    assert "Processed " not in output
 
 
 def test_empty_fleet_returns_before_opening_run_resources(tmp_path, monkeypatch, capsys):
@@ -129,6 +130,56 @@ def test_empty_fleet_returns_before_opening_run_resources(tmp_path, monkeypatch,
     assert result.reason is RunStopReason.NO_WORK
     assert result.attempted == 0
     assert "Nothing pending" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel", "parallel-interrupt"])
+@pytest.mark.parametrize("code", [0, 3])
+def test_final_poll_latches_human_after_the_region_closes(
+        tmp_path, monkeypatch, capsys, reasons, runner, code):
+    from llm_loop import ctrlc, runlifecycle
+
+    class Driver(MemListDriver):
+        report_ready = False
+
+        def needs_human(self):
+            if self.report_ready:
+                if runner == "parallel-interrupt":
+                    ctrlc.current().press()
+                return NeedsHuman("late blocker", exit_code=code)
+
+    driver = Driver(["a"])
+    release = runlifecycle.RunBoundary.release_held
+
+    def release_held(boundary):
+        release(boundary)
+        driver.report_ready = True
+
+    monkeypatch.setattr(runlifecycle.RunBoundary, "release_held", release_held)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
+    monkeypatch.setattr(parallel, "run_job", _ok_job)
+
+    def run():
+        if runner.startswith("parallel"):
+            return parallel.run_parallel(
+                driver, par_args(tmp_path, jobs=1, no_statusline=True),
+                wait_on_start=False)
+        return cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+
+    if code or runner == "parallel-interrupt":
+        with pytest.raises(SystemExit) as stopped, ctrlc.captured():
+            run()
+        if runner == "parallel-interrupt":
+            assert stopped.value.code == 130
+            assert ctrlc.INTERRUPTED_REASON in reasons
+        else:
+            assert stopped.value.code == code
+            assert f"the driver needs a human (exit {code}): late blocker" in reasons
+    else:
+        with ctrlc.captured():
+            assert run().reason is RunStopReason.NEEDS_HUMAN
+        assert "the driver needs a human" in reasons
+    assert capsys.readouterr().out.count("the driver needs a human:") == (
+        0 if runner == "parallel-interrupt" else 1)
 
 
 def test_handback_between_worker_check_and_admission_returns_claim(tmp_path, monkeypatch):
@@ -545,7 +596,33 @@ def test_ledger_and_parked_summary_are_per_runner_call(
         assert result.completed == 0
         assert driver.ledger.parked_lines() == ["bad.md"]
         summary = f"1 file(s) parked after {MAX_ATTEMPTS} failed attempts:"
-        assert capsys.readouterr().out.count(summary) == 1
+        output = capsys.readouterr().out
+        assert output.count(summary) == 1
+        assert output.count("1 item(s) still pending") == 1
+        assert output.count("still pending") == 1
+        assert output.index("1 item(s) still pending") < output.index(summary)
+        if runner == "parallel":
+            assert output.index("Processed 0 file(s)") < output.index("still pending")
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_parked_summary_survives_a_failed_closing_report(
+        tmp_path, monkeypatch, capsys, runner):
+    class Driver(_RefusingDriver):
+        def final_summary(self):
+            raise RuntimeError("closing report failed")
+
+    driver = Driver(["bad.md"], "bad.md")
+    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
+    with pytest.raises(RuntimeError, match="closing report failed"):
+        if runner == "parallel":
+            parallel.run_parallel(driver, par_args(tmp_path, jobs=1, no_statusline=True),
+                                  wait_on_start=False)
+        else:
+            cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+    output = capsys.readouterr().out
+    assert output.count(f"1 file(s) parked after {MAX_ATTEMPTS} failed attempts:") == 1
 
 
 @pytest.mark.parametrize("ending, code", [("errors", 7), ("human", 3),

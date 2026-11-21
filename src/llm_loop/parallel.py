@@ -1680,7 +1680,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
     # `git push` after this run had left.
     push_abort = PushAbort()
     boundary = runlifecycle.RunBoundary(
-        ctx,
+        ctx, driver=driver,
         counts=lambda: ((shared.started, shared.done) if shared is not None
                         else (0, 0)),
         push_abort=push_abort)
@@ -1861,45 +1861,21 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # mention pushing, and the exit push, which the report does precede,
         # comes after that push either way.
         remaining = driver.pending_total()
-        shared.request_driver_handback(driver.needs_human())
-        human = shared.handback.human
-        if human is None:
-            print(f"\nProcessed {shared.done} file(s) this run; "
-                  f"{remaining} still pending in {list_file_rel}.")
-        else:
-            print(f"\nProcessed {shared.done} file(s) this run.")
-        attempts = driver.attempt_summary()
-        if attempts:
-            print(attempts)
 
-        if interrupt.requested:
-            # An interrupt is not a `RunStopReason` — nobody returns from here,
-            # so there is no `RunResult` to carry one — but it IS an ending, and
-            # it gets the same epilogue as any other. It used to get none at
-            # all: no reason recorded, no exit push, no closing snapshot, no
-            # report of the notes nobody delivered, so an operator who pressed
-            # Ctrl+C left the run's commits sitting local and its mailbox
-            # unread.
-            #
-            # THE COST, NAMED because an operator feels it: this can take
-            # minutes. `close_run` hands the exit push to the pusher, and an
-            # interrupt that lands while the pusher is inside `git push` waits
-            # for a subprocess with a 300 s timeout (`gitpush.git_push`), on top
-            # of INTERRUPT_JOIN_TIMEOUT_S for the whole fleet. Waited out
-            # rather than bounded, and that is the decision: the pusher is
-            # PUSHING, so the alternative to waiting is not a faster exit with
-            # the same result, it is racing a second `git` against the first
-            # one. The operator who will not wait presses Ctrl+C again: that
-            # abandons the exit push (`close_run` says how), keeps the rest of
-            # the epilogue, and still leaves with 130.
-            boundary.interrupt()
+        def runner_line():
+            # After the last driver poll: Ctrl+C during that poll must still
+            # win over NeedsHuman, as it does during the workers' turns.
+            # The interrupt door closes the run (including its exit push);
+            # a second press abandons the push, never its exit code of 130.
+            if interrupt.requested:
+                boundary.interrupt()
+            return f"Processed {shared.done} file(s) this run."
 
         # A hook's `NeedsHuman` is the run's ending whatever else got latched
         # around it (`Shared._handback_locked`), and its exit code is the
-        # process's — a door like `LoopStop`'s, after the closing report.
-        if human is not None:
-            shared.stop_reason = runlifecycle.end_needs_human(
-                boundary, driver, human)
+        # process's, unless Ctrl+C took the interrupt door first.
+        shared.stop_reason = (runlifecycle.close_report(
+            boundary, driver, shared.handback, runner_line) or shared.stop_reason)
 
         # `stop_reason` unset means no worker ever reached a verdict about the run:
         # every one of the endings — the cap, the drained queue, a latched stop —

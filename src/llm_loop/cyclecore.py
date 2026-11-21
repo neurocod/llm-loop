@@ -539,17 +539,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # (`RunBoundary`): the region before the housekeeping of an ending that
     # unwinds the loop, after it for the doors taken inside the loop.
     boundary = runlifecycle.RunBoundary(
-        ctx, counts=lambda: (iteration, completed),
+        ctx, counts=lambda: (iteration, completed), driver=driver,
         mailbox=mailbox, pusher=pusher, push_abort=push_abort)
 
-    def report_attempts():
-        attempts = driver.attempt_summary()
-        if attempts:
-            print(f"\n{attempts}")
-
-    # The boundary runs this once on returns, explicit exits and unwinding.
-    # A later item's failure must not hide keys already parked in this run.
-    boundary.on_ending(report_attempts)
     with boundary:
         if not dry_run:
             pusher.start()
@@ -998,14 +990,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # A hook's `NeedsHuman` ends the run whatever broke the loop around
         # it (a stop, the cap): the work is stuck, and that is what the exit
         # code and the record must say. The fleet decides the same way.
-        handback.latch(driver.needs_human())
-        if handback.human is not None:
-            stop_reason = runlifecycle.end_needs_human(
-                boundary, driver, handback.human)
-        else:
-            summary = driver.final_summary()
-            if summary:
-                print(f"\n{summary}")
+        stop_reason = (runlifecycle.close_report(boundary, driver, handback)
+                       or stop_reason)
         # The exit push follows every check queued while agents were running.
         return boundary.end(
             stopchannel.RunResult(stop_reason, iteration, completed))

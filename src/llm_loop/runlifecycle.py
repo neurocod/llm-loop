@@ -697,6 +697,28 @@ def _exit_interrupted(iterations: int, completed: int) -> NoReturn:
     ctrlc.leave(iterations=iterations, completed=completed)
 
 
+def close_report(boundary, driver, latch,
+                 runner_line: Optional[Callable[[], str]] = None
+                 ) -> Optional[stopchannel.RunStopReason]:
+    """Poll through the runner's latch and report its final state before teardown.
+
+    An earlier NeedsHuman survives an empty last poll. `runner_line` runs after
+    the poll, even for a human ending: the fleet uses that point for its last
+    interrupt check, which must precede a human exit. Its text is shown only
+    without a human ending; the sequential runner has no extra line or check.
+    """
+    latch.latch(driver.needs_human())
+    line = runner_line() if runner_line is not None else None
+    if latch.human is not None:
+        return end_needs_human(boundary, driver, latch.human)
+    if line:
+        print(f"\n{line}")
+    summary = driver.final_summary()
+    if summary:
+        print(f"\n{summary}")
+    return None
+
+
 def end_needs_human(boundary, driver,
                     human: stopchannel.NeedsHuman):
     """Report once; a missing boundary means no run resources were opened."""
@@ -868,6 +890,7 @@ class RunBoundary:
 
     def __init__(self, ctx: RunContext, *,
                  counts: Callable[[], Tuple[int, int]],
+                 driver=None,
                  mailbox=None,
                  pusher: Optional[OwnerThread] = None,
                  push_abort: Optional[PushAbort] = None):
@@ -881,6 +904,15 @@ class RunBoundary:
         self.usages: List[Optional[RunUsage]] = []
         self._releases = contextlib.ExitStack()
         self._held = contextlib.ExitStack()
+        if driver is not None:
+            def report_attempts():
+                attempts = driver.attempt_summary()
+                if attempts:
+                    print(f"\n{attempts}")
+
+            # Registered first, so later releases cannot hide parked work,
+            # even when the closing report or a release raises.
+            self.on_ending(report_attempts)
         self.closed = False
         # The budget of the ending under way, kept on the boundary so the
         # steps after the door — the releases and the last pusher close in
