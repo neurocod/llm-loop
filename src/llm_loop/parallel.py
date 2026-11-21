@@ -966,8 +966,9 @@ class Shared:
             worker (a provider CLI that dies mid-stream, a console that refuses
             a write) would otherwise be handed back untouched and kill the next
             worker, and the next — a fleet of ten dies ten times over one line.
-            Counted, the same line stops the run after MAX_ATTEMPTS workers and
-            is reported as failed, which is also what it is.
+            Counted, the same line stops the run after
+            AttemptLedger.MAX_ATTEMPTS workers and is reported as failed,
+            which is also what it is.
 
         The exception itself is not caught here: the guard re-raises, so the
         thread still ends the way it was always going to. What changes is that
@@ -994,7 +995,8 @@ class Shared:
 
         Success is the driver's verdict, not the exit code's: `ok` asks
         `driver.settle(line)`, and a `Settled.REFUSED` is counted exactly like
-        a failed turn — an attempt against the key, parked at MAX_ATTEMPTS,
+        a failed turn — an attempt against the key, parked at
+        AttemptLedger.MAX_ATTEMPTS,
         not "done". GONE (the line was already off the list) is done: nothing
         is left to retry.
 
@@ -1541,8 +1543,8 @@ def _report_finished(out, app, progress, command: AgentCommand, rc: int,
     if verdict is Settled.REFUSED:
         out.line(refusal_line(command.label, parked, suffix), "bold red")
     else:
-        tail = " — parked after repeated failures" if parked else " — will retry"
-        out.line(f"✗ {command.label} (exit {rc}){suffix}{tail}", "bold red")
+        out.line(refusal_line(command.label, parked, suffix, reason=f"exit {rc}"),
+                 "bold red")
 
 
 @stopchannel.stop_file_lifecycle()

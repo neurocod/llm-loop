@@ -541,6 +541,15 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     boundary = runlifecycle.RunBoundary(
         ctx, counts=lambda: (iteration, completed),
         mailbox=mailbox, pusher=pusher, push_abort=push_abort)
+
+    def report_attempts():
+        attempts = driver.attempt_summary()
+        if attempts:
+            print(f"\n{attempts}")
+
+    # The boundary runs this once on returns, explicit exits and unwinding.
+    # A later item's failure must not hide keys already parked in this run.
+    boundary.on_ending(report_attempts)
     with boundary:
         if not dry_run:
             pusher.start()
@@ -986,9 +995,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # This run's own closing line, if the driver has one (e.g. "Final
         # state: …"). Before the shared epilogue, which is housekeeping: the
         # run reports on its work first, then the run is closed down.
-        attempts = driver.attempt_summary()
-        if attempts:
-            print(attempts)
         summary = driver.final_summary()
         if summary:
             print(f"\n{summary}")

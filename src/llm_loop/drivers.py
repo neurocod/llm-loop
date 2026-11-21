@@ -194,10 +194,11 @@ class AttemptLedger:
         return sorted(self._parked.values())
 
 
-def refusal_line(label: str, parked: bool, suffix: str = "") -> str:
-    """One refusal message for either runner, with optional cost/time details."""
+def refusal_line(label: str, parked: bool, suffix: str = "", *,
+                 reason: str = "refused by the driver") -> str:
+    """One failure message for either runner, with optional cost/time details."""
     tail = " — parked after repeated failures" if parked else " — will retry"
-    return f"✗ {label} (refused by the driver){suffix}{tail}"
+    return f"✗ {label} ({reason}){suffix}{tail}"
 
 
 class Settled(Enum):
@@ -214,8 +215,8 @@ class Settled(Enum):
                   change.
       * REFUSED — the driver would not take the turn as done (the output it
                   checks for is missing): a FAILED attempt against the item's
-                  key (MAX_ATTEMPTS), the line stays listed, and the run never
-                  reports it as done.
+                  key (AttemptLedger.MAX_ATTEMPTS), the line stays listed,
+                  and the run never reports it as done.
     """
 
     STRUCK = "struck"
@@ -327,9 +328,9 @@ class ListFileDriver(Driver):
 
         Two lines with one key are one item to both runners: never in flight
         at once (the fleet will not claim a line whose key it holds), and one
-        retry budget between them (MAX_ATTEMPTS counts per key). Override it
-        when distinct spellings name one piece of work — a product slug, a
-        normalised path. Must be pure and cheap: the fleet calls it under
+        retry budget between them (AttemptLedger.MAX_ATTEMPTS counts per key).
+        Override it when distinct spellings name one piece of work — a product
+        slug, a normalised path. Must be pure and cheap: the fleet calls it under
         `Shared.lock`, on every pending line of every claim.
         """
         return line

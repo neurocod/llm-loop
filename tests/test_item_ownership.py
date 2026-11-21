@@ -163,9 +163,7 @@ def test_the_key_taken_at_claim_is_the_one_given_back(ending):
     assert shared.in_progress == set(), "the claimed key was never given back"
     assert shared.running == set()
     if ending == "failed":
-        for _ in range(MAX_ATTEMPTS - 1):
-            driver.ledger.fail(("products/a.md", 0), line)
-        assert driver.ledger.is_parked(("products/a.md", 0)), \
+        assert driver.ledger._attempts == {("products/a.md", 0): 1}, \
             "the failure was counted against a key nobody claimed"
 
 
@@ -365,7 +363,41 @@ def test_ledger_and_parked_summary_are_per_runner_call(
         assert result.attempted == MAX_ATTEMPTS
         assert result.completed == 0
         assert driver.ledger.parked_lines() == ["bad.md"]
-        assert f"1 file(s) parked after {MAX_ATTEMPTS} failed attempts:" in capsys.readouterr().out
+        summary = f"1 file(s) parked after {MAX_ATTEMPTS} failed attempts:"
+        assert capsys.readouterr().out.count(summary) == 1
+
+
+@pytest.mark.parametrize("ending, code", [("errors", 7), ("human", 3),
+                                         ("interrupt", 130)])
+def test_parked_summary_survives_an_abnormal_sequential_ending(
+        tmp_path, monkeypatch, capsys, ending, code):
+    class Driver(_RefusingDriver):
+        def item_finished(self, command, returncode):
+            if command.item == "b.md" and ending == "human":
+                return NeedsHuman("inspect B", exit_code=code)
+
+    driver = Driver(["a.md", "b.md"], "a.md")
+    calls = []
+
+    def run(*args, **kwargs):
+        line = driver._current_line
+        calls.append(line)
+        if line == "b.md":
+            if ending == "interrupt":
+                raise KeyboardInterrupt
+            if ending == "errors":
+                return code
+        return 0
+
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", run)
+    with pytest.raises(SystemExit) as stopped:
+        cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+    assert stopped.value.code == code
+    assert calls == ["a.md"] * MAX_ATTEMPTS + ["b.md"] * (5 if ending == "errors" else 1)
+    assert driver.ledger.parked_lines() == ["a.md"]
+    output = capsys.readouterr().out
+    assert output.count(f"1 file(s) parked after {MAX_ATTEMPTS} failed attempts:") == 1
+    assert "\n\n  ⚠ 1 file(s) parked" in output
 
 
 # --- 4. "a human is needed" ---------------------------------------------------
