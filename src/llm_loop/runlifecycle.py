@@ -702,20 +702,26 @@ def close_report(boundary, driver, latch,
                  ) -> Optional[stopchannel.RunStopReason]:
     """Poll through the runner's latch and report its final state before teardown.
 
-    An earlier NeedsHuman survives an empty last poll. `runner_line` runs after
-    the poll, even for a human ending: the fleet uses that point for its last
-    interrupt check, which must precede a human exit. Its text is shown only
-    without a human ending; the sequential runner has no extra line or check.
+    An earlier NeedsHuman survives an empty last poll. The fleet's runner line
+    is printed on human and interrupt endings too. Its attempt report runs
+    before choosing the ending, so report failures propagate through boundary
+    cleanup and Ctrl+C during reporting wins over a human exit. The sequential
+    runner keeps reporting attempts as a best-effort ending callback.
     """
     latch.latch(driver.needs_human())
     line = runner_line() if runner_line is not None else None
-    if latch.human is not None:
-        return end_needs_human(boundary, driver, latch.human)
     if line:
         print(f"\n{line}")
-    summary = driver.final_summary()
-    if summary:
-        print(f"\n{summary}")
+    if latch.human is None:
+        summary = driver.final_summary()
+        if summary:
+            print(f"\n{summary}")
+    if runner_line is not None:
+        boundary.report_attempts()
+        if ctrlc.current().requested:
+            boundary.interrupt()
+    if latch.human is not None:
+        return end_needs_human(boundary, driver, latch.human)
     return None
 
 
@@ -904,15 +910,11 @@ class RunBoundary:
         self.usages: List[Optional[RunUsage]] = []
         self._releases = contextlib.ExitStack()
         self._held = contextlib.ExitStack()
+        self._attempt_driver = driver
         if driver is not None:
-            def report_attempts():
-                attempts = driver.attempt_summary()
-                if attempts:
-                    print(f"\n{attempts}")
-
             # Registered first, so later releases cannot hide parked work,
             # even when the closing report or a release raises.
-            self.on_ending(report_attempts)
+            self.on_ending(self.report_attempts)
         self.closed = False
         # The budget of the ending under way, kept on the boundary so the
         # steps after the door — the releases and the last pusher close in
@@ -979,6 +981,19 @@ class RunBoundary:
         return open_usage(driver, provider, name=name,
                           dry_run=self.ctx.dry_run,
                           register=self.usages.append)
+
+    def report_attempts(self) -> None:
+        """Report once, consuming the callback before invoking driver/output.
+
+        The fleet calls this before choosing its ending: failures propagate
+        and the boundary still cleans up. On other paths the ending callback
+        is the best-effort fallback, preserving sequential-runner semantics.
+        """
+        driver, self._attempt_driver = self._attempt_driver, None
+        if driver is not None:
+            attempts = driver.attempt_summary()
+            if attempts:
+                print(f"\n{attempts}")
 
     def on_ending(self, release: Callable[[], None]) -> None:
         """Run `release` once as the run's ending begins, whichever ending it

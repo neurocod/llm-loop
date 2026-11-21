@@ -295,7 +295,8 @@ class Driver:
 
         Return a run-wide blocker left by an earlier or interrupted turn.
         Like the item hooks, keep this cheap and thread-safe. The fleet calls
-        it under its claim lock; it must not call back into the runner.
+        it under its claim lock while claiming, and on the main thread for
+        the final closing poll; it must not call back into the runner.
         """
         return None
 

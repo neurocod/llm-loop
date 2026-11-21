@@ -10,6 +10,10 @@ needed" with an exit code (`NeedsHuman`), and the one public writer of the list
 
 import threading
 import time
+import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -111,7 +115,7 @@ def test_human_ending_is_announced_once(tmp_path, monkeypatch, capsys, runner, s
     assert len([line for line in output.splitlines() if "✗" in line]) == 1
     assert output.count("still pending") == 1
     assert "\n\n1 item(s) still pending" in output
-    assert "Processed " not in output
+    assert output.count("Processed 1 file(s) this run.") == int(runner == "parallel")
 
 
 def test_empty_fleet_returns_before_opening_run_resources(tmp_path, monkeypatch, capsys):
@@ -656,6 +660,106 @@ def test_parked_summary_survives_an_abnormal_sequential_ending(
     output = capsys.readouterr().out
     assert output.count(f"1 file(s) parked after {MAX_ATTEMPTS} failed attempts:") == 1
     assert "\n\n  ⚠ 1 file(s) parked" in output
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+@pytest.mark.parametrize("human", [False, True])
+@pytest.mark.parametrize("press_at", ["report", "before_report", "output"])
+def test_parked_report_interrupt_keeps_runner_ending(
+        tmp_path, monkeypatch, capsys, reasons, runner, human, press_at):
+    from llm_loop import ctrlc, runlifecycle
+    import builtins
+
+    calls = []
+
+    class Driver(_RefusingDriver):
+        def needs_human(self):
+            if self.ledger.parked_lines():
+                if press_at == "before_report":
+                    ctrlc.current().press()
+                if human:
+                    return NeedsHuman("parked blocker", exit_code=3)
+
+        def attempt_summary(self):
+            calls.append(1)
+            if press_at == "report":
+                ctrlc.current().press()
+            return super().attempt_summary()
+
+    real_print = builtins.print
+
+    def printing(*args, **kwargs):
+        if press_at == "output" and any("file(s) parked after" in str(a) for a in args):
+            ctrlc.current().press()
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", printing)
+    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
+    driver = Driver(["bad.md"], "bad.md")
+    # Use the runner's own checks, without captured() adding an outer check.
+    monkeypatch.setattr(ctrlc, "current", lambda: interrupt)
+    interrupt = ctrlc.Interrupt()
+
+    def run():
+        if runner == "parallel":
+            return parallel.run_parallel(driver, par_args(tmp_path, jobs=1,
+                                         no_statusline=True), wait_on_start=False)
+        return cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+
+    if runner == "parallel" or human or press_at == "before_report":
+        with pytest.raises(SystemExit) as stopped:
+            run()
+        expected = (3 if runner == "sequential" and human
+                    and press_at != "before_report" else 130)
+        assert stopped.value.code == expected
+        assert reasons[-1] == (ctrlc.INTERRUPTED_REASON if expected == 130 else
+                               "the driver needs a human (exit 3): parked blocker")
+    else:
+        assert run().reason is RunStopReason.NO_WORK
+        assert reasons[-1] == "no more work in the queue"
+    output = capsys.readouterr().out
+    assert calls == [1]
+    assert output.count(f"1 file(s) parked after {MAX_ATTEMPTS} failed attempts:") == 1
+    assert "\n\n  ⚠ 1 file(s) parked" in output
+    if runner == "parallel":
+        assert output.count("Processed 0 file(s) this run.") == 1
+        if not human:
+            assert output.count("1 item(s) still pending") == 1
+
+
+def test_fleet_attempt_report_failure_exits_one_after_cleanup(tmp_path):
+    script = textwrap.dedent('''
+        import sys
+        from pathlib import Path
+        import pytest
+        from llm_loop import parallel, runlifecycle, scriptlock
+        from _runfixtures import MemListDriver, isolated_run, par_args
+
+        patch = pytest.MonkeyPatch()
+        scope = isolated_run(patch, Path(sys.argv[1]))
+        scope.__enter__()
+        patch.setattr(scriptlock, "LOCK_DIR", Path(sys.argv[1]) / "script-locks")
+        class Driver(MemListDriver):
+            def attempt_summary(self):
+                print("ATTEMPT REPORT")
+                raise RuntimeError("attempt report failed")
+        close = runlifecycle.close_run
+        def cleanup(*args, **kwargs):
+            print("CLEANUP " + kwargs.get("ending", "normal"))
+            return close(*args, **kwargs)
+        patch.setattr(runlifecycle, "close_run", cleanup)
+        patch.setattr(parallel, "run_job", lambda *a, **kw: (0, 0, 0))
+        parallel.run_parallel(Driver(["a"]), par_args(
+            Path(sys.argv[1]), jobs=1, no_statusline=True), wait_on_start=False)
+    ''')
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path)],
+                            capture_output=True, text=True, env=env)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout.count("ATTEMPT REPORT") == 1, result.stdout + result.stderr
+    assert result.stdout.count("CLEANUP unhandled RuntimeError") == 1
+    assert "=== run ended: unhandled RuntimeError: attempt report failed" in result.stdout
 
 
 # --- 4. "a human is needed" ---------------------------------------------------

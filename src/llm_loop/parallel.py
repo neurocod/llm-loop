@@ -1863,12 +1863,6 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         remaining = driver.pending_total()
 
         def runner_line():
-            # After the last driver poll: Ctrl+C during that poll must still
-            # win over NeedsHuman, as it does during the workers' turns.
-            # The interrupt door closes the run (including its exit push);
-            # a second press abandons the push, never its exit code of 130.
-            if interrupt.requested:
-                boundary.interrupt()
             return f"Processed {shared.done} file(s) this run."
 
         # A hook's `NeedsHuman` is the run's ending whatever else got latched
