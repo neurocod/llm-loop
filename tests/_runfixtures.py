@@ -16,6 +16,8 @@ carried. These take the namespace from the runner's own parser instead, so a new
 option reaches every pin the day it reaches `clispec`.
 """
 
+from __future__ import annotations
+
 import argparse
 import atexit
 import logging
@@ -25,10 +27,85 @@ import sys
 import threading
 from contextlib import contextmanager
 
-from llm_loop import (clispec, console, exitlog, operator, parallel,
-                      projectroot, providers, runlifecycle)
+from llm_loop import (clispec, console, cyclecore, exitlog, operator, parallel,
+                      projectroot, providers, runlifecycle, scriptlock)
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.drivers import ListFileDriver
+from llm_loop.stopchannel import RunResult
+
+
+@contextmanager
+def isolated_launch_locks(monkeypatch, tmp_path):
+    """Keep locks local and close them before the caller's monkeypatch teardown.
+
+    Use the caller's patch stack: tests may override LOCK_DIR again, and a
+    separate stack restored first would let their teardown resurrect our path.
+    """
+    launches = {}
+    monkeypatch.setattr(scriptlock, "LOCK_DIR", tmp_path / "script-locks")
+    monkeypatch.setattr(scriptlock, "_launches", launches)
+    monkeypatch.setattr(scriptlock, "_launch_decision", None)
+    try:
+        yield
+    finally:
+        for lock in launches.values():
+            if lock is not None:
+                atexit.unregister(lock.close)
+                lock.close()
+
+
+def ok_job(job_id, command, mailbox=None):
+    return 0, 0.0, 0.01
+
+
+def run_either(runner, driver, tmp_path, monkeypatch, *, job=ok_job,
+               seq_rc=0, seq_fields=None, par_fields=None) -> RunResult | SystemExit:
+    """Run either engine; return expected exits, propagate unexpected errors.
+
+    `seq_rc` may be a streaming stub when a pin records calls or stages an
+    event. Field overrides use the real parsers; the finite sequential cap
+    disables quota machinery. Process isolation belongs to the caller.
+    """
+    if runner not in ("sequential", "parallel"):
+        raise ValueError(f"unknown runner: {runner}")
+    with monkeypatch.context() as patch:
+        patch.setattr(parallel, "run_job", job)
+        patch.setattr(cyclecore, "run_claude_streaming",
+                      seq_rc if callable(seq_rc) else lambda *a, **kw: seq_rc)
+        try:
+            if runner == "parallel":
+                fields = dict(jobs=1, no_statusline=True)
+                fields.update(par_fields or {})
+                return parallel.run_parallel(driver, par_args(tmp_path, **fields),
+                                             wait_on_start=False)
+            fields = dict(max=10, no_statusline=True)
+            fields.update(seq_fields or {})
+            return cyclecore.run_loop(driver, seq_args(tmp_path, **fields),
+                                      wait_on_start=False)
+        except SystemExit as exc:
+            return exc
+
+
+def run_parallel_thread(driver, args, *, timeout, app_name) -> RunResult | SystemExit:
+    """Bound a fleet's runtime; carry its result or exception off the thread."""
+    box = []
+    done = threading.Event()
+
+    def go():
+        try:
+            box.append(parallel.run_parallel(driver, args, app_name=app_name))
+        except BaseException as exc:
+            box.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert done.wait(timeout), "run_parallel did not return"
+    assert box, "run_parallel returned nothing and raised nothing"
+    result = box[0]
+    if isinstance(result, BaseException) and not isinstance(result, SystemExit):
+        raise result
+    return result
 
 
 @contextmanager

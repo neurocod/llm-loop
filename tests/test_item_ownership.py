@@ -23,7 +23,7 @@ from llm_loop.drivers import AttemptLedger, ListFileDriver, Settled
 from llm_loop.stopchannel import RunStopReason
 
 from _runfixtures import (MemListDriver, StubPolicy, isolated_run, par_args,
-                          seq_args)
+                          seq_args, ok_job, run_either, run_parallel_thread)
 
 MAX_ATTEMPTS = AttemptLedger.MAX_ATTEMPTS
 
@@ -40,17 +40,12 @@ def test_polled_human_stops_before_the_next_claim(
                 return NeedsHuman("poll blocker", exit_code=3)
 
     driver = Driver(["a", "b"])
-    monkeypatch.setattr(cyclecore, "run_claude_streaming",
-                        lambda *a, **kw: calls.append(1) or 0)
-    monkeypatch.setattr(parallel, "run_job",
-                        lambda *a, **kw: (calls.append(1) or 0, 0, 0))
-    with pytest.raises(SystemExit) as stopped:
-        if runner == "parallel":
-            parallel.run_parallel(driver, par_args(
-                tmp_path, jobs=1, no_statusline=True), wait_on_start=False)
-        else:
-            cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
-    assert stopped.value.code == 3
+    stopped = run_either(
+        runner, driver, tmp_path, monkeypatch,
+        job=lambda *a, **kw: (calls.append(1) or 0, 0, 0),
+        seq_rc=lambda *a, **kw: calls.append(1) or 0)
+    assert isinstance(stopped, SystemExit)
+    assert stopped.code == 3
     assert len(calls) == int(after_turn)
     assert any("the driver needs a human (exit 3): poll blocker" == r
                for r in reasons)
@@ -103,14 +98,8 @@ def test_human_ending_is_announced_once(tmp_path, monkeypatch, capsys, runner, s
                 return NeedsHuman("inspect remaining work")
 
     driver = Driver(["a", "b"])
-    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
-    with pytest.raises(SystemExit):
-        if runner == "parallel":
-            parallel.run_parallel(driver, par_args(tmp_path, jobs=1, no_statusline=True),
-                                  wait_on_start=False)
-        else:
-            cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+    outcome = run_either(runner, driver, tmp_path, monkeypatch)
+    assert isinstance(outcome, SystemExit)
     output = capsys.readouterr().out
     assert len([line for line in output.splitlines() if "✗" in line]) == 1
     assert output.count("still pending") == 1
@@ -159,24 +148,23 @@ def test_final_poll_latches_human_after_the_region_closes(
         driver.report_ready = True
 
     monkeypatch.setattr(runlifecycle.RunBoundary, "release_held", release_held)
-    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
 
     def run():
-        if runner.startswith("parallel"):
-            return parallel.run_parallel(
-                driver, par_args(tmp_path, jobs=1, no_statusline=True),
-                wait_on_start=False)
-        return cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+        mode = "parallel" if runner.startswith("parallel") else "sequential"
+        return run_either(mode, driver, tmp_path, monkeypatch)
 
     if code or runner == "parallel-interrupt":
-        with pytest.raises(SystemExit) as stopped, ctrlc.captured():
-            run()
+        try:
+            with ctrlc.captured():
+                stopped = run()
+        except SystemExit as exc:
+            stopped = exc
+        assert isinstance(stopped, SystemExit)
         if runner == "parallel-interrupt":
-            assert stopped.value.code == 130
+            assert stopped.code == 130
             assert ctrlc.INTERRUPTED_REASON in reasons
         else:
-            assert stopped.value.code == code
+            assert stopped.code == code
             assert f"the driver needs a human (exit {code}): late blocker" in reasons
     else:
         with ctrlc.captured():
@@ -265,28 +253,9 @@ def _isolated_run(tmp_path, monkeypatch):
         yield
 
 
-def _ok_job(job_id, command, mailbox=None):
-    return 0, 0.0, 0.01
-
-
 def _run_parallel(driver, args, timeout=20.0):
-    """run_parallel on a thread: its RunResult, or the SystemExit it left by."""
-    box = []
-    done = threading.Event()
-
-    def go():
-        try:
-            box.append(parallel.run_parallel(driver, args,
-                                             app_name="pytest-ownership"))
-        except BaseException as exc:        # SystemExit is an answer here
-            box.append(exc)
-        finally:
-            done.set()
-
-    threading.Thread(target=go, daemon=True).start()
-    assert done.wait(timeout), "run_parallel did not return"
-    assert box, "run_parallel returned nothing and raised nothing"
-    return box[0]
+    return run_parallel_thread(driver, args, timeout=timeout,
+                               app_name="pytest-ownership")
 
 
 def _seq(tmp_path):
@@ -410,7 +379,7 @@ def test_a_status_row_that_throws_on_finish_does_not_hang_the_run(
     """`job.finish` sits between the guard and `shared.finish`: a raise there
     must still record the outcome and give the key up."""
     from llm_loop import statusline
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    monkeypatch.setattr(parallel, "run_job", ok_job)
     real_finish = statusline.JobHandle.finish
     thrown = []
 
@@ -448,7 +417,7 @@ class _RecordingDriver(MemListDriver):
 
 def test_the_fleet_tells_item_finished_which_line_finished(
         tmp_path, monkeypatch):
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    monkeypatch.setattr(parallel, "run_job", ok_job)
     lines = ["products/x.md", "products/y.md"]
     driver = _RecordingDriver(lines)
 
@@ -570,13 +539,8 @@ def test_success_resets_the_budget_for_a_twin(tmp_path, monkeypatch, runner):
                 return Settled.REFUSED
             return super().settle(line)
 
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
-    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
     driver = Driver()
-    if runner == "parallel":
-        result = _run_parallel(driver, par_args(tmp_path, jobs=1, no_statusline=True))
-    else:
-        result = cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+    result = run_either(runner, driver, tmp_path, monkeypatch)
     assert result.completed == 2
     assert driver.calls == {"k#1": MAX_ATTEMPTS, "k#2": MAX_ATTEMPTS}
     assert driver.pending_lines() == []
@@ -586,15 +550,10 @@ def test_success_resets_the_budget_for_a_twin(tmp_path, monkeypatch, runner):
 @pytest.mark.parametrize("runner", ["sequential", "parallel"])
 def test_ledger_and_parked_summary_are_per_runner_call(
         tmp_path, monkeypatch, capsys, runner):
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
-    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
     driver = _RefusingDriver(["bad.md"], "bad.md")
     for _ in range(2):
         previous = driver.ledger
-        if runner == "parallel":
-            result = _run_parallel(driver, par_args(tmp_path, jobs=1, no_statusline=True))
-        else:
-            result = cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+        result = run_either(runner, driver, tmp_path, monkeypatch)
         assert driver.ledger is not previous
         assert result.attempted == MAX_ATTEMPTS
         assert result.completed == 0
@@ -617,14 +576,8 @@ def test_parked_summary_survives_a_failed_closing_report(
             raise RuntimeError("closing report failed")
 
     driver = Driver(["bad.md"], "bad.md")
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
-    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
     with pytest.raises(RuntimeError, match="closing report failed"):
-        if runner == "parallel":
-            parallel.run_parallel(driver, par_args(tmp_path, jobs=1, no_statusline=True),
-                                  wait_on_start=False)
-        else:
-            cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+        run_either(runner, driver, tmp_path, monkeypatch)
     output = capsys.readouterr().out
     assert output.count(f"1 file(s) parked after {MAX_ATTEMPTS} failed attempts:") == 1
 
@@ -694,25 +647,20 @@ def test_parked_report_interrupt_keeps_runner_ending(
         return real_print(*args, **kwargs)
 
     monkeypatch.setattr(builtins, "print", printing)
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
-    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
     driver = Driver(["bad.md"], "bad.md")
     # Use the runner's own checks, without captured() adding an outer check.
     monkeypatch.setattr(ctrlc, "current", lambda: interrupt)
     interrupt = ctrlc.Interrupt()
 
     def run():
-        if runner == "parallel":
-            return parallel.run_parallel(driver, par_args(tmp_path, jobs=1,
-                                         no_statusline=True), wait_on_start=False)
-        return cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+        return run_either(runner, driver, tmp_path, monkeypatch)
 
     if runner == "parallel" or human or press_at == "before_report":
-        with pytest.raises(SystemExit) as stopped:
-            run()
+        stopped = run()
+        assert isinstance(stopped, SystemExit)
         expected = (3 if runner == "sequential" and human
                     and press_at != "before_report" else 130)
-        assert stopped.value.code == expected
+        assert stopped.code == expected
         assert reasons[-1] == (ctrlc.INTERRUPTED_REASON if expected == 130 else
                                "the driver needs a human (exit 3): parked blocker")
     else:
@@ -805,7 +753,7 @@ def _last_item_answers(answer):
 def test_a_pause_on_the_last_item_is_not_read_as_a_drained_queue(
         tmp_path, monkeypatch):
     """The hook's answer is part of the item's completion, not a race."""
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    monkeypatch.setattr(parallel, "run_job", ok_job)
 
     result = _run_parallel(_last_item_answers("a request was filed"),
                            par_args(tmp_path, jobs=2, no_statusline=True))
@@ -816,7 +764,7 @@ def test_a_pause_on_the_last_item_is_not_read_as_a_drained_queue(
 def test_the_fleet_ends_on_needs_human_not_on_a_drained_queue(
         tmp_path, monkeypatch, reasons):
     """The same window, a human asked for: its exit code and its reason."""
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    monkeypatch.setattr(parallel, "run_job", ok_job)
 
     outcome = _run_parallel(
         _last_item_answers(NeedsHuman("the search tool is down", exit_code=3)),
@@ -852,22 +800,12 @@ def test_the_sequential_loop_exits_with_the_human_code(
 
 @pytest.mark.parametrize("runner", ["sequential", "parallel"])
 def test_needs_human_with_exit_0_is_returned(tmp_path, monkeypatch, runner):
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
-    monkeypatch.setattr(cyclecore, "run_claude_streaming",
-                        lambda *args, **kwargs: 0)
-
     class Driver(MemListDriver):
         def item_finished(self, command, returncode):
             return NeedsHuman("look at this", exit_code=0)
 
     driver = Driver(["products/a.md", "products/b.md"])
-    if runner == "parallel":
-        result = _run_parallel(driver, par_args(tmp_path, jobs=1,
-                                                no_statusline=True))
-    else:
-        result = cyclecore.run_loop(driver, _seq(tmp_path),
-                                    app_name="pytest-ownership",
-                                    wait_on_start=False)
+    result = run_either(runner, driver, tmp_path, monkeypatch)
     assert result.reason is RunStopReason.NEEDS_HUMAN
 
 
@@ -876,25 +814,13 @@ def test_needs_human_from_item_started_ends_the_run(
         tmp_path, monkeypatch, runner, reasons):
     """The start hook's answer: this turn still runs (it is claimed), nothing
     new starts, and the run exits with the human's code."""
-    monkeypatch.setattr(parallel, "run_job", _ok_job)
-    monkeypatch.setattr(cyclecore, "run_claude_streaming",
-                        lambda *args, **kwargs: 0)
 
     class Driver(MemListDriver):
         def item_started(self, command):
             return NeedsHuman("the licence server is down", exit_code=3)
 
     driver = Driver(["products/a.md", "products/b.md"])
-    if runner == "parallel":
-        outcome = _run_parallel(driver, par_args(tmp_path, jobs=1,
-                                                 no_statusline=True))
-    else:
-        try:
-            outcome = cyclecore.run_loop(driver, _seq(tmp_path),
-                                         app_name="pytest-ownership",
-                                         wait_on_start=False)
-        except SystemExit as exc:
-            outcome = exc
+    outcome = run_either(runner, driver, tmp_path, monkeypatch)
 
     assert isinstance(outcome, SystemExit), f"the run returned {outcome!r}"
     assert outcome.code == 3
@@ -920,10 +846,6 @@ def test_needs_human_outranks_the_cap_it_lands_on(tmp_path, monkeypatch,
         capped.wait(5)
         return 0, 0.0, 0.01
 
-    monkeypatch.setattr(parallel, "run_job", job)
-    monkeypatch.setattr(cyclecore, "run_claude_streaming",
-                        lambda *args, **kwargs: 0)
-
     class Driver(MemListDriver):
         def item_finished(self, command, returncode):
             return NeedsHuman("look at this", exit_code=0)
@@ -939,13 +861,10 @@ def test_needs_human_outranks_the_cap_it_lands_on(tmp_path, monkeypatch,
             return answer
 
         monkeypatch.setattr(parallel.Shared, "_exhausted", exhausted)
-        result = _run_parallel(driver, par_args(tmp_path, jobs=2, max=1,
-                                                no_statusline=True))
+    result = run_either(runner, driver, tmp_path, monkeypatch, job=job,
+                        seq_fields={"max": 1}, par_fields={"jobs": 2, "max": 1})
+    if runner == "parallel":
         assert capped.is_set(), "the cap was never latched before the human"
-    else:
-        result = cyclecore.run_loop(
-            driver, seq_args(tmp_path, max=1, no_statusline=True),
-            app_name="pytest-ownership", wait_on_start=False)
 
     assert result.reason is RunStopReason.NEEDS_HUMAN
     assert driver.pending_lines() == ["products/b.md"]

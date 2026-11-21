@@ -24,7 +24,7 @@ from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.stopchannel import RunStopReason
 
 from _runfixtures import (MemListDriver, StubPolicy, isolated_run, par_args,
-                          seq_args)
+                          seq_args, run_parallel_thread)
 
 
 @pytest.fixture(autouse=True)
@@ -62,24 +62,10 @@ def _seq_args(project_dir):
 
 
 def _run_parallel(driver, args, timeout=10.0):
-    """run_parallel on a thread, so a run that never ends fails as a timeout."""
-    box = []
-    done = threading.Event()
-
-    def go():
-        try:
-            box.append(parallel.run_parallel(driver, args,
-                                             app_name="pytest-hooks"))
-        except BaseException as exc:      # reported, not swallowed on a thread
-            box.append(exc)
-        finally:
-            done.set()
-
-    threading.Thread(target=go, daemon=True).start()
-    assert done.wait(timeout), "run_parallel did not return after a driver pause"
-    assert box, "run_parallel returned nothing and raised nothing"
-    assert not isinstance(box[0], BaseException), f"run_parallel raised: {box[0]!r}"
-    return box[0]
+    result = run_parallel_thread(driver, args, timeout=timeout,
+                                 app_name="pytest-hooks")
+    assert not isinstance(result, BaseException), f"run_parallel raised: {result!r}"
+    return result
 
 
 def test_every_stop_reason_has_a_sentence_for_the_ending_line():

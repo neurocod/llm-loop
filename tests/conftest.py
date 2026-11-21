@@ -2,16 +2,15 @@
 run leaves in the process — an exit record, a moved project root, a replaced
 stream, an open console route — outliving the test that left it."""
 
-import atexit
 import sys
 from pathlib import Path
 
 import pytest
 
 from llm_agents import host_policy
-from llm_loop import console, exitlog, limits, projectroot, scriptlock
+from llm_loop import console, exitlog, limits, projectroot
 
-from _runfixtures import finish_record
+from _runfixtures import finish_record, isolated_launch_locks
 
 # `pytester` is what pins the guard below (test_leak_guard): the guard is only
 # worth its name if a test that leaks is shown failing under it.
@@ -245,12 +244,5 @@ def isolate_process_policies(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolate_launch_decision(tmp_path, monkeypatch):
-    launches = {}
-    monkeypatch.setattr(scriptlock, 'LOCK_DIR', tmp_path / 'script-locks')
-    monkeypatch.setattr(scriptlock, '_launches', launches)
-    monkeypatch.setattr(scriptlock, '_launch_decision', None)
-    yield
-    for lock in launches.values():
-        if lock is not None:
-            atexit.unregister(lock.close)
-            lock.close()
+    with isolated_launch_locks(monkeypatch, tmp_path):
+        yield
