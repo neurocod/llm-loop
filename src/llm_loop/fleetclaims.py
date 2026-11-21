@@ -127,7 +127,7 @@ class Shared:
         The two ways it ends of its own accord — the item cap, and a queue that
         drained with nobody still working — latched here rather than inside
         `claim`, because a worker that is NOT claiming has to be able to ask.
-        See `exhausted`, and the pause hold in `worker` that uses it.
+        See `exhausted`, and the pause hold in `parallel.worker` that uses it.
 
         A queue that is merely empty right now is not exhausted: the rest is in
         flight elsewhere, and the caller backs off and retries.
@@ -151,7 +151,7 @@ class Shared:
 
         Asked by a worker held on `p`: a pause is about not STARTING work, and a
         run with none left has no start to hold back — while a fleet that waits
-        for one anyway never sets `stop`, so `run_parallel`'s join() never
+        for one anyway never sets `stop`, so `parallel.run_parallel`'s join() never
         returns and the whole run hangs on a key that was only meant to slow it
         down. It is the same reading `claim` acts on, from the same lock, so the
         two cannot come to different verdicts about the run being over.

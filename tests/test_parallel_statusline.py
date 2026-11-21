@@ -18,7 +18,8 @@ import threading
 
 import pytest
 
-from llm_loop import ctrlc, cyclecore, exitlog, parallel, runlifecycle, stopchannel
+from llm_loop import (ctrlc, cyclecore, exitlog, fleetclaims, parallel,
+                     runlifecycle, stopchannel)
 from llm_loop.agentwork import AgentCommand, Driver, LoopStop
 from llm_loop import statusline as sl
 from llm_loop import termio as tio
@@ -605,7 +606,7 @@ def test_a_sentinel_this_run_did_not_write_is_not_reopenable(tmp_path, monkeypat
 def test_a_max_items_stop_is_never_reopened():
     """The cap and the request both close claims; only the request is undoable."""
     driver = _MemDriver(["a", "b"])
-    shared = parallel.Shared(driver, runlifecycle.RunSettings(max_runs=1))
+    shared = fleetclaims.Shared(driver, runlifecycle.RunSettings(max_runs=1))
 
     assert shared.claim() in ("a", "b")
     assert shared.claim() is None and shared.claims_closed.is_set()
@@ -620,7 +621,7 @@ def test_a_max_items_stop_is_never_reopened():
 
 def test_only_one_worker_owns_the_pending_request():
     """N workers counting down together would each latch on their own deadline."""
-    shared = parallel.Shared(_MemDriver(["a"]), runlifecycle.RunSettings())
+    shared = fleetclaims.Shared(_MemDriver(["a"]), runlifecycle.RunSettings())
 
     assert shared.request_stop(2) == (True, True)     # owner, and the first pass
     assert shared.request_stop(3) == (False, False)
@@ -797,8 +798,8 @@ def test_a_released_claim_preserves_earlier_stream_counts():
     promotion.start_run()
     promotion.record_counts(1, 1)
     progress.start_run()
-    shared = parallel.Shared(_MemDriver(["a"]), runlifecycle.RunSettings(),
-                             progress=progress)
+    shared = fleetclaims.Shared(_MemDriver(["a"]), runlifecycle.RunSettings(),
+                                progress=progress)
     line = shared.claim()
     assert progress.count_fields() == dict(iterations=21, completed=20)
     shared.release(line)

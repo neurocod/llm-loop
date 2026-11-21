@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from llm_loop import cyclecore, parallel, runlifecycle, stopchannel
+from llm_loop import cyclecore, fleetclaims, parallel, runlifecycle, stopchannel
 from llm_loop.agentwork import ClaudeCommand, Driver
 from llm_loop.stopchannel import RunStopReason
 
@@ -274,7 +274,7 @@ def test_an_ending_already_latched_is_not_relabelled_by_a_late_pause():
     so a cap reported as DRIVER_PAUSE would restart a run the user had bounded.
     """
     driver = _HookedListDriver(["products/only.md"])
-    shared = parallel.Shared(driver, type("S", (), {"max_runs": None})())
+    shared = fleetclaims.Shared(driver, type("S", (), {"max_runs": None})())
     shared.stop_reason = RunStopReason.LIMIT_REACHED
     shared.claims_closed.set()
 
@@ -291,7 +291,7 @@ def test_the_fleet_announces_one_handback_however_many_workers_ask():
     cap — and the reason on record stays the first one.
     """
     driver = _HookedListDriver(["products/only.md"])
-    shared = parallel.Shared(driver, type("S", (), {"max_runs": None})())
+    shared = fleetclaims.Shared(driver, type("S", (), {"max_runs": None})())
 
     assert shared.request_driver_handback("first") is True
     assert shared.request_driver_handback("second") is False

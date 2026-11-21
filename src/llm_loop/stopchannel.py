@@ -346,7 +346,7 @@ class DriverHandback:
 
     Its own lock makes `latch` answer True to exactly one caller however many
     threads race it. What a hand-back must NOT override — a final ending the
-    fleet already latched (`parallel.Shared.request_driver_handback`) — is the
+    fleet already latched (`fleetclaims.Shared.request_driver_handback`) — is the
     caller's coupling to decide under the caller's lock; this class knows
     nothing about claims or stop reasons.
 
@@ -418,7 +418,7 @@ def commit_stop(app, source: StopSource) -> Tuple[RunStopReason, str]:
     set: the other workers found the run unlatched, died on the same write in
     turn, and a run that obeyed a stop FILE reported NO_WORK on the way out.
     Everything that decides the outcome therefore finishes before this returns,
-    and nothing on the way to it can fail (see `parallel.Shared.latch_stop`,
+    and nothing on the way to it can fail (see `fleetclaims.Shared.latch_stop`,
     which is where the ordering is spent, and the pin
     `test_parallel_stop_file_is_latched_before_the_winner_announces_it`).
 

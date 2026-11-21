@@ -202,6 +202,7 @@ src/
                      the provider process, `codex_usage` and `llm_agents.codex`
     drivers.py       StateFileDriver (state machine) and ListFileDriver (work queue)
     parallel.py      run_parallel: N concurrent LLM workers over a list file
+    fleetclaims.py   claim/settle state shared by the fleet's workers, behind one lock
     ownership.py     one thread owns a shared resource, the rest post to it
     operator.py      notes typed at the console, on their way to the running agent
     usage.py         what is known about a quota: the queried figures
