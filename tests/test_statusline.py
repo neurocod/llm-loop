@@ -25,6 +25,7 @@ import pytest
 from llm_loop import (console, cyclecore, ownership, projectroot,
                       runlifecycle, stopchannel, textwidth, usage)
 from llm_loop import statusline as sl
+from llm_loop.agentwork import Driver
 from llm_loop import termio as tio
 
 from _runfixtures import capture_run_context, isolated_run, seq_args
@@ -1560,7 +1561,7 @@ def test_the_iteration_cap_is_read_live_from_the_settings_registry(monkeypatch,
     assert "max-runs" not in dict(app.snapshot().script_limits)
 
 
-class _QueueDriver:
+class _QueueDriver(Driver):
     """Just enough of a Driver for the shared prologue and the status area."""
 
     provider = "claude"
