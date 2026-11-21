@@ -935,13 +935,16 @@ class Shared:
         self.in_progress.discard(key)
         return key
 
-    def start_turn(self, line: str) -> None:
-        """This claim is about to become a running provider turn (see busy())."""
+    def start_turn(self, line: str) -> bool:
+        """Admit a turn atomically against handback; False leaves it unstarted."""
         with self.lock:
+            if self.handback.pending:
+                return False
             self.running.add(self._held_key(line))
             self.started += 1
             if self.progress is not None:
                 self.progress.record_counts(self.started, self.done)
+            return True
 
     def abandon(self, line: str, started: bool) -> None:
         """Give a claim back when its worker is dying, so the run can still end.
@@ -1261,8 +1264,8 @@ def announce_handback(job_id: int, answer, latched: bool) -> None:
     if not latched:
         return
     if isinstance(answer, stopchannel.NeedsHuman):
-        job_lines(job_id).line(
-            f"✗ {answer.reason} — {stopchannel.NEEDS_HUMAN_CLAUSE}", "bold red")
+        # Both hook and polled human handbacks are announced by the closing
+        # boundary, after all admitted turns have finished.
         return
     job_lines(job_id).line(
         f"⏸ {answer} — {stopchannel.DRIVER_HANDBACK_CLAUSE}", "yellow")
@@ -1423,7 +1426,9 @@ def worker(job_id: int, shared: Shared, source: Optional[object],
             # window in which the fleet looks idle while it is not. Paired with
             # `job.start(...)` below, which says the same thing to the status line;
             # move one and the other has to move with it.
-            shared.start_turn(line)
+            if not shared.start_turn(line):
+                shared.release(line)
+                break
             turn_started = True
             # Stamped after `command_for`, so an override need not set it.
             command = shared.driver.command_for(line)._replace(item=line)
@@ -1594,7 +1599,12 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     list_file_rel = driver.list_file
     pending_now = driver.pending_lines()
-    if not pending_now and dry_run:
+    if dry_run or not pending_now:
+        human = driver.needs_human()
+        if human is not None:
+            reason = runlifecycle.end_needs_human(None, driver, human)
+            return RunResult(reason, remaining=len(pending_now))
+    if not pending_now:
         print(f"Nothing pending in {list_file_rel} — nothing to do.")
         return RunResult(RunStopReason.NO_WORK, remaining=0)
 
@@ -1856,8 +1866,13 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # mention pushing, and the exit push, which the report does precede,
         # comes after that push either way.
         remaining = driver.pending_total()
-        print(f"\nProcessed {shared.done} file(s) this run; "
-              f"{remaining} still pending in {list_file_rel}.")
+        shared.request_driver_handback(driver.needs_human())
+        human = shared.handback.human
+        if human is None:
+            print(f"\nProcessed {shared.done} file(s) this run; "
+                  f"{remaining} still pending in {list_file_rel}.")
+        else:
+            print(f"\nProcessed {shared.done} file(s) this run.")
         attempts = driver.attempt_summary()
         if attempts:
             print(attempts)
@@ -1887,8 +1902,6 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # A hook's `NeedsHuman` is the run's ending whatever else got latched
         # around it (`Shared._handback_locked`), and its exit code is the
         # process's — a door like `LoopStop`'s, after the closing report.
-        shared.request_driver_handback(driver.needs_human())
-        human = shared.handback.human
         if human is not None:
             shared.stop_reason = runlifecycle.end_needs_human(
                 boundary, driver, human)

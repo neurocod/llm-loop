@@ -699,14 +699,19 @@ def _exit_interrupted(iterations: int, completed: int) -> NoReturn:
 
 def end_needs_human(boundary, driver,
                     human: stopchannel.NeedsHuman):
-    """Report one human handback and use the run's normal closing boundary."""
+    """Report once; a missing boundary means no run resources were opened."""
     reason = stopchannel.RunStopReason.NEEDS_HUMAN
     print(f"  ✗ the driver needs a human: {human.reason}")
     # An empty eligible queue is not success when a blocker excluded its items.
     if driver.pending_total() != 0:
         summary = driver.final_summary()
         if summary:
-            print(summary)
+            print(f"\n{summary}")
+    if boundary is None:
+        exitlog.set_reason(stopchannel.needs_human_exit_reason(human))
+        if human.exit_code:
+            sys.exit(human.exit_code)
+        return reason
     if human.exit_code:
         boundary.exit(human.exit_code,
                       ending=stopchannel.STOP_REASON_TEXT[reason],

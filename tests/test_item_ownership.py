@@ -66,10 +66,112 @@ def test_queue_scan_blocker_wins_over_exhaustion(method):
             if self.scanned:
                 return NeedsHuman("found while scanning")
 
-    shared = parallel.Shared(Driver([]), type("S", (), {"max_runs": None})())
+    latched = []
+
+    class ObservedShared(parallel.Shared):
+        def __setattr__(self, name, value):
+            if name == "stop_reason":
+                latched.append(value)
+            super().__setattr__(name, value)
+
+    shared = ObservedShared(Driver([]), type("S", (), {"max_runs": None})())
     getattr(shared, method)()
+    # A late poll must not conceal NO_WORK having already closed claims.
+    shared.request_driver_handback(shared.driver.needs_human())
+    assert RunStopReason.NO_WORK not in latched
     assert shared.stop_reason is RunStopReason.NEEDS_HUMAN
     assert shared.handback.human.reason == "found while scanning"
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+@pytest.mark.parametrize("source", ["hook", "poll"])
+def test_human_ending_is_announced_once(tmp_path, monkeypatch, capsys, runner, source):
+    class Driver(MemListDriver):
+        blocked = False
+
+        def item_finished(self, command, returncode):
+            self.blocked = True
+            if source == "hook":
+                return NeedsHuman("inspect remaining work")
+
+        def needs_human(self):
+            if source == "poll" and self.blocked:
+                return NeedsHuman("inspect remaining work")
+
+    driver = Driver(["a", "b"])
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
+    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    with pytest.raises(SystemExit):
+        if runner == "parallel":
+            parallel.run_parallel(driver, par_args(tmp_path, jobs=1, no_statusline=True),
+                                  wait_on_start=False)
+        else:
+            cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+    output = capsys.readouterr().out
+    assert len([line for line in output.splitlines() if "✗" in line]) == 1
+    assert output.count("still pending") == 1
+    assert "\n\n1 item(s) still pending" in output
+
+
+def test_empty_fleet_returns_before_opening_run_resources(tmp_path, monkeypatch, capsys):
+    from llm_loop import runlifecycle
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("an empty fleet opened real-run resources")
+
+    monkeypatch.setattr(stopchannel, "wait_for_stop_file_clear", forbidden)
+    monkeypatch.setattr(cyclecore, "wait_before_start", forbidden)
+    monkeypatch.setattr(runlifecycle, "open_status", forbidden)
+    monkeypatch.setattr(runlifecycle, "open_usage", forbidden)
+    monkeypatch.setattr(runlifecycle, "close_run", forbidden)
+    result = parallel.run_parallel(MemListDriver([]), par_args(
+        tmp_path, jobs=2, start_in="1h", ignore_usage=False, no_statusline=True))
+    assert result.reason is RunStopReason.NO_WORK
+    assert result.attempted == 0
+    assert "Nothing pending" in capsys.readouterr().out
+
+
+def test_handback_between_worker_check_and_admission_returns_claim(tmp_path, monkeypatch):
+    at_admission = threading.Event()
+    latched = threading.Event()
+    calls = []
+    shared_seen = []
+    original_start = parallel.Shared.start_turn
+    original_handback = parallel.Shared.request_driver_handback
+
+    def start(self, line):
+        if line == "a":
+            shared_seen.append(self)
+            at_admission.set()
+            # Twice the existing runner helper's 20 s watchdog, no sleeps.
+            assert latched.wait(40), "the second worker never latched handback"
+        return original_start(self, line)
+
+    def handback(self, answer):
+        result = original_handback(self, answer)
+        if isinstance(answer, NeedsHuman):
+            latched.set()
+        return result
+
+    class Driver(MemListDriver):
+        def item_started(self, command):
+            if command.item == "b":
+                assert at_admission.wait(40), "the first worker never reached admission"
+                return NeedsHuman("admission closed")
+
+    monkeypatch.setattr(parallel.Shared, "start_turn", start)
+    monkeypatch.setattr(parallel.Shared, "request_driver_handback", handback)
+    monkeypatch.setattr(parallel, "run_job", lambda job_id, command, mailbox=None:
+                        (calls.append(command.item) or 0, 0, 0))
+    driver = Driver(["a", "b"])
+    outcome = _run_parallel(driver, par_args(tmp_path, jobs=2, no_statusline=True),
+                            timeout=40)
+    assert isinstance(outcome, SystemExit) and outcome.code == 1
+    assert calls == ["b"]
+    shared = shared_seen[0]
+    assert shared.started == shared.claimed == 1
+    assert not shared.in_progress and not shared.running
+    assert driver.pending_lines() == ["a"]
 
 
 def test_polled_human_after_failure_bypasses_quota_wait(tmp_path, monkeypatch):
