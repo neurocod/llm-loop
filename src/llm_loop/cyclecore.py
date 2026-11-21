@@ -640,11 +640,8 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # that will never come. Held there, `p` would keep the caller from
             # getting control back until somebody released it, and the gate
             # would keep it until the quota window reset.
+            handback.latch(driver.needs_human())
             if handback.human is not None:
-                # The closing door is after the loop (see there), so the
-                # driver's final_summary is printed first.
-                print(f"  ✗ {handback.human.reason} — "
-                      f"{stopchannel.NEEDS_HUMAN_CLAUSE}")
                 break
             if handback.pending:
                 print(f"  ⏸ {handback.reason} — "
@@ -911,6 +908,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
             # fleet calls it; the latch keeps the FIRST reason (see
             # DriverHandback).
             handback.latch(driver.item_finished(command, returncode))
+            # A report discovered by the hook must also bypass the error quota
+            # wait below; reaching the next claim can otherwise take hours.
+            handback.latch(driver.needs_human())
 
             # Preserve the wire verdict even when the quota endpoint has no
             # figures. A refused final turn may still exit 0 and advance the
@@ -995,20 +995,17 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # This run's own closing line, if the driver has one (e.g. "Final
         # state: …"). Before the shared epilogue, which is housekeeping: the
         # run reports on its work first, then the run is closed down.
-        summary = driver.final_summary()
-        if summary:
-            print(f"\n{summary}")
         # A hook's `NeedsHuman` ends the run whatever broke the loop around
         # it (a stop, the cap): the work is stuck, and that is what the exit
         # code and the record must say. The fleet decides the same way.
-        human = handback.human
-        if human is not None:
-            stop_reason = stopchannel.RunStopReason.NEEDS_HUMAN
-            if human.exit_code:
-                boundary.exit(
-                    human.exit_code,
-                    ending=stopchannel.STOP_REASON_TEXT[stop_reason],
-                    reason=stopchannel.needs_human_exit_reason(human))
+        handback.latch(driver.needs_human())
+        if handback.human is not None:
+            stop_reason = runlifecycle.end_needs_human(
+                boundary, driver, handback.human)
+        else:
+            summary = driver.final_summary()
+            if summary:
+                print(f"\n{summary}")
         # The exit push follows every check queued while agents were running.
         return boundary.end(
             stopchannel.RunResult(stop_reason, iteration, completed))

@@ -290,6 +290,15 @@ class Driver:
     # several at once. Keep them cheap and re-entrant (a listdir, a counter
     # under a lock); anything that mutates driver state has to guard it.
 
+    def needs_human(self) -> Optional[NeedsHuman]:
+        """Poll before claiming work, including when the queue is empty.
+
+        Return a run-wide blocker left by an earlier or interrupted turn.
+        Like the item hooks, keep this cheap and thread-safe. The fleet calls
+        it under its claim lock; it must not call back into the runner.
+        """
+        return None
+
     def item_started(self, command: AgentCommand) -> Optional[str]:
         """About to send `command` to the provider. Default: nothing to do.
 

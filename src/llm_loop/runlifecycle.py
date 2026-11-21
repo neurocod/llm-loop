@@ -697,6 +697,23 @@ def _exit_interrupted(iterations: int, completed: int) -> NoReturn:
     ctrlc.leave(iterations=iterations, completed=completed)
 
 
+def end_needs_human(boundary, driver,
+                    human: stopchannel.NeedsHuman):
+    """Report one human handback and use the run's normal closing boundary."""
+    reason = stopchannel.RunStopReason.NEEDS_HUMAN
+    print(f"  ✗ the driver needs a human: {human.reason}")
+    # An empty eligible queue is not success when a blocker excluded its items.
+    if driver.pending_total() != 0:
+        summary = driver.final_summary()
+        if summary:
+            print(summary)
+    if human.exit_code:
+        boundary.exit(human.exit_code,
+                      ending=stopchannel.STOP_REASON_TEXT[reason],
+                      reason=stopchannel.needs_human_exit_reason(human))
+    return reason
+
+
 def end_run(ctx: RunContext, result: RunResult, *,
             usages: Iterable[Optional[RunUsage]],
             local_counts: Optional[Tuple[int, int]] = None,

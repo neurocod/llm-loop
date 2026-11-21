@@ -840,6 +840,7 @@ class Shared:
         A queue that is merely empty right now is not exhausted: the rest is in
         flight elsewhere, and the caller backs off and retries.
         """
+        self._handback_locked(self.driver.needs_human())
         if self.claims_closed.is_set():
             return True
         if self.max_items is not None and self.claimed >= self.max_items:
@@ -1593,7 +1594,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
 
     list_file_rel = driver.list_file
     pending_now = driver.pending_lines()
-    if not pending_now:
+    if not pending_now and dry_run:
         print(f"Nothing pending in {list_file_rel} — nothing to do.")
         return RunResult(RunStopReason.NO_WORK, remaining=0)
 
@@ -1886,14 +1887,11 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # A hook's `NeedsHuman` is the run's ending whatever else got latched
         # around it (`Shared._handback_locked`), and its exit code is the
         # process's — a door like `LoopStop`'s, after the closing report.
+        shared.request_driver_handback(driver.needs_human())
         human = shared.handback.human
         if human is not None:
-            print(f"  ✗ the driver needs a human: {human.reason}")
-            if human.exit_code:
-                boundary.exit(human.exit_code,
-                              ending=STOP_REASON_TEXT[RunStopReason.NEEDS_HUMAN],
-                              reason=stopchannel.needs_human_exit_reason(human))
-            shared.stop_reason = RunStopReason.NEEDS_HUMAN
+            shared.stop_reason = runlifecycle.end_needs_human(
+                boundary, driver, human)
 
         # `stop_reason` unset means no worker ever reached a verdict about the run:
         # every one of the endings — the cap, the drained queue, a latched stop —

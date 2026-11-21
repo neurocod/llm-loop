@@ -24,6 +24,84 @@ from _runfixtures import (MemListDriver, StubPolicy, isolated_run, par_args,
 MAX_ATTEMPTS = AttemptLedger.MAX_ATTEMPTS
 
 
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+@pytest.mark.parametrize("after_turn", [False, True])
+def test_polled_human_stops_before_the_next_claim(
+        tmp_path, monkeypatch, capsys, reasons, runner, after_turn):
+    calls = []
+
+    class Driver(MemListDriver):
+        def needs_human(self):
+            if not after_turn or calls:
+                return NeedsHuman("poll blocker", exit_code=3)
+
+    driver = Driver(["a", "b"])
+    monkeypatch.setattr(cyclecore, "run_claude_streaming",
+                        lambda *a, **kw: calls.append(1) or 0)
+    monkeypatch.setattr(parallel, "run_job",
+                        lambda *a, **kw: (calls.append(1) or 0, 0, 0))
+    with pytest.raises(SystemExit) as stopped:
+        if runner == "parallel":
+            parallel.run_parallel(driver, par_args(
+                tmp_path, jobs=1, no_statusline=True), wait_on_start=False)
+        else:
+            cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+    assert stopped.value.code == 3
+    assert len(calls) == int(after_turn)
+    assert any("the driver needs a human (exit 3): poll blocker" == r
+               for r in reasons)
+    assert capsys.readouterr().out.count("the driver needs a human:") == 1
+
+
+@pytest.mark.parametrize("method", ["claim", "exhausted"])
+def test_queue_scan_blocker_wins_over_exhaustion(method):
+    class Driver(MemListDriver):
+        scanned = False
+
+        def pending_lines(self):
+            self.scanned = True
+            return []
+
+        def needs_human(self):
+            if self.scanned:
+                return NeedsHuman("found while scanning")
+
+    shared = parallel.Shared(Driver([]), type("S", (), {"max_runs": None})())
+    getattr(shared, method)()
+    assert shared.stop_reason is RunStopReason.NEEDS_HUMAN
+    assert shared.handback.human.reason == "found while scanning"
+
+
+def test_polled_human_after_failure_bypasses_quota_wait(tmp_path, monkeypatch):
+    from llm_loop import runlifecycle
+    from _runfixtures import StubSource
+
+    class Driver(MemListDriver):
+        blocked = False
+
+        def item_finished(self, command, returncode):
+            self.blocked = True
+
+        def needs_human(self):
+            if self.blocked:
+                return NeedsHuman("report after failure", exit_code=3)
+
+    driver = Driver(["a"])
+
+    class Policy(StubPolicy):
+        def check_and_wait(self, source, session_start, **kwargs):
+            assert not driver.blocked, "a human handback entered the quota wait"
+            return False, session_start
+
+    driver.limit_policy = Policy()
+    monkeypatch.setattr(runlifecycle, "usage_source_for", lambda provider: StubSource())
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 1)
+    with pytest.raises(SystemExit) as stopped:
+        cyclecore.run_loop(driver, seq_args(tmp_path, no_statusline=True),
+                           wait_on_start=False)
+    assert stopped.value.code == 3
+
+
 @pytest.fixture(autouse=True)
 def _isolated_run(tmp_path, monkeypatch):
     with isolated_run(monkeypatch, tmp_path):
