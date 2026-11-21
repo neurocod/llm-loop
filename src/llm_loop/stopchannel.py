@@ -301,11 +301,6 @@ DRIVER_HANDBACK_CLAUSE = ("the driver asked to hand control back; nothing new "
                           "will be started and whatever is running finishes "
                           "first.")
 
-# The same promise for a `NeedsHuman` answer, which winds down the same way
-# and ends the invocation instead of the runner call.
-NEEDS_HUMAN_CLAUSE = ("the driver needs a human; nothing new will be started "
-                      "and whatever is running finishes first.")
-
 
 class NeedsHuman(NamedTuple):
     """What a per-item hook returns, instead of a bare reason, when the work

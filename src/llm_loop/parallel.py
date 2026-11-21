@@ -85,7 +85,7 @@ from .console import print_markup, route_through
 # a run down and therefore the one place that decides how the exit push is
 # guarded.
 from .gitpush import PushAbort, maybe_git_push
-from .stopchannel import STOP_REASON_TEXT, RunResult, RunStopReason
+from .stopchannel import RunResult, RunStopReason
 from .providers import (ended_on_press, note_channel, provider_spec,
                         reap_agent_process, start_agent_process)
 from .drivers import ListFileDriver, Settled, refusal_line
@@ -1261,9 +1261,7 @@ def note_driver_handback(job_id: int, shared: Shared, reason: Optional[str]) -> 
 
 def announce_handback(job_id: int, answer, latched: bool) -> None:
     """The line for a hook's answer, once it has been latched (`latched`)."""
-    if not latched:
-        return
-    if isinstance(answer, stopchannel.NeedsHuman):
+    if not latched or isinstance(answer, stopchannel.NeedsHuman):
         # Both hook and polled human handbacks are announced by the closing
         # boundary, after all admitted turns have finished.
         return
@@ -1546,11 +1544,8 @@ def _report_finished(out, app, progress, command: AgentCommand, rc: int,
         out.line(f"✓ {command.label}{suffix}  "
                  f"[{done_total} done this run, {remaining} left]", "green")
         return
-    if verdict is Settled.REFUSED:
-        out.line(refusal_line(command.label, parked, suffix), "bold red")
-    else:
-        out.line(refusal_line(command.label, parked, suffix, reason=f"exit {rc}"),
-                 "bold red")
+    why = "refused by the driver" if verdict is Settled.REFUSED else f"exit {rc}"
+    out.line(refusal_line(command.label, parked, suffix, reason=why), "bold red")
 
 
 @stopchannel.stop_file_lifecycle()

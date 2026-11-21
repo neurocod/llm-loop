@@ -187,6 +187,9 @@ class AttemptLedger:
         self._attempts.pop(key, None)
         self._parked.pop(key, None)
 
+    def attempts(self, key: Hashable) -> int:
+        return self._attempts.get(key, 0)
+
     def is_parked(self, key: Hashable) -> bool:
         return key in self._parked
 

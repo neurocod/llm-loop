@@ -343,8 +343,9 @@ def test_the_key_taken_at_claim_is_the_one_given_back(ending):
     assert shared.in_progress == set(), "the claimed key was never given back"
     assert shared.running == set()
     if ending == "failed":
-        assert driver.ledger._attempts == {("products/a.md", 0): 1}, \
+        assert driver.ledger.attempts(("products/a.md", 0)) == 1, \
             "the failure was counted against a key nobody claimed"
+        assert driver.ledger.attempts(driver.item_key(line)) == 0
 
 
 @pytest.mark.filterwarnings(
