@@ -76,8 +76,10 @@ def run_either(runner, driver, tmp_path, monkeypatch, *, job=ok_job,
             if runner == "parallel":
                 fields = dict(jobs=1, no_statusline=True)
                 fields.update(par_fields or {})
-                return parallel.run_parallel(driver, par_args(tmp_path, **fields),
-                                             wait_on_start=False)
+                # Preserve the ownership pins' existing 20 s hang watchdog.
+                return run_parallel_thread(
+                    driver, par_args(tmp_path, **fields), timeout=20.0,
+                    app_name="pytest-ownership", wait_on_start=False)
             fields = dict(max=10, no_statusline=True)
             fields.update(seq_fields or {})
             return cyclecore.run_loop(driver, seq_args(tmp_path, **fields),
@@ -86,21 +88,24 @@ def run_either(runner, driver, tmp_path, monkeypatch, *, job=ok_job,
             return exc
 
 
-def run_parallel_thread(driver, args, *, timeout, app_name) -> RunResult | SystemExit:
+def run_parallel_thread(driver, args, *, timeout, app_name, wait_on_start=True,
+                        timeout_message="run_parallel did not return") -> RunResult | SystemExit:
     """Bound a fleet's runtime; carry its result or exception off the thread."""
     box = []
     done = threading.Event()
+    test = os.environ.get("PYTEST_CURRENT_TEST", app_name)
 
     def go():
         try:
-            box.append(parallel.run_parallel(driver, args, app_name=app_name))
+            box.append(parallel.run_parallel(driver, args, app_name=app_name,
+                                             wait_on_start=wait_on_start))
         except BaseException as exc:
             box.append(exc)
         finally:
             done.set()
 
     threading.Thread(target=go, daemon=True).start()
-    assert done.wait(timeout), "run_parallel did not return"
+    assert done.wait(timeout), f"{test}: {timeout_message} within {timeout:g} s"
     assert box, "run_parallel returned nothing and raised nothing"
     result = box[0]
     if isinstance(result, BaseException) and not isinstance(result, SystemExit):

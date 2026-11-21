@@ -63,7 +63,8 @@ def _seq_args(project_dir):
 
 def _run_parallel(driver, args, timeout=10.0):
     result = run_parallel_thread(driver, args, timeout=timeout,
-                                 app_name="pytest-hooks")
+                                 app_name="pytest-hooks",
+                                 timeout_message="run_parallel did not return after a driver pause")
     assert not isinstance(result, BaseException), f"run_parallel raised: {result!r}"
     return result
 

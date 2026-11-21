@@ -151,20 +151,21 @@ def test_final_poll_latches_human_after_the_region_closes(
 
     def run():
         mode = "parallel" if runner.startswith("parallel") else "sequential"
-        return run_either(mode, driver, tmp_path, monkeypatch)
+        result = run_either(mode, driver, tmp_path, monkeypatch)
+        # Deliver the transported exit before captured() unwinds: a normal
+        # return with an interrupt pending would replace the runner's code.
+        if isinstance(result, SystemExit):
+            raise result
+        return result
 
     if code or runner == "parallel-interrupt":
-        try:
-            with ctrlc.captured():
-                stopped = run()
-        except SystemExit as exc:
-            stopped = exc
-        assert isinstance(stopped, SystemExit)
+        with pytest.raises(SystemExit) as stopped, ctrlc.captured():
+            run()
         if runner == "parallel-interrupt":
-            assert stopped.code == 130
+            assert stopped.value.code == 130
             assert ctrlc.INTERRUPTED_REASON in reasons
         else:
-            assert stopped.code == code
+            assert stopped.value.code == code
             assert f"the driver needs a human (exit {code}): late blocker" in reasons
     else:
         with ctrlc.captured():
