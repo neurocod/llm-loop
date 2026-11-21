@@ -17,7 +17,7 @@ import textwrap
 
 import pytest
 
-from llm_loop import cyclecore, exitlog, parallel, stopchannel
+from llm_loop import cyclecore, exitlog, fleetclaims, parallel, stopchannel
 from llm_loop.agentwork import NeedsHuman
 from llm_loop.drivers import AttemptLedger, ListFileDriver, Settled
 from llm_loop.stopchannel import RunStopReason
@@ -72,7 +72,7 @@ def test_queue_scan_blocker_wins_over_exhaustion(method):
 
     latched = []
 
-    class ObservedShared(parallel.Shared):
+    class ObservedShared(fleetclaims.Shared):
         def __setattr__(self, name, value):
             if name == "stop_reason":
                 latched.append(value)
@@ -339,7 +339,7 @@ def test_two_lines_with_one_key_never_run_at_once_in_the_fleet(
 def test_a_held_key_blocks_its_twin_until_the_item_settles():
     """The claim itself, under `Shared.lock`: no twin while a key is held."""
     driver = _KeyedDriver(["k#1", "k#2", "other"])
-    shared = parallel.Shared(driver, type("S", (), {"max_runs": None})())
+    shared = fleetclaims.Shared(driver, type("S", (), {"max_runs": None})())
 
     first = shared.claim()
     second = shared.claim()
@@ -382,7 +382,7 @@ def test_the_key_taken_at_claim_is_the_one_given_back(ending):
     differs would leave the claimed key in `in_progress` (and `running`) for
     ever, so the run never reads as drained."""
     driver = _DriftingKeyDriver(["products/a.md"])
-    shared = parallel.Shared(driver, type("S", (), {"max_runs": None})())
+    shared = fleetclaims.Shared(driver, type("S", (), {"max_runs": None})())
 
     line = shared.claim()
     driver.salt += 1                       # the key drifts mid-item
@@ -963,7 +963,7 @@ def test_a_human_outranks_a_pause_latched_before_it():
 def test_the_fleet_relabels_a_cap_for_a_human():
     """A human is not "too late" for an ending already latched."""
     driver = MemListDriver(["products/only.md"])
-    shared = parallel.Shared(driver, type("S", (), {"max_runs": None})())
+    shared = fleetclaims.Shared(driver, type("S", (), {"max_runs": None})())
     shared.stop_reason = RunStopReason.LIMIT_REACHED
     shared.claims_closed.set()
 

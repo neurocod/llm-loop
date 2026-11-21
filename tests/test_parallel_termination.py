@@ -25,7 +25,7 @@ import threading
 
 import pytest
 
-from llm_loop import parallel, runlifecycle, stopchannel
+from llm_loop import fleetclaims, parallel, runlifecycle, stopchannel
 from llm_loop.stopchannel import RunStopReason
 
 from _runfixtures import MemListDriver, isolated_run, par_args
@@ -203,7 +203,7 @@ def test_a_paused_fleet_still_ends_at_the_item_cap(tmp_path, monkeypatch):
 def test_release_returns_claim_to_queue():
     """release() drops the line from in_progress and undoes its --max reservation."""
     driver = MemListDriver(["a", "b"])
-    shared = parallel.Shared(driver, runlifecycle.RunSettings(max_runs=5))
+    shared = fleetclaims.Shared(driver, runlifecycle.RunSettings(max_runs=5))
     line = shared.claim()
     assert line in ("a", "b")
     assert shared.claimed == 1 and line in shared.in_progress
@@ -506,7 +506,7 @@ def test_a_worker_starts_no_turn_once_ctrl_c_is_pressed(monkeypatch, pressed):
     from llm_loop import ctrlc
 
     driver = MemListDriver(["products/only.md"])
-    shared = parallel.Shared(driver, runlifecycle.RunSettings())
+    shared = fleetclaims.Shared(driver, runlifecycle.RunSettings())
     turns = []
     claims = []
     monkeypatch.setattr(parallel, "run_job",
