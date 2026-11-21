@@ -15,11 +15,13 @@ import pytest
 
 from llm_loop import cyclecore, exitlog, parallel, stopchannel
 from llm_loop.agentwork import NeedsHuman
-from llm_loop.drivers import MAX_ATTEMPTS, ListFileDriver, Settled
+from llm_loop.drivers import AttemptLedger, ListFileDriver, Settled
 from llm_loop.stopchannel import RunStopReason
 
 from _runfixtures import (MemListDriver, StubPolicy, isolated_run, par_args,
                           seq_args)
+
+MAX_ATTEMPTS = AttemptLedger.MAX_ATTEMPTS
 
 
 @pytest.fixture(autouse=True)
@@ -161,7 +163,9 @@ def test_the_key_taken_at_claim_is_the_one_given_back(ending):
     assert shared.in_progress == set(), "the claimed key was never given back"
     assert shared.running == set()
     if ending == "failed":
-        assert shared.attempts == {("products/a.md", 0): 1}, \
+        for _ in range(MAX_ATTEMPTS - 1):
+            driver.ledger.fail(("products/a.md", 0), line)
+        assert driver.ledger.is_parked(("products/a.md", 0)), \
             "the failure was counted against a key nobody claimed"
 
 
@@ -316,6 +320,52 @@ def test_the_sequential_refusal_budget_is_per_runner_call(
 
     assert len(calls) == 2 * MAX_ATTEMPTS, \
         "the second call found the item parked by the first"
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_success_resets_the_budget_for_a_twin(tmp_path, monkeypatch, runner):
+    """Each twin needs two refusals then success; neither inherits failures."""
+    class Driver(_KeyedDriver):
+        def __init__(self):
+            super().__init__(["k#1", "k#2"])
+            self.calls = {}
+
+        def settle(self, line):
+            self.calls[line] = self.calls.get(line, 0) + 1
+            if self.calls[line] < MAX_ATTEMPTS:
+                return Settled.REFUSED
+            return super().settle(line)
+
+    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
+    driver = Driver()
+    if runner == "parallel":
+        result = _run_parallel(driver, par_args(tmp_path, jobs=1, no_statusline=True))
+    else:
+        result = cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+    assert result.completed == 2
+    assert driver.calls == {"k#1": MAX_ATTEMPTS, "k#2": MAX_ATTEMPTS}
+    assert driver.pending_lines() == []
+    assert driver.ledger.parked_lines() == []
+
+
+@pytest.mark.parametrize("runner", ["sequential", "parallel"])
+def test_ledger_and_parked_summary_are_per_runner_call(
+        tmp_path, monkeypatch, capsys, runner):
+    monkeypatch.setattr(parallel, "run_job", _ok_job)
+    monkeypatch.setattr(cyclecore, "run_claude_streaming", lambda *a, **kw: 0)
+    driver = _RefusingDriver(["bad.md"], "bad.md")
+    for _ in range(2):
+        previous = driver.ledger
+        if runner == "parallel":
+            result = _run_parallel(driver, par_args(tmp_path, jobs=1, no_statusline=True))
+        else:
+            result = cyclecore.run_loop(driver, _seq(tmp_path), wait_on_start=False)
+        assert driver.ledger is not previous
+        assert result.attempted == MAX_ATTEMPTS
+        assert result.completed == 0
+        assert driver.ledger.parked_lines() == ["bad.md"]
+        assert f"1 file(s) parked after {MAX_ATTEMPTS} failed attempts:" in capsys.readouterr().out
 
 
 # --- 4. "a human is needed" ---------------------------------------------------

@@ -163,12 +163,41 @@ def _write_list_lines(list_path: str, lines: list) -> None:
             f.write("\n")
 
 
-# Per-KEY retry budget (`ListFileDriver.item_key`), both runners: an item whose
-# turns fail — a non-zero exit in the fleet, a `Settled.REFUSED` in either
-# runner — this many times is parked for the rest of the run (and reported)
-# instead of being retried forever. Per key, not per line, so two lines of one
-# item share one budget rather than doubling it.
-MAX_ATTEMPTS = 3
+class AttemptLedger:
+    """Per-key failures for one runner call, cleared on success for its twins.
+
+    The fleet serialises access under Shared.lock; the sequential runner has
+    one caller. Non-zero exits count only in the fleet: the sequential runner
+    retains its separate five-consecutive-errors stop.
+    """
+
+    MAX_ATTEMPTS = 3
+
+    def __init__(self):
+        self._attempts: dict = {}
+        self._parked: dict = {}
+
+    def fail(self, key: Hashable, line: str) -> bool:
+        self._attempts[key] = self._attempts.get(key, 0) + 1
+        if self._attempts[key] >= self.MAX_ATTEMPTS:
+            self._parked[key] = line
+        return self.is_parked(key)
+
+    def succeed(self, key: Hashable) -> None:
+        self._attempts.pop(key, None)
+        self._parked.pop(key, None)
+
+    def is_parked(self, key: Hashable) -> bool:
+        return key in self._parked
+
+    def parked_lines(self) -> list:
+        return sorted(self._parked.values())
+
+
+def refusal_line(label: str, parked: bool, suffix: str = "") -> str:
+    """One refusal message for either runner, with optional cost/time details."""
+    tail = " — parked after repeated failures" if parked else " — will retry"
+    return f"✗ {label} (refused by the driver){suffix}{tail}"
 
 
 class Settled(Enum):
@@ -251,12 +280,7 @@ class ListFileDriver(Driver):
         # list. Reentrant so an override may call either under it. The
         # parallel runner takes `Shared.lock` BEFORE this one, never after.
         self._list_lock = threading.RLock()
-        # The sequential runner's per-key REFUSED counts (see MAX_ATTEMPTS);
-        # the fleet keeps its own in `parallel.Shared.attempts`. Per runner
-        # CALL, like the fleet's (a fresh `Shared` each `run_parallel`):
-        # `run_loop` empties it on entry (`forget_refusals`), so a wrapper that
-        # reuses one driver for several calls gets a fresh budget each time.
-        self._refused: dict = {}
+        self.ledger = AttemptLedger()
         if jobs is not None:
             self.jobs = jobs
         # Validated once, at construction: a typo here would otherwise pass
@@ -395,7 +419,7 @@ class ListFileDriver(Driver):
         """The sequential runner's claim: a pending line whose key has not
         spent its REFUSED budget, stamped as the command's `item`."""
         pending = [ln for ln in self.pending_lines()
-                   if self._refused.get(self.item_key(ln), 0) < MAX_ATTEMPTS]
+                   if not self.ledger.is_parked(self.item_key(ln))]
         if not pending:
             self._current_line = None
             return None
@@ -403,10 +427,9 @@ class ListFileDriver(Driver):
         return self.command_for(self._current_line)._replace(
             item=self._current_line)
 
-    def forget_refusals(self) -> None:
-        """Start a fresh REFUSED budget: the sequential runner's run boundary
-        (`run_loop` calls it on entry; see `_refused`)."""
-        self._refused.clear()
+    def run_started(self) -> None:
+        self.ledger = AttemptLedger()
+        self._current_line = None
 
     def on_success(self, returncode: int) -> Optional[bool]:
         """Settle the just-processed line (the list is the source of truth for
@@ -415,16 +438,21 @@ class ListFileDriver(Driver):
         line, self._current_line = self._current_line, None
         if line is None:
             return None
-        if self.settle(line) is not Settled.REFUSED:
-            return True
         key = self.item_key(line)
-        self._refused[key] = self._refused.get(key, 0) + 1
-        parked = self._refused[key] >= MAX_ATTEMPTS
-        print(f"  ✗ {os.path.basename(line.strip())}: refused by the "
-              f"driver ({self._refused[key]}/{MAX_ATTEMPTS})"
-              + (" — parked for the rest of this run" if parked
-                 else " — will retry"))
+        if self.settle(line) is not Settled.REFUSED:
+            self.ledger.succeed(key)
+            return True
+        parked = self.ledger.fail(key, line)
+        print("  " + refusal_line(os.path.basename(line.strip()), parked))
         return False
+
+    def attempt_summary(self) -> Optional[str]:
+        lines = self.ledger.parked_lines()
+        if not lines:
+            return None
+        return (f"  ⚠ {len(lines)} file(s) parked after "
+                f"{self.ledger.MAX_ATTEMPTS} failed attempts:\n" +
+                "\n".join(f"      {os.path.basename(line.strip())}" for line in lines))
 
     def final_summary(self) -> Optional[str]:
         remaining = len(self.pending_lines())

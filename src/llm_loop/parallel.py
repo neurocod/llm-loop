@@ -88,9 +88,7 @@ from .gitpush import PushAbort, maybe_git_push
 from .stopchannel import STOP_REASON_TEXT, RunResult, RunStopReason
 from .providers import (ended_on_press, note_channel, provider_spec,
                         reap_agent_process, start_agent_process)
-# MAX_ATTEMPTS is the list drivers' per-key budget, shared with the sequential
-# runner's refusals rather than restated here (see drivers.MAX_ATTEMPTS).
-from .drivers import MAX_ATTEMPTS, ListFileDriver, Settled
+from .drivers import ListFileDriver, Settled, refusal_line
 
 # How many of a failed job's discarded non-JSON lines are kept as its failure
 # explanation. The reason a dying CLI gives is in its last lines, and the bound
@@ -726,7 +724,7 @@ class Finished(NamedTuple):
     done: int                      # items done this run, across all workers
     remaining: int                 # still pending in the list
     verdict: Optional[Settled]     # the driver's verdict; None for a failed turn
-    parked: bool                   # the item's key is in `failed` now
+    parked: bool                   # the ledger has parked the item's key
 
 
 def _settled_done(verdict: Optional[Settled]) -> bool:
@@ -739,7 +737,7 @@ class Shared:
     """Cross-worker state behind a single lock: the list cursor and run stats.
 
     The list file (owned by `driver`) is the source of truth for what remains;
-    `in_progress` keeps workers from claiming the same item, `failed` parks items
+    `in_progress` keeps workers from claiming the same item, the ledger parks items
     that exhausted their retry budget, and the counters bound/report the run. All
     access to THAT state is under `lock`.
 
@@ -774,8 +772,6 @@ class Shared:
         # not doing anything a stop would interrupt, so it must not be counted as
         # work in flight — see busy().
         self.running = set()
-        self.failed = {}              # key -> its last line, parked after MAX_ATTEMPTS
-        self.attempts = {}            # key -> failed-attempt count
         # Line in flight -> the key it was CLAIMED under. Every later step
         # (`start_turn`, `finish`, `settle`, `release`) reads the key here
         # rather than asking `item_key` again: an answer that changed in
@@ -829,7 +825,7 @@ class Shared:
         pending = []
         for ln in self.driver.pending_lines():
             key = self.key(ln)
-            if key not in self.in_progress and key not in self.failed:
+            if key not in self.in_progress and not self.driver.ledger.is_parked(key):
                 pending.append(ln)
         return pending
 
@@ -965,8 +961,8 @@ class Shared:
             picks it up; the run must be able to complete it.
           * AFTER `start_turn` a turn really was attempted, so it is recorded as
             a failed one (`finish(line, False)`). Not cosmetic: `finish` is what
-            increments `attempts`, and `attempts` is the only thing that can
-            ever park a line in `failed`. A file whose turn reliably kills its
+            records a failure in the ledger, which can park the key.
+            A file whose turn reliably kills its
             worker (a provider CLI that dies mid-stream, a console that refuses
             a write) would otherwise be handed back untouched and kill the next
             worker, and the next — a fleet of ten dies ten times over one line.
@@ -1022,11 +1018,9 @@ class Shared:
                     self.done += 1
                     if self.progress is not None:
                         self.progress.record_counts(self.started, self.done)
-                    self.attempts.pop(key, None)
+                    self.driver.ledger.succeed(key)
                 else:
-                    self.attempts[key] = self.attempts.get(key, 0) + 1
-                    if self.attempts[key] >= MAX_ATTEMPTS:
-                        self.failed[key] = line
+                    self.driver.ledger.fail(key, line)
                 remaining = self.driver.pending_total()
             except BaseException:
                 # No `settle` follows a `finish` that raised (the worker never
@@ -1034,7 +1028,8 @@ class Shared:
                 # read as drained.
                 self._drop_locked(line)
                 raise
-            return Finished(self.done, remaining, verdict, key in self.failed)
+            return Finished(self.done, remaining, verdict,
+                            self.driver.ledger.is_parked(key))
 
     def settle(self, line: str, answer) -> bool:
         """The end of a `finish(..., settling=True)`: drop the key from
@@ -1543,9 +1538,11 @@ def _report_finished(out, app, progress, command: AgentCommand, rc: int,
         out.line(f"✓ {command.label}{suffix}  "
                  f"[{done_total} done this run, {remaining} left]", "green")
         return
-    tail = " — parked after repeated failures" if parked else " — will retry"
-    why = "refused by the driver" if verdict is Settled.REFUSED else f"exit {rc}"
-    out.line(f"✗ {command.label} ({why}){suffix}{tail}", "bold red")
+    if verdict is Settled.REFUSED:
+        out.line(refusal_line(command.label, parked, suffix), "bold red")
+    else:
+        tail = " — parked after repeated failures" if parked else " — will retry"
+        out.line(f"✗ {command.label} (exit {rc}){suffix}{tail}", "bold red")
 
 
 @stopchannel.stop_file_lifecycle()
@@ -1858,11 +1855,9 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         remaining = driver.pending_total()
         print(f"\nProcessed {shared.done} file(s) this run; "
               f"{remaining} still pending in {list_file_rel}.")
-        if shared.failed:
-            print(f"  ⚠ {len(shared.failed)} file(s) parked after "
-                  f"{MAX_ATTEMPTS} failed attempts:")
-            for line in sorted(shared.failed.values()):
-                print(f"      {os.path.basename(line.strip())}")
+        attempts = driver.attempt_summary()
+        if attempts:
+            print(attempts)
 
         if interrupt.requested:
             # An interrupt is not a `RunStopReason` — nobody returns from here,
@@ -1903,7 +1898,7 @@ def run_parallel(driver: ListFileDriver, args: argparse.Namespace,
         # writes it before a worker can leave. So the threads did not run out of
         # work, they died holding it (see Shared.abandon), and NO_WORK would tell
         # the reader the opposite of what happened. A queue that ends with lines
-        # parked in `failed` is NOT this case: `_exhausted` latched NO_WORK there.
+        # parked in the ledger is NOT this case: `_exhausted` latched NO_WORK there.
         reason = shared.stop_reason
         if reason is None:
             reason = RunStopReason.WORKERS_DIED

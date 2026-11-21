@@ -200,6 +200,7 @@ def begin_run(driver, args, app_name: str, progress=None, *,
     # Anchor every project-relative operation (git/provider cwd, the stop file,
     # the log name, the Driver's paths) before anything reads the root.
     projectroot.set_project_root(args.project_dir)
+    driver.run_started()
 
     # Decided per invocation, before the first argv is built: the transport is
     # what --no-live-messages turns off, and both the argv and the process's

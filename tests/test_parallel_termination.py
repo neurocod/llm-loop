@@ -529,7 +529,9 @@ def test_a_worker_starts_no_turn_once_ctrl_c_is_pressed(monkeypatch, pressed):
     assert turns == [] and shared.running == set()
     assert shared.in_progress == set() and shared.claimed == 0, (
         "the claim was not given back")
-    assert shared.attempts == {}, "a turn nobody started was counted"
+    for _ in range(shared.driver.ledger.MAX_ATTEMPTS - 1):
+        assert not shared.driver.ledger.fail("products/only.md", "products/only.md"), \
+            "a turn nobody started was counted"
 
 
 def test_max_runs_closes_claims_without_cancelling_in_flight_work(

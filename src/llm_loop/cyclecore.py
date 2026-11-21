@@ -77,8 +77,6 @@ from . import (clispec, console, costlog, ctrlc, exitlog, operator,
 # takes all six straight from `agentwork` — so re-importing them here would only
 # create second addresses for names this file never mentions again.
 from .agentwork import Driver, LoopStop, build_agent_argv
-# The one list-driver fact this loop owns: its REFUSED budget is per call.
-from .drivers import ListFileDriver
 # What the run PRINTS, and the mirror log that is the second copy of it, are
 # `console` (see its header for why those are one module). The line helpers are
 # imported by name because this module calls them on nearly every path; the
@@ -427,11 +425,6 @@ def run_loop(driver: Driver, args: argparse.Namespace,
     # `runlifecycle.begin_run` is the prologue both runners share.
     ctx = runlifecycle.begin_run(driver, args, app_name, progress,
                                  setup_logging=setup_logging)
-    # "Parked for the rest of this run" means THIS call, as the fleet's fresh
-    # `Shared` makes it mean for `run_parallel`: a wrapper that reuses the
-    # driver for another call must not find its items parked already.
-    if isinstance(driver, ListFileDriver):
-        driver.forget_refusals()
     provider, spec = ctx.provider, ctx.spec
     progress = ctx.progress
     # The live knobs (see RunSettings): read where they are USED, never
@@ -993,6 +986,9 @@ def run_loop(driver: Driver, args: argparse.Namespace,
         # This run's own closing line, if the driver has one (e.g. "Final
         # state: …"). Before the shared epilogue, which is housekeeping: the
         # run reports on its work first, then the run is closed down.
+        attempts = driver.attempt_summary()
+        if attempts:
+            print(attempts)
         summary = driver.final_summary()
         if summary:
             print(f"\n{summary}")

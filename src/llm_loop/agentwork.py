@@ -236,6 +236,13 @@ class Driver:
         """
         return None
 
+    def run_started(self) -> None:
+        """Start one runner call after anchoring the project root."""
+
+    def attempt_summary(self) -> Optional[str]:
+        """Retry-budget report, independent of a wrapper's final_summary."""
+        return None
+
     def on_success(self, returncode: int) -> Optional[bool]:
         """Called after an iteration whose provider CLI exited 0 — record progress
         here (mark a file done, advance a cursor). Default: nothing to do.
