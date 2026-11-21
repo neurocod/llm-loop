@@ -5,14 +5,15 @@ Processes the files listed in a ListFileDriver's list, but with N worker threads
 running the selected provider concurrently instead of one file at a time. The work
 parallelises cleanly because each item is independent: a worker reads its own
 source and writes its own target; the only shared mutable state is the list file
-itself (each finished path is struck out of it), guarded by one lock, so the run
+itself (each finished path is struck out of it), guarded by `Shared.lock` and
+the driver's list lock, so the run
 stays idempotent — stop any time and relaunch and whatever is still listed gets
 picked up again.
 
 What this shares with the sequential runner, and what it deliberately drops:
 
-  * Reused — the ListFileDriver (list parsing, is_pending, pick, command_for,
-    strike),
+  * Reused — the ListFileDriver (list parsing, is_pending, item_key, pick,
+    command_for, settle),
     build_agent_argv, the usage session-limit machinery, the git-push policy
     and the rotating mirror log. Every one of those is now a module of its own,
     so this runner no longer imports the sequential one at all: the two are
@@ -728,6 +729,12 @@ class Finished(NamedTuple):
     parked: bool                   # the item's key is in `failed` now
 
 
+def _settled_done(verdict: Optional[Settled]) -> bool:
+    """Does `verdict` count as done? STRUCK and GONE do; REFUSED and a failed
+    turn (None) do not. One reading for the counter and the report line."""
+    return verdict is not None and verdict is not Settled.REFUSED
+
+
 class Shared:
     """Cross-worker state behind a single lock: the list cursor and run stats.
 
@@ -813,10 +820,8 @@ class Shared:
         return self.settings.max_runs
 
     def key(self, line: str):
-        """The item key of `line` (`ListFileDriver.item_key`; the line itself
-        for a driver without one)."""
-        item_key = getattr(self.driver, "item_key", None)
-        return line if item_key is None else item_key(line)
+        """The item key of `line` (`ListFileDriver.item_key`)."""
+        return self.driver.item_key(line)
 
     def _pending(self) -> list:
         """Lines whose key nobody holds and nobody gave up on (call under
@@ -1013,7 +1018,7 @@ class Shared:
             self.running.discard(key)
             try:
                 verdict = self.driver.settle(line) if ok else None
-                if verdict is not None and verdict is not Settled.REFUSED:
+                if _settled_done(verdict):
                     self.done += 1
                     if self.progress is not None:
                         self.progress.record_counts(self.started, self.done)
@@ -1534,7 +1539,7 @@ def _report_finished(out, app, progress, command: AgentCommand, rc: int,
     if cost_usd is not None:
         bits.append(f"${cost_usd:.4f}")
     suffix = f" ({', '.join(bits)})" if bits else ""
-    if verdict is not None and verdict is not Settled.REFUSED:
+    if _settled_done(verdict):
         out.line(f"✓ {command.label}{suffix}  "
                  f"[{done_total} done this run, {remaining} left]", "green")
         return

@@ -202,7 +202,8 @@ class ListFileDriver(Driver):
     is idempotent: stop any time and relaunch — it picks up whatever paths are
     still listed. `next_command` re-reads the list, hands one still-pending line
     to `pick()`, and returns None — ending the loop — once nothing is pending. A
-    failed iteration leaves its line in the list (on_success is what strikes it),
+    failed iteration leaves its line in the list (on_success settles it; a
+    refusal leaves it listed too),
     so it gets retried on some later iteration.
 
     Configure via class attributes on a subclass:
