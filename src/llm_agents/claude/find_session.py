@@ -1,6 +1,9 @@
-"""Find Claude Code sessions by a fragment of a prompt typed into them.
+"""List recent Claude Code sessions or find them by a prompt fragment.
 
     python -m llm_agents.claude.find_session "fix the parser" [--days 7] [--project SUBSTR]
+
+Without a fragment, shows the ten most recently modified sessions, with no age
+cutoff unless --days is supplied. The displayed date is the transcript's mtime.
 
 Scans the transcripts under ~/.claude/projects (all projects unless --project is
 given), newest match first. Each hit prints the id for `claude --resume <id>`, the
@@ -94,8 +97,8 @@ def paint(text, sgr, enabled):
 
 def main():
     ap = argparse.ArgumentParser(allow_abbrev=False, description=__doc__.split("\n")[0])
-    ap.add_argument("text", help="fragment of the prompt (case-insensitive)")
-    ap.add_argument("--days", type=float, default=7, help="only transcripts modified within N days")
+    ap.add_argument("text", nargs="?", help="fragment of the prompt (case-insensitive); omit to list ten recent sessions")
+    ap.add_argument("--days", type=float, help="only transcripts modified within N days (default: 7 for search, unlimited for listing)")
     ap.add_argument("--project", default="", help="only project dirs whose name contains this (case-insensitive)")
     ap.add_argument("--max-chars", type=int, default=0, help="truncate the printed prompt (0 = whole)")
     ap.add_argument("--last-chars", type=int, default=300, help="truncate the last prompt/reply (0 = whole)")
@@ -106,19 +109,25 @@ def main():
 
     if not PROJECTS.is_dir():
         sys.exit(f"no transcripts at {PROJECTS}")
-    needle = args.text.lower()
-    cutoff = time.time() - args.days * 86400
+    recent = args.text is None
+    needle = args.text.lower() if not recent else ""
+    days = args.days if args.days is not None else (None if recent else 7)
+    cutoff = time.time() - days * 86400 if days is not None else float("-inf")
     hits = []
     for proj in PROJECTS.iterdir():
         if not proj.is_dir() or args.project.lower() not in proj.name.lower():
             continue
         for path in proj.glob("*.jsonl"):  # subagent transcripts live deeper and are not resumable
-            if os.path.getmtime(path) < cutoff:
+            modified = os.path.getmtime(path)
+            if modified < cutoff:
                 continue
             match, prompt, reply = scan(path, needle)
             if match:
-                hits.append((match[0], path.stem, proj.name, match[1], prompt, reply))
+                when = datetime.fromtimestamp(modified).astimezone() if recent else match[0]
+                hits.append((when, path.stem, proj.name, match[1], prompt, reply))
     hits.sort(key=lambda h: h[0], reverse=True)
+    if recent:
+        hits = hits[:10]
     color = args.color == "always" or (args.color == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ)
     if color:
         os.system("")  # makes the Windows console interpret ANSI escapes
@@ -127,7 +136,7 @@ def main():
 
     def show(text, limit):
         text = oneline(text, limit)
-        return found.sub(lambda m: paint(m.group(), MATCH, color), text) if color else text
+        return found.sub(lambda m: paint(m.group(), MATCH, color), text) if color and needle else text
 
     for when, sid, proj, text, prompt, reply in hits:
         print(f"{sid}  {paint(f'{when:%Y-%m-%d %H:%M}', DATE, color)}  [{proj}]\n    {show(text, args.max_chars)}")
