@@ -188,6 +188,70 @@ def test_local_files_are_preserved_and_explicit_sharing_refuses(shared_tree):
     assert model.read_bytes() == b"local model"
 
 
+def test_a_local_copy_of_main_files_only_is_replaced_by_the_link(shared_tree):
+    # A slot made before its host shared the directory: its copy holds a
+    # subset of the main checkout's files, and must not hide the rest.
+    _, slot, source, target = shared_tree
+    (source / "kit").mkdir()
+    (source / "kit" / "chair.glb").write_bytes(b"chair")
+    (source / "bed.glb").write_bytes(b"bed")
+    (target / "kit").mkdir(parents=True)
+    (target / "kit" / "chair.glb").write_bytes(b"chair")
+    worktree.share_dirs(slot, keep_local=True)
+    assert target.resolve() == source.resolve()
+    assert (target / "bed.glb").read_bytes() == b"bed"
+    assert (source / "kit" / "chair.glb").read_bytes() == b"chair"
+
+
+def test_an_empty_local_directory_is_replaced_by_the_link(shared_tree):
+    _, slot, source, target = shared_tree
+    (source / "bed.glb").write_bytes(b"bed")
+    target.mkdir(parents=True)
+    worktree.share_dirs(slot, keep_local=True)
+    assert (target / "bed.glb").read_bytes() == b"bed"
+
+
+def test_a_local_file_differing_from_main_keeps_the_copy(shared_tree, capsys):
+    _, slot, source, target = shared_tree
+    (source / "chair.glb").write_bytes(b"main chair")
+    (source / "bed.glb").write_bytes(b"bed")
+    target.mkdir(parents=True)
+    (target / "bed.glb").write_bytes(b"bed")
+    (target / "chair.glb").write_bytes(b"slot chair")   # same size, other bytes
+    worktree.share_dirs(slot, keep_local=True)
+    assert not worktree.is_link(target)
+    assert (target / "chair.glb").read_bytes() == b"slot chair"
+    assert "first: chair.glb" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(worktree.os.name != "nt", reason="directory junctions are Windows-only")
+def test_a_link_inside_the_local_copy_keeps_it_and_its_target(shared_tree):
+    main, slot, source, target = shared_tree
+    outside = main.parent / "outside"
+    outside.mkdir()
+    (outside / "precious.glb").write_bytes(b"precious")
+    target.mkdir(parents=True)
+    import _winapi
+    _winapi.CreateJunction(str(outside), str(target / "kit"))
+    worktree.share_dirs(slot, keep_local=True)
+    assert not worktree.is_link(target)
+    assert (outside / "precious.glb").read_bytes() == b"precious"
+
+
+@pytest.mark.skipif(worktree.os.name != "nt", reason="directory junctions are Windows-only")
+def test_removing_a_copy_detaches_a_late_junction_without_entering_it(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious.glb").write_bytes(b"precious")
+    copy = tmp_path / "copy"
+    (copy / "sub").mkdir(parents=True)
+    import _winapi
+    _winapi.CreateJunction(str(outside), str(copy / "sub" / "late"))
+    worktree.remove_copy(copy)
+    assert not copy.exists()
+    assert (outside / "precious.glb").read_bytes() == b"precious"
+
+
 def test_a_link_elsewhere_is_not_replaced(shared_tree, monkeypatch):
     main, slot, _, target = shared_tree
     worktree.share_dirs(slot)

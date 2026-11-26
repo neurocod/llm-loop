@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import filecmp
 import functools
 import json
 import os
@@ -66,9 +67,10 @@ git = functools.partial(git, errors="replace", terminal_prompt=False, failure="e
 
 @dataclass(frozen=True)
 class SharedDir:
-    """A directory only the main checkout fills, linked into every slot at the
+    """A directory the main checkout holds, linked into every slot at the
     same relative path, so a slot sees the main checkout's files -- and their
-    later additions -- without copying them. `what` names it in messages
+    later additions -- without copying them, and what a slot writes there
+    lands in the main checkout for every slot. `what` names it in messages
     ("shared <what> linked"), `items` names its contents ("keeping local
     <items>")."""
     path: str
@@ -772,10 +774,20 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
     Link the directory the main checkout fills, not its parent: a tracked file
     beside it (a `.gitignore`) stays a regular tracked file in the slot, while
     both a dev server and direct filesystem readers see additions without
-    copying. An existing local directory or a link elsewhere is never
-    overwritten. Remove linked slots through cmd_drop: direct Git removal
-    follows Windows junctions. Creating an empty source directory lets fresh
-    clones prepare slots before the main checkout has filled it.
+    copying. A link elsewhere is never overwritten, nor is a local directory
+    holding anything the main checkout lacks. Remove linked slots through
+    cmd_drop: direct Git removal follows Windows junctions. Creating an empty
+    source directory lets fresh clones prepare slots before the main checkout
+    has filled it.
+
+    `keep_local` (equalize, the create hook) keeps a local directory that
+    holds a file the main checkout lacks or holds differently, and replaces
+    one that holds nothing else -- every file a byte-identical twin of the
+    main checkout's -- by the link, since the link then loses nothing. Kept
+    unconditionally until 2026-11-26, a slot made before its host shared the
+    directory stayed on its first copy for ever (measured: a slot's two-month
+    old copy of model files lacked 123 the main checkout made since, and its
+    dev server answered those with index.html).
     """
     relative = Path(shared.path)
     source = main_dir() / relative
@@ -784,8 +796,15 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
         raise Fail(f"cannot link {shared.what} in the main checkout to itself")
     linked = target.is_symlink() or is_directory_junction(target)
     if keep_local and not linked and target.is_dir():
-        print(f"keeping local {shared.items}: {target}")
-        return
+        own = local_only_files(target, source)
+        if own:
+            print(f"keeping local {shared.items}: {target} holds {len(own)} entries the main "
+                  f"checkout lacks or holds differently (first: {own[0]}), so it does not see "
+                  f"the main checkout's {shared.items}; move it away and run "
+                  f"`{HOST.command} {HOST.share_command} {path}` to share them")
+            return
+        remove_copy(target)
+        print(f"local {shared.items} were all in the main checkout: {target} removed")
     source.mkdir(parents=True, exist_ok=True)
     if linked:
         if norm(target) != norm(source):
@@ -804,6 +823,51 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
     else:
         target.symlink_to(source.resolve(), target_is_directory=True)
     print(f"shared {shared.what} linked: {target} -> {source}")
+
+
+def local_only_files(local: Path, main: Path) -> list[str]:
+    """What under `local` the main checkout's `main` lacks, as sorted paths
+    relative to `local`: a file with no byte-identical twin at the same
+    relative path, and any link (whatever it points at, it is not a copy).
+    Walked without following links; an unreadable folder counts as one entry,
+    since it may hide either."""
+    own: list[str] = []
+    folders = [local]
+    while folders:
+        folder = folders.pop()
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            own.append(Path(folder).relative_to(local).as_posix() + "/")
+            continue
+        for entry in entries:
+            item = Path(entry.path)
+            relative = item.relative_to(local)
+            if is_link(item):
+                own.append(relative.as_posix())
+            elif entry.is_dir(follow_symlinks=False):
+                folders.append(item)
+            else:
+                twin = main / relative
+                if not (twin.is_file() and filecmp.cmp(item, twin, shallow=False)):
+                    own.append(relative.as_posix())
+    return sorted(own)
+
+
+def remove_copy(local: Path) -> None:
+    """Delete a directory `local_only_files` found empty of anything of its own:
+    files and folders bottom-up, by hand rather than `shutil.rmtree` or
+    `os.walk`, so even a link planted after the check is removed as a link,
+    never entered (`os.walk` before Python 3.12 descends into a junction)."""
+    for entry in list(os.scandir(local)):
+        item = Path(entry.path)
+        if is_link(item):
+            _remove_link(item)
+        elif entry.is_dir(follow_symlinks=False):
+            remove_copy(item)
+        else:
+            item.unlink()
+    local.rmdir()
 
 
 def share_dirs(path: Path, *, keep_local: bool = False) -> None:
