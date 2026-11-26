@@ -518,13 +518,28 @@ class SlotOperation:
 
 
 def _holder(path: Path) -> str:
+    """The holder line, only when the process it names is still that process
+    (`same_process`): the line is advisory -- written after the lock is taken,
+    and left behind by a holder killed before it cleared it -- so a line whose
+    process has ended describes a previous holder, not this one."""
+    unknown = "holder unknown"
     try:
         with open(path, "rb") as file:
             file.seek(1)
             text = file.read(4096).decode("utf-8", "replace").strip()
     except OSError as error:
-        return f"its holder cannot be read ({error})"
-    return text or "its holder has not named itself yet"
+        return f"{unknown} (the holder line cannot be read: {error})"
+    if not text:
+        return f"{unknown} (it has not named itself yet)"
+    try:
+        named = json.loads(text)
+        pid, identity = int(named["pid"]), named.get("identity")
+        what, since = str(named.get("what", "")), str(named.get("since", ""))
+    except (ValueError, TypeError, KeyError) as error:
+        return f"{unknown} (the holder line does not parse: {error})"
+    if not same_process(pid, identity if isinstance(identity, int) else None):
+        return f"{unknown} (the line names pid {pid}, which has ended: a previous holder's)"
+    return f"pid {pid} ({what or 'a pool command'}) since {since or 'an unknown time'}"
 
 
 def slot_operation(slot: Path, what: str, *, wait_s: Optional[float] = None,
@@ -549,8 +564,9 @@ def slot_operation(slot: Path, what: str, *, wait_s: Optional[float] = None,
             lock.close()
             raise Busy(f"another pool command is acting on {slot}: {holder}")
         sleep(0.05)
-    line = (f"pid {os.getpid()} ({what or 'a pool command'}) since "
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')}").encode("utf-8")
+    line = json.dumps({"pid": os.getpid(), "identity": process_identity(os.getpid()),
+                       "what": what or "a pool command",
+                       "since": time.strftime("%Y-%m-%d %H:%M:%S")}).encode("utf-8")
     try:
         os.ftruncate(lock._fd, 0)
         os.lseek(lock._fd, 0, os.SEEK_SET)

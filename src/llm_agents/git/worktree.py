@@ -546,7 +546,8 @@ def live_worker_lines(slot: Slot) -> list[str]:
 def worker_excluded(slot: Slot, ignore: bool = False, *,
                     wait_s: Optional[float] = None) -> contextlib.ExitStack:
     """What a command that acts on the slot's tree holds for its whole run,
-    taken before its first look at the slot:
+    taken before its first look at the slot (a `Slot` read before it names
+    only the path; the caller re-reads the rest under it, `reloaded`):
 
     - the slot's operation lock (`live_workers.slot_operation`), so no other
       pool command acts on the slot meanwhile -- waited for up to `wait_s`
@@ -582,15 +583,29 @@ def worker_excluded(slot: Slot, ignore: bool = False, *,
         return undo.pop_all()
 
 
+def reloaded(slot: Slot) -> Slot:
+    """`slot` as git registers it now, matched by path. Called right after
+    `worker_excluded`: a snapshot taken before it is only good for the path the
+    lock is keyed by -- its claim, branch and head may describe a slot another
+    pool command changed while this one waited (the create hook claimed it, a
+    `land` unclaimed it, a `drop` removed it)."""
+    target = norm(slot.path)
+    current = next((s for s in list_slots() if norm(s.path) == target), None)
+    if current is None:
+        raise Fail(f"{slot.name} ({slot.path}) is no longer a registered worktree")
+    return current
+
+
 def excluding_worker(default: str | None = None):
     """Run a slot command as `command(args, slot)` inside `worker_excluded`
-    for the slot it names (`slot_named`, `default`)."""
+    for the slot it names (`slot_named`, `default`), the slot re-read under it
+    (`reloaded`)."""
     def wrap(command):
         @functools.wraps(command)
         def run(args: argparse.Namespace) -> int:
-            slot = find_slot(slot_named(args, default=default))
-            with worker_excluded(slot, args.ignore_live_worker):
-                return command(args, slot)
+            named = find_slot(slot_named(args, default=default))
+            with worker_excluded(named, args.ignore_live_worker):
+                return command(args, reloaded(named))
         return run
     return wrap
 
@@ -1480,6 +1495,10 @@ def cmd_new(args: argparse.Namespace) -> int:
     # parent of the new slot, or a turn started once `worktree add` made the
     # folder, would otherwise write a tree the steps below treat as fresh.
     with worker_excluded(slot):
+        # Asked again under the lock: a `new` of the same number may have
+        # created it while this one waited (`reloaded`).
+        if any(s.number == number for s in list_slots()):
+            raise Fail(f"wt{number} already exists")
         return _new_slot(args, slot)
 
 
@@ -1700,6 +1719,10 @@ def _choose_slot(name: str, reason: str, hold: contextlib.ExitStack) -> tuple[Sl
             # Excluded first, then inspected: a worker that ran between an
             # earlier look and the guard would have left the look stale.
             hold.enter_context(worker_excluded(slot, ignore=override == IGNORE_LIVE_FLAG))
+            # Re-read under the lock: a `land` that held it while this hook
+            # waited may have unclaimed it, and a claim read before would be
+            # trusted and never retaken.
+            slot = reloaded(slot)
             # `next` refused it already, but the slot may have changed since.
             refuse_foreign(slot)
             if not slot.locked:
@@ -1725,6 +1748,7 @@ def _choose_slot(name: str, reason: str, hold: contextlib.ExitStack) -> tuple[Sl
             # acting on is not free now, and the next candidate may be.
             try:
                 candidate.enter_context(worker_excluded(slot, wait_s=0))
+                slot = reloaded(slot)
             except Fail as busy:
                 states.append(f"{slot.name}: {busy}")
                 continue
@@ -1789,6 +1813,7 @@ def cmd_hook_remove(args: argparse.Namespace) -> int:
         # Excluded first, then inspected, then reset, all under one guard.
         try:
             hold.enter_context(worker_excluded(slot))
+            slot = reloaded(slot)
         except Fail as busy:
             print(f"worktree hook remove: {busy}; keeping it as is")
             return 0

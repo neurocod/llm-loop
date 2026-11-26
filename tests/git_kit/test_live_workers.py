@@ -65,6 +65,26 @@ def test_two_pool_commands_on_one_slot_exclude_each_other_and_name_the_holder(tm
     live_workers.slot_operation(slot, "worktree next wt1", wait_s=0).release()
 
 
+def test_a_holder_line_naming_an_ended_process_reads_as_holder_unknown(tmp_path):
+    """The line is advisory: a holder killed before it cleared it leaves it
+    for the next one, which takes the lock before it writes its own."""
+    ended = subprocess.Popen([sys.executable, "-c", "pass"])
+    identity = live_workers.process_identity(ended.pid)
+    ended.wait()
+    with live_workers.slot_operation(tmp_path, "worktree land wt1") as held:
+        left = json.dumps({"pid": ended.pid, "identity": identity, "what": "worktree drop wt1",
+                           "since": "earlier"}).encode("utf-8")
+        os.ftruncate(held._lock._fd, 0)
+        os.lseek(held._lock._fd, 0, os.SEEK_SET)
+        os.write(held._lock._fd, b"\n" + left)
+        with pytest.raises(live_workers.Busy,
+                           match=rf"holder unknown \(the line names pid {ended.pid}, which has ended"):
+            live_workers.slot_operation(tmp_path, "worktree next wt1", wait_s=0)
+        os.ftruncate(held._lock._fd, 1)
+        with pytest.raises(live_workers.Busy, match=r"holder unknown \(it has not named itself"):
+            live_workers.slot_operation(tmp_path, "worktree next wt1", wait_s=0)
+
+
 def test_a_slot_operation_waits_for_a_short_holder(tmp_path):
     first = live_workers.slot_operation(tmp_path, "first")
     timer = threading.Timer(0.3, first.release)

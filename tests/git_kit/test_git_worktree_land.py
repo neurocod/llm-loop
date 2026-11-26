@@ -21,6 +21,8 @@ import pytest
 
 from llm_agents.git import live_workers, worktree
 
+from kit_support import kit_env
+
 _CONFIG = {
     "protocol.file.allow": "always",  # `submodule add/update` from a local path
     "user.name": "Land test",
@@ -525,8 +527,9 @@ def test_land_leaves_a_claimed_slot_s_lagging_submodule_alone(repos, monkeypatch
     if work:
         commit_file(slot, "work.txt", "task")
     run(slot, "rebase", "-q", "main")
-    claimed = worktree.Slot(2, slot, "wt2", "", True, "agent session s")
-    monkeypatch.setattr(worktree, "find_slot", lambda spec: claimed)
+    # A real claim: `land` re-reads the slot under its lock (`reloaded`).
+    run(main, "worktree", "lock", "--reason", f"{worktree.LOCK_REASON_PREFIX}agent session s",
+        str(slot))
     land()
     assert run(slot / "sub", "rev-parse", "HEAD") == base
 
@@ -967,7 +970,7 @@ OPERATION_REFUSAL = r"another pool command is acting on .*: pid \d+ \(worktree "
                                     "equalize-overriding"])
 def test_a_second_pool_command_on_a_slot_another_is_preparing_is_refused(repos, monkeypatch,
                                                                          capsys, second):
-    """Item 2704: the pool's guard is shared among pool commands, so a `land`
+    """The pool's guard is shared among pool commands, so a `land`
     could act while `equalize` (or the create hook) stood between its look at
     the slot and its reset and install, on a verdict the other had made
     stale. Each command holds the slot's operation lock from its first look
@@ -1007,23 +1010,166 @@ def test_a_second_pool_command_on_a_slot_another_is_preparing_is_refused(repos, 
 
 def test_the_create_hook_takes_the_next_slot_while_another_command_holds_one(repos,
                                                                              monkeypatch):
-    """Not waited for: a held slot is not free now."""
+    """Not waited for: a held slot is not free now, and the next one is."""
     main, slot, base = repos
+    other = main.parent / "main-wt3"
+    run(main, "worktree", "add", "-q", "-b", "wt3", str(other))
+    run(other, "submodule", "update", "-q", "--init", "--", "sub")
     monkeypatch.setattr(live_workers, "OPERATION_WAIT_S", 30)
-    free = worktree.Slot(2, slot, "wt2", "", False)
-    monkeypatch.setattr(worktree, "list_slots", lambda: [free])
     monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
     monkeypatch.setattr(worktree, "take_next_assignment", lambda: "")
     with live_workers.slot_operation(slot, "worktree land wt2"):
         started = time.monotonic()
-        with pytest.raises(worktree.Fail, match=r"no free slot \(wt2: .*another pool command"):
-            worktree.choose_slot("agent", "r")
+        taken, reset, how = worktree.choose_slot("agent", "r")
         assert time.monotonic() - started < 10
-    assert "locked" not in run(main, "worktree", "list", "--porcelain")
+    assert (taken.name, reset, how) == ("wt3", True, "first free")
+    assert worktree.norm(taken.path) == worktree.norm(other)
+    locks = {s.name: s.locked for s in worktree.list_slots()}
+    assert locks == {"wt2": False, "wt3": True}
+
+
+# A pool command run as its own process, with two barriers in `barrier` (its
+# own folder): `waiting` is touched right before it asks for the slot's
+# operation lock -- after it has resolved the slot -- and, if `pause` names a
+# `worktree` function, the command stops on entering it (`<pause>-reached`)
+# until `<pause>-go` appears. Its wait for the lock is long (120 s): only a
+# lock never let go may turn into a red.
+CONTENDER = """
+import sys, time
+from pathlib import Path
+from llm_agents.git import live_workers, worktree
+
+barrier, pause, argv = Path(sys.argv[1]), sys.argv[2], sys.argv[3:]
+
+def wait_for(name):
+    deadline = time.monotonic() + 120
+    while not (barrier / name).exists():
+        if time.monotonic() > deadline:
+            sys.exit(f"contender: barrier {name} never came")
+        time.sleep(0.02)
+
+if pause:
+    real_pause = getattr(worktree, pause)
+    def paused(*args, **kwargs):
+        (barrier / f"{pause}-reached").touch()
+        wait_for(f"{pause}-go")
+        return real_pause(*args, **kwargs)
+    setattr(worktree, pause, paused)
+
+real_operation = live_workers.slot_operation
+def announced(*args, **kwargs):
+    (barrier / "waiting").touch()
+    return real_operation(*args, **kwargs)
+live_workers.slot_operation = announced
+live_workers.OPERATION_WAIT_S = 120
+sys.argv = ["worktree.py", *argv]
+sys.exit(worktree.main())
+"""
+
+
+class Contender:
+    def __init__(self, main, tmp_path, name, pause, *argv, stdin=""):
+        self.barrier = tmp_path / f"barrier-{name}"
+        self.barrier.mkdir()
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", CONTENDER, str(self.barrier), pause, *argv], cwd=main,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", env=kit_env())
+        self.proc.stdin.write(stdin)
+        self.proc.stdin.close()
+
+    def reached(self, name):
+        # 120 s: a contender starts a Python and a few gits before it gets
+        # there (about a second each); the bound only turns one that never
+        # arrives into a red.
+        deadline = time.monotonic() + 120
+        while not (self.barrier / name).exists():
+            assert self.proc.poll() is None, f"contender ended early: {self.finish()}"
+            assert time.monotonic() < deadline, f"contender never reached {name}"
+            time.sleep(0.02)
+
+    def go(self, pause):
+        (self.barrier / f"{pause}-go").touch()
+
+    def finish(self):
+        # 180 s: as `reached`, plus the reset of a slot (seconds).
+        out, err = self.proc.communicate(timeout=180)
+        return self.proc.returncode, out, err
+
+    def kill(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.communicate()
+
+
+@pytest.fixture
+def contenders(repos):
+    main, slot, base = repos
+    # The real `is_permitted` in the child: the slot is listed.
+    (main / ".claude").mkdir()
+    (main / ".claude" / "settings.json").write_text(
+        json.dumps({"permissions": {"additionalDirectories": [str(slot)]}}), encoding="utf-8")
+    started = []
+    yield started
+    for contender in started:
+        contender.kill()
+
+
+def test_a_command_that_waited_for_the_hook_sees_the_slot_it_claimed(repos, tmp_path,
+                                                                      contenders):
+    """`equalize` resolved the slot while the create hook held its lock and
+    had not yet claimed it; the hook claimed it and handed it out. Once
+    `equalize` gets the lock it must see that claim and refuse, not reset an
+    assigned slot on what it read before waiting."""
+    main, slot, base = repos
+    work = commit_file(main, "later.txt", "main moved on")
+    hook = Contender(main, tmp_path, "hook", "claim", "hook-create",
+                     stdin=json.dumps({"name": "", "session_id": "hook"}))
+    contenders.append(hook)
+    hook.reached("claim-reached")
+    equalize = Contender(main, tmp_path, "equalize", "", "equalize", "wt2", "--no-push",
+                         "--no-install")
+    contenders.append(equalize)
+    equalize.reached("waiting")
+    hook.go("claim")
+    code, out, err = hook.finish()
+    assert code == 0, err
+    assert worktree.norm(out.strip()) == worktree.norm(slot)
+    code, out, err = equalize.finish()
+    assert code != 0 and "wt2 is locked (worktree.py:" in err, err
+    porcelain = run(main, "worktree", "list", "--porcelain")
+    assert "locked worktree.py:unnamed session hook" in porcelain, porcelain
+    # The hook's own reset brought it to main; nothing reset it after.
+    assert run(slot, "rev-parse", "HEAD") == work
+
+
+def test_an_assignment_that_waited_for_a_land_claims_the_slot_again(repos, tmp_path,
+                                                                     contenders):
+    """`next wt2` queued the claimed slot for its reviewer; the create hook
+    read the claim while `land` held the lock, and `land` unclaimed it. Once
+    the hook gets the lock it must see the slot unclaimed and claim it, not
+    hand out an unclaimed slot on the claim it read before waiting."""
+    main, slot, base = repos
+    run(main, "worktree", "lock", "--reason", f"{worktree.LOCK_REASON_PREFIX}task", str(slot))
+    command("next", "wt2")
+    land = Contender(main, tmp_path, "land", "unclaim", "land", "wt2", "--no-push")
+    contenders.append(land)
+    land.reached("unclaim-reached")
+    hook = Contender(main, tmp_path, "hook", "", "hook-create",
+                     stdin=json.dumps({"name": "", "session_id": "review"}))
+    contenders.append(hook)
+    hook.reached("waiting")
+    land.go("unclaim")
+    code, out, err = land.finish()
+    assert code == 0 and "wt2 has nothing to land" in out, err
+    code, out, err = hook.finish()
+    assert code == 0 and "-> wt2 (assigned" in err, err
+    porcelain = run(main, "worktree", "list", "--porcelain")
+    assert "locked worktree.py:unnamed session review" in porcelain, porcelain
 
 
 def test_a_free_slot_whose_reset_cannot_move_a_submodule_is_not_handed_out(repos, monkeypatch):
-    """Item 2704: the create hook reset the picked slot non-strictly, warned,
+    """The create hook once reset the picked slot non-strictly, warned,
     and handed out a slot showing ` M sub`. Here the slot is behind main,
     whose gitlink tracks a file the slot's clone ignores."""
     main, slot, base = repos
