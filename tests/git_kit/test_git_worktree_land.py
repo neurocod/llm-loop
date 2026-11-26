@@ -1071,12 +1071,16 @@ class Contender:
     def __init__(self, main, tmp_path, name, pause, *argv, stdin=""):
         self.barrier = tmp_path / f"barrier-{name}"
         self.barrier.mkdir()
-        self.proc = subprocess.Popen(
-            [sys.executable, "-c", CONTENDER, str(self.barrier), pause, *argv], cwd=main,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", env=kit_env())
-        self.proc.stdin.write(stdin)
-        self.proc.stdin.close()
+        # Stdin comes from a file, not a pipe closed by hand: before Python
+        # 3.13 a POSIX `communicate()` flushes a closed `proc.stdin` and raises
+        # ValueError (Windows never flushes it, so it only shows off Windows).
+        stdin_file = tmp_path / f"stdin-{name}"
+        stdin_file.write_text(stdin, encoding="utf-8")
+        with stdin_file.open("rb") as feed:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-c", CONTENDER, str(self.barrier), pause, *argv], cwd=main,
+                stdin=feed, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", env=kit_env())
 
     def reached(self, name):
         # 120 s: a contender starts a Python and a few gits before it gets
