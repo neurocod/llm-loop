@@ -136,6 +136,29 @@ def _alive(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+# How long a process whose job was terminated may still read as alive.
+# `TerminateJobObject` starts every member's termination and returns without
+# waiting for it; `stop` then waits only for the leader (the shim), so a
+# grandchild can still be tearing down when the check runs. CI red 2026-11-26
+# (run 45854531307, windows-latest 3.12) caught exactly that window. 10 s is
+# generous for a teardown and still far below the fake's 60 s life, so a kill
+# that never reached the grandchild stays red.
+GRANDCHILD_END_S = 10.0
+
+
+def _ends_within(pid: int, seconds: float) -> bool:
+    """Whether `pid` has ended, or ends within `seconds` (Windows only)."""
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
+    if not handle:
+        return True
+    try:
+        return kernel32.WaitForSingleObject(handle, int(seconds * 1000)) == 0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def test_timeout_is_bounded_and_kills_the_server(pid_log, capsys):
     # The fake outlives stdin EOF, so the kill escalation in `stop` is what
     # ends it.
@@ -168,7 +191,7 @@ def test_timeout_behind_an_npm_shim_ends_the_grandchild(pid_log, tmp_path):
         started = time.monotonic()
         assert source.get_usage(cache_value=False).week_all.percent is None
         assert time.monotonic() - started < 15
-        assert not _alive(int(pid_log.read_text().split()[0]))
+        assert _ends_within(int(pid_log.read_text().split()[0]), GRANDCHILD_END_S)
     finally:
         source.close()
 
