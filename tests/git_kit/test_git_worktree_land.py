@@ -1022,6 +1022,24 @@ def test_the_create_hook_takes_the_next_slot_while_another_command_holds_one(rep
     assert "locked" not in run(main, "worktree", "list", "--porcelain")
 
 
+def test_a_free_slot_whose_reset_cannot_move_a_submodule_is_not_handed_out(repos, monkeypatch):
+    """Item 2704: the create hook reset the picked slot non-strictly, warned,
+    and handed out a slot showing ` M sub`. Here the slot is behind main,
+    whose gitlink tracks a file the slot's clone ignores."""
+    main, slot, base = repos
+    admin = Path(run(slot / "sub", "rev-parse", "--absolute-git-dir"))
+    (admin / "info").mkdir(exist_ok=True)
+    (admin / "info" / "exclude").write_text("cfg.local\n", encoding="utf-8")
+    (slot / "sub" / "cfg.local").write_text("mine", encoding="utf-8")
+    commit_file(main / "sub", "cfg.local", "theirs")
+    run(main, "add", "sub")
+    run(main, "commit", "-q", "-m", "bump sub with cfg.local")
+    assert run(slot, "status", "--porcelain") == ""
+    held_by_the_hook(monkeypatch, slot, "wt2: dirty (wt2's sub was not updated: the checkout of the gitlink failed")
+    assert (slot / "sub" / "cfg.local").read_text(encoding="utf-8") == "mine"
+    assert "locked" not in run(main, "worktree", "list", "--porcelain")
+
+
 @pytest.mark.parametrize("install", [True, False])
 @pytest.mark.parametrize("root", ["slot", "parent"])
 def test_new_creates_nothing_under_a_worker(repos, monkeypatch, install, root):

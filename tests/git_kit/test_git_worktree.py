@@ -115,6 +115,8 @@ def _free_pool(monkeypatch, root, names):
     monkeypatch.setattr(worktree, "slot_state", lambda s: worktree.SlotState(
         exists=True, detached=False, locked=False, lock_reason="", clean=True, unlanded=[], behind=0, head=""))
     monkeypatch.setattr(worktree, "claim", lambda s, reason: True)
+    # The pick resets the slot it hands out (`_choose_slot`); these are no repositories.
+    monkeypatch.setattr(worktree, "reset_to_main_branch", lambda s, install, strict=True: None)
     return slots
 
 

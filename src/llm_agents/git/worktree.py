@@ -1331,8 +1331,9 @@ def reset_to_main_branch(slot: Slot, install: bool, *, strict: bool = True) -> N
     """The slot's branch := the main branch, dependencies refreshed. Caller has
     checked it is safe and holds `worker_excluded` for the slot.
 
-    `strict=False` (the hooks): a failed submodule update is a warning, not an
-    abort, for the reason `follow_gitlinks` gives.
+    `strict=False` (the remove hook, which has unclaimed the slot already): a
+    failed submodule update is a warning, not an abort. The create hook
+    resets strictly and takes another slot instead (`_choose_slot`).
     """
     # Bound (`slot_top`); no recursion into submodules whatever a
     # configuration says (`update_submodules`).
@@ -1666,12 +1667,14 @@ def take_next_assignment() -> str:
 
 def choose_slot(name: str, reason: str,
                 hold: Optional[contextlib.ExitStack] = None) -> tuple[Slot, bool, str]:
-    """Pick and claim the slot for a create hook: (slot, needs_reset, how).
+    """Pick and claim the slot for a create hook: (slot, reset, how); `reset`:
+    the slot was reset to the main branch (still to be installed).
 
     Three policies in order: an explicit `next` assignment (the reviewer/fixer
     of the task that holds the slot is meant to land in it, unlanded commits
     and all, so no reset and the existing claim stands); a slot named by the
-    request; the first free slot. Claiming is what makes concurrent hooks safe.
+    request; the first free slot, reset before it is picked. Claiming is what
+    makes concurrent hooks safe.
     A slot missing from `additionalDirectories` (`is_permitted`) is never the
     first free one -- handing it out would park the agent on a permission prompt
     -- and an assignment or a request by name gets it with a warning, because
@@ -1728,16 +1731,22 @@ def _choose_slot(name: str, reason: str, hold: contextlib.ExitStack) -> tuple[Sl
             state = slot_state(slot)
             states.append(f"{slot.name}: {state.describe()}")
             if state.free and claim(slot, reason):
-                # The lag is what made a ` M <sub>` slot free; a move git
-                # refuses (an ignored file in the way) leaves it as dirty as
-                # it looked, so it is not handed out and the reason is named.
+                # Reset here, strict, not after the pick: a submodule move git
+                # refuses (an ignored file the gitlink tracks, a commit nowhere
+                # to fetch) leaves the slot showing ` M <sub>`, as dirty as a
+                # lagging clone that cannot follow (`SlotState.stale`), so it
+                # is not handed out and the next candidate is tried. The
+                # reset itself loses nothing: a free slot has nothing unlanded.
                 try:
-                    update_submodules(slot, list(state.stale))
+                    reset_to_main_branch(slot, install=False)
                 except Fail as refused:
                     unclaim(slot)
                     why = one_line(str(refused)).removeprefix("error: ")
                     states[-1] = f"{slot.name}: dirty ({why})"
                     continue
+                except BaseException:
+                    unclaim(slot)
+                    raise
                 hold.enter_context(candidate.pop_all())
                 return slot, True, "by name" if slot.name == name else "first free"
     unlisted = any(not is_permitted(s.path) for s in candidates)
@@ -1753,12 +1762,9 @@ def cmd_hook_create(args: argparse.Namespace) -> int:
     session = str(data.get("session_id", ""))[:8]
     # Everything but the path goes to stderr: the harness reads stdout as the directory.
     with contextlib.redirect_stdout(sys.stderr), contextlib.ExitStack() as hold:
-        slot, needs_reset, how = choose_slot(name, f"{name or 'unnamed'} session {session or '?'}",
-                                             hold)
-        if needs_reset:
-            # A free slot may still lag behind the main branch; bring it up
-            # before the agent starts.
-            reset_to_main_branch(slot, install=True, strict=False)
+        slot, reset, how = choose_slot(name, f"{name or 'unnamed'} session {session or '?'}", hold)
+        if reset:
+            HOST.install(slot.path, slot.admin_dir())
         else:
             follow_gitlinks(slot)
             share_dirs(slot.path, keep_local=True)
