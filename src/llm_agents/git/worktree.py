@@ -311,9 +311,78 @@ def is_clean(path: Path, top: Optional[Pinned] = None) -> bool:
     # starts no git in a submodule (it reads the HEAD its `.git` names
     # in-process; `gitlib.SKIP_SUBMODULES`) and on the command line beats an
     # `ignore` in the worker's `.gitmodules`.
-    proc = git(["status", "--porcelain", "--ignore-submodules=dirty"], cwd=path, check=False,
+    return status_entries(path, top) == []
+
+
+def status_entries(path: Path, top: Optional[Pinned] = None) -> Optional[list[tuple[str, str]]]:
+    """(XY, path) per `git status --porcelain` entry, as `is_clean` reads the
+    tree; None when the status itself fails (dirty, never clean)."""
+    proc = git(["status", "--porcelain", "-z", "--ignore-submodules=dirty"], cwd=path, check=False,
                pinned=top)
-    return proc.returncode == 0 and proc.stdout.strip() == ""
+    if proc.returncode != 0:
+        return None
+    entries: list[tuple[str, str]] = []
+    fields = iter(proc.stdout.split("\0"))
+    for item in fields:
+        if not item:
+            continue
+        entries.append((item[:2], item[3:]))
+        if item[0] in "RC":
+            next(fields, None)      # a rename's or copy's source path
+    return entries
+
+
+def gitlink_drift_hold(slot_path: Path, sub: str, pinned: Pinned) -> tuple[str, str, str]:
+    """(head, wanted, why) for the slot's submodule `sub` whose checkout is not
+    the commit the slot's HEAD records: '' as `why` when `git submodule update`
+    may move it there with nothing lost, else the reason the slot stays held.
+
+    The case it exists for (2699, measured): a land bumped a gitlink, the
+    orchestrator rebased the slot onto it, and the slot's clone stayed on the
+    old commit -- ` M <sub>` in the slot's status, so the create hook refused
+    it as dirty ("no free slot") with two slots really free. The move is safe
+    when the clone's tracked and untracked files are clean and its HEAD's
+    commits stay reachable: HEAD is an ancestor of the gitlink, or a descendant
+    whose commits some remote-tracking branch holds. A HEAD with commits no
+    remote holds past the gitlink (a worker's unrecorded submodule work, e.g.
+    on a branch like `wt1-2689`) or one that diverged from it holds the slot.
+    Ancestry is read in the slot's clone, or else in the main checkout's when
+    only that one has the gitlink (landed but not fetched yet); a gitlink in
+    neither holds the slot. Nothing is fetched here: `slot_state` only looks."""
+    wanted = gitlink("HEAD", sub, slot=slot_path)
+    head = bound_git(pinned, ["rev-parse", "HEAD"], check=False).stdout.strip()
+    if not wanted or not head:
+        return head, wanted, "its HEAD or the gitlink the slot records cannot be read"
+    if bound_git(pinned, ["status", "--porcelain", SKIP_SUBMODULES], check=False).stdout.strip():
+        return head, wanted, "it has uncommitted changes or untracked files"
+    branch = bound_git(pinned, ["symbolic-ref", "-q", "--short", "HEAD"], check=False).stdout.strip()
+    at = f"{head[:9]}" + (f" (branch {branch})" if branch else "")
+    main_clone = main_dir() / sub
+    diverged = f"its HEAD {at} has diverged from the gitlink {wanted[:9]} (side-branch work?)"
+    if has_commit(slot_path / sub, wanted, pinned):
+        def is_ancestor(a: str, b: str) -> bool:
+            return bound_git(pinned, ["merge-base", "--is-ancestor", a, b], check=False).returncode == 0
+    elif (main_clone / ".git").exists() and has_commit(main_clone, wanted):
+        # A clone holding `wanted` holds its ancestors, so a `head` it lacks is
+        # none of them; nor a descendant, which the slot's clone would make it hold.
+        if not has_commit(main_clone, head):
+            return head, wanted, diverged
+
+        def is_ancestor(a: str, b: str) -> bool:
+            return git(["merge-base", "--is-ancestor", a, b], cwd=main_clone, check=False).returncode == 0
+    else:
+        return head, wanted, (f"{wanted[:9]} is in neither its clone nor the main checkout's, "
+                              f"so whether the move loses work cannot be told")
+    if is_ancestor(head, wanted):
+        return head, wanted, ""
+    if not is_ancestor(wanted, head):
+        return head, wanted, diverged
+    unpushed = bound_git(pinned, ["rev-list", "--count", "HEAD", "--not", "--remotes", wanted],
+                         check=False).stdout.strip()
+    if unpushed != "0":
+        return head, wanted, (f"its HEAD {at} carries {unpushed or 'uncounted'} commit(s) past the "
+                              f"gitlink {wanted[:9]} that no remote-tracking branch has (unpushed work)")
+    return head, wanted, ""
 
 
 def unlanded_branch(branch: str) -> list[str]:
@@ -344,6 +413,12 @@ class SlotState:
     # One line per live-worker record naming the slot (`live_workers`): no
     # command that acts on the tree runs there unless told IGNORE_LIVE_FLAG.
     live: list[str] = field(default_factory=list)
+    # {sub: (head, gitlink)} per submodule whose checkout lags the gitlink
+    # while nothing else in the tree differs and the move loses nothing
+    # (`gitlink_drift_hold`): not dirt; `equalize`, the create hook and `land`
+    # update it. A drift that may not be followed is dirt, its reason in `held`.
+    stale: dict[str, tuple[str, str]] = field(default_factory=dict)
+    held: list[str] = field(default_factory=list)
 
     @property
     def free(self) -> bool:
@@ -359,7 +434,7 @@ class SlotState:
         if self.locked:
             parts.append(f"locked ({self.lock_reason or 'no reason'})")
         if not self.clean:
-            parts.append("dirty")
+            parts.append(f"dirty ({'; '.join(self.held)})" if self.held else "dirty")
         if self.unlanded:
             parts.append(f"{len(self.unlanded)} unlanded commit(s)")
         if self.behind:
@@ -368,7 +443,11 @@ class SlotState:
             parts.append(f"git not the slot's ({'; '.join(self.foreign)})")
         if self.live:
             parts.append(f"worker alive ({'; '.join(self.live)})")
-        return ", ".join(parts) if parts else "free"
+        verdict = ", ".join(parts) if parts else "free"
+        if self.stale:
+            verdict += " (" + "; ".join(f"{sub} at {head[:9]}, gitlink {wanted[:9]}: updated on hand-out"
+                                        for sub, (head, wanted) in self.stale.items()) + ")"
+        return verdict
 
 
 def slot_state(slot: Slot) -> SlotState:
@@ -380,20 +459,39 @@ def slot_state(slot: Slot) -> SlotState:
                          cwd=main_dir()).stdout.strip() or 0)
     foreign = []
     top: Optional[Pinned] = None
+    bound: dict[str, Pinned] = {}
     if exists:
         top, why = slot_top(slot.path)
         if top is None:
             foreign.append(f"the slot itself: {why}")
         for sub in initialized_submodules(slot.path):
-            why = slot_submodule(slot.path, sub)[1]
+            pinned, why = slot_submodule(slot.path, sub)
             if why:
                 foreign.append(f"{sub}: {why}")
+            elif pinned is not None:
+                bound[sub] = pinned
+    clean, stale, held = True, {}, []
+    if exists:
+        entries = status_entries(slot.path, top) if top is not None else None
+        clean = entries == []
+        # Only a worktree-side gitlink change of a bound submodule may be a
+        # drift to follow; any other entry (a staged gitlink included) is work.
+        if entries and all(xy == " M" and path in bound for xy, path in entries):
+            for _, sub in entries:
+                head, wanted, why = gitlink_drift_hold(slot.path, sub, bound[sub])
+                if why:
+                    held.append(f"{sub}: {why}")
+                else:
+                    stale[sub] = (head, wanted)
+            clean = not held
+            if not clean:
+                stale = {}
     return SlotState(
         exists=exists, detached=slot.detached, locked=slot.locked, lock_reason=slot.lock_reason,
-        clean=(top is not None and is_clean(slot.path, top)) if exists else True,
+        clean=clean,
         unlanded=unlanded_branch(slot.branch) if usable else [],
         behind=behind, head=slot.head, foreign=foreign,
-        live=live_worker_lines(slot) if exists else [])
+        live=live_worker_lines(slot) if exists else [], stale=stale, held=held)
 
 
 def describe(slot: Slot) -> str:
@@ -423,7 +521,8 @@ def refuse_unless_idle(slot: Slot, state: SlotState | None = None) -> None:
     if not state.clean:
         proc = top_git(slot.path, ["status", "--short", "--ignore-submodules=dirty"], check=False)
         status = (proc.stdout + proc.stderr).rstrip()
-        raise Fail(f"{slot.name} has uncommitted changes; commit or discard them first:\n{status}")
+        held = "".join(f"\n{why}" for why in state.held)
+        raise Fail(f"{slot.name} has uncommitted changes; commit or discard them first:\n{status}{held}")
     if state.unlanded:
         raise unlanded_refusal(slot.name, state.unlanded, slot.path)
 
@@ -1421,10 +1520,12 @@ def cmd_land(args: argparse.Namespace, slot: Slot) -> int:
     if state.detached:
         raise Fail(f"{slot.name} is {state.describe()}")
     if not state.clean:
-        print(f"warning: {slot.name} has uncommitted changes; they stay behind, only commits land",
+        held = f" ({'; '.join(state.held)})" if state.held else ""
+        print(f"warning: {slot.name} has uncommitted changes{held}; they stay behind, only commits land",
               file=sys.stderr)
     if not state.unlanded:
         print(f"{slot.name} has nothing to land")
+        update_submodules(slot, list(state.stale), strict=False)
         unclaim(slot)
         return finish(args)
     main = HOST.main_branch
@@ -1452,6 +1553,9 @@ def cmd_land(args: argparse.Namespace, slot: Slot) -> int:
         # claimed or skip the push.
         print(f"warning: the main checkout's submodules were not synced after the land: {error}",
               file=sys.stderr)
+    # The slot's own lagging clones (`SlotState.stale`), judged before the
+    # merge, which moved neither the slot's HEAD nor its submodules.
+    update_submodules(slot, list(state.stale), strict=False)
     unclaim(slot)
     return finish(args)
 

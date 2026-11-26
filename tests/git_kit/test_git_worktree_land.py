@@ -459,6 +459,106 @@ def test_a_follow_git_refuses_warns_and_the_hook_still_starts_the_agent(repos, m
     run(main, "worktree", "unlock", str(slot))
 
 
+# ------------------------ a slot whose submodule only lags its gitlink (2699)
+
+def lagging_slot(main, slot):
+    """What a land plus `git -C <slot> rebase <main>` left (measured
+    2026-11-26): the slot's branch records the landed gitlink, its clone
+    stands on the old commit, the slot's status shows ` M sub`."""
+    landed = bump_in_main(main)
+    run(slot, "rebase", "-q", "main")
+    assert run(slot, "status", "--porcelain") == "M sub"
+    return landed
+
+
+def first_free_hook(monkeypatch, slot):
+    """The create hook with no assignment and no slot asked for by name;
+    returns what it printed to the harness."""
+    monkeypatch.setattr(worktree, "list_slots", lambda: [worktree.Slot(2, slot, "wt2", "", False)])
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    monkeypatch.setattr(worktree, "push_main_branch", lambda: True)
+    monkeypatch.setattr(worktree.sys, "stdin", io.StringIO('{"name": "agent", "session_id": "s"}'))
+    printed = io.StringIO()
+    monkeypatch.setattr(worktree.sys, "__stdout__", printed)
+    assert command("hook-create") == 0
+    return printed.getvalue().strip()
+
+
+def test_a_submodule_lagging_its_gitlink_is_updated_and_the_slot_handed_out(repos, monkeypatch, capsys):
+    """The hook refused such a slot: "no free slot (wt2: dirty ...)"."""
+    main, slot, base = repos
+    landed = lagging_slot(main, slot)
+    assert command("status") == 0
+    assert f"sub at {base[:9]}, gitlink {landed[:9]}: updated on hand-out" in capsys.readouterr().out
+    assert first_free_hook(monkeypatch, slot) == str(slot)
+    assert run(slot / "sub", "rev-parse", "HEAD") == landed
+    assert run(slot, "status", "--porcelain") == ""
+    run(main, "worktree", "unlock", str(slot))
+
+
+def test_equalize_takes_a_slot_whose_submodule_only_lags(repos):
+    main, slot, base = repos
+    landed = lagging_slot(main, slot)
+    assert command("equalize", "wt2", "--no-push", "--no-install") == 0
+    assert run(slot / "sub", "rev-parse", "HEAD") == landed
+
+
+def test_land_updates_the_slot_s_lagging_submodule_without_a_warning(repos, capsys):
+    main, slot, base = repos
+    landed = bump_in_main(main)
+    commit_file(slot, "work.txt", "task")
+    run(slot, "rebase", "-q", "main")
+    land()
+    assert run(slot / "sub", "rev-parse", "HEAD") == landed
+    assert run(slot, "status", "--porcelain") == ""
+    assert "uncommitted changes" not in capsys.readouterr().err
+
+
+def held_by_the_hook(monkeypatch, slot, reason):
+    with pytest.raises(worktree.Fail, match="no free slot") as refused:
+        first_free_hook(monkeypatch, slot)
+    assert reason in str(refused.value)
+
+
+def test_a_dirty_lagging_submodule_holds_the_slot(repos, monkeypatch):
+    main, slot, base = repos
+    lagging_slot(main, slot)
+    (slot / "sub" / "a.txt").write_text("edited", encoding="utf-8")
+    held_by_the_hook(monkeypatch, slot, "wt2: dirty (sub: it has uncommitted changes or untracked files)")
+    assert run(slot / "sub", "rev-parse", "HEAD") == base
+    assert (slot / "sub" / "a.txt").read_text(encoding="utf-8") == "edited"
+
+
+def test_unpushed_submodule_commits_on_a_branch_hold_the_slot(repos, monkeypatch):
+    """A worker's submodule work on its own branch (2689 used `wt1-2689`),
+    not recorded by the gitlink and on no remote."""
+    main, slot, base = repos
+    run(slot / "sub", "checkout", "-q", "-b", "wt2-2699")
+    mine = commit_file(slot / "sub", "mine.txt", "unpushed")
+    held_by_the_hook(monkeypatch, slot, f"its HEAD {mine[:9]} (branch wt2-2699) carries 1 commit(s) past "
+                                        f"the gitlink {base[:9]} that no remote-tracking branch has")
+    assert run(slot / "sub", "rev-parse", "HEAD") == mine
+    with pytest.raises(worktree.Fail, match="no remote-tracking branch has"):
+        command("equalize", "wt2", "--no-push", "--no-install")
+
+
+def test_a_submodule_diverged_from_its_gitlink_holds_the_slot(repos, monkeypatch):
+    main, slot, base = repos
+    landed = lagging_slot(main, slot)
+    mine = commit_file(slot / "sub", "mine.txt", "side")
+    held_by_the_hook(monkeypatch, slot, f"has diverged from the gitlink {landed[:9]}")
+    assert run(slot / "sub", "rev-parse", "HEAD") == mine
+
+
+def test_pushed_submodule_commits_past_the_gitlink_do_not_hold_the_slot(repos, monkeypatch):
+    main, slot, base = repos
+    commit_file(slot / "sub", "mine.txt", "pushed")
+    run(slot / "sub", "push", "-q", "origin", "HEAD:refs/heads/pushed")
+    assert first_free_hook(monkeypatch, slot) == str(slot)
+    assert run(slot / "sub", "rev-parse", "HEAD") == base
+    run(main, "worktree", "unlock", str(slot))
+
+
 # ------------------------------- the worker's own git in a slot's submodule
 
 def plant(slot, tmp_path):
