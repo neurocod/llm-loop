@@ -238,9 +238,9 @@ def test_a_link_inside_the_local_copy_keeps_it_and_its_target(shared_tree):
     assert (outside / "precious.glb").read_bytes() == b"precious"
 
 
-def _between_compare_and_delete(monkeypatch, change):
+def _after_the_rename(monkeypatch, change):
     """Run `change(aside)` after share_dir's first comparison and rename,
-    before it deletes the renamed copy -- the race window."""
+    before it links -- the window a concurrent writer could use."""
     link = worktree._link
 
     def linking(source, target):
@@ -250,7 +250,29 @@ def _between_compare_and_delete(monkeypatch, change):
     monkeypatch.setattr(worktree, "_link", linking)
 
 
-def test_a_file_changed_after_the_comparison_survives_in_the_renamed_copy(
+def _aside(target):
+    (aside,) = target.parent.glob(f"{target.name}.pre-share-*")
+    return aside
+
+
+def test_a_copy_of_twins_is_kept_aside_whole_and_named(shared_tree, capsys):
+    # Nothing is deleted automatically: every compare-then-delete walk raced
+    # a writer (2026-11-26), so the renamed copy stays for a human.
+    _, slot, source, target = shared_tree
+    (source / "kit").mkdir()
+    (source / "kit" / "chair.glb").write_bytes(b"chair")
+    (target / "kit").mkdir(parents=True)
+    (target / "kit" / "chair.glb").write_bytes(b"chair")
+    worktree.share_dirs(slot, keep_local=True)
+    assert target.resolve() == source.resolve()
+    aside = _aside(target)
+    assert (aside / "kit" / "chair.glb").read_bytes() == b"chair"
+    out = capsys.readouterr().out
+    assert f"moved aside to {aside}: every file there has a byte-identical twin" in out
+    assert "can be deleted by hand" in out
+
+
+def test_a_file_changed_after_the_comparison_is_kept_and_named(
         shared_tree, monkeypatch, capsys):
     _, slot, source, target = shared_tree
     (source / "chair.glb").write_bytes(b"main chair")
@@ -262,24 +284,65 @@ def test_a_file_changed_after_the_comparison_survives_in_the_renamed_copy(
     def change(aside):
         (aside / "chair.glb").write_bytes(b"slot chair")
         (aside / "new.glb").write_bytes(b"new")
-    _between_compare_and_delete(monkeypatch, change)
+    _after_the_rename(monkeypatch, change)
     worktree.share_dirs(slot, keep_local=True)
     assert target.resolve() == source.resolve()
-    (aside,) = target.parent.glob(f"{target.name}.pre-share-*")
-    assert sorted(p.name for p in aside.iterdir()) == ["chair.glb", "new.glb"]
+    aside = _aside(target)
+    assert sorted(p.name for p in aside.iterdir()) == ["bed.glb", "chair.glb", "new.glb"]
     assert (aside / "chair.glb").read_bytes() == b"slot chair"
     assert (source / "chair.glb").read_bytes() == b"main chair"
     out = capsys.readouterr().out
-    assert "changed while being replaced" in out and str(aside) in out
+    assert f"moved aside to {aside}: 2 entries there have no byte-identical twin" in out
+    assert "first: chair.glb" in out
 
 
-def test_a_copy_of_twins_leaves_no_renamed_directory(shared_tree):
+def test_a_failed_link_renames_the_copy_back(shared_tree, monkeypatch):
     _, slot, source, target = shared_tree
-    (source / "kit").mkdir()
-    (source / "kit" / "chair.glb").write_bytes(b"chair")
-    (target / "kit").mkdir(parents=True)
-    (target / "kit" / "chair.glb").write_bytes(b"chair")
-    worktree.share_dirs(slot, keep_local=True)
+    (source / "chair.glb").write_bytes(b"chair")
+    target.mkdir(parents=True)
+    (target / "chair.glb").write_bytes(b"chair")
+
+    def failing(source, target):
+        raise OSError("link refused")
+    monkeypatch.setattr(worktree, "_link", failing)
+    with pytest.raises(worktree.Fail, match="renamed back to"):
+        worktree.share_dirs(slot, keep_local=True)
+    assert (target / "chair.glb").read_bytes() == b"chair"
+    assert list(target.parent.glob(f"{target.name}.pre-share-*")) == []
+
+
+def test_a_failed_link_with_the_name_taken_names_both_paths(shared_tree, monkeypatch):
+    _, slot, source, target = shared_tree
+    (source / "chair.glb").write_bytes(b"chair")
+    target.mkdir(parents=True)
+    (target / "chair.glb").write_bytes(b"chair")
+
+    def failing(source, target):
+        target.mkdir()      # someone else took the name in the window
+        raise OSError("link refused")
+    monkeypatch.setattr(worktree, "_link", failing)
+    with pytest.raises(worktree.Fail) as caught:
+        worktree.share_dirs(slot, keep_local=True)
+    aside = _aside(target)
+    assert str(aside) in str(caught.value) and str(target) in str(caught.value)
+    assert (aside / "chair.glb").read_bytes() == b"chair"
+
+
+def test_the_main_directory_is_prepared_before_the_rename(shared_tree, monkeypatch):
+    # A main checkout directory that cannot be made leaves the copy in place.
+    _, slot, source, target = shared_tree
+    source.rmdir()
+    target.mkdir(parents=True)      # empty: with no main files any file would be own
+    mkdir = worktree.Path.mkdir
+
+    def failing(self, *args, **kwargs):
+        if self == source:
+            raise OSError("mkdir refused")
+        return mkdir(self, *args, **kwargs)
+    monkeypatch.setattr(worktree.Path, "mkdir", failing)
+    with pytest.raises(worktree.Fail, match="left as it was"):
+        worktree.share_dirs(slot, keep_local=True)
+    assert target.is_dir() and not worktree.is_link(target)
     assert list(target.parent.glob(f"{target.name}.pre-share-*")) == []
 
 
@@ -299,16 +362,16 @@ def test_a_junction_into_main_planted_after_the_comparison_is_never_entered(
         (aside / "kit" / "chair.glb").unlink()
         (aside / "kit").rmdir()
         _winapi.CreateJunction(str(source / "kit"), str(aside / "kit"))
-    _between_compare_and_delete(monkeypatch, change)
+    _after_the_rename(monkeypatch, change)
     worktree.share_dirs(slot, keep_local=True)
     assert (source / "kit" / "chair.glb").read_bytes() == b"chair"
-    (aside,) = target.parent.glob(f"{target.name}.pre-share-*")
+    aside = _aside(target)
     assert worktree.is_directory_junction(aside / "kit")
     worktree.os.rmdir(aside / "kit")
 
 
 @pytest.mark.skipif(worktree.os.name != "nt", reason="directory junctions are Windows-only")
-def test_removing_twins_keeps_a_junction_and_never_enters_it(tmp_path):
+def test_comparing_never_enters_a_junction(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "precious.glb").write_bytes(b"precious")
@@ -319,7 +382,7 @@ def test_removing_twins_keeps_a_junction_and_never_enters_it(tmp_path):
     (copy / "sub").mkdir(parents=True)
     import _winapi
     _winapi.CreateJunction(str(outside), str(copy / "sub" / "late"))
-    assert worktree.remove_twins(copy, main) == ["sub/late"]
+    assert worktree.local_only_files(copy, main) == ["sub/late"]
     assert (outside / "precious.glb").read_bytes() == b"precious"
     worktree.os.rmdir(copy / "sub" / "late")
 

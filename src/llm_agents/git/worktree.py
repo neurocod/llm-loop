@@ -790,14 +790,19 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
     old copy of model files lacked 123 the main checkout made since, and its
     dev server answered those with index.html).
 
-    The replacement never deletes in place what it compared in place: the copy
-    is first renamed aside (`<dir>.pre-share-<stamp>`, same parent, so an
-    atomic rename that Windows refuses while a file in it is open), the link
-    takes its name, and `remove_twins` then deletes from the renamed copy
-    only what is still a twin -- a file written or swapped in after the first
-    comparison stays there, named in the message. A main checkout directory
-    resolving into the slot's copy (or the copy into it) is refused: every
-    file would be its own twin.
+    The replacement deletes nothing: the copy is renamed aside
+    (`<dir>.pre-share-<stamp>`, same parent, so an atomic rename that Windows
+    refuses while a file in it is open), the link takes its name, and one
+    message line names the renamed copy, says whether a read-only second
+    comparison still finds every file a twin, and leaves deleting it to a
+    human. Deleting it automatically was dropped on 2026-11-26: every
+    compare-then-unlink walk raced a writer (a file rewritten between the
+    comparison and the unlink, a folder swapped for a junction between the
+    reparse-point check and the scan), and a stale copy costs only disk. The
+    main checkout's directory is prepared before the rename; a link that
+    cannot be made renames the copy back when nothing took its name. A main
+    checkout directory resolving into the slot's copy (or the copy into it)
+    is refused: every file would be its own twin.
     """
     relative = Path(shared.path)
     source = main_dir() / relative
@@ -805,7 +810,6 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
     if norm(path) == norm(main_dir()):
         raise Fail(f"cannot link {shared.what} in the main checkout to itself")
     linked = target.is_symlink() or is_directory_junction(target)
-    aside: Path | None = None
     if keep_local and not linked and target.is_dir():
         advice = (f"move it away and run `{HOST.command} {HOST.share_command} {path}` to "
                   f"share them")
@@ -823,6 +827,10 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
                   f"checkout lacks or holds differently (first: {own[0]}), so it does not see "
                   f"the main checkout's {shared.items}; {advice}")
             return
+        try:
+            source.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise Fail(f"cannot create {source} ({error}); {target} is left as it was") from error
         aside = target.with_name(f"{target.name}.pre-share-{time.strftime('%Y%m%d-%H%M%S')}")
         try:
             os.rename(target, aside)
@@ -830,22 +838,9 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
             print(f"keeping local {shared.items}: {target} could not be moved aside "
                   f"({error}); {advice}")
             return
-    source.mkdir(parents=True, exist_ok=True)
-    if aside is not None:
-        try:
-            _link(source, target)
-        except OSError as error:
-            raise Fail(f"cannot link {target} -> {source} ({error}); the local {shared.items} "
-                       f"are kept in {aside}") from error
-        left = remove_twins(aside, source)
-        if left:
-            print(f"local {shared.items} changed while being replaced: {aside} keeps "
-                  f"{len(left)} entries the main checkout lacks or holds differently "
-                  f"(first: {left[0]}); {target} now links to {source}")
-        else:
-            print(f"local {shared.items} were all in the main checkout: {target} replaced")
-        print(f"shared {shared.what} linked: {target} -> {source}")
+        _replace_aside(shared, source, target, aside)
         return
+    source.mkdir(parents=True, exist_ok=True)
     if linked:
         if norm(target) != norm(source):
             raise Fail(f"{target} already links elsewhere; expected {source}")
@@ -855,6 +850,38 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
         raise Fail(f"{target} already exists; move the local {shared.items} away before linking "
                    f"shared {shared.what}")
     _link(source, target)
+    print(f"shared {shared.what} linked: {target} -> {source}")
+
+
+def _replace_aside(shared: SharedDir, source: Path, target: Path, aside: Path) -> None:
+    """Link `target` to `source` once the slot's copy has been renamed to
+    `aside`, and name the copy; it is never deleted from here. Every failure
+    from here on names where the copy is."""
+    try:
+        _link(source, target)
+    except OSError as error:
+        failed = f"cannot link {target} -> {source} ({error})"
+        if os.path.lexists(target):
+            raise Fail(f"{failed}; the local {shared.items} are kept in {aside}, and {target} "
+                       f"is taken by something else since") from error
+        try:
+            os.rename(aside, target)
+        except OSError as back:
+            raise Fail(f"{failed}, nor could {aside} be renamed back ({back}); the local "
+                       f"{shared.items} are kept in {aside}") from error
+        raise Fail(f"{failed}; the local {shared.items} were renamed back to {target}") from error
+    try:
+        left = local_only_files(aside, source)
+    except Exception as error:
+        raise Fail(f"{target} now links to {source}, but comparing the local {shared.items} "
+                   f"kept in {aside} failed ({error}); look before deleting it by hand") from error
+    if left:
+        print(f"local {shared.items} moved aside to {aside}: {len(left)} entries there have no "
+              f"byte-identical twin in {source} (first: {left[0]}; changed after the first "
+              f"comparison); look before deleting it by hand")
+    else:
+        print(f"local {shared.items} moved aside to {aside}: every file there has a "
+              f"byte-identical twin in {source}; it can be deleted by hand")
     print(f"shared {shared.what} linked: {target} -> {source}")
 
 
@@ -885,7 +912,7 @@ def _own(item: Path, twin: Path) -> bool:
     """Whether the copy's `item` is its own, not a byte-identical twin of the
     main checkout's `twin`. The same file reached by both paths (a main
     checkout directory that links back into the slot) is own: its "twin" is
-    itself, and deleting it would delete the only copy."""
+    itself, and calling it a twin would invite deleting the only copy."""
     try:
         return not (twin.is_file() and not os.path.samefile(item, twin)
                     and filecmp.cmp(item, twin, shallow=False))
@@ -893,9 +920,9 @@ def _own(item: Path, twin: Path) -> bool:
         return True
 
 
-def _walk_copy(local: Path, main: Path, *, delete: bool) -> list[str]:
+def _walk_copy(local: Path, main: Path) -> list[str]:
     """Relative paths of what `local` holds of its own; "" stands for `local`
-    itself when it cannot be read or (deleting) removed."""
+    itself when it cannot be read."""
     own: list[str] = []
     try:
         entries = list(os.scandir(local))
@@ -907,48 +934,21 @@ def _walk_copy(local: Path, main: Path, *, delete: bool) -> list[str]:
         if is_reparse_point(item):
             own.append(name)
         elif entry.is_dir(follow_symlinks=False):
-            own += [f"{name}/{inner}" for inner in
-                    _walk_copy(item, main / name, delete=delete)]
+            own += [f"{name}/{inner}" for inner in _walk_copy(item, main / name)]
         elif _own(item, main / name):
             own.append(name)
-        elif delete:
-            try:
-                item.unlink()
-            except OSError:
-                own.append(name)
-    if delete and not own:
-        try:
-            local.rmdir()
-        except OSError:
-            return [""]
     return own
-
-
-def _named(own: list[str]) -> list[str]:
-    return sorted(entry or "./" for entry in own)
 
 
 def local_only_files(local: Path, main: Path) -> list[str]:
     """What under `local` the main checkout's `main` lacks, as sorted paths
     relative to `local`: a file with no byte-identical twin at the same
     relative path (`_own`), and any reparse point (whatever it points at or
-    stands for, it is not a plain copy). Walked without entering a reparse
-    point; an unreadable folder counts as one entry, since it may hide
-    either."""
-    return _named(_walk_copy(local, main, delete=False))
-
-
-def remove_twins(local: Path, main: Path) -> list[str]:
-    """Delete from `local` every file that is a byte-identical twin of
-    `main`'s and every folder that empties, returning what stayed, as
-    `local_only_files` names it. Run on a copy already renamed aside, so the
-    check and the delete look at one file at a time that nothing else is
-    writing; a reparse point is kept, never entered nor removed, so a
-    junction planted into the copy (even one into `main` itself, whose files
-    `_own` then sees as their own twins) costs nothing. By hand rather than
-    `shutil.rmtree` or `os.walk`: `os.walk` before Python 3.12 descends into
-    a junction."""
-    return _named(_walk_copy(local, main, delete=True))
+    stands for, it is not a plain copy). Read-only, and walked by hand
+    without entering a reparse point (`os.walk` before Python 3.12 descends
+    into a junction); an unreadable folder counts as one entry ("./" for
+    `local` itself), since it may hide either."""
+    return sorted(entry or "./" for entry in _walk_copy(local, main))
 
 
 def share_dirs(path: Path, *, keep_local: bool = False) -> None:
