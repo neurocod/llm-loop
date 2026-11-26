@@ -15,7 +15,7 @@ Python 3.9+.
 | `branch_overlap.py` | Which files two diverged branches both touched, and which of ours the other side moved or deleted. |
 | `union_conflicts.py` | Resolves conflict hunks by keeping both sides, in a chosen order. |
 | `slots.py` | The pool's naming rule, shared with the Codex bridge's commit judge. |
-| `live_workers.py` | The exclusion between a running worker and the pool: OS locks the Codex bridge holds for a turn and a pool command (`land`, `release`, `next`, `equalize`, `drop`, `new`'s install, the hooks) holds for its whole run, a kill-on-close job for the worker's process tree, and records of who runs where; `--ignore-live-worker` overrides. |
+| `live_workers.py` | The exclusion between a running worker and the pool: OS locks the Codex bridge holds for a turn and a pool command (`land`, `release`, `next`, `equalize`, `drop`, `new`'s install, the hooks) holds for its whole run, a kill-on-close job for the worker's process tree, and records of who runs where; `--ignore-live-worker` overrides. Also the slot operation lock that lets one pool command at a time act on a slot. |
 | `rebase.py` | The rebase broker a sandboxed Codex worker rebases its own slot through: run by path from the bridge's checkout, with the git, hooks folder, slot and its registered admin directory the bridge hands it. |
 | `commit_broker.py` | The commit broker a sandboxed Codex worker commits in its slot through: `commit.py` run from the bridge's checkout, with the git, hooks and host rules the bridge hands it. |
 | `commit_identity.py` | The approval store that binds a sandboxed worker's commit to the checkout its judge approved. |

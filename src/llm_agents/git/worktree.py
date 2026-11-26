@@ -511,10 +511,10 @@ def refuse_unless_idle(slot: Slot, state: SlotState | None = None) -> None:
     tree once, and the git that follows acts on it later -- a live worker
     could swap `<slot>/<sub>` for a junction between `slot_submodule`'s check
     and a bound checkout, or turn `<sub>/.git` into a directory before
-    `drop`'s `submodule deinit`. For a worker the Codex bridge runs, that is
-    enforced, not assumed: each of those commands holds `worker_excluded`
-    for its whole run. A worker no bridge records (a Claude agent, a shell)
-    leaves only the lock (`claim`)."""
+    `drop`'s `submodule deinit`. For a worker the Codex bridge runs, and for
+    another pool command on the slot, that is enforced, not assumed: each of
+    those commands holds `worker_excluded` for its whole run. A worker no
+    bridge records (a Claude agent, a shell) leaves only the lock (`claim`)."""
     state = state or slot_state(slot)
     if state.detached:
         raise Fail(f"{slot.name} is {state.describe()}")
@@ -543,26 +543,43 @@ def live_worker_lines(slot: Slot) -> list[str]:
         return [f"live-worker records unreadable ({error})"]
 
 
-def worker_excluded(slot: Slot, ignore: bool = False) -> contextlib.AbstractContextManager:
-    """What a command that acts on the slot's tree holds for its whole run:
-    the pool's side of `live_workers.pool_guard`, so no worker turn can start
-    in the slot meanwhile, after checking that none runs there now (a turn's
-    guard, or a record whose job still has processes). `ignore`
-    (`IGNORE_LIVE_FLAG`): neither, for a worker known to be hung or not the
-    slot's."""
+def worker_excluded(slot: Slot, ignore: bool = False, *,
+                    wait_s: Optional[float] = None) -> contextlib.ExitStack:
+    """What a command that acts on the slot's tree holds for its whole run,
+    taken before its first look at the slot:
+
+    - the slot's operation lock (`live_workers.slot_operation`), so no other
+      pool command acts on the slot meanwhile -- waited for up to `wait_s`
+      (default `live_workers.OPERATION_WAIT_S`), then refused naming the
+      holder;
+    - the pool's side of `live_workers.pool_guard`, so no worker turn can
+      start in the slot meanwhile, after checking that none runs there now (a
+      turn's guard, or a record whose job still has processes). `ignore`
+      (`IGNORE_LIVE_FLAG`) skips this part only, for a worker known to be hung
+      or not the slot's: the flag is about workers, never about another pool
+      command."""
+    held = contextlib.ExitStack()
+    what = " ".join(["worktree", *sys.argv[1:]])
+    try:
+        operation = live_workers.slot_operation(slot.path, what, wait_s=wait_s)
+    except live_workers.Busy as busy:
+        raise Fail(f"{slot.name}: {busy}. Run this again once it is done; a holder that hangs "
+                   f"is stopped by hand (its lock dies with it)") from busy
+    held.enter_context(operation)
     if ignore:
-        return contextlib.nullcontext()
+        return held
     remedy = (f"Stop it first: the pool's checks assume the slot's worker has ended. If it "
               f"is hung or not this slot's: rerun with {IGNORE_LIVE_FLAG}")
-    try:
-        guard = live_workers.pool_guard(slot.path)
-    except live_workers.Busy as busy:
-        raise Fail(f"{slot.name}: a worker is running there ({busy}). {remedy}") from busy
-    live = live_worker_lines(slot)
-    if live:
-        guard.release()
-        raise Fail(f"{slot.name}: a worker is still alive there ({'; '.join(live)}). {remedy}")
-    return guard
+    with held.pop_all() as undo:
+        try:
+            guard = live_workers.pool_guard(slot.path)
+        except live_workers.Busy as busy:
+            raise Fail(f"{slot.name}: a worker is running there ({busy}). {remedy}") from busy
+        undo.enter_context(guard)
+        live = live_worker_lines(slot)
+        if live:
+            raise Fail(f"{slot.name}: a worker is still alive there ({'; '.join(live)}). {remedy}")
+        return undo.pop_all()
 
 
 def excluding_worker(default: str | None = None):
@@ -1700,9 +1717,11 @@ def _choose_slot(name: str, reason: str, hold: contextlib.ExitStack) -> tuple[Sl
         with contextlib.ExitStack() as candidate:
             # Excluded before the verdict, which is then read under the guard
             # and held to the end of the hook: a verdict read first could
-            # describe a tree a worker changed before the guard was taken.
+            # describe a tree a worker or another pool command changed before
+            # the guard was taken. Not waited for: a slot another command is
+            # acting on is not free now, and the next candidate may be.
             try:
-                candidate.enter_context(worker_excluded(slot))
+                candidate.enter_context(worker_excluded(slot, wait_s=0))
             except Fail as busy:
                 states.append(f"{slot.name}: {busy}")
                 continue

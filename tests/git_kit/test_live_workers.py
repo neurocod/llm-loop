@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -49,6 +50,55 @@ def test_a_worker_and_a_pool_command_on_one_slot_exclude_each_other(tmp_path):
         with pytest.raises(live_workers.Busy):
             live_workers.worker_guard([slot])
     live_workers.worker_guard([slot]).release()
+
+
+def test_two_pool_commands_on_one_slot_exclude_each_other_and_name_the_holder(tmp_path):
+    """`pool_guard` is shared among pool commands; `slot_operation` is not."""
+    slot, other = tmp_path / "repo-wt1", tmp_path / "repo-wt2"
+    with live_workers.pool_guard(slot), live_workers.pool_guard(slot):
+        pass
+    with live_workers.slot_operation(slot, "worktree land wt1"):
+        with pytest.raises(live_workers.Busy,
+                           match=rf"pid {os.getpid()} \(worktree land wt1\) since "):
+            live_workers.slot_operation(slot, "worktree next wt1", wait_s=0)
+        live_workers.slot_operation(other, "worktree next wt2", wait_s=0).release()
+    live_workers.slot_operation(slot, "worktree next wt1", wait_s=0).release()
+
+
+def test_a_slot_operation_waits_for_a_short_holder(tmp_path):
+    first = live_workers.slot_operation(tmp_path, "first")
+    timer = threading.Timer(0.3, first.release)
+    timer.start()
+    try:
+        # 30 s: only turns a lock never let go into a red; the wait itself is
+        # the timer's 0.3 s.
+        live_workers.slot_operation(tmp_path, "second", wait_s=30).release()
+    finally:
+        timer.join()
+
+
+HOLDER = textwrap.dedent("""
+    import sys, time
+    from llm_agents.git import live_workers
+    live_workers.slot_operation(sys.argv[1], "worktree hook-create")
+    print("held", flush=True)
+    time.sleep(120)
+""")
+
+
+def test_a_killed_holder_leaves_no_slot_operation_behind(tmp_path):
+    holder = subprocess.Popen([sys.executable, "-c", HOLDER, str(tmp_path)],
+                              stdout=subprocess.PIPE, text=True, env=kit_env())
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(live_workers.Busy, match=rf"pid {holder.pid} \(worktree hook-create\)"):
+            live_workers.slot_operation(tmp_path, "worktree land", wait_s=0)
+    finally:
+        holder.kill()
+        holder.wait()
+    # 30 s: the OS releases a dead process's lock asynchronously; the bound
+    # only turns a lock that outlives its process into a red.
+    live_workers.slot_operation(tmp_path, "worktree land", wait_s=30).release()
 
 
 def test_a_worker_allowed_to_write_a_parent_holds_the_slot(tmp_path):

@@ -30,6 +30,10 @@ Three parts, all in `live_dir()`:
   is empty or gone is stale, never blocks, and is pruned when read; one that
   cannot be read blocks.
 
+Beside them, one lock between pool commands (`slot_operation`): the guards
+let any number of pool commands share a slot, and this one lets only one act
+there at a time.
+
 The folder is outside every checkout and outside the temp folders a
 sandboxed worker may write (`codex.sandbox.sandbox_temp_dirs`): a record or
 lock the worker could delete is none. `refuse_overlap` holds the bridge to
@@ -355,7 +359,8 @@ class _FileLock:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self._fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        # Binary: `slot_operation` writes its holder line through this fd.
+        self._fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
         self._held = False
 
     def try_lock(self, exclusive: bool) -> bool:
@@ -475,6 +480,84 @@ def pool_guard(slot: Path) -> Guard:
     path = canonical(slot)
     keys = {("tree", path)} | {("exact", folder) for folder in _ancestors(path)[1:]}
     return _guard("pool", keys, f"the pool command on {slot}")
+
+
+# How long `slot_operation` waits for another pool command on the slot before
+# refusing. Most pool commands on a slot take well under a second (`release`,
+# `next`, a `land` with nothing to land); one that installs takes minutes, and
+# no wait worth sitting through covers it -- the refusal names the holder
+# instead. Read per call, so a test may shorten it.
+OPERATION_WAIT_S = 5.0
+
+
+class SlotOperation:
+    """An exclusive OS lock on one slot that a pool command holds from its
+    first look at the slot to its last act there (`slot_operation`). Byte 0 is
+    the lock; the bytes after it name the holder for a refused command to
+    print -- outside the locked range, so Windows lets another handle read
+    them."""
+
+    def __init__(self, lock: _FileLock) -> None:
+        self._lock = lock
+
+    def release(self) -> None:
+        if self._lock is None:
+            return
+        lock, self._lock = self._lock, None
+        try:
+            os.ftruncate(lock._fd, 0)
+        except OSError:
+            pass
+        lock.close()
+
+    def __enter__(self) -> "SlotOperation":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def _holder(path: Path) -> str:
+    try:
+        with open(path, "rb") as file:
+            file.seek(1)
+            text = file.read(4096).decode("utf-8", "replace").strip()
+    except OSError as error:
+        return f"its holder cannot be read ({error})"
+    return text or "its holder has not named itself yet"
+
+
+def slot_operation(slot: Path, what: str, *, wait_s: Optional[float] = None,
+                   sleep: Callable[[float], None] = time.sleep) -> SlotOperation:
+    """Hold the slot's operation lock exclusively, waiting up to `wait_s`
+    (default `OPERATION_WAIT_S`) for another holder to let go; `Busy` naming
+    that holder otherwise.
+
+    What it closes that `pool_guard` does not: pool commands hold the pool's
+    side SHARED, so two of them on one slot -- a `land` while the create hook
+    stands between its inspection, claim, submodule update and reset -- would
+    each act on a verdict the other had made stale. A worker no bridge records
+    (a Claude agent) takes neither lock: the worktree lock (`claim`) is its
+    side. An OS lock dies with its process, so a killed command leaves no
+    stale lock to recover, and `what` (the command, for the holder line) is
+    only ever read while the lock is held."""
+    lock = _FileLock(_lock_path("slot", canonical(slot), "operation"))
+    deadline = time.monotonic() + (OPERATION_WAIT_S if wait_s is None else wait_s)
+    while not lock.try_lock(exclusive=True):
+        if time.monotonic() >= deadline:
+            holder = _holder(lock.path)
+            lock.close()
+            raise Busy(f"another pool command is acting on {slot}: {holder}")
+        sleep(0.05)
+    line = (f"pid {os.getpid()} ({what or 'a pool command'}) since "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')}").encode("utf-8")
+    try:
+        os.ftruncate(lock._fd, 0)
+        os.lseek(lock._fd, 0, os.SEEK_SET)
+        os.write(lock._fd, b"\n" + line)
+    except OSError:
+        pass    # the holder line is a courtesy to the refused; the lock is held
+    return SlotOperation(lock)
 
 
 # -------------------------------------------------------------------- records

@@ -11,8 +11,10 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -958,6 +960,68 @@ def test_a_worker_starting_during_a_pool_command_is_refused(repos, monkeypatch):
         pass
 
 
+OPERATION_REFUSAL = r"another pool command is acting on .*: pid \d+ \(worktree "
+
+
+@pytest.mark.parametrize("second", [*sorted(TREE_COMMANDS), "hook-create", "hook-remove",
+                                    "equalize-overriding"])
+def test_a_second_pool_command_on_a_slot_another_is_preparing_is_refused(repos, monkeypatch,
+                                                                         capsys, second):
+    """Item 2704: the pool's guard is shared among pool commands, so a `land`
+    could act while `equalize` (or the create hook) stood between its look at
+    the slot and its reset and install, on a verdict the other had made
+    stale. Each command holds the slot's operation lock from its first look
+    to its last act; `--ignore-live-worker` is about workers and does not
+    lift it."""
+    main, slot, base = repos
+    monkeypatch.setattr(live_workers, "OPERATION_WAIT_S", 0.2)
+    free = worktree.Slot(2, slot, "wt2", "", False)
+    monkeypatch.setattr(worktree, "list_slots", lambda: [free])
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    monkeypatch.setattr(worktree, "take_next_assignment", lambda: "")
+    monkeypatch.setattr(worktree.sys, "stdin", io.StringIO(json.dumps({"path": str(slot)})))
+    argv = {"hook-create": ("hook-create",), "hook-remove": ("hook-remove",),
+            "equalize-overriding": (*TREE_COMMANDS["equalize"], worktree.IGNORE_LIVE_FLAG)}
+    refused = []
+
+    def install(path, admin):
+        try:
+            command(*argv.get(second, TREE_COMMANDS.get(second, ())))
+        except worktree.Fail as error:
+            refused.append(str(error))
+        if second == "hook-remove":     # it refuses by keeping the slot, exit 0
+            refused.extend(line for line in capsys.readouterr().err.splitlines()
+                           if "keeping it as is" in line)
+
+    monkeypatch.setattr(worktree, "HOST", worktree.PoolHost(main_branch="main", install=install))
+    head = run(main, "rev-parse", "main")
+    assert command("equalize", "wt2", "--no-push") == 0
+    assert len(refused) == 1, f"{second} ran inside equalize's install"
+    assert re.search(OPERATION_REFUSAL, refused[0]), refused[0]
+    assert run(main, "rev-parse", "main") == head and slot.is_dir()
+    assert "locked" not in run(main, "worktree", "list", "--porcelain")
+    assert not (main / ".git" / worktree.NEXT_FILE).exists()
+    # And the lock went with the command.
+    assert command("release", "wt2") == 0
+
+
+def test_the_create_hook_takes_the_next_slot_while_another_command_holds_one(repos,
+                                                                             monkeypatch):
+    """Not waited for: a held slot is not free now."""
+    main, slot, base = repos
+    monkeypatch.setattr(live_workers, "OPERATION_WAIT_S", 30)
+    free = worktree.Slot(2, slot, "wt2", "", False)
+    monkeypatch.setattr(worktree, "list_slots", lambda: [free])
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    monkeypatch.setattr(worktree, "take_next_assignment", lambda: "")
+    with live_workers.slot_operation(slot, "worktree land wt2"):
+        started = time.monotonic()
+        with pytest.raises(worktree.Fail, match=r"no free slot \(wt2: .*another pool command"):
+            worktree.choose_slot("agent", "r")
+        assert time.monotonic() - started < 10
+    assert "locked" not in run(main, "worktree", "list", "--porcelain")
+
+
 @pytest.mark.parametrize("install", [True, False])
 @pytest.mark.parametrize("root", ["slot", "parent"])
 def test_new_creates_nothing_under_a_worker(repos, monkeypatch, install, root):
@@ -1008,9 +1072,9 @@ def worker_finishing_before_the_guard(monkeypatch, change):
     turn completing between an inspection and the guard leaves behind."""
     real = worktree.worker_excluded
 
-    def late(slot, ignore=False):
+    def late(slot, ignore=False, **kwargs):
         change()
-        return real(slot, ignore)
+        return real(slot, ignore, **kwargs)
 
     monkeypatch.setattr(worktree, "worker_excluded", late)
 
