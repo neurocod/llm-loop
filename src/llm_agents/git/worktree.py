@@ -1672,7 +1672,9 @@ def hook_input() -> dict:
 
 
 def take_next_assignment() -> str:
-    """Atomically consume `.git/wt-pool-next`; '' if nobody set it."""
+    """Atomically consume `.git/wt-pool-next`; '' if nobody set it. Taken
+    before the slot's lock, so two hooks never both follow one assignment; a
+    hook that then fails puts it back (`requeue_assignment`)."""
     nxt = git_dir() / NEXT_FILE
     claimed = nxt.with_name(f"{NEXT_FILE}.{os.getpid()}")
     try:
@@ -1682,6 +1684,31 @@ def take_next_assignment() -> str:
     wanted = claimed.read_text().strip()
     claimed.unlink(missing_ok=True)
     return wanted
+
+
+def requeue_assignment(assignment: str) -> None:
+    """Put back an assignment a create hook took and could not serve (the
+    slot's operation lock not let go within its wait, a live worker, a foreign
+    git, a failed install): the harness starts no agent then, and a retry that
+    found the queue empty would hand out the first free slot -- a reviewer or
+    fixer in another task's tree. A `next` written meanwhile is newer and wins:
+    the file is linked into place, never replaced."""
+    nxt = git_dir() / NEXT_FILE
+    staged = nxt.with_name(f"{NEXT_FILE}.{os.getpid()}")
+    try:
+        staged.write_text(assignment)
+        os.link(staged, nxt)
+        print(f"worktree hook: `next {assignment}` stays queued for the retry "
+              f"(delete {nxt} to hand out the first free slot instead)", file=sys.stderr)
+    except FileExistsError:
+        print(f"worktree hook: `next {assignment}` dropped: a newer `next` was queued meanwhile",
+              file=sys.stderr)
+    except OSError as error:
+        # Never in place of the failure being unwound: that one is the news.
+        print(f"worktree hook: `next {assignment}` lost, it could not be put back ({error}); "
+              f"run `next` again before the retry", file=sys.stderr)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def choose_slot(name: str, reason: str,
@@ -1702,7 +1729,8 @@ def choose_slot(name: str, reason: str,
     harness starts no agent. A slot a worker runs in (`worker_excluded`) is
     never free, and an assignment is refused for it too unless its `next` was
     told `IGNORE_LIVE_FLAG`. The exclusion is entered into `hold`, which the
-    caller keeps until the slot is ready (without one, until this returns).
+    caller keeps until the slot is ready (without one, until this returns); an
+    assignment that fails before then is queued again (`requeue_assignment`).
     """
     with contextlib.ExitStack() as own:
         return _choose_slot(name, reason, hold if hold is not None else own)
@@ -1710,12 +1738,20 @@ def choose_slot(name: str, reason: str,
 
 def _choose_slot(name: str, reason: str, hold: contextlib.ExitStack) -> tuple[Slot, bool, str]:
     slots = list_slots()
-    wanted, _, override = take_next_assignment().partition(" ")
+    assignment = take_next_assignment()
+    wanted, _, override = assignment.partition(" ")
     if wanted:
         slot = next((s for s in slots if s.name == wanted), None)
         if slot is None:
             print(f"worktree hook: `next` named {wanted}, which does not exist; ignoring", file=sys.stderr)
         else:
+            # Pushed before the lock is asked for: any failure up to the
+            # hook's last act unwinds `hold` through it.
+            def requeue_if_failed(failed, *_) -> bool:
+                if failed is not None:
+                    requeue_assignment(assignment)
+                return False
+            hold.push(requeue_if_failed)
             # Excluded first, then inspected: a worker that ran between an
             # earlier look and the guard would have left the look stale.
             hold.enter_context(worker_excluded(slot, ignore=override == IGNORE_LIVE_FLAG))

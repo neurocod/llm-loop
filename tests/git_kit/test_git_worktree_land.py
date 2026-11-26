@@ -1168,6 +1168,75 @@ def test_an_assignment_that_waited_for_a_land_claims_the_slot_again(repos, tmp_p
     assert "locked worktree.py:unnamed session review" in porcelain, porcelain
 
 
+def in_process_hook(monkeypatch, session):
+    """The create hook run here: (exit code or the `Fail` it raised, what it
+    printed to the harness)."""
+    monkeypatch.setattr(worktree.sys, "stdin",
+                        io.StringIO(json.dumps({"name": "", "session_id": session})))
+    printed = io.StringIO()
+    monkeypatch.setattr(worktree.sys, "__stdout__", printed)
+    try:
+        result = command("hook-create")
+    except worktree.Fail as refused:
+        result = refused
+    return result, printed.getvalue().strip()
+
+
+def test_an_assignment_survives_a_hook_that_could_not_take_the_slot_s_lock(repos, tmp_path,
+                                                                            monkeypatch, capsys,
+                                                                            contenders):
+    """`next wt2` queued the claimed slot (its task's commits unlanded) for
+    the task's reviewer; another pool command held wt2's lock longer than the
+    hook waits, so the hook failed and no agent started. The assignment had
+    been taken from the queue before the lock was asked for, so the retry
+    found it empty and handed out the first free slot: the reviewer in
+    another task's tree. The failed hook puts it back."""
+    main, slot, base = repos
+    commit_file(slot, "work.txt", "task")
+    run(main, "worktree", "lock", "--reason", f"{worktree.LOCK_REASON_PREFIX}task", str(slot))
+    other = main.parent / "main-wt3"
+    run(main, "worktree", "add", "-q", "-b", "wt3", str(other))
+    run(other, "submodule", "update", "-q", "--init", "--", "sub")
+    monkeypatch.setattr(worktree, "is_permitted", lambda path: True)
+    monkeypatch.setattr(worktree, "push_main_branch", lambda: True)
+    assert command("next", "wt2") == 0
+    queued = main / ".git" / worktree.NEXT_FILE
+    # Holds wt2's lock from before its first look to the go below.
+    holder = Contender(main, tmp_path, "equalize", "refuse_unless_idle", "equalize", "wt2",
+                       "--no-push", "--no-install")
+    contenders.append(holder)
+    holder.reached("refuse_unless_idle-reached")
+    monkeypatch.setattr(live_workers, "OPERATION_WAIT_S", 0.3)
+    capsys.readouterr()
+    refused, printed = in_process_hook(monkeypatch, "review")
+    assert isinstance(refused, worktree.Fail) and re.search(OPERATION_REFUSAL, str(refused)), refused
+    assert printed == ""
+    assert queued.read_text() == "wt2"
+    assert "`next wt2` stays queued" in capsys.readouterr().err
+    holder.go("refuse_unless_idle")
+    code, out, err = holder.finish()
+    assert code != 0 and "wt2 is locked (worktree.py:" in err, err
+    code, printed = in_process_hook(monkeypatch, "retry")
+    assert code == 0 and "-> wt2 (assigned" in capsys.readouterr().err
+    assert worktree.norm(printed) == worktree.norm(slot)
+    assert not queued.exists()
+    locks = {s.name: s.locked for s in worktree.list_slots()}
+    assert locks == {"wt2": True, "wt3": False}
+
+
+def test_a_requeued_assignment_never_replaces_a_newer_next(repos, capsys):
+    main, slot, base = repos
+    queued = main / ".git" / worktree.NEXT_FILE
+    queued.write_text("wt3")
+    worktree.requeue_assignment("wt2 --ignore-live-worker")
+    assert queued.read_text() == "wt3"
+    assert "a newer `next` was queued meanwhile" in capsys.readouterr().err
+    queued.unlink()
+    worktree.requeue_assignment("wt2 --ignore-live-worker")
+    assert queued.read_text() == "wt2 --ignore-live-worker"
+    assert [p.name for p in queued.parent.glob(f"{worktree.NEXT_FILE}*")] == [worktree.NEXT_FILE]
+
+
 def test_a_free_slot_whose_reset_cannot_move_a_submodule_is_not_handed_out(repos, monkeypatch):
     """The create hook once reset the picked slot non-strictly, warned,
     and handed out a slot showing ` M sub`. Here the slot is behind main,
