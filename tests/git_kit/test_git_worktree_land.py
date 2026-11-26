@@ -514,6 +514,21 @@ def test_land_updates_the_slot_s_lagging_submodule_without_a_warning(repos, caps
     assert "uncommitted changes" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("work", [True, False], ids=["landing", "nothing-to-land"])
+def test_land_leaves_a_claimed_slot_s_lagging_submodule_alone(repos, monkeypatch, work):
+    """A claim is an agent that may still run in the slot: its checkout must
+    not move under it; the next hand-out updates it."""
+    main, slot, base = repos
+    bump_in_main(main)
+    if work:
+        commit_file(slot, "work.txt", "task")
+    run(slot, "rebase", "-q", "main")
+    claimed = worktree.Slot(2, slot, "wt2", "", True, "agent session s")
+    monkeypatch.setattr(worktree, "find_slot", lambda spec: claimed)
+    land()
+    assert run(slot / "sub", "rev-parse", "HEAD") == base
+
+
 def held_by_the_hook(monkeypatch, slot, reason):
     with pytest.raises(worktree.Fail, match="no free slot") as refused:
         first_free_hook(monkeypatch, slot)
@@ -536,9 +551,9 @@ def test_unpushed_submodule_commits_on_a_branch_hold_the_slot(repos, monkeypatch
     run(slot / "sub", "checkout", "-q", "-b", "wt2-2699")
     mine = commit_file(slot / "sub", "mine.txt", "unpushed")
     held_by_the_hook(monkeypatch, slot, f"its HEAD {mine[:9]} (branch wt2-2699) carries 1 commit(s) past "
-                                        f"the gitlink {base[:9]} that no remote-tracking branch has")
+                                        f"the gitlink {base[:9]}")
     assert run(slot / "sub", "rev-parse", "HEAD") == mine
-    with pytest.raises(worktree.Fail, match="no remote-tracking branch has"):
+    with pytest.raises(worktree.Fail, match="past the gitlink"):
         command("equalize", "wt2", "--no-push", "--no-install")
 
 
@@ -550,12 +565,70 @@ def test_a_submodule_diverged_from_its_gitlink_holds_the_slot(repos, monkeypatch
     assert run(slot / "sub", "rev-parse", "HEAD") == mine
 
 
-def test_pushed_submodule_commits_past_the_gitlink_do_not_hold_the_slot(repos, monkeypatch):
+def test_commits_past_the_gitlink_hold_the_slot_even_on_a_remote_tracking_branch(repos, monkeypatch):
+    """A remote-tracking ref proves the commit reachable here, not published:
+    a fetch from a local path or a stale ref makes one too."""
     main, slot, base = repos
-    commit_file(slot / "sub", "mine.txt", "pushed")
+    mine = commit_file(slot / "sub", "mine.txt", "pushed")
     run(slot / "sub", "push", "-q", "origin", "HEAD:refs/heads/pushed")
-    assert first_free_hook(monkeypatch, slot) == str(slot)
+    run(slot / "sub", "fetch", "-q", "origin")
+    assert run(slot / "sub", "branch", "-r", "--contains", mine)
+    held_by_the_hook(monkeypatch, slot, f"carries 1 commit(s) past the gitlink {base[:9]}")
+    assert run(slot / "sub", "rev-parse", "HEAD") == mine
+
+
+def test_an_ignored_file_the_gitlink_tracks_is_not_overwritten_and_holds_the_slot(repos, monkeypatch):
+    """An ordinary checkout replaced it silently."""
+    main, slot, base = repos
+    admin = Path(run(slot / "sub", "rev-parse", "--absolute-git-dir"))
+    (admin / "info").mkdir(exist_ok=True)
+    (admin / "info" / "exclude").write_text("cfg.local\n", encoding="utf-8")
+    (slot / "sub" / "cfg.local").write_text("mine", encoding="utf-8")
+    commit_file(main / "sub", "cfg.local", "theirs")
+    run(main, "add", "sub")
+    run(main, "commit", "-q", "-m", "bump sub with cfg.local")
+    run(slot, "rebase", "-q", "main")
+    assert run(slot / "sub", "status", "--porcelain") == ""
+    held_by_the_hook(monkeypatch, slot, "wt2: dirty (wt2's sub was not updated: the checkout of the gitlink failed")
     assert run(slot / "sub", "rev-parse", "HEAD") == base
+    assert (slot / "sub" / "cfg.local").read_text(encoding="utf-8") == "mine"
+    assert "locked" not in run(main, "worktree", "list", "--porcelain")
+    with pytest.raises(worktree.Fail, match="the checkout of the gitlink failed"):
+        command("equalize", "wt2", "--no-push", "--no-install")
+    assert (slot / "sub" / "cfg.local").read_text(encoding="utf-8") == "mine"
+
+
+def test_a_submodule_status_that_fails_holds_the_slot(repos):
+    """An error prints nothing on stdout, which read as a clean clone."""
+    main, slot, base = repos
+    lagging_slot(main, slot)
+    admin = Path(run(slot / "sub", "rev-parse", "--absolute-git-dir"))
+    (admin / "index").write_bytes(b"not an index")
+    state = worktree.slot_state(worktree.find_slot("wt2"))
+    assert not state.clean and not state.stale
+    assert any(why.startswith("sub: its status cannot be read") for why in state.held), state.held
+
+
+def test_the_update_keeps_other_branches_and_the_stash_of_the_submodule(repos, monkeypatch):
+    """HEAD is an ancestor of the gitlink, so the slot is handed out; work
+    that is not checked out -- a local branch with unpushed commits, a stash
+    -- must come through the move."""
+    main, slot, base = repos
+    sub = slot / "sub"
+    run(sub, "checkout", "-q", "-b", "side")
+    kept = commit_file(sub, "side.txt", "unpushed")
+    run(sub, "checkout", "-q", "--detach", base)
+    (sub / "a.txt").write_text("stashed", encoding="utf-8")
+    run(sub, "stash", "push", "-q", "-m", "wip")
+    stash = run(sub, "rev-parse", "refs/stash")
+    landed = lagging_slot(main, slot)
+    assert first_free_hook(monkeypatch, slot) == str(slot)
+    assert run(sub, "rev-parse", "HEAD") == landed
+    assert run(sub, "rev-parse", "refs/heads/side") == kept
+    assert run(sub, "rev-parse", "refs/stash") == stash
+    run(sub, "cat-file", "-e", f"{kept}^{{commit}}")
+    run(sub, "cat-file", "-e", f"{stash}^{{commit}}")
+    assert "wip" in run(sub, "stash", "list")
     run(main, "worktree", "unlock", str(slot))
 
 

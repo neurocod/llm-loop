@@ -341,19 +341,25 @@ def gitlink_drift_hold(slot_path: Path, sub: str, pinned: Pinned) -> tuple[str, 
     orchestrator rebased the slot onto it, and the slot's clone stayed on the
     old commit -- ` M <sub>` in the slot's status, so the create hook refused
     it as dirty ("no free slot") with two slots really free. The move is safe
-    when the clone's tracked and untracked files are clean and its HEAD's
-    commits stay reachable: HEAD is an ancestor of the gitlink, or a descendant
-    whose commits some remote-tracking branch holds. A HEAD with commits no
-    remote holds past the gitlink (a worker's unrecorded submodule work, e.g.
-    on a branch like `wt1-2689`) or one that diverged from it holds the slot.
-    Ancestry is read in the slot's clone, or else in the main checkout's when
-    only that one has the gitlink (landed but not fetched yet); a gitlink in
-    neither holds the slot. Nothing is fetched here: `slot_state` only looks."""
+    when the clone's tracked and untracked files are clean and its HEAD is an
+    ancestor of the gitlink. Any commit past the gitlink holds the slot, even
+    one a remote-tracking branch has: such a ref proves the commit reachable
+    here, not published (a fetch from a local path or a stale ref counts as
+    one), so whether it is a worker's unrecorded submodule work (e.g. on a
+    branch like `wt1-2689`) is the orchestrator's call. A HEAD that diverged
+    from the gitlink holds it too. Ancestry is read in the slot's clone, or
+    else in the main checkout's when only that one has the gitlink (landed but
+    not fetched yet); a gitlink in neither holds the slot. Nothing is fetched
+    here: `slot_state` only looks."""
     wanted = gitlink("HEAD", sub, slot=slot_path)
     head = bound_git(pinned, ["rev-parse", "HEAD"], check=False).stdout.strip()
     if not wanted or not head:
         return head, wanted, "its HEAD or the gitlink the slot records cannot be read"
-    if bound_git(pinned, ["status", "--porcelain", SKIP_SUBMODULES], check=False).stdout.strip():
+    status = bound_git(pinned, ["status", "--porcelain", SKIP_SUBMODULES], check=False)
+    if status.returncode != 0:
+        # An error prints nothing on stdout: read as output only, it was clean.
+        return head, wanted, f"its status cannot be read ({one_line(status.stderr) or f'exit {status.returncode}'})"
+    if status.stdout.strip():
         return head, wanted, "it has uncommitted changes or untracked files"
     branch = bound_git(pinned, ["symbolic-ref", "-q", "--short", "HEAD"], check=False).stdout.strip()
     at = f"{head[:9]}" + (f" (branch {branch})" if branch else "")
@@ -377,12 +383,9 @@ def gitlink_drift_hold(slot_path: Path, sub: str, pinned: Pinned) -> tuple[str, 
         return head, wanted, ""
     if not is_ancestor(wanted, head):
         return head, wanted, diverged
-    unpushed = bound_git(pinned, ["rev-list", "--count", "HEAD", "--not", "--remotes", wanted],
-                         check=False).stdout.strip()
-    if unpushed != "0":
-        return head, wanted, (f"its HEAD {at} carries {unpushed or 'uncounted'} commit(s) past the "
-                              f"gitlink {wanted[:9]} that no remote-tracking branch has (unpushed work)")
-    return head, wanted, ""
+    past = bound_git(pinned, ["rev-list", "--count", "HEAD", "--not", wanted], check=False).stdout.strip()
+    return head, wanted, (f"its HEAD {at} carries {past or 'uncounted'} commit(s) past the gitlink "
+                          f"{wanted[:9]} (unrecorded work? record or drop it)")
 
 
 def unlanded_branch(branch: str) -> list[str]:
@@ -416,7 +419,8 @@ class SlotState:
     # {sub: (head, gitlink)} per submodule whose checkout lags the gitlink
     # while nothing else in the tree differs and the move loses nothing
     # (`gitlink_drift_hold`): not dirt; `equalize`, the create hook and `land`
-    # update it. A drift that may not be followed is dirt, its reason in `held`.
+    # of an unclaimed slot update it (`cmd_land`). A drift that may not be
+    # followed is dirt, its reason in `held`.
     stale: dict[str, tuple[str, str]] = field(default_factory=dict)
     held: list[str] = field(default_factory=list)
 
@@ -1267,8 +1271,15 @@ def check_out_gitlink(pinned: Pinned, wanted: str) -> str:
     """What `git submodule update` does to one initialized submodule
     (a detached checkout of the gitlink), with the bound git
     (`slot_submodule`) instead of the one `submodule update` would find
-    through the submodule's `.git`; '' when done, else why not."""
-    moved = bound_git(pinned, ["checkout", "--quiet", "--detach", wanted], check=False)
+    through the submodule's `.git`; '' when done, else why not.
+
+    `--no-overwrite-ignore`: an ordinary checkout silently replaces an IGNORED
+    file the clone holds at a path the gitlink's commit tracks (a worker's
+    local config, a build output), so git refuses instead and the refusal is
+    the returned reason. `--no-recurse-submodules`: a configured
+    `submodule.recurse` must not move the clone's own nested repositories."""
+    moved = bound_git(pinned, ["checkout", "--quiet", "--no-overwrite-ignore", "--no-recurse-submodules",
+                               "--detach", wanted], check=False)
     return "" if moved.returncode == 0 else (
         f"the checkout of the gitlink failed: {one_line(moved.stdout + moved.stderr)}")
 
@@ -1517,6 +1528,11 @@ def cmd_share(args: argparse.Namespace) -> int:
 @excluding_worker()
 def cmd_land(args: argparse.Namespace, slot: Slot) -> int:
     state = slot_state(slot)
+    # The slot's own lagging clones (`SlotState.stale`) move only when it is
+    # unclaimed: a claim is an agent that may still run there (a Claude agent
+    # registers no live worker), and its checkout must not move under it. A
+    # claimed slot keeps the lag until the create hook or `equalize` hands it out.
+    stale = [] if state.locked else list(state.stale)
     if state.detached:
         raise Fail(f"{slot.name} is {state.describe()}")
     if not state.clean:
@@ -1525,7 +1541,7 @@ def cmd_land(args: argparse.Namespace, slot: Slot) -> int:
               file=sys.stderr)
     if not state.unlanded:
         print(f"{slot.name} has nothing to land")
-        update_submodules(slot, list(state.stale), strict=False)
+        update_submodules(slot, stale, strict=False)
         unclaim(slot)
         return finish(args)
     main = HOST.main_branch
@@ -1553,9 +1569,8 @@ def cmd_land(args: argparse.Namespace, slot: Slot) -> int:
         # claimed or skip the push.
         print(f"warning: the main checkout's submodules were not synced after the land: {error}",
               file=sys.stderr)
-    # The slot's own lagging clones (`SlotState.stale`), judged before the
-    # merge, which moved neither the slot's HEAD nor its submodules.
-    update_submodules(slot, list(state.stale), strict=False)
+    # Judged before the merge, which moved neither the slot's HEAD nor its submodules.
+    update_submodules(slot, stale, strict=False)
     unclaim(slot)
     return finish(args)
 
@@ -1694,6 +1709,16 @@ def _choose_slot(name: str, reason: str, hold: contextlib.ExitStack) -> tuple[Sl
             state = slot_state(slot)
             states.append(f"{slot.name}: {state.describe()}")
             if state.free and claim(slot, reason):
+                # The lag is what made a ` M <sub>` slot free; a move git
+                # refuses (an ignored file in the way) leaves it as dirty as
+                # it looked, so it is not handed out and the reason is named.
+                try:
+                    update_submodules(slot, list(state.stale))
+                except Fail as refused:
+                    unclaim(slot)
+                    why = one_line(str(refused)).removeprefix("error: ")
+                    states[-1] = f"{slot.name}: dirty ({why})"
+                    continue
                 hold.enter_context(candidate.pop_all())
                 return slot, True, "by name" if slot.name == name else "first free"
     unlisted = any(not is_permitted(s.path) for s in candidates)
