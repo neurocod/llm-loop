@@ -47,6 +47,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional
@@ -788,6 +789,15 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
     directory stayed on its first copy for ever (measured: a slot's two-month
     old copy of model files lacked 123 the main checkout made since, and its
     dev server answered those with index.html).
+
+    The replacement never deletes in place what it compared in place: the copy
+    is first renamed aside (`<dir>.pre-share-<stamp>`, same parent, so an
+    atomic rename that Windows refuses while a file in it is open), the link
+    takes its name, and `remove_twins` then deletes from the renamed copy
+    only what is still a twin -- a file written or swapped in after the first
+    comparison stays there, named in the message. A main checkout directory
+    resolving into the slot's copy (or the copy into it) is refused: every
+    file would be its own twin.
     """
     relative = Path(shared.path)
     source = main_dir() / relative
@@ -795,17 +805,47 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
     if norm(path) == norm(main_dir()):
         raise Fail(f"cannot link {shared.what} in the main checkout to itself")
     linked = target.is_symlink() or is_directory_junction(target)
+    aside: Path | None = None
     if keep_local and not linked and target.is_dir():
+        advice = (f"move it away and run `{HOST.command} {HOST.share_command} {path}` to "
+                  f"share them")
+        if is_reparse_point(target):
+            print(f"keeping local {shared.items}: {target} is a reparse point, not plain "
+                  f"files; {advice}")
+            return
+        if source.exists() and (is_inside(source, target) or is_inside(target, source)):
+            raise Fail(f"{source} resolves to {os.path.realpath(source)}, which overlaps the "
+                       f"slot's {target}: comparing them would find every file its own twin; "
+                       f"fix the main checkout's {shared.what} by hand")
         own = local_only_files(target, source)
         if own:
             print(f"keeping local {shared.items}: {target} holds {len(own)} entries the main "
                   f"checkout lacks or holds differently (first: {own[0]}), so it does not see "
-                  f"the main checkout's {shared.items}; move it away and run "
-                  f"`{HOST.command} {HOST.share_command} {path}` to share them")
+                  f"the main checkout's {shared.items}; {advice}")
             return
-        remove_copy(target)
-        print(f"local {shared.items} were all in the main checkout: {target} removed")
+        aside = target.with_name(f"{target.name}.pre-share-{time.strftime('%Y%m%d-%H%M%S')}")
+        try:
+            os.rename(target, aside)
+        except OSError as error:
+            print(f"keeping local {shared.items}: {target} could not be moved aside "
+                  f"({error}); {advice}")
+            return
     source.mkdir(parents=True, exist_ok=True)
+    if aside is not None:
+        try:
+            _link(source, target)
+        except OSError as error:
+            raise Fail(f"cannot link {target} -> {source} ({error}); the local {shared.items} "
+                       f"are kept in {aside}") from error
+        left = remove_twins(aside, source)
+        if left:
+            print(f"local {shared.items} changed while being replaced: {aside} keeps "
+                  f"{len(left)} entries the main checkout lacks or holds differently "
+                  f"(first: {left[0]}); {target} now links to {source}")
+        else:
+            print(f"local {shared.items} were all in the main checkout: {target} replaced")
+        print(f"shared {shared.what} linked: {target} -> {source}")
+        return
     if linked:
         if norm(target) != norm(source):
             raise Fail(f"{target} already links elsewhere; expected {source}")
@@ -814,6 +854,11 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
     if target.exists():
         raise Fail(f"{target} already exists; move the local {shared.items} away before linking "
                    f"shared {shared.what}")
+    _link(source, target)
+    print(f"shared {shared.what} linked: {target} -> {source}")
+
+
+def _link(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         # Unlike a Windows symlink, a directory junction needs no administrator
@@ -822,52 +867,88 @@ def share_dir(shared: SharedDir, path: Path, *, keep_local: bool = False) -> Non
         _winapi.CreateJunction(str(source.resolve()), str(target.absolute()))
     else:
         target.symlink_to(source.resolve(), target_is_directory=True)
-    print(f"shared {shared.what} linked: {target} -> {source}")
+
+
+def is_reparse_point(path: Path) -> bool:
+    """Anything that is not plain data: a symlink or junction, and on Windows
+    every other reparse point too (a cloud-sync placeholder, a WSL link, a
+    deduplicated file), whose bytes or target the copy does not own."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = getattr(info, "st_file_attributes", 0)
+    return stat.S_ISLNK(info.st_mode) or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _own(item: Path, twin: Path) -> bool:
+    """Whether the copy's `item` is its own, not a byte-identical twin of the
+    main checkout's `twin`. The same file reached by both paths (a main
+    checkout directory that links back into the slot) is own: its "twin" is
+    itself, and deleting it would delete the only copy."""
+    try:
+        return not (twin.is_file() and not os.path.samefile(item, twin)
+                    and filecmp.cmp(item, twin, shallow=False))
+    except OSError:
+        return True
+
+
+def _walk_copy(local: Path, main: Path, *, delete: bool) -> list[str]:
+    """Relative paths of what `local` holds of its own; "" stands for `local`
+    itself when it cannot be read or (deleting) removed."""
+    own: list[str] = []
+    try:
+        entries = list(os.scandir(local))
+    except OSError:
+        return [""]
+    for entry in entries:
+        item = Path(entry.path)
+        name = entry.name
+        if is_reparse_point(item):
+            own.append(name)
+        elif entry.is_dir(follow_symlinks=False):
+            own += [f"{name}/{inner}" for inner in
+                    _walk_copy(item, main / name, delete=delete)]
+        elif _own(item, main / name):
+            own.append(name)
+        elif delete:
+            try:
+                item.unlink()
+            except OSError:
+                own.append(name)
+    if delete and not own:
+        try:
+            local.rmdir()
+        except OSError:
+            return [""]
+    return own
+
+
+def _named(own: list[str]) -> list[str]:
+    return sorted(entry or "./" for entry in own)
 
 
 def local_only_files(local: Path, main: Path) -> list[str]:
     """What under `local` the main checkout's `main` lacks, as sorted paths
     relative to `local`: a file with no byte-identical twin at the same
-    relative path, and any link (whatever it points at, it is not a copy).
-    Walked without following links; an unreadable folder counts as one entry,
-    since it may hide either."""
-    own: list[str] = []
-    folders = [local]
-    while folders:
-        folder = folders.pop()
-        try:
-            entries = list(os.scandir(folder))
-        except OSError:
-            own.append(Path(folder).relative_to(local).as_posix() + "/")
-            continue
-        for entry in entries:
-            item = Path(entry.path)
-            relative = item.relative_to(local)
-            if is_link(item):
-                own.append(relative.as_posix())
-            elif entry.is_dir(follow_symlinks=False):
-                folders.append(item)
-            else:
-                twin = main / relative
-                if not (twin.is_file() and filecmp.cmp(item, twin, shallow=False)):
-                    own.append(relative.as_posix())
-    return sorted(own)
+    relative path (`_own`), and any reparse point (whatever it points at or
+    stands for, it is not a plain copy). Walked without entering a reparse
+    point; an unreadable folder counts as one entry, since it may hide
+    either."""
+    return _named(_walk_copy(local, main, delete=False))
 
 
-def remove_copy(local: Path) -> None:
-    """Delete a directory `local_only_files` found empty of anything of its own:
-    files and folders bottom-up, by hand rather than `shutil.rmtree` or
-    `os.walk`, so even a link planted after the check is removed as a link,
-    never entered (`os.walk` before Python 3.12 descends into a junction)."""
-    for entry in list(os.scandir(local)):
-        item = Path(entry.path)
-        if is_link(item):
-            _remove_link(item)
-        elif entry.is_dir(follow_symlinks=False):
-            remove_copy(item)
-        else:
-            item.unlink()
-    local.rmdir()
+def remove_twins(local: Path, main: Path) -> list[str]:
+    """Delete from `local` every file that is a byte-identical twin of
+    `main`'s and every folder that empties, returning what stayed, as
+    `local_only_files` names it. Run on a copy already renamed aside, so the
+    check and the delete look at one file at a time that nothing else is
+    writing; a reparse point is kept, never entered nor removed, so a
+    junction planted into the copy (even one into `main` itself, whose files
+    `_own` then sees as their own twins) costs nothing. By hand rather than
+    `shutil.rmtree` or `os.walk`: `os.walk` before Python 3.12 descends into
+    a junction."""
+    return _named(_walk_copy(local, main, delete=True))
 
 
 def share_dirs(path: Path, *, keep_local: bool = False) -> None:

@@ -238,18 +238,142 @@ def test_a_link_inside_the_local_copy_keeps_it_and_its_target(shared_tree):
     assert (outside / "precious.glb").read_bytes() == b"precious"
 
 
+def _between_compare_and_delete(monkeypatch, change):
+    """Run `change(aside)` after share_dir's first comparison and rename,
+    before it deletes the renamed copy -- the race window."""
+    link = worktree._link
+
+    def linking(source, target):
+        (aside,) = target.parent.glob(f"{target.name}.pre-share-*")
+        change(aside)
+        link(source, target)
+    monkeypatch.setattr(worktree, "_link", linking)
+
+
+def test_a_file_changed_after_the_comparison_survives_in_the_renamed_copy(
+        shared_tree, monkeypatch, capsys):
+    _, slot, source, target = shared_tree
+    (source / "chair.glb").write_bytes(b"main chair")
+    (source / "bed.glb").write_bytes(b"bed")
+    target.mkdir(parents=True)
+    (target / "chair.glb").write_bytes(b"main chair")
+    (target / "bed.glb").write_bytes(b"bed")
+
+    def change(aside):
+        (aside / "chair.glb").write_bytes(b"slot chair")
+        (aside / "new.glb").write_bytes(b"new")
+    _between_compare_and_delete(monkeypatch, change)
+    worktree.share_dirs(slot, keep_local=True)
+    assert target.resolve() == source.resolve()
+    (aside,) = target.parent.glob(f"{target.name}.pre-share-*")
+    assert sorted(p.name for p in aside.iterdir()) == ["chair.glb", "new.glb"]
+    assert (aside / "chair.glb").read_bytes() == b"slot chair"
+    assert (source / "chair.glb").read_bytes() == b"main chair"
+    out = capsys.readouterr().out
+    assert "changed while being replaced" in out and str(aside) in out
+
+
+def test_a_copy_of_twins_leaves_no_renamed_directory(shared_tree):
+    _, slot, source, target = shared_tree
+    (source / "kit").mkdir()
+    (source / "kit" / "chair.glb").write_bytes(b"chair")
+    (target / "kit").mkdir(parents=True)
+    (target / "kit" / "chair.glb").write_bytes(b"chair")
+    worktree.share_dirs(slot, keep_local=True)
+    assert list(target.parent.glob(f"{target.name}.pre-share-*")) == []
+
+
 @pytest.mark.skipif(worktree.os.name != "nt", reason="directory junctions are Windows-only")
-def test_removing_a_copy_detaches_a_late_junction_without_entering_it(tmp_path):
+def test_a_junction_into_main_planted_after_the_comparison_is_never_entered(
+        shared_tree, monkeypatch):
+    # The worst swap: a folder of the copy replaced by a junction to the main
+    # checkout's same folder, whose files then compare equal to themselves.
+    _, slot, source, target = shared_tree
+    (source / "kit").mkdir()
+    (source / "kit" / "chair.glb").write_bytes(b"chair")
+    (target / "kit").mkdir(parents=True)
+    (target / "kit" / "chair.glb").write_bytes(b"chair")
+    import _winapi
+
+    def change(aside):
+        (aside / "kit" / "chair.glb").unlink()
+        (aside / "kit").rmdir()
+        _winapi.CreateJunction(str(source / "kit"), str(aside / "kit"))
+    _between_compare_and_delete(monkeypatch, change)
+    worktree.share_dirs(slot, keep_local=True)
+    assert (source / "kit" / "chair.glb").read_bytes() == b"chair"
+    (aside,) = target.parent.glob(f"{target.name}.pre-share-*")
+    assert worktree.is_directory_junction(aside / "kit")
+    worktree.os.rmdir(aside / "kit")
+
+
+@pytest.mark.skipif(worktree.os.name != "nt", reason="directory junctions are Windows-only")
+def test_removing_twins_keeps_a_junction_and_never_enters_it(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "precious.glb").write_bytes(b"precious")
+    main = tmp_path / "main"
+    (main / "sub" / "late").mkdir(parents=True)
+    (main / "sub" / "late" / "precious.glb").write_bytes(b"precious")
     copy = tmp_path / "copy"
     (copy / "sub").mkdir(parents=True)
     import _winapi
     _winapi.CreateJunction(str(outside), str(copy / "sub" / "late"))
-    worktree.remove_copy(copy)
-    assert not copy.exists()
+    assert worktree.remove_twins(copy, main) == ["sub/late"]
     assert (outside / "precious.glb").read_bytes() == b"precious"
+    worktree.os.rmdir(copy / "sub" / "late")
+
+
+@pytest.mark.skipif(worktree.os.name != "nt", reason="directory junctions are Windows-only")
+def test_a_main_directory_linking_back_into_the_slot_is_refused(shared_tree):
+    # Every file of the slot's copy would be its own twin, and the only copy
+    # would go.
+    _, slot, source, target = shared_tree
+    (target / "kit").mkdir(parents=True)
+    (target / "kit" / "chair.glb").write_bytes(b"only copy")
+    source.rmdir()
+    import _winapi
+    _winapi.CreateJunction(str(target), str(source))
+    try:
+        with pytest.raises(worktree.Fail, match="overlaps"):
+            worktree.share_dirs(slot, keep_local=True)
+        assert (target / "kit" / "chair.glb").read_bytes() == b"only copy"
+    finally:
+        worktree.os.rmdir(source)
+
+
+@pytest.mark.skipif(worktree.os.name != "nt", reason="directory junctions are Windows-only")
+def test_a_main_subfolder_linking_back_into_the_slot_keeps_the_copy(shared_tree):
+    _, slot, source, target = shared_tree
+    (target / "kit").mkdir(parents=True)
+    (target / "kit" / "chair.glb").write_bytes(b"only copy")
+    import _winapi
+    _winapi.CreateJunction(str(target / "kit"), str(source / "kit"))
+    try:
+        worktree.share_dirs(slot, keep_local=True)
+        assert not worktree.is_link(target)
+        assert (target / "kit" / "chair.glb").read_bytes() == b"only copy"
+    finally:
+        worktree.os.rmdir(source / "kit")
+
+
+def test_any_reparse_point_in_the_copy_is_its_own(tmp_path, monkeypatch):
+    # A cloud placeholder or WSL link is no plain file, whatever its bytes.
+    main, copy = tmp_path / "main", tmp_path / "copy"
+    main.mkdir()
+    copy.mkdir()
+    (main / "chair.glb").write_bytes(b"chair")
+    (copy / "chair.glb").write_bytes(b"chair")
+    lstat = worktree.Path.lstat
+
+    def placeholder(self):
+        info = lstat(self)
+        if self.name != "chair.glb" or self.parent != copy:
+            return info
+        return SimpleNamespace(st_mode=info.st_mode, st_reparse_tag=0x9000001A,  # cloud
+                               st_file_attributes=worktree.stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    monkeypatch.setattr(worktree.Path, "lstat", placeholder)
+    assert worktree.local_only_files(copy, main) == ["chair.glb"]
 
 
 def test_a_link_elsewhere_is_not_replaced(shared_tree, monkeypatch):
